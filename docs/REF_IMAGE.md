@@ -99,3 +99,60 @@ cd /root/Ai-works/情绪app
   我们的 `image_tool` 只接受模型每次传的 `reference_image_path`。
   想让"她每次都长得一样"，应把人设的参考图作为默认值接进来。
 - **vibe 模式未实现**：账号没额度，实现了也用不了。
+
+---
+
+## 6. 🆕 人设固定参考图（2026-09-25 补）
+
+**为什么还要这个**：光让参考图"能发出去"不够 —— 每次还得**模型自己传路径**，
+同一个角色画出来每次都不一样。把角色图设成默认值，`selfie` 才稳定。
+
+### 用法
+
+```bash
+# .env
+EMOTION_IMAGE_PERSONA_REFERENCE='/path/to/角色图.png'
+```
+
+配好之后：`kind="selfie"` 且模型**没**指定 `reference_image_path` → 自动带上它。
+
+### 🔴 三条边界（都有判据盯着）
+
+| 边界 | 为什么 |
+|---|---|
+| **只给 `selfie`** | `edit` 的语义是"改**用户给的那张图**"，拿角色图兜底会把语义**静默换掉**（画出来完全不是用户要改的图）→ `edit` 缺路径时**照旧拒绝** |
+| **`text2img` 也不给** | 风景/物件画面注入角色参考图 = 画错东西 |
+| **读不到就响亮失败** | 不静默降级成纯文生图（那样用户只会觉得"怎么画得还是不像"，无从排查） |
+
+另外两条实现约束：
+
+* **显式路径优先** —— 模型真给了 `reference_image_path` 就用人家的。
+* **必须留痕** —— 走人设兜底时打一条 `selfie 未指定参考图，使用人设固定参考图`
+  （参考图"从哪来的"是排查时唯一的现场证据；静默替换是本项目最贵的一课）。
+
+### 代码位置
+
+| 文件 | 改了什么 |
+|---|---|
+| `emotion_app/infra/config.py` | `ImageConfig.persona_reference` + env 绑定 `EMOTION_IMAGE_PERSONA_REFERENCE`；`public_view` 只暴露 `persona_reference_configured` 布尔（**不回路径全文**，少一条泄漏目录结构的通道） |
+| `emotion_app/domain/image_tool.py` | `ImageToolService(persona_reference=...)` + `set_persona_reference()`（切人设用）；`__call__` 里给 `selfie` 兜底 |
+| `emotion_app/__main__.py` | 把 `config.image.persona_reference` 接进服务 |
+
+### 判据
+
+| 组 | 条数 | 覆盖 |
+|---|---|---|
+| `tests/test_s6_image_reference.py` §6 | **8** | 兜底生效/显式优先/不漏进 edit/不漏进 text2img/未配时不崩/读不到响亮失败/留痕/切人设 |
+| `tests/test_assembly.py` | **2** | ⭐ **接线**：入口把配置传进服务了；env 键名真的绑上了 |
+
+**注入验证**：`tools/inject_persona_ref_check.py` **10 组全被抓住**。
+⚠️ 第一轮有 **3 组没抓住**（⑤ 不判空 / ⑧ 装配漏传 / ⑩ env 绑定去掉）——
+说明判据只测了**函数**没测**接线**。已补 `tests/test_assembly.py` 两条并收紧 ⑤，
+第二轮 10/10。**又一次印证「函数对 ≠ 接线对」。**
+
+### 还没做的
+
+* **真正的角色图要你自己放** —— 仓库里/本机没有现成的人设参考图，
+  代码只负责把它接上（`photo_persona_reference_image_path` 在插件里也是空的）。
+* **按人设自动切换**：现在只有一个全局默认值。多个人设各配一张图需要上层调
+  `set_persona_reference()`（接口已留好，暂无人调用）。

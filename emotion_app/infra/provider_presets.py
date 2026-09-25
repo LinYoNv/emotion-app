@@ -19,7 +19,8 @@
 * 预设是**产品数据**，必须随代码走、可 review、可 diff；
 * 少一次磁盘 IO 和一次"文件坏了怎么办"的分支（读 JSON 就得处理损坏）。
 
-🔴 **改法**：要增删预设，改下面的 `PRESETS` 元组，并同步
+🔴 **改法**：要增删预设，改下面的 `PRESETS` 元组（**照 AstrBot 抄的那份，逐字对照**）
+或 `LOCAL_EXTENSION_PRESETS`（**我们自己补的**），并同步
 `tests/test_provider_presets.py` 里的数量判据（那份测试会拿
 `conductor/presets_source.json` 当**对照物**逐项比 —— 数据源丢了/被改了它就会挂，
 所以"抄错一个字段"必被抓住）。
@@ -108,6 +109,19 @@ NOTE_OPENAI_RESPONSES = (
 
 #: 不可执行的统一文案（契约 §2 原文，**别改**：前端/判据都可能按它匹配）。
 NOTE_ADAPTER_REQUIRED = "需 AstrBot 适配器，本平台暂不能执行"
+
+#: 🔴 **本地扩展**的文案：这些是**我们自己加的**，AstrBot 目录里没有对应的那一条。
+#: 为什么要加：AstrBot 给这些厂商写的适配器其实是 `ProviderOpenAIOfficial`
+#: 的**薄包装**（10~59 行，只加 header / 归一化 URL / 改默认模型），
+#: 也就是说**这些厂商的接口本来就是 OpenAI 格式** —— AstrBot 只是给它挂了个名字。
+#: 出处（本机装在 `/root/.local/share/uv/tools/astrbot/.../core/provider/sources/`）：
+#:   `oai_aihubmix_source.py`(10 行) · `zhipu_source.py`(16) ·
+#:   `groq_source.py`(23) · `longcat_source.py`(23) · `openrouter_source.py`(23) ·
+#:   `xiaomi_source.py`(56) · `ssycloud_source.py`(59) —— 全都 `class ProviderXxx(ProviderOpenAIOfficial)`。
+#: ⚠️ 对照：`anthropic_source.py`(1010 行) / `gemini_source.py`(1118 行) 是**真专有**，不在此列；
+#:   `kimi_code` / `minimax_token_plan` / `xiaomi_token_plan` 继承的是 `ProviderAnthropic`。
+#: 每条的 note 里写清**我们没搬过来的那些适配器行为**（不写 = 用户以为一模一样）。
+NOTE_LOCAL_EXTENSION = "本平台添加的 OpenAI 兼容预设（AstrBot 该厂商的适配器即此格式）"
 
 #: `provider_type` 的分组顺序（契约 §2 的"按 provider_type 分组"具体是哪种顺序）。
 #: ⚠️ 用 `PROVIDER_TYPE_STT` 常量（**别写字符串字面量**）—— 同一概念只留一处定义，
@@ -411,10 +425,74 @@ PRESETS: tuple[ProviderPreset, ...] = (
 
 
 # ---------------------------------------------------------------------------
+# 🆕 本地扩展预设（AstrBot 目录里**没有**这些条目；我们按实测补的）
+# ---------------------------------------------------------------------------
+#
+# 🔴 为什么不直接改 `PRESETS`：那张表是**照 AstrBot v4.27.5 逐字抄的对照物**，
+#    `tests/test_provider_presets.py` 拿 `conductor/presets_source.json` 逐字段比它。
+#    本地扩展**另立一张表**，两者互不污染 —— 抄错一个字照样被抓，扩展有没有问题
+#    由另一组判据守。
+#
+# 加这些的取证（2026-09-25，**不需要真 key**）：带一个假 key 打 `GET {api_base}/models`，
+#   · 401/403 ⇒ 端点存在且要鉴权（URL 对了，只差用户的 key）
+#   · 404     ⇒ 路径不对，说明不是 OpenAI 格式 → **不许加**
+#   实测：groq 403 · zhipu 401 · xiaomi 401 · longcat 401 ·
+#        aihubmix/openrouter/ssycloud 200 ⇒ 这 7 条可以加；
+#        kimi-code / minimax-token-plan / xiaomi-token-plan 全 404 ⇒ **不加**。
+#   ⚠️ 这个探针只证明"那个 URL 上有 OpenAI 形状的端点"，**不证明 `/chat/completions`
+#      一定通** —— 真正的通过与否取决于用户填的 key 和订阅。所以 note 里写清事实，
+#      不写"已验证可用"。
+
+LOCAL_EXTENSION_PRESETS: tuple[ProviderPreset, ...] = (
+    ProviderPreset(
+        id='zhipu-openai', label='智谱 GLM（OpenAI 格式）', provider='zhipu',
+        type='openai_chat_completion', provider_type=PROVIDER_TYPE_CHAT, api_base='https://open.bigmodel.cn/api/paas/v4/',
+        note=NOTE_LOCAL_EXTENSION,
+    ),
+    ProviderPreset(
+        id='groq-openai', label='Groq（OpenAI 格式）', provider='groq',
+        type='openai_chat_completion', provider_type=PROVIDER_TYPE_CHAT, api_base='https://api.groq.com/openai/v1',
+        note=NOTE_LOCAL_EXTENSION + "；⚠️ AstrBot 的 groq 适配器会从 assistant 历史里剔除 reasoning 字段（Groq 会拒收），本平台未做该清理，长对话若带上思维链可能被 Groq 拒绝",
+    ),
+    ProviderPreset(
+        id='longcat-openai', label='LongCat（OpenAI 格式）', provider='longcat',
+        type='openai_chat_completion', provider_type=PROVIDER_TYPE_CHAT, api_base='https://api.longcat.chat/openai/v1',
+        note=NOTE_LOCAL_EXTENSION + "；⚠️ 地址已按 AstrBot 的归一化补上 /v1（AstrBot 源数据里写的是不带 /v1 的 /openai）",
+    ),
+    ProviderPreset(
+        id='openrouter-openai', label='OpenRouter（OpenAI 格式）', provider='openrouter',
+        type='openai_chat_completion', provider_type=PROVIDER_TYPE_CHAT, api_base='https://openrouter.ai/api/v1',
+        note=NOTE_LOCAL_EXTENSION + "；未带 OpenRouter 的归属 header（不影响调用）",
+    ),
+    ProviderPreset(
+        id='aihubmix-openai', label='AIHubMix（OpenAI 格式）', provider='aihubmix',
+        type='openai_chat_completion', provider_type=PROVIDER_TYPE_CHAT, api_base='https://aihubmix.com/v1',
+        note=NOTE_LOCAL_EXTENSION + "；未带 AstrBot 的 APP-Code 折扣 header（不影响调用，仅少了折扣）",
+    ),
+    ProviderPreset(
+        id='xiaomi-openai', label='小米 MiMo（OpenAI 格式）', provider='xiaomi',
+        type='openai_chat_completion', provider_type=PROVIDER_TYPE_CHAT, api_base='https://api.xiaomimimo.com/v1',
+        note=NOTE_LOCAL_EXTENSION,
+    ),
+    ProviderPreset(
+        id='ssycloud-openai', label='胜算云（OpenAI 格式）', provider='ssycloud',
+        type='openai_chat_completion', provider_type=PROVIDER_TYPE_CHAT, api_base='https://router.shengsuanyun.com/api/v1',
+        note=NOTE_LOCAL_EXTENSION + "；未带 X-Title header（不影响调用）",
+    ),
+)
+
+
+#: 面板与查找用的**全量目录** = AstrBot 忠实副本 + 本地扩展。
+#: ⚠️ 现有的 `PRESETS` 引用一律**不要**换成它 —— 判据拿 `PRESETS` 跟源数据比对，
+#:    换了就等于把扩展混进"忠实副本"里，那条判据就失去意义了。
+ALL_PRESETS: tuple[ProviderPreset, ...] = PRESETS + LOCAL_EXTENSION_PRESETS
+
+
+# ---------------------------------------------------------------------------
 # 导入时的自检（不静默：重 id 会让 `find_preset` 永远只返回第一条）
 # ---------------------------------------------------------------------------
 
-_PRESET_IDS: tuple[str, ...] = tuple(p.id for p in PRESETS)
+_PRESET_IDS: tuple[str, ...] = tuple(p.id for p in ALL_PRESETS)
 
 #: 重 id 是**抄数据时最可能犯的错**，而且症状很隐蔽：面板上两条同名，
 #: `find_preset` 只返回先出现的那条。这里在导入时就喊出来（判据另有专门一条）。
@@ -423,13 +501,15 @@ _DUPLICATE_IDS: tuple[str, ...] = tuple(
 )
 if _DUPLICATE_IDS:  # pragma: no cover — 正常数据下不会进（判据是测试里的）
     log.error(
-        "厂商预设表里有重复 id：%s —— find_preset() 只会返回第一条，请修 PRESETS",
+        "厂商预设表里有重复 id：%s —— find_preset() 只会返回第一条，请修 PRESETS / LOCAL_EXTENSION_PRESETS",
         list(_DUPLICATE_IDS),
     )
 
 #: 未知的 `provider_type` 说明抄数据时把分类写错了（排序也会跟着乱）。
 _UNKNOWN_TYPES: tuple[str, ...] = tuple(
-    sorted({p.provider_type for p in PRESETS if p.provider_type not in PROVIDER_TYPE_ORDER})
+    sorted(
+        {p.provider_type for p in ALL_PRESETS if p.provider_type not in PROVIDER_TYPE_ORDER}
+    )
 )
 if _UNKNOWN_TYPES:  # pragma: no cover — 同上
     log.error(
@@ -466,7 +546,9 @@ def list_presets(
          `xinference_stt` / `mimo_stt_api`）我们**一个都跑不了**，
          由 `preset_public_view()['executable_by_us']` 如实标 false。
 
-    ⚠️ 返回的是**新列表**（`PRESETS` 本体是常量元组，外部怎么改都影响不到它）。
+    ⚠️ 返回的是**新列表**（`ALL_PRESETS` 本体是常量元组，外部怎么改都影响不到它）。
+    ⚠️ 取的是 **`ALL_PRESETS`（忠实副本 + 本地扩展）**，不是 `PRESETS` ——
+       面板要能看到我们补的那 7 条 OpenAI 兼容预设。
     """
     if not isinstance(provider_type, str) and provider_type is not None:
         # 🔴 不是"过滤/跳过"分支就一定静默 —— 这里每一条异常输入都留痕：
@@ -478,7 +560,7 @@ def list_presets(
         return []
 
     if provider_type is None:
-        picked = list(PRESETS)
+        picked = list(ALL_PRESETS)
     else:
         wanted = provider_type.strip()
         if not wanted:
@@ -494,7 +576,7 @@ def list_presets(
                 list(PROVIDER_TYPE_ORDER),
             )
             return []
-        picked = [p for p in PRESETS if p.provider_type == wanted]
+        picked = [p for p in ALL_PRESETS if p.provider_type == wanted]
 
     if storable_only:
         from .providers_store import SUPPORTED_PROVIDER_TYPES
@@ -526,10 +608,10 @@ def find_preset(preset_id: str) -> ProviderPreset | None:
     if not wanted:
         log.debug("find_preset 收到空 id → None")
         return None
-    for preset in PRESETS:
+    for preset in ALL_PRESETS:
         if preset.id == wanted:
             return preset
-    log.debug("find_preset 未命中：%r（目录共 %d 条）", wanted, len(PRESETS))
+    log.debug("find_preset 未命中：%r（目录共 %d 条）", wanted, len(ALL_PRESETS))
     return None
 
 
@@ -553,7 +635,10 @@ def preset_public_view(p: ProviderPreset) -> dict:
 
 
 __all__ = [
+    "ALL_PRESETS",
+    "LOCAL_EXTENSION_PRESETS",
     "NOTE_ADAPTER_REQUIRED",
+    "NOTE_LOCAL_EXTENSION",
     "NOTE_OPENAI_CHAT",
     "NOTE_OPENAI_RESPONSES",
     "PRESETS",

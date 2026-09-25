@@ -441,10 +441,16 @@ def build_blueprint(require_auth: Any) -> Blueprint:
         query：`provider_type`（可选）= `chat_completion` / `text_to_speech` / `embedding`。
         非法值 → **400 `invalid_provider_type`**，消息里列出合法值（不是静默回空列表）。
 
-        🔴 数据来源 = `infra/provider_presets.py`，抓自**真 AstrBot v4.27.5**
-           （50 条），不是我们编的。其中只有 `openai_chat_completion` /
-           `openai_responses` 我们**真能执行** —— 每条带 `executable_by_us`，
-           前端据此**如实标注**（作者验收判据③：能力不对等要如实 degraded）。
+        🔴 数据来源 = `infra/provider_presets.py`：
+           * `PRESETS`（**50 条**，逐字抄自**真 AstrBot v4.27.5**，拿源数据逐字段比对）
+           * `LOCAL_EXTENSION_PRESETS`（**7 条本地扩展**，2026-09-25 补）
+             —— AstrBot 给这些厂商写的适配器其实是 `ProviderOpenAIOfficial` 的
+             **薄包装**（10~59 行，只加 header / 归一化 URL / 改默认模型），
+             即**它们本来就是 OpenAI 格式**。
+           → 相加 = `ALL_PRESETS`（**57 条**），`list_presets()` 取的就是它。
+        其中只有 `openai_chat_completion` / `openai_responses` 我们**真能执行** ——
+        每条带 `executable_by_us`，前端据此**如实标注**
+        （作者验收判据③：能力不对等要如实 degraded）。
         """
         denied = require_auth()
         if denied is not None:

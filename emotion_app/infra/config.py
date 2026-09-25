@@ -160,6 +160,18 @@ class ImageConfig:
     #: ⚠️ 之所以做成配置：将来对接陪伴插件的工具协议时，只改这一项。
     dispatch: str = "function_call"
 
+    #: 🆕 **人设固定参考图**（2026-09-25）—— 生图时的**默认参考图**。
+    #:
+    #: 为什么需要它：光把参考图"能发出去"还不够，每次还得模型自己传路径
+    #: → 同一个角色每次长得都不一样。把它设成人设图后，
+    #: `kind="selfie"` 且模型没指定参考图时**自动带上**，长相/画风才稳定。
+    #:
+    #: ⚠️ **只在 `selfie` 上生效**：`edit` 的语义是"改用户给的那张图"，
+    #:    拿角色参考图兜底会**静默换掉语义**（本项目最忌那类）。
+    #: ⚠️ 路径读不到 → **响亮失败**（`reference_unreadable`），
+    #:    不静默降级成纯文生图（那样用户只会觉得"怎么长得不像"）。
+    persona_reference: str = ""
+
     def effective_base(self, fallback: str) -> str:
         return self.base_url or fallback
 
@@ -193,6 +205,7 @@ class ImageConfig:
             "output_dir": self.output_dir,
             "dispatch": self.dispatch,
             "extra_params": sorted(json.loads(self.extra_params)) if self.extra_params else [],
+            "persona_reference_configured": bool(self.persona_reference),
         }
 
 
@@ -425,6 +438,7 @@ _ENV_MAP: dict[str, tuple[str, str, str]] = {
     "IMAGE_OUTPUT_DIR": ("image", "output_dir", "str"),
     "IMAGE_DISPATCH": ("image", "dispatch", "str"),
     "IMAGE_EXTRA_PARAMS": ("image", "extra_params", "str"),
+    "IMAGE_PERSONA_REFERENCE": ("image", "persona_reference", "str"),
     "LOGGING_LEVEL": ("logging", "level", "str"),
     "LOGGING_JSON": ("logging", "json_output", "bool"),
     "PLUGINS_ENABLED": ("plugins", "enabled", "bool"),

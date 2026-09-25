@@ -118,6 +118,8 @@ async def _serve() -> int:
         enabled=config.image.enabled,
         defaults=image_defaults,
         url_prefix="/api/v1/images",
+        # 🆕 人设固定参考图：selfie 没给路径时自动带上（画风/长相才稳定）
+        persona_reference=config.image.persona_reference,
     )
     register_image_tool(tools, image_service, enabled=config.image.enabled)
 

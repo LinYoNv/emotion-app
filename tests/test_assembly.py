@@ -157,3 +157,39 @@ def test_provider_config_path_is_ours_not_astrbot():
     assert "data/providers.json" in src or "providers_store" in src, (
         "供应商配置应落在我们自己的 data/ 目录"
     )
+
+
+def test_persona_reference_is_wired_from_config():
+    """🔴 人设固定参考图必须**从配置接到服务**上（2026-09-25 加）。
+
+    ⚠️ 为什么单独守这一条：`.env` 里有 `EMOTION_IMAGE_PERSONA_REFERENCE`、
+    `ImageConfig` 也认它，**但入口那句 `persona_reference=...` 一旦漏了，
+    整个功能就是死的，而且没有任何判据会红** —— 用户只会觉得"怎么画得还是不像"。
+    这正是本文件开头说的那类失效（模块能工作 ≠ 被接上了）。
+    """
+    src = inspect.getsource(cli)
+    assert "persona_reference=config.image.persona_reference" in src, (
+        "入口没把 config.image.persona_reference 传给 ImageToolService —— "
+        "配置白填，selfie 永远不带人设参考图"
+    )
+
+
+def test_persona_reference_env_key_is_wired():
+    """🔴 env 键名 `EMOTION_IMAGE_PERSONA_REFERENCE` 必须真的绑到 `image.persona_reference`。
+
+    ⚠️ 只测"入口传了字段"是**不够的**（注入 ⑧ 证明过）：配置的 env 绑定若漏了，
+       入口那句照样在、服务照样建，但**用户配 `.env` 永远不生效**。
+       → 从**真实 `.env` 形态**出发端到端验一次。
+    """
+    from emotion_app.infra.config import load_config
+
+    cfg = load_config({
+        "EMOTION_AUTH_ACCESS_TOKEN": "t" * 32,
+        "EMOTION_IMAGE_PERSONA_REFERENCE": "/tmp/wired-probe.png",
+    })
+    assert cfg.image.persona_reference == "/tmp/wired-probe.png", (
+        "EMOTION_IMAGE_PERSONA_REFERENCE 没有绑到 image.persona_reference —— "
+        "用户在 .env 里配了也不生效（且不报错）"
+    )
+    cfg2 = load_config({"EMOTION_AUTH_ACCESS_TOKEN": "t" * 32})
+    assert cfg2.image.persona_reference == ""

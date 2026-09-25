@@ -474,3 +474,228 @@ def test_tool_reports_reference_unreadable_to_model(tmp_path):
     assert r.must_not_claim_sent is True
     payload = r.to_payload()
     assert "不要编造" in payload or "不要编造图片路径" in payload
+
+
+# ===========================================================================
+# 6. 🆕 人设固定参考图（2026-09-25）
+# ===========================================================================
+#
+# 起因：光让参考图"能发出去"还不够 —— 每次还得模型自己传路径，同一个角色
+# 画出来每次都不一样。把人设图设成默认值，`selfie` 才会稳定。
+#
+# 🔴 两条边界（都写进了 docstring，判据也盯着）：
+#   * **只给 `selfie`**：`edit` 的语义是"改用户给的那张图"，拿角色参考图兜底
+#     会**静默换掉语义**（画出来完全不是用户要改的图）。
+#   * **必须留痕**：参考图"从哪来的"要有日志，静默替换 = 本项目最贵那类 bug。
+
+
+def test_persona_reference_is_used_for_selfie_without_explicit_path(tmp_path):
+    """⭐ 核心判据：selfie 没给路径 → 自动带人设参考图，且**真的发到了 HTTP**。"""
+    cap = _Capture()
+    backend = _backend(cap)
+    persona_ref = _ref_file(tmp_path)
+
+    async def go():
+        client = backend._client  # noqa: SLF001
+        await client.open()
+        try:
+            svc = ImageToolService(
+                backend, output_dir=tmp_path / "out", persona_reference=str(persona_ref)
+            )
+            return await svc({"prompt": "自拍", "kind": "selfie", "send": False})
+        finally:
+            await client.close()
+
+    r = asyncio.run(go())
+    assert r.success is True, r
+    assert cap.last["url"].endswith("/images/generations")
+    refs = cap.last["body"]["parameters"]["director_reference_images"]
+    assert refs[0].startswith("data:image/png;base64,"), "人设参考图没被带上去"
+
+
+def test_explicit_path_wins_over_persona_reference(tmp_path):
+    """模型**显式**给了路径时，人设图不许抢 —— 显式优先。"""
+    cap = _Capture()
+    backend = _backend(cap)
+    persona_ref = _ref_file(tmp_path)
+    explicit = tmp_path / "explicit.png"
+    explicit.write_bytes(base64.b64decode(PNG_1PX) + b"\x00" * 8)  # 与 persona 不同的内容
+
+    async def go():
+        client = backend._client  # noqa: SLF001
+        await client.open()
+        try:
+            svc = ImageToolService(
+                backend, output_dir=tmp_path / "out", persona_reference=str(persona_ref)
+            )
+            return await svc({
+                "prompt": "自拍", "kind": "selfie",
+                "reference_image_path": str(explicit), "send": False,
+            })
+        finally:
+            await client.close()
+
+    r = asyncio.run(go())
+    assert r.success is True, r
+    got = cap.last["body"]["parameters"]["director_reference_images"][0]
+    assert got == reference_data_uri(str(explicit)), "显式路径被人设图顶掉了"
+
+
+def test_persona_reference_does_not_leak_into_edit(tmp_path):
+    """🔴 **edit 不许**吃人设参考图 —— 那会静默把"改这张图"变成"画角色"。"""
+    cap = _Capture()
+    backend = _backend(cap)
+    persona_ref = _ref_file(tmp_path)
+
+    async def go():
+        client = backend._client  # noqa: SLF001
+        await client.open()
+        try:
+            svc = ImageToolService(
+                backend, output_dir=tmp_path / "out", persona_reference=str(persona_ref)
+            )
+            return await svc({"prompt": "改成红裙子", "kind": "edit", "send": False})
+        finally:
+            await client.close()
+
+    r = asyncio.run(go())
+    assert r.success is False, "edit 缺参考图竟然成功了 —— 语义被静默换掉"
+    # ⚠️ 这里是**工具自身的前置守卫**先命中（`edit 需要 reference_image_path`
+    #    → `invalid_args`），不是后端那条 `reference_unreadable`。
+    #    先查清"哪个值才对"再这么断言（本项目铁律：断言失败先查正确值，别改代码迁就）。
+    assert r.status == "invalid_args", r.status
+    assert not cap.calls, "edit 不该发出任何请求"
+
+
+def test_persona_reference_does_not_leak_into_text2img(tmp_path):
+    """🔴 text2img（风景/物件）也不许吃人设图 —— 会画错东西。"""
+    cap = _Capture()
+    backend = _backend(cap)
+
+    async def go():
+        client = backend._client  # noqa: SLF001
+        await client.open()
+        try:
+            svc = ImageToolService(
+                backend, output_dir=tmp_path / "out", persona_reference=str(_ref_file(tmp_path))
+            )
+            return await svc({"prompt": "一片海", "kind": "text2img", "send": False})
+        finally:
+            await client.close()
+
+    r = asyncio.run(go())
+    assert r.success is True, r
+    assert "parameters" not in cap.last["body"], "text2img 不该带参考图字段"
+
+
+def test_persona_reference_falls_back_cleanly_when_unset(tmp_path):
+    """没配人设图时，`selfie` **照旧**是纯文生图（不能因此报错）。
+
+    ⚠️ 光断言"不带 parameters"是**抓不住** "不判空就硬塞空串" 那种注入的 ——
+       因为 `reference_images=[""]` 会被 `ImageClient.generate` 里的
+       `[r for r in ... if r]` 过滤掉，**照样**不带 parameters。
+       → 所以必须**从工具视角**断言：`ref` 为空，且**没有**打出"用了人设图"的日志。
+    """
+    cap = _Capture()
+    backend = _backend(cap)
+    logs: list[str] = []
+
+    async def go():
+        client = backend._client  # noqa: SLF001
+        await client.open()
+        try:
+            svc = ImageToolService(backend, output_dir=tmp_path / "out")  # 不传 persona_reference
+            return await svc({"prompt": "自拍", "kind": "selfie", "send": False})
+        finally:
+            await client.close()
+
+    import logging as _logging
+
+    class _H(_logging.Handler):
+        def emit(self, record):  # noqa: D102
+            logs.append(record.getMessage())
+
+    lg = _logging.getLogger("emotion_app.domain.image_tool")
+    h = _H()
+    lg.addHandler(h)
+    try:
+        r = asyncio.run(go())
+    finally:
+        lg.removeHandler(h)
+
+    assert r.success is True, r
+    assert "parameters" not in cap.last["body"]
+    assert not any("人设固定参考图" in m for m in logs), (
+        f"没配人设图却声称用了它：{logs}"
+    )
+
+
+def test_persona_reference_missing_file_is_loud_not_silent(tmp_path):
+    """配了人设图但**文件不在** → 响亮失败，不静默降级成纯文生图。"""
+    cap = _Capture()
+    backend = _backend(cap)
+
+    async def go():
+        client = backend._client  # noqa: SLF001
+        await client.open()
+        try:
+            svc = ImageToolService(
+                backend, output_dir=tmp_path / "out",
+                persona_reference=str(tmp_path / "gone.png"),
+            )
+            return await svc({"prompt": "自拍", "kind": "selfie", "send": False})
+        finally:
+            await client.close()
+
+    r = asyncio.run(go())
+    assert r.success is False
+    assert r.status == "reference_unreadable", r.status
+    assert not cap.calls, "人设图读不到却仍然发了请求（= 静默降级）"
+
+
+def test_persona_reference_use_is_logged(tmp_path, caplog):
+    """🔴 **留痕判据**：参考图从哪来的必须有日志（本项目最贵的一课）。"""
+    caplog.set_level(logging.INFO, logger="emotion_app.domain.image_tool")
+    cap = _Capture()
+    backend = _backend(cap)
+
+    async def go():
+        client = backend._client  # noqa: SLF001
+        await client.open()
+        try:
+            svc = ImageToolService(
+                backend, output_dir=tmp_path / "out",
+                persona_reference=str(_ref_file(tmp_path)),
+            )
+            return await svc({"prompt": "自拍", "kind": "selfie", "send": False})
+        finally:
+            await client.close()
+
+    asyncio.run(go())
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("人设固定参考图" in m for m in msgs), msgs
+
+
+def test_set_persona_reference_switches_default(tmp_path):
+    """切人设时要能换默认参考图（`set_persona_reference`）。"""
+    cap = _Capture()
+    backend = _backend(cap)
+    a, b = _ref_file(tmp_path), tmp_path / "b.png"
+    b.write_bytes(base64.b64decode(PNG_1PX) + b"\x00" * 4)
+
+    async def go():
+        client = backend._client  # noqa: SLF001
+        await client.open()
+        try:
+            svc = ImageToolService(backend, output_dir=tmp_path / "out", persona_reference=str(a))
+            assert svc.persona_reference == str(a)
+            svc.set_persona_reference(str(b))
+            assert svc.persona_reference == str(b)
+            return await svc({"prompt": "自拍", "kind": "selfie", "send": False})
+        finally:
+            await client.close()
+
+    r = asyncio.run(go())
+    assert r.success is True, r
+    got = cap.last["body"]["parameters"]["director_reference_images"][0]
+    assert got == reference_data_uri(str(b)), "换过之后用的还是旧的人设图"

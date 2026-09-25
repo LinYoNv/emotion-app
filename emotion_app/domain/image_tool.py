@@ -125,9 +125,16 @@ class ImageToolService:
         enabled: bool = True,
         defaults: dict[str, Any] | None = None,
         url_prefix: str = "/api/v1/images",
+        persona_reference: str = "",
     ) -> None:
         """⚠️ 只依赖 `ImageBackend` Protocol —— 换生图后端（NAI/ComfyUI/陪伴的）
         不用改这里（情绪：「接口别写死了」）。
+
+        Args:
+            persona_reference: 🆕 **人设固定参考图**（2026-09-25）。`selfie` 且模型
+                没给 `reference_image_path` 时**自动带上它** —— 否则同一个角色
+                每次画出来都不一样。只在 `selfie` 上生效（`edit` 的语义是
+                "改用户给的那张图"，拿它兜底会静默换掉语义）。
         """
         self._backend = backend
         self._out_dir = Path(output_dir)
@@ -137,6 +144,24 @@ class ImageToolService:
         #: 落盘图片的 HTTP 前缀 —— 有了它 `sent` 才能诚实地为 true
         #: （图片真能被客户端看到，而不是只躺在磁盘上）
         self._url_prefix = url_prefix.rstrip("/")
+        #: 🆕 人设固定参考图（空 = 没配，selfie 就退化成纯文生图）
+        self._persona_reference = str(persona_reference or "").strip()
+
+    @property
+    def persona_reference(self) -> str:
+        """当前配的人设参考图（**只回一个布尔式的事实**由调用方决定怎么用）。"""
+        return self._persona_reference
+
+    def set_persona_reference(self, path: str) -> None:
+        """换人设参考图（切人设时由上层调）。
+
+        ⚠️ 只改**默认值**，不影响已经开始的调用 —— 与 `self.enabled` 同类语义。
+        """
+        self._persona_reference = str(path or "").strip()
+        log.info(
+            "人设参考图已更新",
+            extra={"data": {"configured": bool(self._persona_reference)}},
+        )
 
     @property
     def configured(self) -> bool:
@@ -187,6 +212,18 @@ class ImageToolService:
 
         # ⚠️ edit 必须有参考图 —— 缺了要明确拒绝，不能让模型编路径
         ref = str(args.get("reference_image_path") or "").strip()
+        # 🆕 人设固定参考图兜底：**只给 selfie**。
+        #    * 为什么不做 `edit`：edit 的语义是"改用户给的那张图"，
+        #      拿角色参考图兜底会**静默换掉语义**（画出来完全不是用户要改的图）。
+        #    * 为什么不做 `text2img`：那是风景/物件，注入角色参考图会画错东西。
+        if not ref and kind == image_gen.KIND_SELFIE and self._persona_reference:
+            ref = self._persona_reference
+            # 🔴 **必须留痕**：这是"参考图从哪来的"唯一现场证据
+            #    （本项目最贵的一课就是参考图被静默丢弃/替换）
+            log.info(
+                "selfie 未指定参考图，使用人设固定参考图",
+                extra={"data": {"configured_chars": len(ref)}},
+            )
         if kind == image_gen.KIND_EDIT and not ref:
             return ToolResult(
                 status="invalid_args",

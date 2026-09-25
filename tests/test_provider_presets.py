@@ -33,6 +33,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from emotion_app.infra.provider_presets import (  # noqa: E402
+    ALL_PRESETS,
+    LOCAL_EXTENSION_PRESETS,
     PRESETS,
     find_preset,
     list_presets,
@@ -209,9 +211,11 @@ def test_list_presets_filters_by_type():
     #    AstrBot 那 50 条**全部存得进** → 两者相等。
     #    🔴 断言按 `SUPPORTED_PROVIDER_TYPES` 算，**不写死 50** ——
     #       将来加/减支持的类型时这条判据自动跟着走。
-    storable = [p for p in PRESETS if p.provider_type in SUPPORTED_PROVIDER_TYPES]
+    #    🆕 2026-09-25：对照物从 `PRESETS` 换成 `ALL_PRESETS`（忠实副本 + 本地扩展）。
+    #       **机制没变**（下发集 == 可存集），只是目录长大了 —— 不是为迁就数据改判据。
+    storable = [p for p in ALL_PRESETS if p.provider_type in SUPPORTED_PROVIDER_TYPES]
     assert len(list_presets(None)) == len(storable)
-    unstorable = len(PRESETS) - len(storable)
+    unstorable = len(ALL_PRESETS) - len(storable)
     assert unstorable == 0, (
         f"有 {unstorable} 条预设存不进本平台；若是有意的（新类型未支持），"
         "请同步更新本断言与 SUPPORTED_PROVIDER_TYPES 的说明"
@@ -231,12 +235,14 @@ def test_list_presets_storable_only_drops_what_we_cannot_save():
           机制不变就不该为了迁就数据去改判据。
     """
     default_ids = {p.id for p in list_presets(None)}
-    storable = {p.id for p in PRESETS if p.provider_type in SUPPORTED_PROVIDER_TYPES}
+    storable = {p.id for p in ALL_PRESETS if p.provider_type in SUPPORTED_PROVIDER_TYPES}
     assert default_ids == storable, (
         f"默认下发里混进了存不进的：{sorted(default_ids - storable)}"
     )
     # 显式要全量时仍给全量（保留"看看 AstrBot 有什么"的能力）
-    assert {p.id for p in list_presets(None, storable_only=False)} == {p.id for p in PRESETS}
+    assert {p.id for p in list_presets(None, storable_only=False)} == {
+        p.id for p in ALL_PRESETS
+    }
     # 而 storable_only 的结果里，绝不该有存不进的
     assert all(
         p.provider_type in SUPPORTED_PROVIDER_TYPES
@@ -312,6 +318,31 @@ async def test_route_requires_auth(mk):
     assert r.status_code in (401, 403), r.status_code
 
 
+async def test_route_actually_serves_local_extensions(mk):
+    """🔴 **接线判据**：本地扩展必须真的出现在面板拿到的响应里。
+
+    ⚠️ 只测 `list_presets()` 是**不够的**（本项目踩过「函数对 ≠ 接线对」）：
+       路由若哪天改回 `PRESETS`，函数判据照样全绿，但面板上那 7 条消失了。
+       所以这里**从 HTTP 响应出发**点名要它们。
+    """
+    c = await mk()
+    from tests.test_providers_api import _data
+
+    r = await c.get("/api/v1/provider-presets?provider_type=chat_completion")
+    assert r.status_code == 200, await r.get_data(as_text=True)
+    d = _data(await r.get_json())
+    got = {p["id"]: p for p in d["presets"]}
+    for p in LOCAL_EXTENSION_PRESETS:
+        assert p.id in got, f"面板拿不到本地扩展 {p.id}（路由没走 ALL_PRESETS？）"
+        assert got[p.id]["executable_by_us"] is True, p.id
+    # 全量响应里也要有（不带 query 的那条路）
+    r2 = await c.get("/api/v1/provider-presets")
+    allids = {p["id"] for p in _data(await r2.get_json())["presets"]}
+    assert {p.id for p in LOCAL_EXTENSION_PRESETS} <= allids
+    # 而忠实副本一条都不能少
+    assert {p.id for p in PRESETS} <= allids
+
+
 # ===========================================================================
 # ⑤ 范围变更：TTS/embedding 现在存得下（但跑不了）
 # ===========================================================================
@@ -369,3 +400,113 @@ def test_stt_presets_are_listed_and_storable_but_not_executable():
             f"{p.id}({p.type}) 被标成可执行了 —— 若真实现了它，请同步更新这里与文档"
         )
         assert view["note"], f"{p.id} 没有 note，用户看不出为什么不能用"
+
+
+# ===========================================================================
+# ④ 🆕 本地扩展预设（2026-09-25）
+# ===========================================================================
+#
+# 背景：AstrBot 给若干厂商写的适配器其实是 `ProviderOpenAIOfficial` 的**薄包装**
+# （10~59 行，只加 header / 归一化 URL / 改默认模型）—— 即**那些厂商本来就是
+# OpenAI 格式**。AstrBot 目录里它们被标成专有适配器名，于是我们判成"不能执行"。
+# 我们按实测补了 7 条（`LOCAL_EXTENSION_PRESETS`），**不改** AstrBot 那份忠实副本。
+#
+# 取证方式（**不需要真 key**）：带假 key 打 `GET {api_base}/models` ——
+# 401/403 = 端点存在且要鉴权（URL 对了）；404 = 路径不对（不许加）。
+
+
+def test_local_extensions_do_not_pollute_the_faithful_copy():
+    """🔴 本地扩展**绝不能**混进 `PRESETS`（那是拿源数据逐字段比的对照物）。
+
+    这是本组最重要的判据：一旦有人图省事把扩展直接塞进 `PRESETS`，
+    `test_preset_ids_match_source_exactly` 会红，但若那条被判据作者顺手"放宽"了，
+    忠实副本就悄悄腐化了 —— 这条独立盯着它。
+    """
+    faithful_ids = {p.id for p in PRESETS}
+    ext_ids = {p.id for p in LOCAL_EXTENSION_PRESETS}
+    assert not (faithful_ids & ext_ids), (
+        f"本地扩展的 id 撞进了忠实副本：{sorted(faithful_ids & ext_ids)}"
+    )
+    assert len(ALL_PRESETS) == len(PRESETS) + len(LOCAL_EXTENSION_PRESETS)
+    assert set(p.id for p in ALL_PRESETS) == faithful_ids | ext_ids
+
+
+def test_local_extensions_are_all_executable_openai_chat():
+    """扩展**必须**是我们真能执行的格式 —— 否则加它只是把"看着能用"搬进面板。"""
+    for p in LOCAL_EXTENSION_PRESETS:
+        assert p.type in EXECUTABLE_ADAPTER_TYPES, (
+            f"{p.id} 的适配器 {p.type!r} 我们跑不了，不该作为本地扩展加进来"
+        )
+        assert preset_public_view(p)["executable_by_us"] is True, p.id
+        assert p.provider_type in SUPPORTED_PROVIDER_TYPES, p.id
+
+
+def test_local_extensions_have_urls_and_notes():
+    """扩展必须**带地址、带说明** —— 空地址等于让用户自己猜，空说明等于隐瞒差异。"""
+    for p in LOCAL_EXTENSION_PRESETS:
+        assert p.api_base.startswith("https://"), f"{p.id} 的 api_base 不像地址：{p.api_base!r}"
+        assert p.note and len(p.note) > 10, f"{p.id} 没有说明文案"
+        assert p.label and p.label != p.id, f"{p.id} 没起展示名"
+        # 面板上要和厂商原条目**并排可选**（N4-3 的验收点）
+        assert p.provider, p.id
+
+
+def test_longcat_extension_url_carries_v1():
+    """🔴 `longcat` 的坑：AstrBot 源数据里是 `/openai`（**不带 /v1**），
+    而它的适配器会在初始化时归一化成 `/openai/v1`。
+
+    → 我们直接用 OpenAI 适配器打源数据那个地址会**打到错路径**。
+       这条判据点名守住：扩展里的 longcat 地址**必须**带 `/v1`。
+    """
+    ext = find_preset("longcat-openai")
+    assert ext is not None, "本地扩展里的 longcat 预设不见了"
+    assert ext.api_base.endswith("/v1"), (
+        f"longcat 扩展地址必须以 /v1 结尾（AstrBot 会归一化，我们不归一化）：{ext.api_base}"
+    )
+    # 而忠实副本里那条**保持原样**（别去改它，它就是 AstrBot 的原文）
+    faithful = find_preset("longcat")
+    assert faithful.api_base == "https://api.longcat.chat/openai", faithful.api_base
+
+
+def test_local_extension_notes_disclose_unported_adapter_behaviour():
+    """🔴 哪些适配器行为我们**没搬**，必须在 note 里说清（不说 = 用户以为一模一样）。
+
+    点名三条已知差异：
+      * groq     —— 适配器会剔除 assistant 历史里的 reasoning 字段，我们不做
+      * aihubmix —— 适配器带 APP-Code 折扣 header，我们不带
+      * openrouter / ssycloud —— 适配器带归属/标题 header，我们不带
+    """
+    for pid, keyword in [
+        ("groq-openai", "reasoning"),
+        ("aihubmix-openai", "APP-Code"),
+        ("openrouter-openai", "header"),
+        ("ssycloud-openai", "X-Title"),
+    ]:
+        p = find_preset(pid)
+        assert p is not None, f"{pid} 不见了"
+        assert keyword in p.note, f"{pid} 的 note 没写清未搬过来的行为（缺 {keyword!r}）：{p.note}"
+
+
+def test_known_non_openai_vendors_are_not_extended():
+    """🔴 **不许**给不是 OpenAI 格式的厂商加扩展（实测 404）。
+
+    `kimi-code` / `minimax-token-plan` / `xiaomi-token-plan` 继承的是
+    `ProviderAnthropic`，`anthropic` / `gemini` 是真专有 —— 给它们挂
+    `openai_chat_completion` 就是"看着能用其实不能用"。
+    """
+    forbidden = {
+        "anthropic", "google_gemini", "kimi-code", "minimax-token-plan",
+        "xiaomi-token-plan",
+    }
+    ext_providers = {p.provider for p in LOCAL_EXTENSION_PRESETS}
+    bad = sorted(forbidden & ext_providers)
+    assert not bad, f"给这些厂商加了 OpenAI 扩展，但它们实测不是 OpenAI 格式：{bad}"
+
+
+def test_find_preset_reaches_local_extensions():
+    """面板按 id 取预设 —— 取不到就等于没加。"""
+    for p in LOCAL_EXTENSION_PRESETS:
+        got = find_preset(p.id)
+        assert got is not None and got.id == p.id, p.id
+        # 同时**不能**把忠实副本挤掉
+        assert find_preset("openai") is not None
