@@ -1,0 +1,402 @@
+[
+ {
+  "id": "openai",
+  "provider": "openai",
+  "type": "openai_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.openai.com/v1",
+  "executable_by_us": true
+ },
+ {
+  "id": "openai-responses",
+  "provider": "openai",
+  "type": "openai_responses",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.openai.com/v1",
+  "executable_by_us": true
+ },
+ {
+  "id": "google_gemini",
+  "provider": "google",
+  "type": "googlegenai_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://generativelanguage.googleapis.com/",
+  "executable_by_us": false
+ },
+ {
+  "id": "anthropic",
+  "provider": "anthropic",
+  "type": "anthropic_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.anthropic.com/v1",
+  "executable_by_us": false
+ },
+ {
+  "id": "kimi-code",
+  "provider": "kimi-code",
+  "type": "kimi_code_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.kimi.com/coding",
+  "executable_by_us": false
+ },
+ {
+  "id": "moonshot",
+  "provider": "moonshot",
+  "type": "openai_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.moonshot.cn/v1",
+  "executable_by_us": true
+ },
+ {
+  "id": "minimax",
+  "provider": "minimax",
+  "type": "openai_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.minimaxi.com/v1",
+  "executable_by_us": true
+ },
+ {
+  "id": "minimax-token-plan",
+  "provider": "minimax-token-plan",
+  "type": "minimax_token_plan",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.minimaxi.com/anthropic",
+  "executable_by_us": false
+ },
+ {
+  "id": "xiaomi",
+  "provider": "xiaomi",
+  "type": "xiaomi_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.xiaomimimo.com/v1",
+  "executable_by_us": false
+ },
+ {
+  "id": "xiaomi-token-plan",
+  "provider": "xiaomi-token-plan",
+  "type": "xiaomi_token_plan",
+  "provider_type": "chat_completion",
+  "api_base": "https://token-plan-cn.xiaomimimo.com/anthropic",
+  "executable_by_us": false
+ },
+ {
+  "id": "xai",
+  "provider": "xai",
+  "type": "openai_responses",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.x.ai/v1",
+  "executable_by_us": true
+ },
+ {
+  "id": "deepseek",
+  "provider": "deepseek",
+  "type": "openai_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.deepseek.com/v1",
+  "executable_by_us": true
+ },
+ {
+  "id": "deepseek-responses",
+  "provider": "deepseek",
+  "type": "openai_responses",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.deepseek.com/v1",
+  "executable_by_us": true
+ },
+ {
+  "id": "zhipu",
+  "provider": "zhipu",
+  "type": "zhipu_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://open.bigmodel.cn/api/paas/v4/",
+  "executable_by_us": false
+ },
+ {
+  "id": "longcat",
+  "provider": "longcat",
+  "type": "longcat_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.longcat.chat/openai",
+  "executable_by_us": false
+ },
+ {
+  "id": "aihubmix",
+  "provider": "aihubmix",
+  "type": "aihubmix_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://aihubmix.com/v1",
+  "executable_by_us": false
+ },
+ {
+  "id": "openrouter",
+  "provider": "openrouter",
+  "type": "openrouter_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://openrouter.ai/api/v1",
+  "executable_by_us": false
+ },
+ {
+  "id": "ssycloud",
+  "provider": "ssycloud",
+  "type": "ssycloud_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://router.shengsuanyun.com/api/v1",
+  "executable_by_us": false
+ },
+ {
+  "id": "nvidia",
+  "provider": "nvidia",
+  "type": "openai_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://integrate.api.nvidia.com/v1",
+  "executable_by_us": true
+ },
+ {
+  "id": "azure_openai",
+  "provider": "azure",
+  "type": "openai_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "",
+  "executable_by_us": true
+ },
+ {
+  "id": "ollama",
+  "provider": "ollama",
+  "type": "openai_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "http://127.0.0.1:11434/v1",
+  "executable_by_us": true
+ },
+ {
+  "id": "lm_studio",
+  "provider": "lm_studio",
+  "type": "openai_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "http://127.0.0.1:1234/v1",
+  "executable_by_us": true
+ },
+ {
+  "id": "google_gemini_openai",
+  "provider": "google",
+  "type": "openai_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://generativelanguage.googleapis.com/v1beta/openai/",
+  "executable_by_us": true
+ },
+ {
+  "id": "groq",
+  "provider": "groq",
+  "type": "groq_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.groq.com/openai/v1",
+  "executable_by_us": false
+ },
+ {
+  "id": "302ai",
+  "provider": "302ai",
+  "type": "openai_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.302.ai/v1",
+  "executable_by_us": true
+ },
+ {
+  "id": "siliconflow",
+  "provider": "siliconflow",
+  "type": "openai_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.siliconflow.cn/v1",
+  "executable_by_us": true
+ },
+ {
+  "id": "ppio",
+  "provider": "ppio",
+  "type": "openai_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.ppinfra.com/v3/openai",
+  "executable_by_us": true
+ },
+ {
+  "id": "tokenpony",
+  "provider": "tokenpony",
+  "type": "openai_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.tokenpony.cn/v1",
+  "executable_by_us": true
+ },
+ {
+  "id": "compshare",
+  "provider": "compshare",
+  "type": "openai_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.modelverse.cn/v1",
+  "executable_by_us": true
+ },
+ {
+  "id": "modelscope",
+  "provider": "modelscope",
+  "type": "openai_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://api-inference.modelscope.cn/v1",
+  "executable_by_us": true
+ },
+ {
+  "id": "fastgpt",
+  "provider": "fastgpt",
+  "type": "openai_chat_completion",
+  "provider_type": "chat_completion",
+  "api_base": "https://api.fastgpt.in/api/v1",
+  "executable_by_us": true
+ },
+ {
+  "id": "whisper",
+  "provider": "openai",
+  "type": "openai_whisper_api",
+  "provider_type": "speech_to_text",
+  "api_base": "",
+  "executable_by_us": false
+ },
+ {
+  "id": "mimo_stt",
+  "provider": "mimo",
+  "type": "mimo_stt_api",
+  "provider_type": "speech_to_text",
+  "api_base": "https://api.xiaomimimo.com/v1",
+  "executable_by_us": false
+ },
+ {
+  "id": "openai_tts",
+  "provider": "openai",
+  "type": "openai_tts_api",
+  "provider_type": "text_to_speech",
+  "api_base": "",
+  "executable_by_us": false
+ },
+ {
+  "id": "mimo_tts",
+  "provider": "mimo",
+  "type": "mimo_tts_api",
+  "provider_type": "text_to_speech",
+  "api_base": "https://api.xiaomimimo.com/v1",
+  "executable_by_us": false
+ },
+ {
+  "id": "genie_tts",
+  "provider": "genie_tts",
+  "type": "genie_tts",
+  "provider_type": "text_to_speech",
+  "api_base": "",
+  "executable_by_us": false
+ },
+ {
+  "id": "edge_tts",
+  "provider": "microsoft",
+  "type": "edge_tts",
+  "provider_type": "text_to_speech",
+  "api_base": "",
+  "executable_by_us": false
+ },
+ {
+  "id": "gsv_tts",
+  "provider": "gpt_sovits",
+  "type": "gsv_tts_selfhost",
+  "provider_type": "text_to_speech",
+  "api_base": "http://127.0.0.1:9880",
+  "executable_by_us": false
+ },
+ {
+  "id": "gsvi_tts",
+  "provider": "gpt_sovits_inference",
+  "type": "gsvi_tts_api",
+  "provider_type": "text_to_speech",
+  "api_base": "http://127.0.0.1:8000",
+  "executable_by_us": false
+ },
+ {
+  "id": "fishaudio_tts",
+  "provider": "fishaudio",
+  "type": "fishaudio_tts_api",
+  "provider_type": "text_to_speech",
+  "api_base": "https://api.fish.audio/v1",
+  "executable_by_us": false
+ },
+ {
+  "id": "azure_tts",
+  "provider": "azure",
+  "type": "azure_tts",
+  "provider_type": "text_to_speech",
+  "api_base": "",
+  "executable_by_us": false
+ },
+ {
+  "id": "minimax_tts",
+  "provider": "minimax",
+  "type": "minimax_tts_api",
+  "provider_type": "text_to_speech",
+  "api_base": "https://api.minimax.chat/v1/t2a_v2",
+  "executable_by_us": false
+ },
+ {
+  "id": "volcengine_tts",
+  "provider": "volcengine",
+  "type": "volcengine_tts",
+  "provider_type": "text_to_speech",
+  "api_base": "https://openspeech.bytedance.com/api/v1/tts",
+  "executable_by_us": false
+ },
+ {
+  "id": "gemini_tts",
+  "provider": "google",
+  "type": "gemini_tts",
+  "provider_type": "text_to_speech",
+  "api_base": "",
+  "executable_by_us": false
+ },
+ {
+  "id": "openai_embedding",
+  "provider": "openai",
+  "type": "openai_embedding",
+  "provider_type": "embedding",
+  "api_base": "",
+  "executable_by_us": false
+ },
+ {
+  "id": "gemini_embedding",
+  "provider": "google",
+  "type": "gemini_embedding",
+  "provider_type": "embedding",
+  "api_base": "",
+  "executable_by_us": false
+ },
+ {
+  "id": "nvidia_embedding",
+  "provider": "nvidia",
+  "type": "nvidia_embedding",
+  "provider_type": "embedding",
+  "api_base": "",
+  "executable_by_us": false
+ },
+ {
+  "id": "ollama_embedding",
+  "provider": "ollama",
+  "type": "ollama_embedding",
+  "provider_type": "embedding",
+  "api_base": "",
+  "executable_by_us": false
+ },
+ {
+  "id": "dashscope_embedding",
+  "provider": "dashscope",
+  "type": "dashscope_embedding",
+  "provider_type": "embedding",
+  "api_base": "",
+  "executable_by_us": false
+ },
+ {
+  "id": "xinference_stt",
+  "provider": "xinference",
+  "type": "xinference_stt",
+  "provider_type": "speech_to_text",
+  "api_base": "http://127.0.0.1:9997",
+  "executable_by_us": false
+ }
+]

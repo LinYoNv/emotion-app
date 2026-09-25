@@ -1,0 +1,5 @@
+name: hello_plugin
+display_name: Hello 插件
+desc: 宿主兼容层的最小验证插件（hello-world）
+version: 0.1.0
+author: 良芙

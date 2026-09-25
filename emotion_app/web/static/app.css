@@ -1,0 +1,821 @@
+:root {
+  --bg: #14161a; --panel: #1c1f26; --border: #2b3140;
+  --fg: #e6e8ee; --muted: #99a1b3; --accent: #8ba7e8;
+  --user: #2a3142; --bot: #232733; --danger: #f7768e;
+  /* 侧边栏 + 层级（用变量而不是散落的 9999） */
+  --sidebar-w: 216px;
+  --sidebar-w-collapsed: 60px;
+  --z-scrim: 40; --z-sidebar: 50; --z-modal: 60;
+  --radius: 8px; --radius-sm: 6px;
+  --ease: 180ms cubic-bezier(.4, 0, .2, 1);
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 14px/1.6 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  /* 100dvh：iOS Safari 的地址栏会变，100vh 会导致底部被裁 */
+  height: 100dvh; overflow: hidden;
+}
+
+/* 键盘用户：跳转到主内容（平时不可见） */
+.skip-link {
+  position: absolute; left: -9999px; top: 0; z-index: 100;
+  background: var(--accent); color: #10131a; padding: 8px 14px;
+  border-radius: 0 0 var(--radius-sm) 0; font-weight: 600;
+}
+.skip-link:focus { left: 0; }
+
+/* ==================== 外壳：侧边栏 + 内容 ==================== */
+.app { display: flex; height: 100dvh; }
+
+.sidebar {
+  width: var(--sidebar-w); flex-shrink: 0;
+  display: flex; flex-direction: column;
+  background: var(--panel); border-right: 1px solid var(--border);
+  transition: width var(--ease);
+  overflow: hidden;
+}
+.sidebar-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 12px; border-bottom: 1px solid var(--border);
+  min-height: 56px;
+}
+.brand {
+  font-weight: 600; font-size: 14px; white-space: nowrap;
+  letter-spacing: -0.01em;
+}
+
+/* 汉堡按钮：纯 CSS 画三条线（不引图标库） */
+.icon-btn {
+  flex-shrink: 0; width: 32px; height: 32px; padding: 0;
+  display: grid; place-items: center;
+  background: transparent; border: 1px solid transparent; border-radius: var(--radius-sm);
+  cursor: pointer; transition: background var(--ease), border-color var(--ease);
+}
+.icon-btn:hover { background: #262b36; border-color: var(--border); }
+.icon-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.burger, .burger::before, .burger::after {
+  display: block; width: 15px; height: 2px; border-radius: 1px;
+  background: var(--fg); transition: transform var(--ease);
+}
+.burger { position: relative; }
+.burger::before, .burger::after { content: ""; position: absolute; left: 0; }
+.burger::before { top: -5px; }
+.burger::after { top: 5px; }
+
+.sidebar-nav { flex: 1; min-height: 0; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 2px; }
+.nav-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 10px; border-radius: var(--radius-sm);
+  color: var(--fg); text-decoration: none; font-size: 13.5px;
+  white-space: nowrap; position: relative;
+  transition: background var(--ease), color var(--ease);
+}
+.nav-item:hover { background: #262b36; }
+.nav-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.nav-item.active { background: var(--accent); color: #10131a; font-weight: 600; }
+.nav-ico { width: 20px; text-align: center; flex-shrink: 0; font-size: 15px; }
+.nav-label { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.nav-badge {
+  background: var(--danger); color: #10131a; font-size: 11px; font-weight: 700;
+  border-radius: 9px; padding: 0 6px; line-height: 18px; min-width: 18px; text-align: center;
+}
+.nav-item.active .nav-badge { background: #10131a; color: var(--accent); }
+
+.sidebar-foot {
+  padding: 10px 12px; border-top: 1px solid var(--border);
+  font-size: 11.5px; color: var(--muted);
+}
+.status { color: var(--muted); font-size: 11.5px; }
+.status.ok::before { content: "● "; color: #9ece6a; }
+.status.bad::before { content: "● "; color: var(--danger); }
+
+/* 收起态（桌面）：只剩图标条 */
+.app.collapsed .sidebar { width: var(--sidebar-w-collapsed); }
+.app.collapsed .brand,
+.app.collapsed .nav-label,
+.app.collapsed .nav-badge,
+.app.collapsed .sidebar-foot { display: none; }
+.app.collapsed .sidebar-head { justify-content: center; padding: 12px 0; }
+.app.collapsed .nav-item { justify-content: center; padding: 10px 0; }
+
+/* 手机端抽屉遮罩 */
+.scrim {
+  position: fixed; inset: 0; background: #000a;
+  z-index: var(--z-scrim); backdrop-filter: blur(1px);
+}
+
+button {
+  background: #262b36; color: var(--fg); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 6px 12px; cursor: pointer; font-size: 13px;
+  transition: background var(--ease), border-color var(--ease), transform var(--ease);
+}
+button:hover { border-color: var(--accent); }
+button:active { transform: translateY(1px); }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+button.danger:hover { border-color: var(--danger); color: var(--danger); }
+.link-btn {
+  color: var(--accent); text-decoration: none; font-size: 12.5px;
+  border-bottom: 1px dashed transparent;
+}
+.link-btn:hover { border-bottom-color: var(--accent); }
+
+.content { flex: 1; min-width: 0; min-height: 0; display: flex; }
+.panel { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 16px; gap: 12px; overflow: auto; }
+.hidden { display: none !important; }
+
+/* 聊天 */
+.chatbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.chatbar select { min-width: 200px; }
+.chatbar .hint { margin-left: auto; }
+
+.messages { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding-right: 6px; }
+.msg { padding: 9px 13px; border-radius: 10px; max-width: 76%; white-space: pre-wrap; word-break: break-word; }
+.msg.user { align-self: flex-end; background: var(--user); }
+.msg.assistant { align-self: flex-start; background: var(--bot); }
+.msg.error { align-self: center; background: #3a2028; color: #ffc9d2; font-size: 13px; }
+.msg .meta { display: block; color: var(--muted); font-size: 11px; margin-top: 4px; }
+.composer { display: flex; gap: 8px; }
+.composer textarea {
+  flex: 1; background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px; resize: none; font: inherit;
+}
+.hint { color: var(--muted); font-size: 12px; margin: 0; }
+
+/* 生成图片 */
+.gen-image {
+  display: block;
+  /* ⚠️ 实测：1024x1024 图在面板里会占满整屏 → 必须限高 */
+  max-width: 100%;
+  max-height: 420px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  margin-top: 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  cursor: zoom-in;
+  background: #0f1116;
+}
+/* 消息气泡里有图时放宽宽度限制 */
+.msg:has(.gen-image) { max-width: 92%; }
+
+/* 人设 */
+.split { display: flex; gap: 16px; flex: 1; min-height: 0; }
+.split aside { width: 240px; flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
+.editor { flex: 1; overflow-y: auto; }
+.list { list-style: none; margin: 0; padding: 0; overflow-y: auto; }
+.list li {
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
+  margin-bottom: 6px; cursor: pointer; font-size: 13px;
+}
+.list li:hover { border-color: var(--accent); }
+.list li.active { border-color: var(--accent); background: #202737; }
+.list li .badge { color: var(--accent); font-size: 11px; margin-left: 6px; }
+.empty { color: var(--muted); padding: 24px; text-align: center; }
+
+form { display: flex; flex-direction: column; gap: 10px; }
+label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+
+/* 「模型」那一行：输入框 + 「获取模型」按钮并排（按钮不占满整行） */
+.field-row { display: flex; gap: 8px; align-items: stretch; }
+.field-row input { flex: 1 1 auto; min-width: 0; }
+.field-row button { flex: 0 0 auto; white-space: nowrap; }
+input, textarea, select {
+  background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px; font: inherit;
+}
+input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+details { border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+
+/* 片段表 */
+table.sections { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.sections th, table.sections td { border: 1px solid var(--border); padding: 5px 7px; text-align: left; }
+table.sections th { color: var(--muted); font-weight: 500; }
+table.sections input[type=text], table.sections textarea { width: 100%; }
+table.sections td.narrow { width: 70px; }
+/* 空态行：没有"额外片段"时说明原因（别让表格看起来像加载失败） */
+table.sections tr.empty-row td { color: var(--muted); text-align: center; font-size: 12px; }
+
+.preview {
+  background: #0f1116; border: 1px solid var(--border); border-radius: 6px;
+  padding: 12px; overflow: auto; max-height: 55vh; white-space: pre-wrap;
+  font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace; color: #c8d0e0;
+}
+
+/* 弹层 */
+.modal { position: fixed; inset: 0; background: #000a; display: flex; align-items: center; justify-content: center; z-index: 20; }
+.modal-box { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; width: min(860px, 92vw); }
+.modal-box h3 { margin: 0; }
+.modal-box .row { justify-content: space-between; margin-bottom: 10px; }
+/* 登录框：独立的紧凑尺寸（宽度跟 modal-box 走会太宽） */
+.login-box { width: min(400px, 92vw); }
+.login-box h3 { margin-bottom: 6px; }
+.login-box .row { justify-content: flex-start; margin: 4px 0 0; }
+.login-box .hint { margin: 0 0 4px; }
+.login-box code { background: #0f1116; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+
+/* 导入人设弹层 */
+.import-box { width: min(560px, 94vw); }
+.import-box .row { justify-content: space-between; }
+.import-box form { gap: 8px; }
+.import-box code { background: #0f1116; padding: 1px 4px; border-radius: 4px; font-size: 12px; }
+.import-box input[type=file] {
+  /* 文件选择器在深色主题下默认很丑，统一一下 */
+  padding: 8px; background: #0f1116; border: 1px dashed var(--border);
+}
+#import-result { margin-top: 10px; max-height: 40vh; }
+
+h3 { font-size: 14px; margin: 6px 0; }
+h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
+
+/* ==========================================================================
+   移动端适配
+   --------------------------------------------------------------------------
+   🔴 起因（情绪 2026-09-19 截图反馈）：「人设页面没有做移动端优化…
+      我现在没办法操作电脑」—— 实测此前**一条媒体查询都没有**，手机上面板
+      左右分栏挤成一团、标签换行、表格横向溢出，完全没法用。
+
+   设计原则（不是"缩一缩"）：
+     ① **单列优先** —— 窄屏把 `.split` 从左右分栏改成**上下堆叠**；
+     ② **触控目标 ≥44px** —— 手指点得中（Apple HIG 的最小值）；
+     ③ **表格改卡片** —— 宽表在手机上必然溢出，靠 `data-label` 竖排显示；
+     ④ **不横向滚动** —— 除代码/预览这类必须横滚的内容；
+     ⑤ **iOS 输入框 ≥16px** —— 否则聚焦时会自动放大页面（很烦）。
+   ========================================================================== */
+
+/* 触摸设备：去掉 hover 效果（触摸屏上 hover 会"粘住"） */
+@media (hover: none) {
+  button:hover { border-color: var(--border); }
+  .list li:hover { border-color: var(--border); }
+}
+
+/* ---------- 平板及以下 ---------- */
+@media (max-width: 900px) {
+  .split aside { width: 200px; }
+  .msg { max-width: 88%; }
+}
+
+/* ---------- 手机 ---------- */
+@media (max-width: 640px) {
+  /* --- 侧边栏 → 抽屉（默认收起，汉堡点开）--- */
+  .sidebar {
+    position: fixed; left: 0; top: 0; bottom: 0;
+    width: min(78vw, 280px);
+    z-index: var(--z-sidebar);
+    transform: translateX(-100%);
+    transition: transform var(--ease);
+    box-shadow: 4px 0 24px #0007;
+  }
+  .app.drawer-open .sidebar { transform: translateX(0); }
+  /* 手机上"收起"= 抽屉关闭，等价于桌面的 collapsed */
+  .app.collapsed .sidebar { width: min(78vw, 280px); }
+  .app.collapsed .brand,
+  .app.collapsed .nav-label,
+  .app.collapsed .nav-badge,
+  .app.collapsed .sidebar-foot { display: revert; }
+  .app.collapsed .sidebar-head { justify-content: flex-start; padding: 12px 12px; }
+  .app.collapsed .nav-item { justify-content: flex-start; padding: 10px 10px; }
+  .nav-item { min-height: 44px; font-size: 15px; }
+
+  /* 内容区始终占满（抽屉是浮层） */
+  .content { width: 100%; }
+  .panel { padding: 10px; gap: 10px; }
+
+  /* 🔴 分栏 → 上下堆叠（人设页）
+     ⚠️ 这里**不能**再写 `.panel { height: auto }`（旧代码犯过）：
+        `.split { flex: 1 }` 依赖父级是 flex 容器且有确定高度，
+        父级一变成 height:auto，aside/editor 的高度就**塌成 0**
+        → 情绪截图里的"右侧被挤成一条、字段看不见"就是这个。
+        正解：保持 .panel 是 flex 列容器（默认规则已够），只把 split 改成竖排。 */
+  .split {
+    flex-direction: column;
+    gap: 10px;
+    min-height: 0;
+    flex: 1;
+  }
+  .split aside {
+    width: 100%;
+    max-height: 34vh;          /* 列表可滚，但不占满整屏 */
+    flex-shrink: 0;
+  }
+  .editor { overflow-y: auto; min-height: 0; flex: 1; }
+
+  /* --- 人设详情：手机端"点开后路由到详情" --- */
+  /* 没选人设：只显示列表；选了：列表收起，只显示详情 + 返回按钮。
+     🔴 这里**不要**跟 `.hidden { display:none !important }` 硬碰：
+        按钮的显隐完全由 `.is-detail` 这一个状态类决定（见下面的基础规则），
+        JS 只切换 `.is-detail`，不再同时管 `.hidden` —— 单一事实来源，
+        省掉 `!important` 提权那种容易埋雷的写法。 */
+  #tab-persona.is-detail aside { display: none; }
+  #tab-persona.is-detail .back-btn { display: inline-flex; }
+  /* 模型供应商页同理：「点左侧源 → 路由到详情」，列表收起、出返回按钮 */
+  #tab-providers.is-detail .providers-aside { display: none; }
+  #tab-providers.is-detail .back-btn { display: inline-flex; }
+  .back-btn {
+    align-self: flex-start; margin-bottom: 8px;
+    min-height: 40px; padding: 8px 14px;
+  }
+
+  /* 表单控件够大够好点 */
+  button { min-height: 40px; padding: 8px 12px; }
+  input, textarea, select {
+    /* ⚠️ iOS：<16px 会在聚焦时自动放大整个页面 */
+    font-size: 16px;
+    padding: 10px;
+  }
+  label { gap: 5px; }
+  .row { gap: 6px; }
+  .row button { flex: 1 1 auto; }   /* 按钮均分宽度，别挤成小方块 */
+
+  /* --- 聊天 --- */
+  .chatbar { gap: 6px; }
+  .chatbar select { min-width: 0; flex: 1 1 100%; }
+  .chatbar .hint { margin-left: 0; flex: 1 1 100%; }
+  .messages { gap: 8px; }
+  .msg { max-width: 92%; padding: 8px 11px; font-size: 15px; }
+  .composer { gap: 6px; }
+  .composer textarea { font-size: 16px; }
+  .composer button { flex: 0 0 auto; padding: 8px 16px; }
+
+  /* --- 提示词片段表 → 卡片（手机上看宽表必然溢出）--- */
+  #sections-block { overflow-x: visible; }
+  table.sections, table.sections thead, table.sections tbody,
+  table.sections tr, table.sections td { display: block; width: 100%; }
+  table.sections thead { display: none; }         /* 表头靠 data-label 替代 */
+  table.sections tr {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px;
+    margin-bottom: 10px;
+    background: #191c23;
+  }
+  table.sections td {
+    border: none;
+    padding: 5px 0;
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  table.sections td::before {
+    /* 用 CSS 造"字段名"，无需改 JS */
+    content: attr(data-label);
+    flex: 0 0 64px;
+    color: var(--muted);
+    font-size: 12px;
+    padding-top: 9px;
+  }
+  table.sections td input, table.sections td textarea { flex: 1 1 auto; }
+  table.sections td.narrow { width: auto; }
+  table.sections td:last-child:empty { display: none; }
+
+  /* --- 弹层：手机上留足边距，内容可滚 --- */
+  .modal { align-items: flex-start; padding: 12px; overflow-y: auto; }
+  .modal-box { width: 100%; max-height: none; padding: 14px; }
+  .modal-box .row { margin-bottom: 8px; }
+  .preview { max-height: 60vh; font-size: 12px; }
+
+  h3 { font-size: 15px; }
+}
+
+/* ---------- 很窄的屏（如 iPhone SE）---------- */
+@media (max-width: 380px) {
+  .nav-item { font-size: 14px; }
+  .split aside { max-height: 28vh; }
+  table.sections td::before { flex-basis: 54px; }
+}
+
+/* ---------- 横屏手机：竖向空间紧张，收紧一点 ---------- */
+@media (max-height: 480px) and (orientation: landscape) {
+  .split aside { max-height: 40vh; }
+  .messages { max-height: 45vh; }
+}
+
+/* ==================== 插件拓展页 ==================== */
+.frame-wrap {
+  flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 8px;
+}
+.frame-bar { align-items: center; gap: 10px; flex-wrap: wrap; }
+.frame-bar strong { font-size: 13.5px; }
+.frame-bar .link-btn { margin-left: auto; }
+.plugin-frame {
+  flex: 1; min-height: 420px; width: 100%;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: #fff;   /* 插件面板多为浅色主题，白底不会闪 */
+}
+#plugin-page-list li { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+#plugin-page-list li .pid { color: var(--muted); font-size: 11.5px; margin-left: auto; }
+
+/* 细节控件 */
+.list li:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.empty { color: var(--muted); padding: 20px 4px; }
+
+/* 「← 返回列表」：**默认隐藏**（桌面端两栏并列，不需要返回）。
+   手机端由 `#tab-persona.is-detail .back-btn` 打开（见上面的媒体查询）。 */
+.back-btn { display: none; }
+
+/* ==================== 模型供应商页（两层结构） ====================
+ * 🔴 设计约束（情绪的要求）：**卡片式、圆角、留白舒展**，但**复用现有设计语言** ——
+ *    颜色只用既有 CSS 变量、分栏复用 `.split/.editor`、模型行复用 `.list/.badge`
+ *    的观感、结果区复用 `.preview`、空态复用 `.empty`。
+ *    下面只加"确实缺的"：左侧源列表项的两行结构、右侧卡片与三段分块、
+ *    字段的「说明在左 / 控件在右」两列布局、可折叠的高级配置、模型行。
+ *
+ *    字段布局为什么不用 `label` 默认的"上下堆叠"：
+ *    参考站是**左说明右控件**，一屏能看全三段；上下堆叠会把一页拉得很长。
+ *    ⚠️ 但手机端必须回到上下堆叠（见文末媒体查询），否则窄屏放不下。
+ * ================================================================ */
+
+/* 左栏：提供商源 */
+/* ⚠️ 选择器要带 `.split` 才能盖过上面的 `.split aside { width: 240px }`（同权重、靠后生效） */
+.split .providers-aside { width: 270px; }
+.providers-aside-head {
+  display: flex; align-items: center; gap: 8px; justify-content: space-between;
+}
+.providers-aside-head h3 { margin: 0; }
+.providers-aside .list { margin-top: 2px; }
+
+/* 源列表项：id + api_base 两行（照截图），选中有高亮态，右侧删除 */
+#provider-source-list li {
+  display: flex; align-items: center; gap: 8px;
+  padding: 9px 10px; border-radius: var(--radius-sm);
+}
+#provider-source-list li .src-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+#provider-source-list li .src-id {
+  color: var(--fg); font-size: 13.5px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+#provider-source-list li .src-base {
+  color: var(--muted); font-size: 11.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+#provider-source-list li.active .src-id { color: var(--fg); }
+/* 删除按钮：默认低调，hover/聚焦才变红（列表里不该有一排红按钮抢注意力） */
+#provider-source-list li .src-del {
+  flex: 0 0 auto; padding: 3px 7px; font-size: 12px; line-height: 1.4;
+  background: transparent; border-color: transparent; color: var(--muted);
+}
+#provider-source-list li .src-del:hover { color: var(--danger); border-color: var(--danger); }
+
+/* 右侧：详情 */
+.providers-detail { padding-bottom: 4px; }
+/* 未选源的空态：图标 + 一句话，居中在详情区（参考站也是"请选择一个提供商源"） */
+#provider-source-placeholder {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 6px; min-height: 45vh; padding: 24px;
+}
+#provider-source-placeholder .empty-ico { font-size: 28px; opacity: .75; }
+#provider-source-placeholder p { margin: 0; }
+
+/* 卡片：与 `.modal-box`/侧边栏同族（同一个 --panel/--border/--radius） */
+.providers-card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 16px 18px 12px;
+}
+.providers-card-head {
+  display: flex; align-items: flex-start; gap: 12px; justify-content: space-between;
+  flex-wrap: wrap;
+}
+.providers-card-head h3 { margin: 0 0 2px; font-size: 16px; letter-spacing: -0.01em; }
+.providers-card-head .hint { word-break: break-all; }
+.providers-card-head button { flex: 0 0 auto; }
+
+/* 三段分块：靠上边框分隔（不是三个各自带边框的小盒子 —— 少一层框更干净） */
+.providers-block { padding: 14px 0 10px; border-top: 1px solid var(--border); margin-top: 12px; }
+.providers-block h4 { margin: 0 0 4px; font-size: 13.5px; color: var(--fg); }
+.providers-block h4 small { color: var(--muted); font-weight: 400; font-size: 12px; }
+.providers-block h4 code, .fl-text code, .providers-block small code {
+  background: #0f1116; padding: 1px 5px; border-radius: 4px; font-size: 11.5px; color: var(--muted);
+}
+.providers-block h5 { margin: 14px 0 0; font-size: 12.5px; color: var(--muted); font-weight: 500; }
+
+/* 字段：左说明 / 右控件（参考站的观感） */
+.field-labeled {
+  display: grid; grid-template-columns: minmax(190px, 280px) 1fr;
+  gap: 14px; align-items: start; padding: 9px 0;
+}
+.fl-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.fl-text label { color: var(--fg); font-size: 13.5px; font-weight: 500; display: block; }
+.fl-text .hint { line-height: 1.5; }
+.fl-ctl { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.fl-ctl > input { width: 100%; }
+
+/* 自定义请求头：一行一个「键 / 值 / 移除」 */
+.header-rows { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+#ps-header-rows { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+.header-row { display: flex; gap: 6px; align-items: center; width: 100%; }
+.header-row input { flex: 1 1 0; min-width: 0; }
+#ps-header-empty { font-style: italic; }
+
+/* 模型区 */
+.providers-model-bar { gap: 8px; }
+.ps-search { flex: 1 1 200px; min-width: 0; }
+#ps-model-count { background: #262b36; color: var(--muted); white-space: nowrap; }
+.ps-models { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.ps-models li {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: #191c23; font-size: 13px;
+}
+.ps-models li .mid {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ps-models li .sub { color: var(--muted); font-size: 11.5px; flex: 0 0 auto; }
+.ps-models li.disabled .mid { color: var(--muted); text-decoration: line-through; }
+.ps-models li input[type=checkbox] {
+  flex: 0 0 auto; width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer;
+}
+.ps-models li .row { flex: 0 0 auto; flex-wrap: nowrap; gap: 6px; }
+.ps-models li button { padding: 4px 10px; font-size: 12px; }
+/* 候选模型列表（「获取模型列表」的结果）用左边框区分"还没加进来" */
+#ps-available-list li { background: transparent; border-style: dashed; }
+#ps-available-list code { color: var(--fg); font-size: 12.5px; }
+
+.providers-card-foot {
+  border-top: 1px solid var(--border); margin-top: 14px; padding-top: 12px;
+  display: flex; justify-content: flex-end;
+}
+#providers-test-result { margin: 12px 0 0; max-height: 30vh; }
+
+/* 类型筛选（契约 §5.1）：一排小按钮，当前项高亮。
+   ⚠️ 用 `flex-wrap` 而不是横向滚动：260px 左栏里四个按钮会换行，
+      横向滚动在桌面端没有滚动条提示（用户根本不知道右边还有「全部」）。 */
+.providers-filter { display: flex; flex-wrap: wrap; gap: 4px; }
+.providers-filter .filter-btn {
+  flex: 0 0 auto; padding: 3px 9px; font-size: 11.5px; line-height: 1.6;
+  background: transparent; color: var(--muted); border-color: var(--border);
+  border-radius: 999px;
+}
+.providers-filter .filter-btn:hover { color: var(--fg); border-color: var(--accent); }
+/* 当前筛选：实心高亮（`aria-pressed=true` 是**同一条事实**，两者必须一起切） */
+.providers-filter .filter-btn.active {
+  background: var(--accent); border-color: var(--accent);
+  color: #10131a; font-weight: 600;
+}
+
+/* 源列表项的类型徽标（语音 / 嵌入）。
+   ⚠️ 对话类**不挂**徽标：默认视图里每条都是对话，挂上去纯属噪音；
+      切到「全部」时非对话项才靠它一眼分出来。 */
+#provider-source-list li .src-type {
+  margin-left: 6px; padding: 0 5px; border-radius: 4px;
+  font-size: 10.5px; font-weight: 500; vertical-align: 1px;
+  background: #2b3140; color: var(--muted); border: 1px solid var(--border);
+}
+#provider-source-list li.active .src-type { color: var(--fg); }
+
+/* 不可执行提示：**必须显眼**（它说的是"这个配置跑不了"），但不用红色警报 ——
+   "能存不能跑"是**已知边界**，不是出错。 */
+#ps-not-executable {
+  color: #e8c07d; background: #2b2718; border: 1px solid #4a4028;
+  border-radius: var(--radius-sm); padding: 7px 9px; line-height: 1.6;
+}
+
+/* 只读适配器展示（预设带来的非 OpenAI 类型） */
+#ps-type-adapter { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
+#ps-type-adapter code {
+  background: #0f1116; padding: 2px 6px; border-radius: 4px;
+  font-size: 12px; color: var(--fg);
+}
+#ps-type-adapter .hint { line-height: 1.5; }
+
+/* ---------- 厂商预设弹层（契约 §5.2） ---------- */
+.preset-box { width: min(620px, 94vw); display: flex; flex-direction: column; gap: 8px; }
+.preset-box .row { justify-content: space-between; }
+.preset-groups { display: flex; flex-wrap: wrap; gap: 5px; }
+.preset-groups .preset-group-btn {
+  padding: 4px 10px; font-size: 12px; border-radius: 999px;
+  background: transparent; color: var(--muted);
+}
+.preset-groups .preset-group-btn.active {
+  background: var(--accent); border-color: var(--accent); color: #10131a; font-weight: 600;
+}
+.preset-list {
+  list-style: none; margin: 0; padding: 0; overflow-y: auto;
+  max-height: 46vh; display: flex; flex-direction: column; gap: 6px;
+}
+.preset-list li {
+  display: grid; grid-template-columns: 1fr auto; gap: 2px 10px;
+  align-items: center; cursor: pointer;
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: #191c23;
+}
+.preset-list li:hover { border-color: var(--accent); }
+.preset-list li:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* 左列是 `.preset-main`（label + meta 两行），右列是「可执行/不可执行」徽标。
+   ⚠️ `.preset-meta` **不是** grid 的直接子元素（它在 `.preset-main` 里），
+      所以这里**不能**写 `grid-column: 1 / -1`（写了也不生效的死规则，
+      以后有人会以为它能跨列而依赖它）。要跨列的是下面的 `.preset-note`。 */
+.preset-list li .preset-main { min-width: 0; }
+.preset-list li .preset-label { font-size: 13.5px; font-weight: 600; color: var(--fg); }
+.preset-list li .preset-meta {
+  color: var(--muted); font-size: 11.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.preset-list li .preset-note {
+  grid-column: 1 / -1; color: var(--muted); font-size: 11.5px; line-height: 1.5;
+}
+/* 可执行 / 不可执行徽标：**颜色必须一眼分得开**（这是"能力诚实"的落点） */
+.preset-list li .preset-tag {
+  justify-self: end; padding: 1px 7px; border-radius: 999px;
+  font-size: 11px; white-space: nowrap; border: 1px solid transparent;
+}
+.preset-list li .preset-tag.ok { background: #1e3324; color: #8fd39a; border-color: #2c4a34; }
+.preset-list li .preset-tag.warn { background: #2b2718; color: #e8c07d; border-color: #4a4028; }
+.preset-list li.preset-none {
+  grid-template-columns: 1fr; cursor: default; color: var(--muted);
+  text-align: center; border-style: dashed;
+}
+
+/* ---------- 「可用模型」/「模型测试」弹层（情绪 2026-09-21 要求改弹窗） ----------
+ * 结构照既有 `.modal` / `.modal-box`（连 `.preset-box` 的"纵向排列 + 尺寸变体"一起复用），
+ * 这里**只加确实缺的东西**：候选列表的高度上限、以及卡片的单列堆叠。
+ * 🔴 为什么"只加这些"是刻意的：`.modal` 自带居中 + z-index，
+ *    手机端媒体查询里还有 `.modal { align-items:flex-start; padding:12px; overflow-y:auto }`
+ *    和 `.modal-box { width:100% }` —— 复制一套新样式就等于**丢掉这些移动端修正**
+ *    （本项目踩过"用户手机上还是旧样式"的缓存事故，别再造第二套真相）。
+ */
+.models-box, .test-box { width: min(680px, 94vw); display: flex; flex-direction: column; gap: 8px; }
+.models-box .row, .test-box .row { justify-content: space-between; }
+/* 搜索框：用的是卡片里那套 `.ps-search`（flex:1 1 200px），
+   在弹层这种纵向 flex 容器里要显式占满一行，否则会被压成半宽。 */
+.models-box .ps-search { width: 100%; flex: 0 0 auto; }
+/* 🔴 候选列表**必须自己滚**：31 条预设那次已经教过一遍（`.preset-list` 限高 46vh），
+   候选模型动辄几十上百条，不限高的话弹层会长过屏幕，
+   底下那句"关掉本窗口不影响添加结果"和关闭按钮一起被顶出视野。 */
+.models-box #ps-available-list { overflow-y: auto; max-height: 46vh; margin-top: 0; }
+/* 测试结果：`.preview` 默认 max-height 55vh，弹层里再套一层框就太满了，收紧一点 */
+.test-box #providers-test-result { margin: 0; max-height: 50vh; }
+.models-box .hint, .test-box .hint { margin: 0; line-height: 1.5; }
+
+/* ---------- 手机端：字段回到上下堆叠 ---------- */
+@media (max-width: 640px) {
+  .field-labeled { grid-template-columns: 1fr; gap: 4px; padding: 10px 0; }
+  .split .providers-aside { max-height: 40vh; }
+  .providers-card { padding: 12px; }
+  .providers-card-head { flex-direction: column; align-items: stretch; }
+  .providers-card-head button { width: 100%; }
+  .header-row { flex-wrap: wrap; }
+  .header-row input { flex: 1 1 100%; }
+  #provider-source-placeholder { min-height: 30vh; }
+  .ps-models li { flex-wrap: wrap; }
+
+  /* --- 类型筛选 / 预设弹层（手机）--- */
+  /* ⚠️ 上面的 `button { min-height: 40px }` 会把四个筛选药丸撑成一坨占掉半屏
+         → 这里显式放小，但 **32px 仍高于纯文字链接的可点区域**，
+         药丸也够宽（`padding` 6/12）不至于点错。 */
+  .providers-filter .filter-btn { min-height: 32px; padding: 4px 12px; font-size: 12.5px; }
+  /* 预设弹层：列表限定高度（否则 31 个预设会把「不用预设」按钮顶出屏幕外，
+     而那是用户**唯一**的退路）*/
+  .preset-list { max-height: 40vh; }
+  .preset-box .row button { flex: 1 1 auto; }
+  .preset-list li .preset-meta { white-space: normal; }
+
+  /* 可用模型弹层：手机上候选列表再收紧一档。
+     ⚠️ 46vh 在桌面端够用，但手机上弹层是**顶部对齐 + 整层可滚**，
+        列表太高会让"当前屏只剩列表"，用户看不到自己刚勾了什么。 */
+  .models-box #ps-available-list { max-height: 38vh; }
+  .models-box .row button, .test-box .row button { flex: 0 0 auto; min-height: 32px; }
+}
+
+/* ============================================================================
+ * 配置文件（会话 + 上下文管理策略）—— 契约 §6
+ * ============================================================================
+ * 这些控件是**按后端 schema 动态生成**的（`renderConfigSection`），
+ * 所以样式必须对"运行时才出现的元素"生效 —— 不能用只覆盖既有 id 的写法。
+ */
+.cfg-section {
+  margin: 14px 0 18px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel, transparent);
+}
+.cfg-head { display: flex; flex-direction: column; gap: 2px; margin-bottom: 10px; }
+.cfg-head h4 { margin: 0; font-size: 15px; }
+.cfg-form .cfg-fields {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+/* 桌面宽屏两列；手机单列（面板本来就有移动端布局，别把它挤坏） */
+@media (min-width: 720px) {
+  .cfg-form .cfg-fields { grid-template-columns: 1fr 1fr; }
+}
+.cfg-field { display: flex; flex-direction: column; gap: 4px; }
+.cfg-field .cfg-label { font-size: 13px; color: var(--text, inherit); }
+.cfg-field input[type="text"],
+.cfg-field input[type="number"],
+.cfg-field select,
+.cfg-field textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--input-bg, transparent);
+  color: inherit;
+  font: inherit;
+}
+.cfg-field textarea { resize: vertical; }
+.cfg-field input[type="checkbox"] { width: 18px; height: 18px; align-self: flex-start; }
+.cfg-field .cfg-hint-line { color: var(--muted); font-size: 12px; line-height: 1.4; }
+
+/* `provider_select` 的容器：下拉 + 没有可选时的说明 */
+.cfg-provider-select { display: flex; flex-direction: column; gap: 4px; }
+.cfg-empty-models { color: var(--muted); font-size: 12px; }
+
+/* 🔴 后端 400 带 `error.field` 时，把那个字段标红 ——
+ *    只给一句"值不合法"，用户在几十个字段里找不到是哪一个。 */
+.cfg-field input.cfg-invalid,
+.cfg-field select.cfg-invalid,
+.cfg-field textarea.cfg-invalid {
+  border-color: var(--danger, #d33);
+  box-shadow: 0 0 0 2px rgba(221, 51, 51, 0.15);
+}
+.cfg-actions { align-items: center; gap: 10px; }
+.cfg-foot { align-items: center; gap: 10px; margin-top: 6px; }
+
+/* ==========================================================================
+ * 日志页（情绪 2026-09-21 要求）
+ * ==========================================================================
+ * 🔴 级别用**左侧色条 + 文字**双重表达：
+ *    只靠颜色的话，色盲用户/黑白打印就读不出级别（而无障碍是本项目的既有要求）。
+ * 🔴 等宽字体：日志要对齐才好看懂（时间戳/级别/logger 三段对齐）。
+ */
+.logs-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+.logs-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.9rem;
+}
+.logs-auto { user-select: none; }
+
+.logs-list {
+  max-height: 60vh;
+  overflow-y: auto;
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  padding: 0.25rem;
+  /* 手机上日志很长，横向也不许撑破布局 */
+  overflow-x: auto;
+}
+
+.log-row {
+  border-left: 3px solid transparent;   /* 色条；具体颜色按级别覆盖 */
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.15);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+}
+.log-row:last-child { border-bottom: none; }
+
+.log-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: baseline;
+  opacity: 0.85;
+  margin-bottom: 0.15rem;
+}
+.log-level { font-weight: 700; min-width: 4.6em; }
+.log-ts { opacity: 0.7; }
+.log-logger { opacity: 0.7; word-break: break-all; }
+
+.log-msg {
+  white-space: pre-wrap;      /* 保留换行但允许折行（长路径/URL 不撑破） */
+  word-break: break-word;
+}
+
+.log-data,
+.log-exc {
+  margin: 0.3rem 0 0;
+  padding: 0.35rem 0.5rem;
+  background: rgba(128, 128, 128, 0.12);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.78rem;
+  max-height: 12rem;
+  overflow: auto;
+}
+
+/* 级别配色（色条 + 级别文字颜色） */
+.log-debug   { border-left-color: #6b7280; }
+.log-debug   .log-level { color: #6b7280; }
+.log-info    { border-left-color: #3b82f6; }
+.log-info    .log-level { color: #3b82f6; }
+.log-warning { border-left-color: #f59e0b; }
+.log-warning .log-level { color: #f59e0b; }
+.log-error,
+.log-critical { border-left-color: #ef4444; }
+.log-error   .log-level,
+.log-critical .log-level { color: #ef4444; }

@@ -1,0 +1,3189 @@
+{
+  "_meta": {
+    "契约来源": "真实 AstrBot 磁盘源码（只读参考）",
+    "源码绝对路径": "/root/.local/share/uv/tools/astrbot/lib/python3.12/site-packages/astrbot/",
+    "本文档内所有相对路径的基准": "site-packages/astrbot/",
+    "astrbot_version": "4.27.5",
+    "version_依据": "astrbot/__init__.py:3",
+    "包元数据": "AstrBot 4.27.5 (astrbot-4.27.5.dist-info/METADATA)，License AGPL-3.0-or-later",
+    "file_lineno_convention": "file 字段为相对 astrbot/ 的路径；lineno 为该文件内 1-based 行号",
+    "抽取方法": [
+      "静态：Python ast 模块解析（保留源码顺序与行号）",
+      "动态：在真实 site-packages 上 import 并做运行时探针（排序语义、装饰器解析行为、组件构造）"
+    ],
+    "未确认项策略": "读不出来的字段一律写 null 或 'unconfirmed'，绝不编造",
+    "生成时间说明": "由子 agent 于本次调研一次性生成，未做人工复核以外的二次校验"
+  },
+  "star_class": {
+    "file": "core/star/base.py",
+    "class": "Star",
+    "lineno": 19,
+    "end_lineno": 114,
+    "bases": [
+      "CommandParserMixin",
+      "PluginKVStoreMixin"
+    ],
+    "bases_import": {
+      "CommandParserMixin": "astrbot.core.utils.command_parser (base.py:8)",
+      "PluginKVStoreMixin": "astrbot.core.utils.plugin_kv_store (base.py:9)"
+    },
+    "doc": "所有插件（Star）的父类，所有插件都应该继承于这个类",
+    "class_annotations": [
+      {
+        "name": "author",
+        "annotation": "str",
+        "lineno": 22,
+        "备注": "仅类注解，无默认值；由 star_manager 在实例化前 setattr 注入"
+      },
+      {
+        "name": "name",
+        "annotation": "str",
+        "lineno": 23,
+        "备注": "仅类注解，无默认值；由 star_manager 注入（见 star_manager.py:1212-1214,1234-1236）"
+      },
+      {
+        "name": "context",
+        "annotation": "Context",
+        "lineno": 24,
+        "备注": "类注解，但实际在 __init__ 里赋为实例属性"
+      },
+      {
+        "name": "logger",
+        "annotation": "logging.Logger",
+        "lineno": 25,
+        "备注": "插件专属 logger，与全局 astrbot logger 隔离；__init__ 中赋值"
+      }
+    ],
+    "class_annotations_无默认值": true,
+    "重要_基类无_config属性": "Star 基类【没有】config 属性/字段。config 虽是 __init__ 形参，但基类实现完全忽略它（base.py:28-52 内仅使用 context）。插件若要用配置须自行 self.config = config。",
+    "methods": [
+      {
+        "name": "__init__",
+        "signature": "def __init__(self, context: Context, config: dict | None = None) -> None",
+        "lineno": 28,
+        "end_lineno": 52,
+        "async": false,
+        "doc": null,
+        "行为": "赋值 self.context = context；从 star_map[self.__class__.__module__] 取 metadata.name（回退 getattr(self,'name')）作为 plugin_name；用 LogManager.get_plugin_logger(plugin_name) 建 self.logger，无名字则 logging.getLogger('astrbot')；AttributeError 时保留插件自己的 logger property。",
+        "config_形参": "被忽略，未存到任何属性"
+      },
+      {
+        "name": "_get_context_config",
+        "signature": "def _get_context_config(self) -> Any",
+        "lineno": 54,
+        "end_lineno": 62,
+        "async": false,
+        "行为": "私有；优先调用 context.get_config()，异常返回 None；否则回退 getattr(context,'_config',None)"
+      },
+      {
+        "name": "__init_subclass__",
+        "signature": "def __init_subclass__(cls, **kwargs)",
+        "lineno": 64,
+        "end_lineno": 75,
+        "async": false,
+        "doc": null,
+        "副作用": "任何 Star 子类定义时自动执行（无需装饰器）"
+      },
+      {
+        "name": "text_to_image",
+        "signature": "async def text_to_image(self, text: str, return_url = True) -> str",
+        "lineno": 77,
+        "end_lineno": 90,
+        "async": true,
+        "doc": "将文本转换为图片",
+        "行为": "读 context 配置里的 t2i_active_template，调用 html_renderer.render_t2i"
+      },
+      {
+        "name": "html_render",
+        "signature": "async def html_render(self, tmpl: str, data: dict, return_url = True, options: dict | None = None) -> str",
+        "lineno": 92,
+        "end_lineno": 105,
+        "async": true,
+        "doc": "渲染 HTML",
+        "行为": "html_renderer.render_custom_template"
+      },
+      {
+        "name": "initialize",
+        "signature": "async def initialize(self) -> None",
+        "lineno": 107,
+        "end_lineno": 108,
+        "async": true,
+        "doc": "当插件被激活时会调用这个方法",
+        "行为": "空实现（函数体只有 docstring）"
+      },
+      {
+        "name": "terminate",
+        "signature": "async def terminate(self) -> None",
+        "lineno": 110,
+        "end_lineno": 111,
+        "async": true,
+        "doc": "当插件被禁用、重载插件时会调用这个方法",
+        "行为": "空实现"
+      },
+      {
+        "name": "__del__",
+        "signature": "def __del__(self) -> None",
+        "lineno": 113,
+        "end_lineno": 114,
+        "async": false,
+        "doc": "[Deprecated] 当插件被禁用、重载插件时会调用这个方法",
+        "行为": "空实现"
+      }
+    ],
+    "__init_subclass__": {
+      "signature": "def __init_subclass__(cls, **kwargs)",
+      "lineno": 64,
+      "end_lineno": 75,
+      "副作用_逐行": [
+        "base.py:66 —— if not star_map.get(cls.__module__): 以【模块路径 __module__】为 key 判重",
+        "base.py:67-71 —— 不存在则新建 StarMetadata(star_cls_type=cls, module_path=cls.__module__)，写入 star_map[cls.__module__]",
+        "base.py:72 —— 同时 append 到 star_registry（list，顺序=定义顺序）",
+        "base.py:73-75 —— 已存在则只更新 star_map[cls.__module__].star_cls_type 和 .module_path"
+      ],
+      "注册目标": {
+        "star_map": "dict[str, StarMetadata]，key = 模块路径 __module__（core/star/star.py:10-11）",
+        "star_registry": "list[StarMetadata]，顺序为子类定义顺序（core/star/star.py:9）"
+      },
+      "关键含义": "副作用由【继承 Star】这一动作触发，与是否被 AstrBot 加载无关；同一模块内定义多个 Star 子类时只有【第一个】创建 metadata，后续只覆盖 star_cls_type（导致一个模块只能有一个生效插件类）。",
+      "注册的字段仅2个": "star_cls_type / module_path —— name/author/version 等在加载期由 star_manager 填（star_manager.py:1212-1214）"
+    },
+    "StarMetadata": {
+      "file": "core/star/star.py",
+      "class": "StarMetadata",
+      "lineno": 18,
+      "end_lineno": 88,
+      "decorator": "@dataclass (star.py:17)",
+      "fields": [
+        {
+          "name": "name",
+          "annotation": "str | None",
+          "default": null,
+          "lineno": 24,
+          "doc": "插件名"
+        },
+        {
+          "name": "author",
+          "annotation": "str | None",
+          "default": null,
+          "lineno": 26,
+          "doc": "插件作者"
+        },
+        {
+          "name": "desc",
+          "annotation": "str | None",
+          "default": null,
+          "lineno": 28,
+          "doc": "插件简介"
+        },
+        {
+          "name": "short_desc",
+          "annotation": "str | None",
+          "default": null,
+          "lineno": 30,
+          "doc": "插件短简介"
+        },
+        {
+          "name": "version",
+          "annotation": "str | None",
+          "default": null,
+          "lineno": 32,
+          "doc": "插件版本"
+        },
+        {
+          "name": "repo",
+          "annotation": "str | None",
+          "default": null,
+          "lineno": 34,
+          "doc": "插件仓库地址"
+        },
+        {
+          "name": "star_cls_type",
+          "annotation": "type[Star] | None",
+          "default": null,
+          "lineno": 37,
+          "doc": "插件的类对象的类型"
+        },
+        {
+          "name": "module_path",
+          "annotation": "str | None",
+          "default": null,
+          "lineno": 39,
+          "doc": "插件的模块路径"
+        },
+        {
+          "name": "star_cls",
+          "annotation": "Star | None",
+          "default": null,
+          "lineno": 42,
+          "doc": "插件的类对象（实例）"
+        },
+        {
+          "name": "module",
+          "annotation": "ModuleType | None",
+          "default": null,
+          "lineno": 44,
+          "doc": "插件的模块对象"
+        },
+        {
+          "name": "root_dir_name",
+          "annotation": "str | None",
+          "default": null,
+          "lineno": 46,
+          "doc": "插件的目录名称"
+        },
+        {
+          "name": "reserved",
+          "annotation": "bool",
+          "default": false,
+          "lineno": 48,
+          "doc": "是否是 AstrBot 的保留插件"
+        },
+        {
+          "name": "activated",
+          "annotation": "bool",
+          "default": true,
+          "lineno": 51,
+          "doc": "是否被激活"
+        },
+        {
+          "name": "config",
+          "annotation": "AstrBotConfig | None",
+          "default": null,
+          "lineno": 54,
+          "doc": "插件配置"
+        },
+        {
+          "name": "star_handler_full_names",
+          "annotation": "list[str]",
+          "default": "field(default_factory=list)",
+          "lineno": 57,
+          "doc": "注册的 Handler 的全名列表"
+        },
+        {
+          "name": "display_name",
+          "annotation": "str | None",
+          "default": null,
+          "lineno": 60,
+          "doc": "用于展示的插件名称"
+        },
+        {
+          "name": "logo_path",
+          "annotation": "str | None",
+          "default": null,
+          "lineno": 63,
+          "doc": "插件 Logo 的路径"
+        },
+        {
+          "name": "support_platforms",
+          "annotation": "list[str]",
+          "default": "field(default_factory=list)",
+          "lineno": 66,
+          "doc": "插件声明支持的平台适配器 ID 列表"
+        },
+        {
+          "name": "astrbot_version",
+          "annotation": "str | None",
+          "default": null,
+          "lineno": 69,
+          "doc": "插件要求的 AstrBot 版本范围（PEP 440 specifier）"
+        },
+        {
+          "name": "i18n",
+          "annotation": "dict[str, dict]",
+          "default": "field(default_factory=dict)",
+          "lineno": 72,
+          "doc": "插件自带的国际化文案，按 locale 分组"
+        },
+        {
+          "name": "pages",
+          "annotation": "list[dict]",
+          "default": "field(default_factory=list)",
+          "lineno": 75,
+          "doc": "插件注册的 Pages 元数据"
+        }
+      ],
+      "field_count": 21,
+      "properties": [
+        {
+          "name": "plugin_id",
+          "signature": "def plugin_id(self) -> str",
+          "lineno": 79,
+          "行为": "f\"{author.lower().replace('/','_')}/{name.lower().replace('/','_')}\"，缺省用 'unknown'"
+        }
+      ],
+      "dunder": [
+        {
+          "signature": "def __str__(self) -> str",
+          "lineno": 84
+        },
+        {
+          "signature": "def __repr__(self) -> str",
+          "lineno": 87
+        }
+      ]
+    },
+    "生命周期_宿主侧调用点": {
+      "实例化": {
+        "file": "core/star/star_manager.py",
+        "lineno": "1221-1237",
+        "语义": "先注入类属性 name/author/plugin_id（1212-1214）；有 plugin_config 时试 star_cls_type(context=..., config=...)（1222-1226），捕获 TypeError 后回退 star_cls_type(context=...)（1227-1229）；无 config 时 star_cls_type(context=...)（1230-1232）；随后把 name/author/plugin_id 也 setattr 到实例上（1234-1236）",
+        "注意": "只捕获 TypeError，且是构造期抛出的 TypeError 才触发回退"
+      },
+      "initialize": {
+        "lineno": "1417-1418",
+        "代码": "if hasattr(metadata.star_cls, 'initialize') and metadata.star_cls: await metadata.star_cls.initialize()",
+        "注意": "用 hasattr，会命中原类继承来的 Star.initialize（空实现）"
+      },
+      "terminate": {
+        "lineno": "2022-2041",
+        "语义": "if '__del__' in star_metadata.star_cls_type.__dict__: 在线程池里跑 __del__；【elif】 'terminate' in star_metadata.star_cls_type.__dict__: await terminate()",
+        "重大陷阱": "①判断用 __dict__，即必须在插件类【自己的命名空间】里定义，继承自 Star 的默认 terminate 不会被调用；②__del__ 与 terminate 是 elif 关系 —— 插件类若同时定义了 __del__，则 terminate 永远不会被调用。"
+      }
+    }
+  },
+  "event_types": {
+    "file": "core/star/star_handler.py",
+    "class": "EventType",
+    "lineno": 219,
+    "end_lineno": 241,
+    "kind": "enum.Enum",
+    "member_count": 16,
+    "members_逐字及顺序": [
+      {
+        "name": "OnAstrBotLoadedEvent",
+        "value": "enum.auto()",
+        "lineno": 225,
+        "comment": "AstrBot 加载完成"
+      },
+      {
+        "name": "OnPlatformLoadedEvent",
+        "value": "enum.auto()",
+        "lineno": 226,
+        "comment": "平台加载完成"
+      },
+      {
+        "name": "AdapterMessageEvent",
+        "value": "enum.auto()",
+        "lineno": 228,
+        "comment": "收到适配器发来的消息"
+      },
+      {
+        "name": "OnWaitingLLMRequestEvent",
+        "value": "enum.auto()",
+        "lineno": 229,
+        "comment": "等待调用 LLM（在获取锁之前，仅通知）"
+      },
+      {
+        "name": "OnLLMRequestEvent",
+        "value": "enum.auto()",
+        "lineno": 230,
+        "comment": "收到 LLM 请求（可以是用户也可以是插件）"
+      },
+      {
+        "name": "OnLLMResponseEvent",
+        "value": "enum.auto()",
+        "lineno": 231,
+        "comment": "LLM 响应后"
+      },
+      {
+        "name": "OnAgentBeginEvent",
+        "value": "enum.auto()",
+        "lineno": 232,
+        "comment": "Agent 开始运行"
+      },
+      {
+        "name": "OnAgentDoneEvent",
+        "value": "enum.auto()",
+        "lineno": 233,
+        "comment": "Agent 运行完成"
+      },
+      {
+        "name": "OnDecoratingResultEvent",
+        "value": "enum.auto()",
+        "lineno": 234,
+        "comment": "发送消息前"
+      },
+      {
+        "name": "OnCallingFuncToolEvent",
+        "value": "enum.auto()",
+        "lineno": 235,
+        "comment": "调用函数工具"
+      },
+      {
+        "name": "OnUsingLLMToolEvent",
+        "value": "enum.auto()",
+        "lineno": 236,
+        "comment": "使用 LLM 工具"
+      },
+      {
+        "name": "OnLLMToolRespondEvent",
+        "value": "enum.auto()",
+        "lineno": 237,
+        "comment": "调用函数工具后"
+      },
+      {
+        "name": "OnAfterMessageSentEvent",
+        "value": "enum.auto()",
+        "lineno": 238,
+        "comment": "发送消息后"
+      },
+      {
+        "name": "OnPluginErrorEvent",
+        "value": "enum.auto()",
+        "lineno": 239,
+        "comment": "插件处理消息异常时"
+      },
+      {
+        "name": "OnPluginLoadedEvent",
+        "value": "enum.auto()",
+        "lineno": 240,
+        "comment": "插件加载完成"
+      },
+      {
+        "name": "OnPluginUnloadedEvent",
+        "value": "enum.auto()",
+        "lineno": 241,
+        "comment": "插件卸载完成"
+      }
+    ],
+    "运行时确认": "len(list(EventType)) == 16，顺序与上表完全一致（已 import 实测）",
+    "无成员的事件类型": "无。16 个 enum.auto() 成员，值即 1..16（定义顺序）"
+  },
+  "star_handler_metadata": {
+    "file": "core/star/star_handler.py",
+    "class": "StarHandlerMetadata",
+    "lineno": 248,
+    "end_lineno": 282,
+    "decorator": "@dataclass (star_handler.py:247)",
+    "generic": "Generic[H]，H = TypeVar('H', bound=Callable[..., Any])",
+    "fields": [
+      {
+        "name": "event_type",
+        "annotation": "EventType",
+        "default": "无默认值（必填）",
+        "lineno": 251,
+        "doc": "Handler 的事件类型"
+      },
+      {
+        "name": "handler_full_name",
+        "annotation": "str",
+        "default": "无默认值（必填）",
+        "lineno": 254,
+        "doc": "格式为 f\"{handler.__module__}_{handler.__name__}\""
+      },
+      {
+        "name": "handler_name",
+        "annotation": "str",
+        "default": "无默认值（必填）",
+        "lineno": 257,
+        "doc": "Handler 的名字，也就是方法名"
+      },
+      {
+        "name": "handler_module_path",
+        "annotation": "str",
+        "default": "无默认值（必填）",
+        "lineno": 260,
+        "doc": "Handler 所在的模块路径"
+      },
+      {
+        "name": "handler",
+        "annotation": "H",
+        "default": "无默认值（必填）",
+        "lineno": 263,
+        "doc": "Handler 的函数对象，应当是一个异步函数"
+      },
+      {
+        "name": "event_filters",
+        "annotation": "list[HandlerFilter]",
+        "default": "无默认值（必填）",
+        "lineno": 266,
+        "doc": "适配器消息事件过滤器"
+      },
+      {
+        "name": "desc",
+        "annotation": "str",
+        "default": "\"\"",
+        "lineno": 269,
+        "doc": "Handler 的描述信息"
+      },
+      {
+        "name": "extras_configs",
+        "annotation": "dict",
+        "default": "field(default_factory=dict)",
+        "lineno": 272,
+        "doc": "插件注册的一些其他的信息, 如 priority 等"
+      },
+      {
+        "name": "enabled",
+        "annotation": "bool",
+        "default": true,
+        "lineno": 275,
+        "doc": "（无 doc）"
+      }
+    ],
+    "field_count": 9,
+    "dunder": [
+      {
+        "name": "__lt__",
+        "signature": "def __lt__(self, other: StarHandlerMetadata)",
+        "lineno": 277,
+        "end_lineno": 282,
+        "body": "return self.extras_configs.get('priority', 0) < other.extras_configs.get('priority', 0)",
+        "doc": "定义小于运算符以支持优先队列",
+        "方向": "升序比较（priority 小 < priority 大）",
+        "重要": "全库 grep 'heapq|heappush|heappop' 零命中 —— 该类并未真的被放进堆，__lt__ 当前【没有任何调用点】，属遗留/陷阱代码。"
+      }
+    ],
+    "handler_full_name_生成规则": {
+      "file": "core/star/register/star_handler.py",
+      "lineno": 31,
+      "end_lineno": 35,
+      "code": "f\"{awaitable.__module__}_{awaitable.__name__}\""
+    }
+  },
+  "star_handler_registry": {
+    "file": "core/star/star_handler.py",
+    "class": "StarHandlerRegistry",
+    "lineno": 14,
+    "end_lineno": 213,
+    "generic": "Generic[T]，T = TypeVar('T', bound='StarHandlerMetadata')",
+    "module_singleton": {
+      "name": "star_handlers_registry",
+      "lineno": 216,
+      "code": "star_handlers_registry = StarHandlerRegistry()  # type: ignore"
+    },
+    "state": [
+      {
+        "name": "star_handlers_map",
+        "annotation": "dict[str, StarHandlerMetadata]",
+        "lineno": 16,
+        "说明": "key = handler_full_name"
+      },
+      {
+        "name": "_handlers",
+        "annotation": "list[StarHandlerMetadata]",
+        "lineno": 17,
+        "说明": "私有有序列表；唯一被迭代的顺序来源"
+      }
+    ],
+    "methods": [
+      {
+        "name": "__init__",
+        "signature": "def __init__(self) -> None",
+        "lineno": 15
+      },
+      {
+        "name": "append",
+        "signature": "def append(self, handler: StarHandlerMetadata) -> None",
+        "lineno": 19,
+        "doc": "添加一个 Handler，并保持按优先级有序"
+      },
+      {
+        "name": "_print_handlers",
+        "signature": "def _print_handlers(self) -> None",
+        "lineno": 28,
+        "private": true
+      },
+      {
+        "name": "get_handlers_by_event_type",
+        "signature": "def get_handlers_by_event_type(self, event_type: EventType, only_activated=True, plugins_name: list[str] | None = None) -> list[StarHandlerMetadata]",
+        "lineno": 150,
+        "end_lineno": 186,
+        "overloads_at": [
+          33,
+          41,
+          49,
+          59,
+          67,
+          75,
+          83,
+          91,
+          99,
+          109,
+          117,
+          125,
+          133,
+          141
+        ],
+        "过滤顺序": [
+          "handler.event_type != event_type -> skip (159)",
+          "not handler.enabled -> skip (161)",
+          "only_activated 且 star_map[handler.handler_module_path].activated 为假 -> skip (164-167)",
+          "plugins_name 非 None 且 != ['*'] 时，plugin.name 不在白名单且事件类型不属 4 个加载事件且非 reserved -> skip (169-184)"
+        ]
+      },
+      {
+        "name": "get_handler_by_full_name",
+        "signature": "def get_handler_by_full_name(self, full_name: str) -> StarHandlerMetadata | None",
+        "lineno": 188
+      },
+      {
+        "name": "get_handlers_by_module_name",
+        "signature": "def get_handlers_by_module_name(self, module_name: str) -> list[StarHandlerMetadata]",
+        "lineno": 191
+      },
+      {
+        "name": "clear",
+        "signature": "def clear(self) -> None",
+        "lineno": 201
+      },
+      {
+        "name": "remove",
+        "signature": "def remove(self, handler: StarHandlerMetadata) -> None",
+        "lineno": 205,
+        "end_lineno": 207,
+        "注意": "用 dataclass 自动生成的 __eq__ 做 h != handler 比较（字段值全等），不是身份比较"
+      },
+      {
+        "name": "__iter__",
+        "signature": "def __iter__(self)",
+        "lineno": 209,
+        "行为": "return iter(self._handlers) —— 直接迭代即按 _handlers 当前顺序"
+      },
+      {
+        "name": "__len__",
+        "signature": "def __len__(self) -> int",
+        "lineno": 212
+      }
+    ],
+    "method_count": 11,
+    "排序语义": {
+      "问题": "append() 用的排序键是什么方向？和 __lt__ 的方向一致吗？",
+      "append_实现": {
+        "lineno": "19-26",
+        "code": "if 'priority' not in handler.extras_configs: handler.extras_configs['priority'] = 0; self.star_handlers_map[handler.handler_full_name] = handler; self._handlers.append(handler); self._handlers.sort(key=lambda h: -h.extras_configs['priority'])"
+      },
+      "append_方向": "降序（DESCENDING）—— sort key 是 priority 的【负数】，priority 大者排在 _handlers 前面，迭代时先执行",
+      "lt_方向": "升序（ASCENDING）—— self.priority < other.priority，priority 小者排在前面",
+      "一致吗": "【不一致，方向完全相反】",
+      "默认优先级": 0,
+      "默认行为": "未显式传 priority 的 handler 一律 priority=0；显式 priority 越大越先执行",
+      "sort_稳定性": "Python list.sort 稳定 —— 同 priority 的 handler 保持 append 的先后（即注册/导入顺序）",
+      "运行时实测": {
+        "输入": "依次 append A(1) B(5) C(3) D(5) E(0) F(-2)",
+        "_handlers_结果": "[B(5), D(5), C(3), A(1), E(0), F(-2)]",
+        "sorted_用__lt__升序": "[F, E, A, C, B, D]",
+        "sorted_reverse=True": "[B, D, C, A, E, F]",
+        "结论": "_handlers 顺序 == sorted(reverse=True)，与 __lt__ 定义的升序相反"
+      },
+      "消费侧影响": "get_handlers_by_event_type() / __iter__ 都直接遍历 _handlers，所以【运行时实际生效的是降序】；__lt__ 无调用点，不生效。",
+      "优先级元数据来源": "get_handler_or_create 把装饰器的全部 **kwargs 原样塞进 md.extras_configs（register/star_handler.py:68），所以 @filter.command(priority=10) 的 priority 走这里",
+      "append_首次调用时机的陷阱": "append 只在 'priority' not in extras_configs 时补 0；但 extras_configs 是普通 dict，若插件自己塞了非数字 priority 会在 sort 时抛 TypeError"
+    },
+    "重复注册语义": "get_handler_or_create 先 get_handler_by_full_name，命中则【直接返回已存在的 md】（register/star_handler.py:50-52），即同名 handler 不重复 append；但同一函数叠加多个装饰器时，会共享同一个 md，只追加 event_filters。"
+  },
+  "filter_decorators": {
+    "定义文件": "core/star/register/star_handler.py",
+    "再导出文件": "api/event/filter/__init__.py（第 11-40 行逐个 as 别名），__all__ 在 42-72 行",
+    "插件惯用导入": "from astrbot.api.event import filter  →  @filter.xxx(...)",
+    "全部导出名_count": 29,
+    "全部导出名": [
+      "CustomFilter",
+      "EventMessageType",
+      "EventMessageTypeFilter",
+      "PermissionType",
+      "PermissionTypeFilter",
+      "PlatformAdapterType",
+      "PlatformAdapterTypeFilter",
+      "after_message_sent",
+      "command",
+      "command_group",
+      "custom_filter",
+      "event_message_type",
+      "llm_tool",
+      "on_agent_begin",
+      "on_agent_done",
+      "on_astrbot_loaded",
+      "on_decorating_result",
+      "on_llm_request",
+      "on_llm_response",
+      "on_plugin_error",
+      "on_plugin_loaded",
+      "on_plugin_unloaded",
+      "on_platform_loaded",
+      "on_waiting_llm_request",
+      "permission_type",
+      "platform_adapter_type",
+      "regex",
+      "on_using_llm_tool",
+      "on_llm_tool_respond"
+    ],
+    "装饰器工厂_count": 22,
+    "非装饰器导出_7个类或枚举": [
+      "CustomFilter",
+      "EventMessageType",
+      "EventMessageTypeFilter",
+      "PermissionType",
+      "PermissionTypeFilter",
+      "PlatformAdapterType",
+      "PlatformAdapterTypeFilter"
+    ],
+    "decorators": [
+      {
+        "name": "command",
+        "lineno": 75,
+        "signature": "register_command(command_name: str | None = None, sub_command: str | None = None, alias: set | None = None, **kwargs)",
+        "event_type": "AdapterMessageEvent",
+        "备注": "添加 CommandFilter（79-126）",
+        "再导出名": "command",
+        "插件写法": "@filter.command(...)"
+      },
+      {
+        "name": "command_group",
+        "lineno": 208,
+        "signature": "register_command_group(command_group_name: str | None = None, sub_command: str | None = None, alias: set | None = None, **kwargs)",
+        "event_type": "AdapterMessageEvent",
+        "备注": "添加 CommandGroupFilter，返回 RegisteringCommandable（236-248）",
+        "再导出名": "command_group",
+        "插件写法": "@filter.command_group(...)"
+      },
+      {
+        "name": "custom_filter",
+        "lineno": 129,
+        "signature": "register_custom_filter(custom_type_filter, *args, **kwargs)",
+        "event_type": "AdapterMessageEvent",
+        "备注": "裸指令时 args[0]=raise_error 默认 True；支持 CustomFilterAnd/Or 组合（129-205）",
+        "再导出名": "custom_filter",
+        "插件写法": "@filter.custom_filter(...)"
+      },
+      {
+        "name": "event_message_type",
+        "lineno": 262,
+        "signature": "register_event_message_type(event_message_type: EventMessageType, **kwargs)",
+        "event_type": "AdapterMessageEvent",
+        "备注": "添加 EventMessageTypeFilter（265-272）",
+        "再导出名": "event_message_type",
+        "插件写法": "@filter.event_message_type(...)"
+      },
+      {
+        "name": "platform_adapter_type",
+        "lineno": 277,
+        "signature": "register_platform_adapter_type(platform_adapter_type: PlatformAdapterType, **kwargs)",
+        "event_type": "AdapterMessageEvent",
+        "备注": "添加 PlatformAdapterTypeFilter（283-292）",
+        "再导出名": "platform_adapter_type",
+        "插件写法": "@filter.platform_adapter_type(...)"
+      },
+      {
+        "name": "regex",
+        "lineno": 297,
+        "signature": "register_regex(regex: str | re.Pattern, **kwargs)",
+        "event_type": "AdapterMessageEvent",
+        "备注": "添加 RegexFilter（300-307）",
+        "再导出名": "regex",
+        "插件写法": "@filter.regex(...)"
+      },
+      {
+        "name": "permission_type",
+        "lineno": 312,
+        "signature": "register_permission_type(permission_type: PermissionType, raise_error: bool = True, **kwargs)",
+        "event_type": "AdapterMessageEvent",
+        "备注": "添加 PermissionTypeFilter(permission_type, raise_error)（323-332）",
+        "再导出名": "permission_type",
+        "插件写法": "@filter.permission_type(...)"
+      },
+      {
+        "name": "llm_tool",
+        "lineno": 586,
+        "signature": "register_llm_tool(name: str | None = None, **kwargs)",
+        "event_type": "OnCallingFuncToolEvent",
+        "备注": "解析 docstring 后 llm_tools.add_func(...)（631-670）",
+        "再导出名": "llm_tool",
+        "插件写法": "@filter.llm_tool(...)"
+      },
+      {
+        "name": "on_astrbot_loaded",
+        "lineno": 337,
+        "signature": "register_on_astrbot_loaded(**kwargs)",
+        "event_type": "OnAstrBotLoadedEvent",
+        "备注": "仅注册 handler",
+        "再导出名": "on_astrbot_loaded",
+        "插件写法": "@filter.on_astrbot_loaded(...)"
+      },
+      {
+        "name": "on_platform_loaded",
+        "lineno": 347,
+        "signature": "register_on_platform_loaded(**kwargs)",
+        "event_type": "OnPlatformLoadedEvent",
+        "备注": "仅注册 handler",
+        "再导出名": "on_platform_loaded",
+        "插件写法": "@filter.on_platform_loaded(...)"
+      },
+      {
+        "name": "on_plugin_error",
+        "lineno": 357,
+        "signature": "register_on_plugin_error(**kwargs)",
+        "event_type": "OnPluginErrorEvent",
+        "备注": "hook 参数: event, plugin_name, handler_name, error, traceback_text；stop_event() 可屏蔽默认报错回显",
+        "再导出名": "on_plugin_error",
+        "插件写法": "@filter.on_plugin_error(...)"
+      },
+      {
+        "name": "on_plugin_loaded",
+        "lineno": 375,
+        "signature": "register_on_plugin_loaded(**kwargs)",
+        "event_type": "OnPluginLoadedEvent",
+        "备注": "hook 参数: metadata",
+        "再导出名": "on_plugin_loaded",
+        "插件写法": "@filter.on_plugin_loaded(...)"
+      },
+      {
+        "name": "on_plugin_unloaded",
+        "lineno": 392,
+        "signature": "register_on_plugin_unloaded(**kwargs)",
+        "event_type": "OnPluginUnloadedEvent",
+        "备注": "hook 参数: metadata",
+        "再导出名": "on_plugin_unloaded",
+        "插件写法": "@filter.on_plugin_unloaded(...)"
+      },
+      {
+        "name": "on_waiting_llm_request",
+        "lineno": 409,
+        "signature": "register_on_waiting_llm_request(**kwargs)",
+        "event_type": "OnWaitingLLMRequestEvent",
+        "备注": "hook 参数: event；在获取 LLM 锁之前通知",
+        "再导出名": "on_waiting_llm_request",
+        "插件写法": "@filter.on_waiting_llm_request(...)"
+      },
+      {
+        "name": "on_llm_request",
+        "lineno": 433,
+        "signature": "register_on_llm_request(**kwargs)",
+        "event_type": "OnLLMRequestEvent",
+        "备注": "hook 参数: event, req(ProviderRequest)",
+        "再导出名": "on_llm_request",
+        "插件写法": "@filter.on_llm_request(...)"
+      },
+      {
+        "name": "on_llm_response",
+        "lineno": 456,
+        "signature": "register_on_llm_response(**kwargs)",
+        "event_type": "OnLLMResponseEvent",
+        "备注": "hook 参数: event, response(LLMResponse)",
+        "再导出名": "on_llm_response",
+        "插件写法": "@filter.on_llm_response(...)"
+      },
+      {
+        "name": "on_agent_begin",
+        "lineno": 479,
+        "signature": "register_on_agent_begin(**kwargs)",
+        "event_type": "OnAgentBeginEvent",
+        "备注": "hook 参数: event, run_context",
+        "再导出名": "on_agent_begin",
+        "插件写法": "@filter.on_agent_begin(...)"
+      },
+      {
+        "name": "on_agent_done",
+        "lineno": 507,
+        "signature": "register_on_agent_done(**kwargs)",
+        "event_type": "OnAgentDoneEvent",
+        "备注": "hook 参数: event, run_context, response",
+        "再导出名": "on_agent_done",
+        "插件写法": "@filter.on_agent_done(...)"
+      },
+      {
+        "name": "on_using_llm_tool",
+        "lineno": 537,
+        "signature": "register_on_using_llm_tool(**kwargs)",
+        "event_type": "OnUsingLLMToolEvent",
+        "备注": "hook 参数: event, tool, tool_args",
+        "再导出名": "on_using_llm_tool",
+        "插件写法": "@filter.on_using_llm_tool(...)"
+      },
+      {
+        "name": "on_llm_tool_respond",
+        "lineno": 561,
+        "signature": "register_on_llm_tool_respond(**kwargs)",
+        "event_type": "OnLLMToolRespondEvent",
+        "备注": "hook 参数: event, tool, tool_args, tool_result",
+        "再导出名": "on_llm_tool_respond",
+        "插件写法": "@filter.on_llm_tool_respond(...)"
+      },
+      {
+        "name": "on_decorating_result",
+        "lineno": 730,
+        "signature": "register_on_decorating_result(**kwargs)",
+        "event_type": "OnDecoratingResultEvent",
+        "备注": "发送消息前",
+        "再导出名": "on_decorating_result",
+        "插件写法": "@filter.on_decorating_result(...)"
+      },
+      {
+        "name": "after_message_sent",
+        "lineno": 744,
+        "signature": "register_after_message_sent(**kwargs)",
+        "event_type": "OnAfterMessageSentEvent",
+        "备注": "消息发送后",
+        "再导出名": "after_message_sent",
+        "插件写法": "@filter.after_message_sent(...)"
+      }
+    ],
+    "不在_filter_命名空间但属_core.star.register": [
+      {
+        "name": "register_agent",
+        "lineno": 697,
+        "signature": "register_agent(name: str, instruction: str, tools: list[str | FunctionTool] | None = None, run_hooks: BaseAgentRunHooks[Any] | None = None)",
+        "导出": "astrbot.api.agent（api/__init__.py:8）与 astrbot.core.star.register.register_agent",
+        "行为": "构造 Agent + HandoffTool，把工具 append 进 llm_tools.func_list，返回 RegisteringAgent（该对象有 .llm_tool 方法）"
+      },
+      {
+        "name": "register_star",
+        "lineno": 8,
+        "file": "core/star/register/star.py",
+        "signature": "register_star(name: str, author: str, desc: str, version: str, repo: str | None = None)",
+        "导出": "astrbot.api.star.register（api/star/__init__.py:4）",
+        "状态": "已废弃（DeprecationWarning，star.py:41-45），v3.5.19 之后继承 Star 即自动识别"
+      }
+    ],
+    "装饰器公共机制": {
+      "get_handler_or_create": {
+        "file": "core/star/register/star_handler.py",
+        "lineno": 38,
+        "end_lineno": 72,
+        "语义": "按 full_name 查重 -> 命中直接返回（50-52）；否则新建 StarHandlerMetadata，desc 先取 handler.__doc__.strip()（63-64），kwargs 里的 desc 覆盖它（65-67），其余 kwargs 全部塞进 md.extras_configs（68）；dont_add=False 时 append 进注册表（70-71）",
+        "推论": "装饰器的 **kwargs 不是被忽略的 —— 它们成为 extras_configs，其中 'priority' 影响排序"
+      },
+      "命令参数解析": {
+        "file": "core/star/filter/command.py",
+        "init_handler_md": "lineno 66-79：用 inspect.signature(handler, eval_str=True)，跳过前两个参数（self 与 event），其余参数名 -> 注解或默认值",
+        "filter": "lineno 191-220：要求 event.is_at_or_wake_command（192）；把消息 strip 后按指令名匹配（199-206）；把剩余文本按空格切分（209-211）；validate_and_convert_params 转换（214）；结果写入 event.set_extra('parsed_params', params)（218）",
+        "GreedyStr": "lineno 15-16 与 102-114：GreedyStr 必须是最后一个参数，否则 ValueError；命中时把剩余全部参数用空格 join",
+        "类型转换": "lineno 129-172：None -> 数字串转 int；str 默认值 -> 原样；bool -> true/yes/1 与 false/no/0；int -> int()；float -> float()；联合类型 -> 取唯一非 None 类型构造；失败抛 ValueError(f\"参数 {param_name} 类型错误。完整参数: ...\")",
+        "指令名匹配": "lineno 175-189：get_complete_command_names 把 parent_command_names 与本命令名/别名做笛卡尔积（'父 子'）"
+      },
+      "regex_filter_不受_wake_prefix_制约": {
+        "file": "core/star/filter/regex.py",
+        "lineno": 9,
+        "code": "# 正则表达式过滤器不会受到 wake_prefix 的制约。",
+        "filter": "lineno 17-18：self.regex.search(event.get_message_str().strip())"
+      },
+      "command_filter_受_wake_prefix_制约": {
+        "file": "core/star/filter/command.py",
+        "lineno": 30,
+        "code": "# 标准指令受到 wake_prefix 的制约。"
+      },
+      "filter_AND_语义": {
+        "file": "core/pipeline/waking_check/stage.py",
+        "lineno": "177-192",
+        "语义": "handler.event_filters 内所有 filter 必须全部通过（AND）；PermissionTypeFilter 特殊处理：不通过时记 permission_not_pass 与 raise_error，不算 passed=False"
+      },
+      "无_filter_的_AdapterMessageEvent_handler_会被跳过": {
+        "file": "core/pipeline/waking_check/stage.py",
+        "lineno": "182-183",
+        "code": "if len(handler.event_filters) == 0: continue"
+      }
+    },
+    "register_llm_tool_深度解析": {
+      "file": "core/star/register/star_handler.py",
+      "lineno": 586,
+      "end_lineno": 683,
+      "工具名解析": "llm_tool_name = name_ if name_ else awaitable.__name__（631）",
+      "docstring_解析": "docstring_parser.parse(awaitable.__doc__ or '')（632-633）；只遍历 docstring.params（635）",
+      "类型名归一化_逐行": [
+        "637: type_name = arg.type_name",
+        "638-641: 若 type_name 为空 -> raise ValueError(f\"LLM 函数工具 {awaitable.__module__}_{llm_tool_name} 的参数 {arg.arg_name} 缺少类型注释。\")",
+        "643: match = re.match(r\"(\\w+)\\[(\\w+)\\]\", type_name)  # 拆 'list[string]' 这类泛型",
+        "644-646: 命中则 type_name=match.group(1), sub_type_name=match.group(2)",
+        "647: type_name = PY_TO_JSON_TYPE.get(type_name, type_name)",
+        "648-649: sub_type_name 同样过 PY_TO_JSON_TYPE",
+        "650-655: 若 type_name 不在 SUPPORTED_TYPES，或 sub_type_name 存在且不在 SUPPORTED_TYPES -> raise ValueError(f\"LLM 函数工具 {awaitable.__module__}_{llm_tool_name} 不支持的参数类型：{arg.type_name}\")",
+        "657-661: arg_json_schema = {'type': type_name, 'name': arg.arg_name, 'description': arg.description}",
+        "662-664: 仅当 type_name == 'array' 时补 'items': {'type': sub_type_name}"
+      ],
+      "SUPPORTED_TYPES": {
+        "value": [
+          "string",
+          "number",
+          "object",
+          "array",
+          "boolean"
+        ],
+        "file": "core/provider/func_tool_manager.py",
+        "lineno": "128-134"
+      },
+      "PY_TO_JSON_TYPE": {
+        "value": {
+          "int": "number",
+          "float": "number",
+          "bool": "boolean",
+          "str": "string",
+          "dict": "object",
+          "list": "array",
+          "tuple": "array",
+          "set": "array"
+        },
+        "file": "core/provider/func_tool_manager.py",
+        "lineno": "136-145"
+      },
+      "注册": [
+        "667-670（无 registering_agent）：doc_desc = docstring.description.strip()（668）；md = get_handler_or_create(awaitable, EventType.OnCallingFuncToolEvent)（669）；llm_tools.add_func(llm_tool_name, args, doc_desc, md.handler)（670）",
+        "671-679（registering_agent 分支，由 RegisteringAgent.llm_tool 注入）：spec_to_func 后 append 到 agent.tools，【不】注册进全局 llm_tools"
+      ],
+      "返回值语义_源码docstring_604-606": "返回 str：结果会被加入下一次 LLM 请求的 prompt 中，用于让 LLM 总结工具返回的结果；返回 None：结果不会被加入下一次 LLM 请求的 prompt 中。可用 yield 发送消息、终止事件（event.stop_event(); yield）。",
+      "参数描述来源": "docstring 里的 Args: 段（docstring_parser 解析）",
+      "实测_合法类型": [
+        {
+          "docstring类型": "string",
+          "JSON schema type": "string"
+        },
+        {
+          "docstring类型": "number",
+          "JSON schema type": "number"
+        },
+        {
+          "docstring类型": "boolean",
+          "JSON schema type": "boolean"
+        },
+        {
+          "docstring类型": "object",
+          "JSON schema type": "object"
+        },
+        {
+          "docstring类型": "array",
+          "JSON schema type": "array"
+        },
+        {
+          "docstring类型": "str",
+          "JSON schema type": "string"
+        },
+        {
+          "docstring类型": "int",
+          "JSON schema type": "number"
+        },
+        {
+          "docstring类型": "float",
+          "JSON schema type": "number"
+        },
+        {
+          "docstring类型": "bool",
+          "JSON schema type": "boolean"
+        },
+        {
+          "docstring类型": "dict",
+          "JSON schema type": "object"
+        },
+        {
+          "docstring类型": "list",
+          "JSON schema type": "array"
+        },
+        {
+          "docstring类型": "list[str]",
+          "JSON schema type": "array + items:{type:string}"
+        },
+        {
+          "docstring类型": "list[string]",
+          "JSON schema type": "array + items:{type:string}"
+        }
+      ],
+      "实测_解析失败": [
+        {
+          "docstring类型": "integer",
+          "结果": "ValueError: LLM 函数工具 <mod>_<name> 不支持的参数类型：integer（integer 不在 SUPPORTED_TYPES，也不在 PY_TO_JSON_TYPE；JSON Schema 虽支持 integer，AstrBot 不接受）"
+        },
+        {
+          "docstring类型": "Any",
+          "结果": "ValueError ... 不支持的参数类型：Any"
+        },
+        {
+          "docstring类型": "Foo",
+          "结果": "ValueError ... 不支持的参数类型：Foo"
+        },
+        {
+          "docstring类型": "list[Foo]",
+          "结果": "ValueError ... 不支持的参数类型：list[Foo]（外层 list 已映射为 array，但 sub_type Foo 不合法）"
+        },
+        {
+          "docstring类型": "（缺类型，写 'location: 地点'）",
+          "结果": "ValueError: LLM 函数工具 <mod>_<name> 的参数 location 缺少类型注释。"
+        }
+      ],
+      "实测_无_docstring_或无_Args_段": "不报错：docstring.params 为空 -> args=[] -> 注册出 parameters={'type':'object','properties':{}} 的无参工具；docstring.description 也为空则 desc=''",
+      "实测_把_event_写进_Args": "不报错，且会把 event 也注册成一个工具参数（源码不排除前两个位置参数）—— 插件作者须自行不要在 Args: 里写 event",
+      "参数 schema 组装": {
+        "file": "core/provider/func_tool_manager.py",
+        "lineno": "343-363",
+        "code": "params = {'type':'object','properties':{}}；每个 param 深拷贝后 pop('name')，再把 param['name'] 作为 properties 的 key；返回 FuncTool(name, parameters, description, handler)"
+      },
+      "重复注册": "add_func 先 self.remove_func(name)（380），同名工具后者覆盖前者（func_tool_manager.py:365-390）",
+      "抛错时机": "上述 ValueError 在【装饰器执行时】抛出，即插件 import / 加载阶段就会失败（不是调用工具时才失败）"
+    },
+    "枚举_关联类型": {
+      "EventMessageType": {
+        "file": "core/star/filter/event_message_type.py",
+        "lineno": 10,
+        "kind": "enum.Flag",
+        "members": [
+          {
+            "name": "GROUP_MESSAGE",
+            "value": 1
+          },
+          {
+            "name": "PRIVATE_MESSAGE",
+            "value": 2
+          },
+          {
+            "name": "OTHER_MESSAGE",
+            "value": 4
+          },
+          {
+            "name": "ALL",
+            "value": "GROUP_MESSAGE | PRIVATE_MESSAGE | OTHER_MESSAGE = 7"
+          }
+        ],
+        "备注": "ALL 是成员，遍历 Flag 时 list(EventMessageType) 只含 3 个单比特成员"
+      },
+      "PermissionType": {
+        "file": "core/star/filter/permission.py",
+        "lineno": 9,
+        "kind": "enum.Flag",
+        "members": [
+          {
+            "name": "ADMIN",
+            "value": 1
+          },
+          {
+            "name": "MEMBER",
+            "value": 2
+          }
+        ],
+        "doc": "权限类型。当选择 MEMBER，ADMIN 也可以通过。",
+        "filter实现": "permission.py:23-31 —— 仅当 permission_type == PermissionType.ADMIN 时检查 event.is_admin()；== 比较（不是位与），故传 MEMBER 恒返回 True"
+      },
+      "PlatformAdapterType": {
+        "file": "core/star/filter/platform_adapter_type.py",
+        "lineno": 9,
+        "kind": "enum.Flag",
+        "member_count": 21,
+        "members": [
+          "AIOCQHTTP",
+          "QQOFFICIAL",
+          "QQOFFICIAL_WEBHOOK",
+          "TELEGRAM",
+          "WECOM",
+          "WECOM_AI_BOT",
+          "LARK",
+          "DINGTALK",
+          "DISCORD",
+          "SLACK",
+          "KOOK",
+          "VOCECHAT",
+          "WEIXIN_OFFICIAL_ACCOUNT",
+          "SATORI",
+          "MISSKEY",
+          "LINE",
+          "MATRIX",
+          "WEIXIN_OC",
+          "MATTERMOST",
+          "WEBCHAT",
+          "ALL"
+        ],
+        "ADAPTER_NAME_2_TYPE": {
+          "lineno": "33-54",
+          "keys": [
+            "aiocqhttp",
+            "qq_official",
+            "qq_official_webhook",
+            "telegram",
+            "wecom",
+            "wecom_ai_bot",
+            "lark",
+            "dingtalk",
+            "discord",
+            "slack",
+            "kook",
+            "vocechat",
+            "weixin_official_account",
+            "satori",
+            "misskey",
+            "line",
+            "matrix",
+            "weixin_oc",
+            "mattermost",
+            "webchat"
+          ]
+        },
+        "备注": "ALL 是 enum.auto() 的【下一个独立位】，不是所有位的或 —— filter 里用 self.platform_type & PlatformAdapterType.ALL 判真，仅当显式传 ALL（最高位）时才为真"
+      }
+    }
+  },
+  "context_class": {
+    "file": "core/star/context.py",
+    "class": "Context",
+    "lineno": 123,
+    "end_lineno": 894,
+    "doc": "暴露给插件的接口上下文。",
+    "class_attributes": [
+      {
+        "name": "registered_web_apis",
+        "annotation": "list[RegisteredWebApi]",
+        "default": "[]",
+        "lineno": 126,
+        "注意": "写在类体里 = 【类属性】，所有实例共享同一个 list"
+      },
+      {
+        "name": "_register_tasks",
+        "annotation": "list[Awaitable]",
+        "default": "[]",
+        "lineno": 129,
+        "注意": "类属性；注释标为“向后兼容的变量”"
+      },
+      {
+        "name": "_star_manager",
+        "annotation": null,
+        "default": "None",
+        "lineno": 130,
+        "注意": "类属性"
+      }
+    ],
+    "instance_attributes_由__init__赋值": [
+      {
+        "name": "_event_queue",
+        "lineno": 147
+      },
+      {
+        "name": "_config",
+        "lineno": 149
+      },
+      {
+        "name": "_db",
+        "lineno": 151
+      },
+      {
+        "name": "provider_manager",
+        "lineno": 153
+      },
+      {
+        "name": "platform_manager",
+        "lineno": 155
+      },
+      {
+        "name": "conversation_manager",
+        "lineno": 157,
+        "注释": "会话管理器"
+      },
+      {
+        "name": "message_history_manager",
+        "lineno": 159
+      },
+      {
+        "name": "persona_manager",
+        "lineno": 161
+      },
+      {
+        "name": "astrbot_config_mgr",
+        "lineno": 163
+      },
+      {
+        "name": "kb_manager",
+        "lineno": 165
+      },
+      {
+        "name": "cron_manager",
+        "lineno": 167
+      },
+      {
+        "name": "subagent_orchestrator",
+        "lineno": 169
+      }
+    ],
+    "public_method_count": 34,
+    "public_methods": [
+      {
+        "name": "llm_generate",
+        "signature": "async def llm_generate(self, *, chat_provider_id: str, prompt: str | None = None, image_urls: list[str] | None = None, audio_urls: list[str] | None = None, tools: ToolSet | None = None, system_prompt: str | None = None, contexts: list[Message] | None = None, **kwargs: Any) -> LLMResponse",
+        "lineno": 171,
+        "async": true
+      },
+      {
+        "name": "tool_loop_agent",
+        "signature": "async def tool_loop_agent(self, *, event: AstrMessageEvent, chat_provider_id: str, prompt: str | None = None, image_urls: list[str] | None = None, audio_urls: list[str] | None = None, tools: ToolSet | None = None, system_prompt: str | None = None, contexts: list[Message] | None = None, max_steps: int = 30, tool_call_timeout: int = 120, **kwargs: Any) -> LLMResponse",
+        "lineno": 215,
+        "async": true
+      },
+      {
+        "name": "get_current_chat_provider_id",
+        "signature": "async def get_current_chat_provider_id(self, umo: str) -> str",
+        "lineno": 329,
+        "async": true
+      },
+      {
+        "name": "get_registered_star",
+        "signature": "def get_registered_star(self, star_name: str) -> StarMetadata | None",
+        "lineno": 346,
+        "async": false
+      },
+      {
+        "name": "get_all_stars",
+        "signature": "def get_all_stars(self) -> list[StarMetadata]",
+        "lineno": 352,
+        "async": false
+      },
+      {
+        "name": "get_llm_tool_manager",
+        "signature": "def get_llm_tool_manager(self) -> FunctionToolManager",
+        "lineno": 356,
+        "async": false
+      },
+      {
+        "name": "activate_llm_tool",
+        "signature": "def activate_llm_tool(self, name: str) -> bool",
+        "lineno": 361,
+        "async": false,
+        "deprecated": "Use activate_llm_tool_async() instead.（360）"
+      },
+      {
+        "name": "activate_llm_tool_async",
+        "signature": "async def activate_llm_tool_async(self, name: str) -> bool",
+        "lineno": 375,
+        "async": true
+      },
+      {
+        "name": "deactivate_llm_tool",
+        "signature": "def deactivate_llm_tool(self, name: str) -> bool",
+        "lineno": 393,
+        "async": false,
+        "deprecated": "Use deactivate_llm_tool_async() instead.（392）"
+      },
+      {
+        "name": "deactivate_llm_tool_async",
+        "signature": "async def deactivate_llm_tool_async(self, name: str) -> bool",
+        "lineno": 404,
+        "async": true
+      },
+      {
+        "name": "get_provider_by_id",
+        "signature": "def get_provider_by_id(self, provider_id: str) -> Provider | TTSProvider | STTProvider | EmbeddingProvider | RerankProvider | None",
+        "lineno": 415,
+        "async": false
+      },
+      {
+        "name": "get_all_providers",
+        "signature": "def get_all_providers(self) -> list[Provider]",
+        "lineno": 440,
+        "async": false
+      },
+      {
+        "name": "get_all_tts_providers",
+        "signature": "def get_all_tts_providers(self) -> list[TTSProvider]",
+        "lineno": 444,
+        "async": false
+      },
+      {
+        "name": "get_all_stt_providers",
+        "signature": "def get_all_stt_providers(self) -> list[STTProvider]",
+        "lineno": 448,
+        "async": false
+      },
+      {
+        "name": "get_all_embedding_providers",
+        "signature": "def get_all_embedding_providers(self) -> list[EmbeddingProvider]",
+        "lineno": 452,
+        "async": false
+      },
+      {
+        "name": "get_using_provider",
+        "signature": "def get_using_provider(self, umo: str | None = None) -> Provider | None",
+        "lineno": 457,
+        "async": false,
+        "deprecated": "Use get_using_provider_async() instead.（456）"
+      },
+      {
+        "name": "get_using_provider_async",
+        "signature": "async def get_using_provider_async(self, umo: str | None = None) -> Provider | None",
+        "lineno": 482,
+        "async": true
+      },
+      {
+        "name": "get_using_tts_provider",
+        "signature": "def get_using_tts_provider(self, umo: str | None = None) -> TTSProvider | None",
+        "lineno": 510,
+        "async": false,
+        "deprecated": "Use get_using_tts_provider_async() instead.（509）"
+      },
+      {
+        "name": "get_using_tts_provider_async",
+        "signature": "async def get_using_tts_provider_async(self, umo: str | None = None) -> TTSProvider | None",
+        "lineno": 530,
+        "async": true
+      },
+      {
+        "name": "get_using_stt_provider",
+        "signature": "def get_using_stt_provider(self, umo: str | None = None) -> STTProvider | None",
+        "lineno": 554,
+        "async": false,
+        "deprecated": "Use get_using_stt_provider_async() instead.（553）"
+      },
+      {
+        "name": "get_using_stt_provider_async",
+        "signature": "async def get_using_stt_provider_async(self, umo: str | None = None) -> STTProvider | None",
+        "lineno": 574,
+        "async": true
+      },
+      {
+        "name": "get_config",
+        "signature": "def get_config(self, umo: str | None = None) -> AstrBotConfig",
+        "lineno": 597,
+        "async": false
+      },
+      {
+        "name": "send_message",
+        "signature": "async def send_message(self, session: str | MessageSesion, message_chain: MessageChain) -> bool",
+        "lineno": 614,
+        "async": true
+      },
+      {
+        "name": "add_llm_tools",
+        "signature": "def add_llm_tools(self, *tools: FunctionTool) -> None",
+        "lineno": 679,
+        "async": false
+      },
+      {
+        "name": "register_web_api",
+        "signature": "def register_web_api(self, route: str, view_handler: WebApiHandler, methods: list[str], desc: str) -> None",
+        "lineno": 705,
+        "async": false
+      },
+      {
+        "name": "get_event_queue",
+        "signature": "def get_event_queue(self) -> Queue",
+        "lineno": 733,
+        "async": false
+      },
+      {
+        "name": "get_platform",
+        "signature": "def get_platform(self, platform_type: PlatformAdapterType | str) -> Platform | None",
+        "lineno": 738,
+        "async": false,
+        "deprecated": "Use get_platform_inst instead（737，version 4.0.0）"
+      },
+      {
+        "name": "get_platform_inst",
+        "signature": "def get_platform_inst(self, platform_id: str) -> Platform | None",
+        "lineno": 761,
+        "async": false
+      },
+      {
+        "name": "get_db",
+        "signature": "def get_db(self) -> BaseDatabase",
+        "lineno": 777,
+        "async": false
+      },
+      {
+        "name": "register_provider",
+        "signature": "def register_provider(self, provider: Provider) -> None",
+        "lineno": 785,
+        "async": false
+      },
+      {
+        "name": "register_llm_tool",
+        "signature": "def register_llm_tool(self, name: str, func_args: list, desc: str, func_obj: Callable[..., Awaitable[Any]]) -> None",
+        "lineno": 794,
+        "async": false,
+        "deprecated": "Use decorator-based tool registration instead.（793）"
+      },
+      {
+        "name": "unregister_llm_tool",
+        "signature": "def unregister_llm_tool(self, name: str) -> None",
+        "lineno": 827,
+        "async": false,
+        "deprecated": "Use deactivate_llm_tool() to disable a tool instead.（826）"
+      },
+      {
+        "name": "register_commands",
+        "signature": "def register_commands(self, star_name: str, command_name: str, desc: str, priority: int, awaitable: Callable[..., Awaitable[Any]], use_regex = False, ignore_prefix = False) -> None",
+        "lineno": 840,
+        "async": false,
+        "deprecated": "Use the command decorator (@filter.command) instead.（839）"
+      },
+      {
+        "name": "register_task",
+        "signature": "def register_task(self, task: Awaitable, desc: str) -> None",
+        "lineno": 884,
+        "async": false,
+        "deprecated": "Start background tasks in the plugin's initialize() method instead.（881-883）"
+      }
+    ],
+    "六个重点方法": {
+      "get_config": {
+        "是属性还是方法": "方法（同步）",
+        "signature": "def get_config(self, umo: str | None = None) -> AstrBotConfig",
+        "lineno": 597,
+        "end_lineno": 612,
+        "返回值语义": "umo 为空/None -> 返回 self._config（AstrBot 默认全局配置 AstrBotConfig）；umo 非空 -> 返回 self.astrbot_config_mgr.get_conf(umo)（该会话来源的配置）。不会返回 None。",
+        "异常": "源码内未显式捕获异常；umo 非法时由 astrbot_config_mgr.get_conf 决定（未读该实现，未确认）",
+        "调用侧证据": "Star._get_context_config 用 getattr(self.context,'get_config',None) 并捕获 Exception（base.py:54-62）"
+      },
+      "conversation_manager": {
+        "是属性还是方法": "【实例属性】，不是方法（没有 conversation_manager() 这个方法）",
+        "赋值位置": "context.py:157 self.conversation_manager = conversation_manager",
+        "构造形参": "context.py:139 conversation_manager: ConversationManager",
+        "类型": "astrbot.core.conversation_mgr.ConversationManager（import 见 context.py:16）",
+        "访问形态": "ctx.conversation_manager.<方法>，例如 await ctx.conversation_manager.get_curr_conversation_id(umo)"
+      },
+      "send_message": {
+        "是属性还是方法": "方法（异步）",
+        "signature": "async def send_message(self, session: str | MessageSesion, message_chain: MessageChain) -> bool",
+        "lineno": 614,
+        "end_lineno": 677,
+        "返回值语义": "bool —— 是否找到匹配的平台。找到则 await platform.send_by_session(...) 后 return True（673）；遍历完都没匹配 return False 并 logger.warning(f\"cannot find platform for session {session}, message not sent\")（674-677）。",
+        "session 形态": "str 时用 MessageSesion.from_str(session) 解析，解析失败 raise ValueError('不合法的 session 字符串: ' + str(e))（635-639）",
+        "副作用": "群聊且平台 meta().name != 'webchat' 且配置 provider_ltm_settings.group_message_history_enable 为真时，会把该消息写入 message_history_manager（644-672，异常被吞并 logger.exception）",
+        "注意": "qq_official（QQ 官方 API 平台）不支持此方法（docstring 633）；类名 MessageSesion 是历史拼写错误（docstring 632）",
+        "平台匹配": "按 platform.meta().id == session.platform_name 遍历 self.platform_manager.platform_insts（641-642）"
+      },
+      "llm_generate": {
+        "是属性还是方法": "方法（异步）",
+        "signature": "async def llm_generate(self, *, chat_provider_id: str, prompt: str | None = None, image_urls: list[str] | None = None, audio_urls: list[str] | None = None, tools: ToolSet | None = None, system_prompt: str | None = None, contexts: list[Message] | None = None, **kwargs: Any) -> LLMResponse",
+        "lineno": 171,
+        "end_lineno": 213,
+        "重要": "【全部参数 keyword-only】（签名里有裸 *），必须 ctx.llm_generate(chat_provider_id=..., prompt=...)",
+        "返回值语义": "返回 LLMResponse（provider.entities.LLMResponse）。【不会自动执行 tool calls】—— 需要工具循环请用 tool_loop_agent()（docstring 183）。",
+        "异常": "provider 不存在或类型不符 -> raise ProviderNotFoundError(f\"Provider {chat_provider_id} not found\")（201-203）；其他错误由 prov.text_chat 抛出",
+        "参数透传": "**kwargs 直接透传给 prov.text_chat(...)（204-212），OpenAI 兼容参数",
+        "contexts 与 prompt 的关系": "两者都提供时，prompt 会作为最后一条 user message 追加（docstring 189）",
+        "versionadded": "4.5.7 (sdk)（docstring 185）"
+      },
+      "get_using_tts_provider": {
+        "是属性还是方法": "方法（同步，且【已废弃】）",
+        "signature": "def get_using_tts_provider(self, umo: str | None = None) -> TTSProvider | None",
+        "lineno": 510,
+        "end_lineno": 528,
+        "deprecated": "@deprecated(reason=\"Use get_using_tts_provider_async() instead.\")（509）",
+        "返回值语义": "返回 TTSProvider 或 None（未设置时）。若 provider_manager 返回的不是 TTSProvider -> raise ValueError('返回的 Provider 不是 TTSProvider 类型')（526-527）。",
+        "异步版本": {
+          "signature": "async def get_using_tts_provider_async(self, umo: str | None = None) -> TTSProvider | None",
+          "lineno": 530,
+          "end_lineno": 551
+        },
+        "兼容层建议": "两个都要提供：老插件用同步版（如陪伴插件），新代码用 async 版"
+      },
+      "get_llm_tool_manager": {
+        "是属性还是方法": "方法（同步）",
+        "signature": "def get_llm_tool_manager(self) -> FunctionToolManager",
+        "lineno": 356,
+        "end_lineno": 358,
+        "返回值语义": "return self.provider_manager.llm_tools，类型 FunctionToolManager；永不为 None（管理所有已注册的 function-calling tools）",
+        "FunctionToolManager_关键成员": {
+          "file": "core/provider/func_tool_manager.py",
+          "lineno": 288,
+          "func_list": "list[FuncTool]，所有工具（含 mcp 与插件工具，不含 astrbot 内置工具）（290-291）",
+          "builtin_func_list": "dict[type[FuncTool], FuncTool]（292-293）",
+          "spec_to_func": "def spec_to_func(self, name: str, func_args: list[dict], desc: str, handler) -> FuncTool（343）",
+          "add_func": "def add_func(self, name: str, func_args: list, desc: str, handler) -> None（365）",
+          "remove_func": "def remove_func(self, name: str) -> None（392）"
+        }
+      }
+    },
+    "Context_构造依赖": {
+      "signature": "def __init__(self, event_queue: Queue, config: AstrBotConfig, db: BaseDatabase, provider_manager: ProviderManager, platform_manager: PlatformManagerProtocol, conversation_manager: ConversationManager, message_history_manager: PlatformMessageHistoryManager, persona_manager: PersonaManager, astrbot_config_mgr: AstrBotConfigManager, knowledge_base_manager: KnowledgeBaseManager, cron_manager: CronJobManager, subagent_orchestrator: SubAgentOrchestrator | None = None) -> None",
+      "lineno": 132,
+      "注意": "12 个位置参数（最后 1 个可选）—— 兼容层若自建 Context 必须提供全部前 11 个，或改签名。",
+      "PlatformManagerProtocol": {
+        "lineno": 118,
+        "end_lineno": 120,
+        "members": [
+          "platform_insts: list[Platform]",
+          "get_insts: Callable[[], list[Platform]]"
+        ]
+      }
+    }
+  },
+  "astr_message_event": {
+    "file": "core/platform/astr_message_event.py",
+    "class": "AstrMessageEvent",
+    "lineno": 37,
+    "end_lineno": 512,
+    "bases": [
+      "abc.ABC"
+    ],
+    "抽象方法": "无（abc.ABC 但未使用 @abstractmethod，理论上可实例化）",
+    "构造": {
+      "signature": "def __init__(self, message_str: str, message_obj: AstrBotMessage, platform_meta: PlatformMetadata, session_id: str) -> None",
+      "lineno": 38
+    },
+    "instance_attributes": [
+      {
+        "name": "message_str",
+        "annotation": "str",
+        "lineno": 45,
+        "doc": "纯文本的消息"
+      },
+      {
+        "name": "message_obj",
+        "annotation": "AstrBotMessage",
+        "lineno": 47,
+        "doc": "消息对象, AstrBotMessage。带有完整的消息结构。"
+      },
+      {
+        "name": "platform_meta",
+        "annotation": "PlatformMetadata",
+        "lineno": 49,
+        "doc": "消息平台的信息, 其中 name 是平台的类型，如 aiocqhttp"
+      },
+      {
+        "name": "role",
+        "annotation": "str",
+        "default": "'member'",
+        "lineno": 51,
+        "doc": "用户是否是管理员。如果是管理员，这里是 admin"
+      },
+      {
+        "name": "is_wake",
+        "annotation": "bool",
+        "default": "False",
+        "lineno": 53,
+        "doc": "是否唤醒(是否通过 WakingStage)"
+      },
+      {
+        "name": "is_at_or_wake_command",
+        "annotation": "bool",
+        "default": "False",
+        "lineno": 55,
+        "doc": "是否是 At 机器人或者带有唤醒词或者是私聊"
+      },
+      {
+        "name": "_extras",
+        "annotation": "dict[str, Any]",
+        "lineno": 57
+      },
+      {
+        "name": "_force_stopped",
+        "annotation": "bool",
+        "lineno": 58,
+        "doc": "独立的停止标志，不依赖 _result，不会被 clear_result() 重置"
+      },
+      {
+        "name": "session",
+        "annotation": "MessageSession",
+        "lineno": 70
+      },
+      {
+        "name": "_result",
+        "annotation": "MessageEventResult | None",
+        "lineno": 77,
+        "doc": "消息事件的结果"
+      },
+      {
+        "name": "created_at",
+        "annotation": "float",
+        "lineno": 80,
+        "doc": "事件创建时间(Unix timestamp)"
+      },
+      {
+        "name": "trace",
+        "annotation": "TraceSpan",
+        "lineno": 82
+      },
+      {
+        "name": "span",
+        "annotation": "TraceSpan",
+        "lineno": 89,
+        "doc": "事件级 TraceSpan(别名: span)"
+      },
+      {
+        "name": "_has_send_oper",
+        "annotation": "bool",
+        "lineno": 92,
+        "doc": "在此次事件中是否有过至少一次发送消息的操作"
+      },
+      {
+        "name": "call_llm",
+        "annotation": "bool",
+        "lineno": 94,
+        "doc": "是否在此消息事件中禁止默认的 LLM 请求"
+      },
+      {
+        "name": "_temporary_local_files",
+        "annotation": "list[str]",
+        "lineno": 96
+      },
+      {
+        "name": "plugins_name",
+        "annotation": "list[str] | None",
+        "lineno": 99,
+        "doc": "该事件启用的插件名称列表。None 表示所有插件都启用。空列表表示没有启用任何插件。"
+      },
+      {
+        "name": "platform",
+        "annotation": "PlatformMetadata",
+        "lineno": 103,
+        "doc": "back_compability，等于 platform_meta"
+      }
+    ],
+    "properties": [
+      {
+        "name": "unified_msg_origin",
+        "kind": "property（有 getter 与 setter）",
+        "getter_lineno": 106,
+        "setter_lineno": 111,
+        "getter_signature": "def unified_msg_origin(self) -> str",
+        "setter_signature": "def unified_msg_origin(self, value: str) -> None",
+        "返回值语义": "return str(self.session)，格式为 platform_name:message_type:session_id（docstring 107）",
+        "setter行为": "解析出 MessageSession 并【整体替换】self.session（113-114）"
+      },
+      {
+        "name": "session_id",
+        "kind": "property（有 getter 与 setter）",
+        "getter_lineno": 117,
+        "setter_lineno": 122,
+        "getter签名": "def session_id(self) -> str",
+        "行为": "return self.session.session_id；setter 直接改 self.session.session_id"
+      }
+    ],
+    "methods": [
+      {
+        "name": "get_platform_name",
+        "signature": "def get_platform_name(self)",
+        "lineno": 126
+      },
+      {
+        "name": "get_platform_id",
+        "signature": "def get_platform_id(self)",
+        "lineno": 133
+      },
+      {
+        "name": "get_message_str",
+        "signature": "def get_message_str(self) -> str",
+        "lineno": 140
+      },
+      {
+        "name": "get_message_outline",
+        "signature": "def get_message_outline(self) -> str",
+        "lineno": 173
+      },
+      {
+        "name": "get_messages",
+        "signature": "def get_messages(self) -> list[BaseMessageComponent]",
+        "lineno": 180
+      },
+      {
+        "name": "get_message_type",
+        "signature": "def get_message_type(self) -> MessageType",
+        "lineno": 184
+      },
+      {
+        "name": "get_session_id",
+        "signature": "def get_session_id(self) -> str",
+        "lineno": 191
+      },
+      {
+        "name": "get_group_id",
+        "signature": "def get_group_id(self) -> str",
+        "lineno": 195
+      },
+      {
+        "name": "get_self_id",
+        "signature": "def get_self_id(self) -> str",
+        "lineno": 199
+      },
+      {
+        "name": "get_sender_id",
+        "signature": "def get_sender_id(self) -> str",
+        "lineno": 203
+      },
+      {
+        "name": "get_sender_name",
+        "signature": "def get_sender_name(self) -> str",
+        "lineno": 210
+      },
+      {
+        "name": "set_extra",
+        "signature": "def set_extra(self, key, value) -> None",
+        "lineno": 222
+      },
+      {
+        "name": "get_extra",
+        "signature": "def get_extra(self, key: str | None = None, default = None) -> Any",
+        "lineno": 226
+      },
+      {
+        "name": "clear_extra",
+        "signature": "def clear_extra(self) -> None",
+        "lineno": 232
+      },
+      {
+        "name": "track_temporary_local_file",
+        "signature": "def track_temporary_local_file(self, path: str) -> None",
+        "lineno": 237
+      },
+      {
+        "name": "cleanup_temporary_local_files",
+        "signature": "def cleanup_temporary_local_files(self) -> None",
+        "lineno": 241
+      },
+      {
+        "name": "is_private_chat",
+        "signature": "def is_private_chat(self) -> bool",
+        "lineno": 255
+      },
+      {
+        "name": "is_wake_up",
+        "signature": "def is_wake_up(self) -> bool",
+        "lineno": 259
+      },
+      {
+        "name": "is_admin",
+        "signature": "def is_admin(self) -> bool",
+        "lineno": 263
+      },
+      {
+        "name": "process_buffer",
+        "signature": "async def process_buffer(self, buffer: str, pattern: re.Pattern) -> str",
+        "lineno": 267,
+        "async": true
+      },
+      {
+        "name": "send_streaming",
+        "signature": "async def send_streaming(self, generator: AsyncGenerator[MessageChain, None], use_fallback: bool = False) -> None",
+        "lineno": 280,
+        "async": true
+      },
+      {
+        "name": "send_typing",
+        "signature": "async def send_typing(self) -> None",
+        "lineno": 294,
+        "async": true
+      },
+      {
+        "name": "stop_typing",
+        "signature": "async def stop_typing(self) -> None",
+        "lineno": 300,
+        "async": true
+      },
+      {
+        "name": "set_result",
+        "signature": "def set_result(self, result: MessageEventResult | str) -> None",
+        "lineno": 314
+      },
+      {
+        "name": "stop_event",
+        "signature": "def stop_event(self) -> None",
+        "lineno": 343
+      },
+      {
+        "name": "continue_event",
+        "signature": "def continue_event(self) -> None",
+        "lineno": 351
+      },
+      {
+        "name": "is_stopped",
+        "signature": "def is_stopped(self) -> bool",
+        "lineno": 359
+      },
+      {
+        "name": "should_call_llm",
+        "signature": "def should_call_llm(self, call_llm: bool) -> None",
+        "lineno": 367
+      },
+      {
+        "name": "get_result",
+        "signature": "def get_result(self) -> MessageEventResult | None",
+        "lineno": 374
+      },
+      {
+        "name": "clear_result",
+        "signature": "def clear_result(self) -> None",
+        "lineno": 378
+      },
+      {
+        "name": "make_result",
+        "signature": "def make_result(self) -> MessageEventResult",
+        "lineno": 384
+      },
+      {
+        "name": "plain_result",
+        "signature": "def plain_result(self, text: str) -> MessageEventResult",
+        "lineno": 399
+      },
+      {
+        "name": "image_result",
+        "signature": "def image_result(self, url_or_path: str) -> MessageEventResult",
+        "lineno": 403
+      },
+      {
+        "name": "chain_result",
+        "signature": "def chain_result(self, chain: list[BaseMessageComponent]) -> MessageEventResult",
+        "lineno": 412
+      },
+      {
+        "name": "request_llm",
+        "signature": "def request_llm(self, prompt: str, func_tool_manager = None, tool_set: ToolSet | None = None, session_id: str = '', image_urls: list[str] | None = None, audio_urls: list[str] | None = None, contexts: list | None = None, system_prompt: str = '', conversation: Conversation | None = None) -> ProviderRequest",
+        "lineno": 420
+      },
+      {
+        "name": "send",
+        "signature": "async def send(self, message: MessageChain) -> None",
+        "lineno": 478,
+        "async": true
+      },
+      {
+        "name": "react",
+        "signature": "async def react(self, emoji: str) -> None",
+        "lineno": 497,
+        "async": true
+      },
+      {
+        "name": "get_group",
+        "signature": "async def get_group(self, group_id: str | None = None, **kwargs) -> Group | None",
+        "lineno": 506,
+        "async": true
+      }
+    ],
+    "deprecated_methods": [
+      {
+        "name": "_pre_send",
+        "signature": "async def _pre_send(self) -> None",
+        "lineno": 307,
+        "deprecated": "version 3.5.18, No longer invoked by the message scheduler."
+      },
+      {
+        "name": "_post_send",
+        "signature": "async def _post_send(self) -> None",
+        "lineno": 311,
+        "deprecated": "version 3.5.18"
+      }
+    ],
+    "六个被点名的成员形态": {
+      "message_str": {
+        "存在": true,
+        "形态": "实例属性（普通 str，非 property、非方法）",
+        "lineno": 45,
+        "取值": "构造时传入的纯文本；等价接口 event.get_message_str()（140）"
+      },
+      "stop_event": {
+        "存在": true,
+        "形态": "【方法】不是属性",
+        "signature": "def stop_event(self) -> None",
+        "lineno": 343,
+        "end_lineno": 349,
+        "语义": "置 self._force_stopped = True（345）；_result 为 None 时 set_result(MessageEventResult().stop_event())（346-347），否则对已有 result 调 .stop_event()（348-349）",
+        "重要": "_force_stopped 独立于 _result，clear_result() 不会重置它（lineno 58-59 的注释）"
+      },
+      "send": {
+        "存在": true,
+        "形态": "【异步方法】",
+        "signature": "async def send(self, message: MessageChain) -> None",
+        "lineno": 478,
+        "语义": "基类实现【只】上报 Metric 与置 self._has_send_oper = True（485-495）；真正发送由平台子类覆写。【返回值是 None，不是 bool】",
+        "参数类型": "MessageChain（不是 str）",
+        "react": "async def react(self, emoji: str)（497）默认实现是 send(MessageChain([Plain(emoji)]))（504）"
+      },
+      "is_admin": {
+        "存在": true,
+        "形态": "【方法】不是属性",
+        "signature": "def is_admin(self) -> bool",
+        "lineno": 263,
+        "语义": "return self.role == 'admin'（265）—— 判据是实例属性 role，可由平台适配器改写"
+      },
+      "get_sender_id": {
+        "存在": true,
+        "形态": "方法",
+        "signature": "def get_sender_id(self) -> str",
+        "lineno": 203,
+        "语义": "取 message_obj.sender.user_id；sender 不存在或 user_id 不是 str 时返回 【空字符串】（205-208）"
+      },
+      "unified_msg_origin": {
+        "存在": true,
+        "形态": "【property（有 getter 与 setter）】，不是方法",
+        "getter_lineno": 106,
+        "setter_lineno": 110,
+        "语义": "str(self.session)，格式 platform_name:message_type:session_id；赋值会整体替换 session（113-114）"
+      }
+    },
+    "真实插件高频使用排行": {
+      "说明": "对磁盘上 astrbot_plugin_private_companion（陪伴插件）全部 .py 做 event.<成员> 词频统计，可视为插件侧真实用法证据",
+      "file_scope": "/opt/astrbot/data/plugins/astrbot_plugin_private_companion/",
+      "命中次数": {
+        "get_sender_id": 112,
+        "stop_event": 83,
+        "send": 59,
+        "message_str": 57,
+        "get_result": 43,
+        "set_result": 36,
+        "unified_msg_origin": 33,
+        "chain_result": 23,
+        "plain_result": 18,
+        "is_private_chat": 14,
+        "get_extra": 11,
+        "is_stopped": 7,
+        "set_extra": 4,
+        "send_streaming": 4,
+        "get_self_id": 3,
+        "get_platform_name": 2,
+        "get_messages": 2,
+        "should_call_llm": 1,
+        "get_sender_name": 1,
+        "get_message_str": 1
+      },
+      "兼容层优先级建议": "get_sender_id / stop_event / send / message_str / get_result / set_result / unified_msg_origin / chain_result / plain_result / is_private_chat 是最小必需集"
+    }
+  },
+  "message_components": {
+    "file": "core/message/components.py",
+    "api_再导出文件": "api/message_components.py（全文仅 1 行：from astrbot.core.message.components import *，第 1 行）",
+    "插件惯用导入": "from astrbot.api.message_components import Plain, Image, At, Reply, Record ...",
+    "基类": {
+      "name": "BaseMessageComponent",
+      "lineno": 73,
+      "bases": [
+        "BaseModel"
+      ],
+      "pydantic": "Python >= 3.14 用 pydantic.BaseModel，否则 pydantic.v1.BaseModel（components.py:35-38）",
+      "fields": [
+        {
+          "name": "type",
+          "annotation": "ComponentType",
+          "lineno": 74
+        }
+      ],
+      "methods": [
+        {
+          "signature": "def __init__(self, **kwargs) -> None",
+          "lineno": 76
+        },
+        {
+          "signature": "def toDict(self)",
+          "lineno": 98
+        },
+        {
+          "signature": "async def to_dict(self) -> dict",
+          "lineno": 108
+        }
+      ],
+      "toDict_语义": "跳过 type 与 None 值；把 _type 改名回 type；返回 {'type': self.type.lower(), 'data': data}（98-106）",
+      "repr_args": "截断超长/base64 字段（79-96）"
+    },
+    "ComponentType_枚举": {
+      "lineno": 46,
+      "end_lineno": 70,
+      "kind": "str, Enum（值 = 类名字符串）",
+      "members": [
+        "Plain",
+        "Image",
+        "Record",
+        "Video",
+        "File",
+        "Face",
+        "At",
+        "Node",
+        "Nodes",
+        "Poke",
+        "Reply",
+        "Forward",
+        "RPS",
+        "Dice",
+        "Shake",
+        "Share",
+        "Contact",
+        "Location",
+        "Music",
+        "Json",
+        "Unknown"
+      ],
+      "member_count": 21
+    },
+    "component_classes": [
+      {
+        "name": "Plain",
+        "lineno": 113,
+        "init_signature": "def __init__(self, text: str, convert: bool = True, **_) -> None",
+        "init_lineno": 117,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Plain",
+            "lineno": 114
+          },
+          {
+            "name": "text",
+            "annotation": "str",
+            "lineno": 115
+          }
+        ],
+        "extra": "toDict() -> {'type': 'text', 'data': {'text': ...}}（120-124）",
+        "用途": "文本"
+      },
+      {
+        "name": "Face",
+        "lineno": 127,
+        "init_signature": "def __init__(self, **_) -> None",
+        "init_lineno": 131,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Face",
+            "lineno": 128
+          },
+          {
+            "name": "id",
+            "annotation": "int",
+            "lineno": 129
+          }
+        ],
+        "extra": null,
+        "用途": "QQ 表情"
+      },
+      {
+        "name": "Record",
+        "lineno": 135,
+        "init_signature": "def __init__(self, file: str | None, **_) -> None",
+        "init_lineno": 144,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Record",
+            "lineno": 136
+          },
+          {
+            "name": "file",
+            "annotation": "str | None = ''",
+            "lineno": 137
+          },
+          {
+            "name": "url",
+            "annotation": "str | None = ''",
+            "lineno": 138
+          },
+          {
+            "name": "text",
+            "annotation": "str | None = None",
+            "lineno": 140
+          },
+          {
+            "name": "path",
+            "annotation": "str | None = None",
+            "lineno": 142
+          }
+        ],
+        "extra": "静态方法 fromFileSystem(path, **_)（151）、fromURL(url, **_)(156)、fromBase64(bs64_data, **_)(162)",
+        "用途": "语音/音频"
+      },
+      {
+        "name": "Video",
+        "lineno": 288,
+        "init_signature": "def __init__(self, file: str, **_) -> None",
+        "init_lineno": 296,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Video",
+            "lineno": 289
+          },
+          {
+            "name": "file",
+            "annotation": "str",
+            "lineno": 290
+          },
+          {
+            "name": "url",
+            "annotation": "str | None = ''",
+            "lineno": 291
+          },
+          {
+            "name": "cover",
+            "annotation": "str | None = ''",
+            "lineno": 292
+          },
+          {
+            "name": "path",
+            "annotation": "str | None = ''",
+            "lineno": 294
+          }
+        ],
+        "extra": "fromFileSystem(300)、fromURL(305)、fromBase64(311)",
+        "用途": "视频"
+      },
+      {
+        "name": "At",
+        "lineno": 410,
+        "init_signature": "def __init__(self, **_) -> None",
+        "init_lineno": 415,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.At",
+            "lineno": 411
+          },
+          {
+            "name": "qq",
+            "annotation": "int | str（str 为 'all' 时代表所有人）",
+            "lineno": 412
+          },
+          {
+            "name": "name",
+            "annotation": "str | None = ''",
+            "lineno": 413
+          }
+        ],
+        "extra": "toDict() -> {'type':'at','data':{'qq': str(qq)}}（418-422）",
+        "用途": "@某人"
+      },
+      {
+        "name": "AtAll",
+        "lineno": 425,
+        "init_signature": "def __init__(self, **_) -> None",
+        "init_lineno": 428,
+        "fields": [
+          {
+            "name": "qq",
+            "annotation": "str = 'all'",
+            "lineno": 426
+          }
+        ],
+        "extra": "继承 At",
+        "用途": "@全体成员"
+      },
+      {
+        "name": "RPS",
+        "lineno": 432,
+        "init_signature": "def __init__(self, **_) -> None",
+        "init_lineno": 435,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.RPS",
+            "lineno": 433
+          }
+        ],
+        "extra": null,
+        "用途": "TODO 未实现（源码注释）"
+      },
+      {
+        "name": "Dice",
+        "lineno": 439,
+        "init_signature": "def __init__(self, **_) -> None",
+        "init_lineno": 442,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Dice",
+            "lineno": 440
+          }
+        ],
+        "extra": null,
+        "用途": "TODO 未实现"
+      },
+      {
+        "name": "Shake",
+        "lineno": 446,
+        "init_signature": "def __init__(self, **_) -> None",
+        "init_lineno": 449,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Shake",
+            "lineno": 447
+          }
+        ],
+        "extra": null,
+        "用途": "TODO 未实现"
+      },
+      {
+        "name": "Share",
+        "lineno": 453,
+        "init_signature": "def __init__(self, **_) -> None",
+        "init_lineno": 460,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Share",
+            "lineno": 454
+          },
+          {
+            "name": "url",
+            "annotation": "str",
+            "lineno": 455
+          },
+          {
+            "name": "title",
+            "annotation": "str",
+            "lineno": 456
+          },
+          {
+            "name": "content",
+            "annotation": "str | None = ''",
+            "lineno": 457
+          },
+          {
+            "name": "image",
+            "annotation": "str | None = ''",
+            "lineno": 458
+          }
+        ],
+        "extra": null,
+        "用途": "链接分享"
+      },
+      {
+        "name": "Contact",
+        "lineno": 464,
+        "init_signature": "def __init__(self, **_) -> None",
+        "init_lineno": 469,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Contact",
+            "lineno": 465
+          },
+          {
+            "name": "_type",
+            "annotation": "str",
+            "lineno": 466
+          },
+          {
+            "name": "id",
+            "annotation": "int | None = 0",
+            "lineno": 467
+          }
+        ],
+        "extra": null,
+        "用途": "TODO 未实现"
+      },
+      {
+        "name": "Location",
+        "lineno": 473,
+        "init_signature": "def __init__(self, **_) -> None",
+        "init_lineno": 480,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Location",
+            "lineno": 474
+          },
+          {
+            "name": "lat",
+            "annotation": "float",
+            "lineno": 475
+          },
+          {
+            "name": "lon",
+            "annotation": "float",
+            "lineno": 476
+          },
+          {
+            "name": "title",
+            "annotation": "str | None = ''",
+            "lineno": 477
+          },
+          {
+            "name": "content",
+            "annotation": "str | None = ''",
+            "lineno": 478
+          }
+        ],
+        "extra": null,
+        "用途": "TODO 未实现"
+      },
+      {
+        "name": "Music",
+        "lineno": 484,
+        "init_signature": "def __init__(self, **_) -> None",
+        "init_lineno": 494,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Music",
+            "lineno": 485
+          },
+          {
+            "name": "_type",
+            "annotation": "str",
+            "lineno": 486
+          },
+          {
+            "name": "id",
+            "annotation": "int | None = 0",
+            "lineno": 487
+          },
+          {
+            "name": "url",
+            "annotation": "str | None = ''",
+            "lineno": 488
+          },
+          {
+            "name": "audio",
+            "annotation": "str | None = ''",
+            "lineno": 489
+          },
+          {
+            "name": "title",
+            "annotation": "str | None = ''",
+            "lineno": 490
+          },
+          {
+            "name": "content",
+            "annotation": "str | None = ''",
+            "lineno": 491
+          },
+          {
+            "name": "image",
+            "annotation": "str | None = ''",
+            "lineno": 492
+          }
+        ],
+        "extra": null,
+        "用途": "音乐"
+      },
+      {
+        "name": "Image",
+        "lineno": 501,
+        "init_signature": "def __init__(self, file: str | None, **_) -> None",
+        "init_lineno": 509,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Image",
+            "lineno": 502
+          },
+          {
+            "name": "file",
+            "annotation": "str | None = ''",
+            "lineno": 503
+          },
+          {
+            "name": "_type",
+            "annotation": "str | None = ''",
+            "lineno": 504
+          },
+          {
+            "name": "url",
+            "annotation": "str | None = ''",
+            "lineno": 505
+          },
+          {
+            "name": "path",
+            "annotation": "str | None = ''",
+            "lineno": 507
+          }
+        ],
+        "extra": "fromURL(513)、fromFileSystem(519)、fromBase64(524)、fromBytes(528)、fromIO(532)；注意 pydantic v1 下字段名是 file/url/path，_type 为私有属性",
+        "用途": "图片"
+      },
+      {
+        "name": "Reply",
+        "lineno": 584,
+        "init_signature": "def __init__(self, **_) -> None",
+        "init_lineno": 606,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Reply",
+            "lineno": 585
+          },
+          {
+            "name": "id",
+            "annotation": "str | int（必填）",
+            "lineno": 586
+          },
+          {
+            "name": "chain",
+            "annotation": "list[BaseMessageComponent] | None = []",
+            "lineno": 588
+          },
+          {
+            "name": "sender_id",
+            "annotation": "int | None | str = 0",
+            "lineno": 590
+          },
+          {
+            "name": "sender_nickname",
+            "annotation": "str | None = ''",
+            "lineno": 592
+          },
+          {
+            "name": "time",
+            "annotation": "int | None = 0",
+            "lineno": 594
+          },
+          {
+            "name": "message_str",
+            "annotation": "str | None = ''",
+            "lineno": 596
+          },
+          {
+            "name": "text",
+            "annotation": "str | None = ''（deprecated）",
+            "lineno": 599
+          },
+          {
+            "name": "qq",
+            "annotation": "int | None = 0（deprecated）",
+            "lineno": 601
+          },
+          {
+            "name": "seq",
+            "annotation": "int | None = 0（deprecated）",
+            "lineno": 603
+          }
+        ],
+        "extra": "toDict() 【仅输出 id】：{'type':'reply','data':{'id': str(id)}}（609-612）",
+        "用途": "引用回复"
+      },
+      {
+        "name": "Poke",
+        "lineno": 614,
+        "init_signature": "def __init__(self, poke_type: str | int | None = None, **_) -> None",
+        "init_lineno": 620,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Poke",
+            "lineno": 615
+          },
+          {
+            "name": "_type",
+            "annotation": "str | int = '126'",
+            "lineno": 616
+          },
+          {
+            "name": "id",
+            "annotation": "int | str | None = 0",
+            "lineno": 617
+          },
+          {
+            "name": "qq",
+            "annotation": "int | str | None = 0（deprecated）",
+            "lineno": 618
+          }
+        ],
+        "extra": "兼容旧签名 Poke(type='poke',...)：poke_type 为空/''/'poke'/'Poke' 时归一为 '126'（625-629）；target_id() 依次尝试 id、qq，跳过空与 '0'（631-637）；toDict()（639-645）",
+        "用途": "戳一戳"
+      },
+      {
+        "name": "Forward",
+        "lineno": 647,
+        "init_signature": "def __init__(self, **_) -> None",
+        "init_lineno": 651,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Forward",
+            "lineno": 648
+          },
+          {
+            "name": "id",
+            "annotation": "str（必填）",
+            "lineno": 649
+          }
+        ],
+        "extra": null,
+        "用途": "转发消息"
+      },
+      {
+        "name": "Node",
+        "lineno": 655,
+        "init_signature": "def __init__(self, content: list[BaseMessageComponent], **_) -> None",
+        "init_lineno": 666,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Node",
+            "lineno": 658
+          },
+          {
+            "name": "id",
+            "annotation": "int | None = 0（忽略）",
+            "lineno": 659
+          },
+          {
+            "name": "name",
+            "annotation": "str | None = ''",
+            "lineno": 660
+          },
+          {
+            "name": "uin",
+            "annotation": "str | None = '0'",
+            "lineno": 661
+          },
+          {
+            "name": "content",
+            "annotation": "list[BaseMessageComponent] = []",
+            "lineno": 662
+          },
+          {
+            "name": "seq",
+            "annotation": "str | list | None = ''（忽略）",
+            "lineno": 663
+          },
+          {
+            "name": "time",
+            "annotation": "int | None = 0（忽略）",
+            "lineno": 664
+          }
+        ],
+        "extra": "若 content 本身是 Node 会自动包成 [content]（667-669）",
+        "用途": "合并转发里的一个节点"
+      },
+      {
+        "name": "Nodes",
+        "lineno": 709,
+        "init_signature": "def __init__(self, nodes: list[Node], **_) -> None",
+        "init_lineno": 713,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Nodes",
+            "lineno": 710
+          },
+          {
+            "name": "nodes",
+            "annotation": "list[Node]（必填）",
+            "lineno": 711
+          }
+        ],
+        "extra": "toDict 已 deprecated（716），用 async to_dict()（727）",
+        "用途": "合并转发"
+      },
+      {
+        "name": "Json",
+        "lineno": 736,
+        "init_signature": "def __init__(self, data: str | dict, **_) -> None",
+        "init_lineno": 740,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Json",
+            "lineno": 737
+          },
+          {
+            "name": "data",
+            "annotation": "dict（必填）",
+            "lineno": 738
+          }
+        ],
+        "extra": "data 为 str 时 json.loads（741-742）",
+        "用途": "JSON 卡片"
+      },
+      {
+        "name": "Unknown",
+        "lineno": 746,
+        "init_signature": "（无自定义 __init__，继承 BaseMessageComponent(**kwargs)）",
+        "init_lineno": null,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.Unknown",
+            "lineno": 747
+          },
+          {
+            "name": "text",
+            "annotation": "str（必填）",
+            "lineno": 748
+          }
+        ],
+        "extra": null,
+        "用途": "未知段"
+      },
+      {
+        "name": "File",
+        "lineno": 764,
+        "init_signature": "def __init__(self, name: str, file: str = '', url: str = '') -> None",
+        "init_lineno": 772,
+        "fields": [
+          {
+            "name": "type",
+            "annotation": "ComponentType.File",
+            "lineno": 767
+          },
+          {
+            "name": "name",
+            "annotation": "str | None = ''",
+            "lineno": 768
+          },
+          {
+            "name": "file_",
+            "annotation": "str | None = ''（本地路径）",
+            "lineno": 769
+          },
+          {
+            "name": "url",
+            "annotation": "str | None = ''",
+            "lineno": 770
+          }
+        ],
+        "extra": "构造参数叫 file 但内部字段是 file_（774）；file 是 property（777 getter / 815 setter），getter 在 file_ 不存在但有 url 时会同步下载",
+        "用途": "文件"
+      }
+    ],
+    "component_class_count": 22,
+    "运行时实测_构造": [
+      {
+        "调用": "Plain('hi')",
+        "结果": "OK"
+      },
+      {
+        "调用": "Image('http://x/y.png')",
+        "结果": "OK（file 是第一个位置参数）"
+      },
+      {
+        "调用": "At(qq=123)",
+        "结果": "OK（qq 必填，name 可省）"
+      },
+      {
+        "调用": "AtAll()",
+        "结果": "OK -> qq='all'"
+      },
+      {
+        "调用": "Reply(id='1')",
+        "结果": "OK（id 必填，其余有默认）"
+      },
+      {
+        "调用": "Record('x.mp3') / Record(file='x.mp3')",
+        "结果": "OK（位置或关键字都可）"
+      },
+      {
+        "调用": "Face(id=1)",
+        "结果": "OK"
+      },
+      {
+        "调用": "Video(file='v.mp4')",
+        "结果": "OK"
+      },
+      {
+        "调用": "File(name='a.txt', file='/tmp/a')",
+        "结果": "OK -> 内部 file_='/tmp/a'"
+      },
+      {
+        "调用": "Poke()",
+        "结果": "OK -> _type='126'，toDict()={'type':'poke','data':{'type':'126'}}"
+      },
+      {
+        "调用": "Node(content=[Plain('x')])",
+        "结果": "OK"
+      },
+      {
+        "调用": "Nodes(nodes=[...])",
+        "结果": "OK"
+      },
+      {
+        "调用": "Json(data='{\"a\":1}')",
+        "结果": "OK，自动 json.loads 成 dict"
+      },
+      {
+        "调用": "Music()",
+        "结果": "OK（全部字段有默认值）"
+      }
+    ],
+    "注意_Unknown_无法直接构造": "Unknown 未定义 __init__，text 字段继承自 BaseMessageComponent(type) 的 pydantic 校验 —— text 是必填字段，必须 Unknown(text='...') 才合法（未实测，源码 components.py:746-748）",
+    "MessageChain": {
+      "file": "core/message/message_event_result.py",
+      "lineno": 18,
+      "kind": "dataclass",
+      "构造": "MessageChain(chain: list[BaseMessageComponent] = <factory>, use_t2i_: bool | None = None, use_markdown_: bool | None = None, type: str | None = None)",
+      "methods": [
+        {
+          "name": "derive",
+          "signature": "def derive(self, chain: list[BaseMessageComponent] | None = None) -> 'MessageChain'",
+          "lineno": 36
+        },
+        {
+          "name": "message",
+          "signature": "def message(self, message: str)",
+          "lineno": 49
+        },
+        {
+          "name": "at",
+          "signature": "def at(self, name: str, qq: str | int)",
+          "lineno": 60
+        },
+        {
+          "name": "at_all",
+          "signature": "def at_all(self)",
+          "lineno": 71
+        },
+        {
+          "name": "error",
+          "signature": "def error(self, message: str)",
+          "lineno": 82,
+          "deprecated": "请使用 message 方法代替。"
+        },
+        {
+          "name": "url_image",
+          "signature": "def url_image(self, url: str)",
+          "lineno": 93
+        },
+        {
+          "name": "file_image",
+          "signature": "def file_image(self, path: str)",
+          "lineno": 106
+        },
+        {
+          "name": "base64_image",
+          "signature": "def base64_image(self, base64_str: str)",
+          "lineno": 118
+        },
+        {
+          "name": "use_t2i",
+          "signature": "def use_t2i(self, use_t2i: bool)",
+          "lineno": 127
+        },
+        {
+          "name": "use_markdown",
+          "signature": "def use_markdown(self, use: bool | None = True)",
+          "lineno": 137
+        },
+        {
+          "name": "get_plain_text",
+          "signature": "def get_plain_text(self, with_other_comps_mark: bool = False) -> str",
+          "lineno": 149
+        },
+        {
+          "name": "squash_plain",
+          "signature": "def squash_plain(self)",
+          "lineno": 170
+        }
+      ],
+      "链式返回": "上述方法基本都 return self，可链式调用"
+    },
+    "MessageEventResult": {
+      "file": "core/message/message_event_result.py",
+      "lineno": 224,
+      "bases": [
+        "MessageChain"
+      ],
+      "额外方法": [
+        {
+          "name": "stop_event",
+          "signature": "def stop_event(self) -> 'MessageEventResult'",
+          "lineno": 246
+        },
+        {
+          "name": "continue_event",
+          "signature": "def continue_event(self) -> 'MessageEventResult'",
+          "lineno": 251
+        },
+        {
+          "name": "is_stopped",
+          "signature": "def is_stopped(self) -> bool",
+          "lineno": 256
+        },
+        {
+          "name": "set_async_stream",
+          "signature": "def set_async_stream(self, stream: AsyncGenerator) -> 'MessageEventResult'",
+          "lineno": 260
+        },
+        {
+          "name": "set_result_content_type",
+          "signature": "def set_result_content_type(self, typ: ResultContentType) -> 'MessageEventResult'",
+          "lineno": 265
+        },
+        {
+          "name": "is_llm_result",
+          "signature": "def is_llm_result(self) -> bool",
+          "lineno": 275
+        },
+        {
+          "name": "is_model_result",
+          "signature": "def is_model_result(self) -> bool",
+          "lineno": 279
+        }
+      ],
+      "EventResultType": {
+        "lineno": 195,
+        "members": [
+          "CONTINUE",
+          "STOP"
+        ]
+      },
+      "ResultContentType": {
+        "lineno": 208,
+        "members": [
+          "LLM_RESULT",
+          "AGENT_RUNNER_ERROR",
+          "GENERAL_RESULT",
+          "STREAMING_RESULT",
+          "STREAMING_FINISH"
+        ]
+      }
+    }
+  },
+  "star_tools": {
+    "file": "core/star/star_tools.py",
+    "class": "StarTools",
+    "lineno": 20,
+    "kind": "全 classmethod 工具类",
+    "methods": [
+      {
+        "name": "initialize",
+        "signature": "@classmethod def initialize(cls, context: Context) -> None",
+        "lineno": 26
+      },
+      {
+        "name": "send_message",
+        "signature": "@classmethod async def send_message(...)",
+        "lineno": 35,
+        "未展开": true
+      },
+      {
+        "name": "create_message",
+        "signature": "@classmethod async def create_message(...)",
+        "lineno": 57,
+        "未展开": true
+      },
+      {
+        "name": "create_event",
+        "signature": "@classmethod async def create_event(...)",
+        "lineno": 104,
+        "未展开": true
+      },
+      {
+        "name": "activate_llm_tool",
+        "signature": "@classmethod def activate_llm_tool(cls, name: str) -> bool",
+        "lineno": 138
+      },
+      {
+        "name": "activate_llm_tool_async",
+        "signature": "@classmethod async def activate_llm_tool_async(cls, name: str) -> bool",
+        "lineno": 155
+      },
+      {
+        "name": "deactivate_llm_tool",
+        "signature": "@classmethod def deactivate_llm_tool(cls, name: str) -> bool",
+        "lineno": 173
+      },
+      {
+        "name": "deactivate_llm_tool_async",
+        "signature": "@classmethod async def deactivate_llm_tool_async(cls, name: str) -> bool",
+        "lineno": 190
+      },
+      {
+        "name": "register_llm_tool",
+        "signature": "@classmethod def register_llm_tool(...)",
+        "lineno": 207,
+        "未展开": true
+      },
+      {
+        "name": "unregister_llm_tool",
+        "signature": "@classmethod def unregister_llm_tool(cls, name: str) -> None",
+        "lineno": 230
+      },
+      {
+        "name": "get_data_dir",
+        "signature": "@classmethod def get_data_dir(cls, plugin_name: str | None = None) -> Path",
+        "lineno": 244
+      }
+    ],
+    "未展开说明": "带 '未展开' 的方法签名含多行参数，本次未逐字抽取，标注为待补（不编造）",
+    "导出": "astrbot.core.star.__all__ 含 StarTools（core/star/__init__.py:15）；astrbot.api.star 导出 StarTools（api/star/__init__.py:1,7）"
+  },
+  "plugin_import_surface": {
+    "说明": "磁盘上真实插件实际使用的 import 形态（对 /opt/astrbot/data/plugins 全量 .py 统计），是兼容层必须支持的最小导入面",
+    "from_astrbot.api.event import AstrMessageEvent, MessageChain, filter": 14,
+    "from astrbot.api.event import AstrMessageEvent": 17,
+    "from astrbot.api.message_components import Plain": 18,
+    "from astrbot.api.message_components import At, Image, Plain, Record, Reply": 13,
+    "from astrbot.api import logger": 27,
+    "from astrbot.api import AstrBotConfig": 14,
+    "from astrbot.api.star import Context, Star, StarTools, register": 19,
+    "from astrbot.api.provider import ProviderRequest": 16,
+    "装饰器实际使用频次": {
+      "@filter.llm_tool": 39,
+      "@filter.on_decorating_result": 33,
+      "@filter.command": 26,
+      "@filter.on_llm_request": 25,
+      "@filter.event_message_type": 14,
+      "@filter.on_llm_response": 13,
+      "@filter.permission_type": 12,
+      "@filter.after_message_sent": 12,
+      "@filter.on_agent_done": 3,
+      "@filter.command_group": 3,
+      "@filter.on_astrbot_loaded": 2,
+      "@filter.on_agent_begin": 2,
+      "@filter.on_waiting_llm_request": 1,
+      "@filter.on_plugin_unloaded": 1,
+      "@filter.on_plugin_loaded": 1,
+      "@filter.on_llm_tool_respond": 1
+    },
+    "未出现于真实插件的装饰器": [
+      "custom_filter",
+      "platform_adapter_type",
+      "regex",
+      "on_platform_loaded",
+      "on_plugin_error",
+      "on_using_llm_tool"
+    ]
+  },
+  "未确认项": [
+    {
+      "项": "astrbot_config_mgr.get_conf(umo) 在 umo 非法时的行为",
+      "原因": "未读 core/astrbot_config_mgr.py 实现",
+      "状态": "未确认"
+    },
+    {
+      "项": "StarTools.send_message / create_message / create_event / register_llm_tool 的完整参数列表",
+      "原因": "本次未逐字展开多行签名",
+      "状态": "未确认（仅知起始行号 35/57/104/207）"
+    },
+    {
+      "项": "ConversationManager 的公开方法",
+      "原因": "core/conversation_mgr.py 未读",
+      "状态": "未确认"
+    },
+    {
+      "项": "FunctionTool / ToolSet 的字段",
+      "原因": "core/agent/tool.py 未读",
+      "状态": "未确认"
+    },
+    {
+      "项": "MessageSesion.from_str 的解析与容错细则",
+      "原因": "core/platform/message_session.py 未读",
+      "状态": "未确认"
+    },
+    {
+      "项": "Unknown(text=...) 能否构造",
+      "原因": "pydantic v1 校验未实测",
+      "状态": "未确认"
+    },
+    {
+      "项": "AstrBotConfig 的字典接口细节",
+      "原因": "未读 core/config/astrbot_config.py",
+      "状态": "未确认"
+    }
+  ],
+  "与直觉不符的重要发现": [
+    {
+      "编号": 1,
+      "主题": "append 排序方向与 __lt__ 相反",
+      "详情": "append 用 sort(key=lambda h: -priority) 即【降序，高优先级先执行】；__lt__ 定义为 self.priority < other.priority 即升序。两者方向完全相反。",
+      "证据": "core/star/star_handler.py:26 与 :277-282",
+      "实测": "_handlers 顺序 == sorted(reverse=True)，与 __lt__ 升序相反"
+    },
+    {
+      "编号": 2,
+      "主题": "__lt__ 是死代码",
+      "详情": "docstring 说“支持优先队列”，但全库 grep heapq/heappush/heappop 零命中，没有任何调用点使用 __lt__。",
+      "证据": "core/star/star_handler.py:278；全库 grep 无 heapq"
+    },
+    {
+      "编号": 3,
+      "主题": "Star.__init__ 的 config 形参被完全丢弃",
+      "详情": "基类 __init__(self, context, config=None) 的函数体里从不使用 config，Star 也没有 config 属性。插件要读配置必须自己 self.config = config，或走 self.context.get_config()。",
+      "证据": "core/star/base.py:28-52"
+    },
+    {
+      "编号": 4,
+      "主题": "terminate 与 __del__ 是 elif 关系，且判断用 __dict__",
+      "详情": "宿主卸载插件时：若插件类【自己】定义了 __del__，则在 executor 里跑 __del__ 且【不会】调用 terminate；只有插件类自己没定义 __del__、但自己定义了 terminate 时才 await terminate。两个都没自定义（即用 Star 的空实现）则都不调用。继承来的 terminate 因为不在 star_cls_type.__dict__ 里，永远不会被宿主调用。",
+      "证据": "core/star/star_manager.py:2022-2041"
+    },
+    {
+      "编号": 5,
+      "主题": "initialize 用 hasattr（会继承），terminate 用 __dict__（不继承）",
+      "详情": "同一对生命周期钩子用了两种不同的存在性判断，行为不一致。",
+      "证据": "core/star/star_manager.py:1417（hasattr）vs :2040（__dict__）"
+    },
+    {
+      "编号": 6,
+      "主题": "实例化时只捕获 TypeError 做 config 回退",
+      "详情": "star_cls_type(context=..., config=...) 抛 TypeError 才回退到 star_cls_type(context=...)。如果插件的 __init__ 内部因别的原因抛 TypeError，会被误判成“签名不兼容”而重试一次（可能掩盖真实错误）。",
+      "证据": "core/star/star_manager.py:1221-1229"
+    },
+    {
+      "编号": 7,
+      "主题": "一个模块只能生效一个 Star 子类",
+      "详情": "__init_subclass__ 以 cls.__module__ 为 key 判重；同模块内第二个 Star 子类只会覆盖 star_map 的 star_cls_type，不会新建 metadata，也不改变 star_registry 长度。",
+      "证据": "core/star/base.py:66-75"
+    },
+    {
+      "编号": 8,
+      "主题": "EventMessageType.ALL 是独立位而非或运算",
+      "详情": "ALL = GROUP_MESSAGE | PRIVATE_MESSAGE | OTHER_MESSAGE = 7，是 enum.Flag 里的第 4 个独立成员；filter 用 event_message_type & self.event_message_type 判断，传 ALL 时能匹配任意类型（因为 7 覆盖 1|2|4），但 list(EventMessageType) 只遍历 3 个。",
+      "证据": "core/star/filter/event_message_type.py:10-14,32"
+    },
+    {
+      "编号": 9,
+      "主题": "PlatformAdapterType.ALL 不是“所有位的或”",
+      "详情": "ALL = enum.auto()，是第 21 个独立位；filter 里 if self.platform_type & PlatformAdapterType.ALL: return True —— 只有显式传 ALL 时才恒真，传其他任何成员都不会触发这条捷径（但 ADAPTER_NAME_2_TYPE 映射仍会让具体类型正常工作）。",
+      "证据": "core/star/filter/platform_adapter_type.py:30,64-69"
+    },
+    {
+      "编号": 10,
+      "主题": "PermissionTypeFilter 用 == 而非位与",
+      "详情": "只判断 if self.permission_type == PermissionType.ADMIN；传 MEMBER 时恒返回 True（docstring 说“当选择 MEMBER，ADMIN 也可以通过”，即 MEMBER 不做任何过滤，而不是“仅普通成员”）。",
+      "证据": "core/star/filter/permission.py:23-31"
+    },
+    {
+      "编号": 11,
+      "主题": "context.conversation_manager 是属性而不是方法",
+      "详情": "在 __init__ 里 self.conversation_manager = conversation_manager（context.py:157），没有同名方法。",
+      "证据": "core/star/context.py:139,157"
+    },
+    {
+      "编号": 12,
+      "主题": "get_using_tts_provider 已废弃，但同步版仍存在",
+      "详情": "同步版带 @deprecated 装饰器（调用时会发 DeprecationWarning），新代码应使用 get_using_tts_provider_async。兼容层两个都要有，否则老插件（如陪伴插件用了 4 处）会挂。",
+      "证据": "core/star/context.py:509-510 vs :530"
+    },
+    {
+      "编号": 13,
+      "主题": "没有 event_filters 的 AdapterMessageEvent handler 会被静默跳过",
+      "详情": "waking_check 阶段 if len(handler.event_filters) == 0: continue —— 用 @filter.on_xxx() 注册的消息类 handler 若一个 filter 都没加，永远不会被触发。",
+      "证据": "core/pipeline/waking_check/stage.py:182-183"
+    },
+    {
+      "编号": 14,
+      "主题": "llm_tool 的 docstring 类型白名单比 JSON Schema 窄得多",
+      "详情": "只接受 string/number/object/array/boolean（+ 由 Python 类型名映射来的 str/int/float/bool/dict/list/tuple/set）。JSON Schema 支持的 integer 会被拒绝并抛 ValueError；没有任何类型时的报错文案是“缺少类型注释”。",
+      "证据": "core/provider/func_tool_manager.py:128-145 + core/star/register/star_handler.py:637-655；实测确认"
+    },
+    {
+      "编号": 15,
+      "主题": "llm_tool 不会排除 event 参数",
+      "详情": "Args: 段里写了 event 也会被注册成工具参数（源码不跳过前两个位置参数）。",
+      "证据": "core/star/register/star_handler.py:635-665；实测 q_eventparam 的 properties 里出现了 event"
+    },
+    {
+      "编号": 16,
+      "主题": "AstrMessageEvent.send 基类实现并不真的发消息",
+      "详情": "基类 async def send(self, message: MessageChain) -> None 只上报 Metric 并置 _has_send_oper=True，真正发送靠平台子类覆写。返回值是 None 不是 bool。",
+      "证据": "core/platform/astr_message_event.py:478-495"
+    },
+    {
+      "编号": 17,
+      "主题": "get_sender_id 可能返回空字符串",
+      "详情": "sender 缺失或 user_id 不是 str 时返回 ''（不抛异常、不返回 None）。",
+      "证据": "core/platform/astr_message_event.py:203-208"
+    },
+    {
+      "编号": 18,
+      "主题": "clear_result() 不会重置停止标志",
+      "详情": "_force_stopped 是独立字段，stop_event() 置真后 clear_result() 只清 _result，is_stopped() 仍返回 True。",
+      "证据": "core/platform/astr_message_event.py:58-59, 343-349, 359-365, 378-380"
+    },
+    {
+      "编号": 19,
+      "主题": "api/message_components.py 只有一行通配导入",
+      "详情": "文件全文为 from astrbot.core.message.components import *，因此组件类的真实定义（含所有字段与行号）都在 core/message/components.py。",
+      "证据": "api/message_components.py:1"
+    },
+    {
+      "编号": 20,
+      "主题": "register_llm_tool 的解析失败发生在 import 期",
+      "详情": "ValueError 在装饰器执行时抛出，即插件加载阶段就失败，不会等到调用工具。",
+      "证据": "core/star/register/star_handler.py:639-655（装饰器体内，非 handler 体内）"
+    },
+    {
+      "编号": 21,
+      "主题": "Context.registered_web_apis 是类属性（跨实例共享）",
+      "详情": "写类体里而非 __init__，所有 Context 实例共享同一个 list；_register_tasks / _star_manager 同理。",
+      "证据": "core/star/context.py:126,129,130"
+    },
+    {
+      "编号": 22,
+      "主题": "regex 过滤器不受唤醒前缀制约",
+      "详情": "CommandFilter 要求 event.is_at_or_wake_command 为真（受 wake_prefix 制约），RegexFilter 直接 search 消息文本，不受制约。",
+      "证据": "core/star/filter/command.py:30,192 vs core/star/filter/regex.py:9,17-18"
+    },
+    {
+      "编号": 23,
+      "主题": "llm_generate 全部参数 keyword-only",
+      "详情": "签名里有裸 *，必须关键字调用；且它不会自动执行 tool calls，需要工具循环要用 tool_loop_agent。",
+      "证据": "core/star/context.py:171-182, docstring 183"
+    },
+    {
+      "编号": 24,
+      "主题": "send_message 返回的 bool 语义是“找到平台”而非“发送成功”",
+      "详情": "只要 platform.meta().id 匹配到就 return True，底层 send_by_session 是否真的送达不在返回值里体现。",
+      "证据": "core/star/context.py:641-677"
+    }
+  ]
+}

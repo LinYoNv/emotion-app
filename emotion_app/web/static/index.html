@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>情绪app</title>
+<link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+<!--
+  🔴 布局：**侧边栏 + 内容区**（取代原来的顶栏 tab）。
+     情绪的要求：「顶栏就不要了喵做成侧边栏模式可收起展开的那种。点开之后再路由到详情」
+
+  * 侧边栏在**左侧**，可整体收起（桌面：变窄成图标条；手机：抽屉式滑出）
+  * 每项用 hash 路由（`#/chat`、`#/persona/<id>` …），
+    所以"点开之后再路由到详情"是真的可分享/可后退的 URL，不是假状态。
+  * 「插件」是新页：列出插件拓展页（陪伴面板等），点开在内容区里打开。
+-->
+<a class="skip-link" href="#main">跳到主内容</a>
+
+<div class="app">
+  <!-- ==================== 侧边栏 ==================== -->
+  <aside id="sidebar" class="sidebar">
+    <div class="sidebar-head">
+      <button id="sidebar-toggle" class="icon-btn" type="button"
+              aria-label="收起/展开侧边栏" aria-expanded="true" title="收起/展开侧边栏">
+        <span class="burger" aria-hidden="true"></span>
+      </button>
+      <span class="brand">情绪app</span>
+    </div>
+
+    <nav id="sidebar-nav" class="sidebar-nav" aria-label="主导航">
+      <a class="nav-item" href="#/chat" data-nav="chat">
+        <span class="nav-ico" aria-hidden="true">💬</span><span class="nav-label">聊天</span>
+      </a>
+      <a class="nav-item" href="#/session" data-nav="session">
+        <span class="nav-ico" aria-hidden="true">🗂️</span><span class="nav-label">会话</span>
+      </a>
+      <a class="nav-item" href="#/persona" data-nav="persona">
+        <span class="nav-ico" aria-hidden="true">🎭</span><span class="nav-label">人设</span>
+      </a>
+      <a class="nav-item" href="#/plugins" data-nav="plugins">
+        <span class="nav-ico" aria-hidden="true">🧩</span><span class="nav-label">插件</span>
+        <span class="nav-badge hidden" id="plugins-badge">0</span>
+      </a>
+      <!-- ⚠️ 与契约 §4 的唯一差异：**图标用 🔌 而不是 🧩**。
+           原因：上面「插件」已经用了 🧩，而侧边栏**收起态只剩图标**
+           （`.app.collapsed .nav-label { display: none }`）→ 两个 🧩 在图标条里
+           完全分不出来。结构（class/层级/nav-ico/nav-label）与其它 nav-item 逐字一致。 -->
+      <a class="nav-item" href="#/providers" data-nav="providers">
+        <span class="nav-ico" aria-hidden="true">🔌</span><span class="nav-label">模型供应商</span>
+      </a>
+      <!-- ⚠️ 图标用 📜（不是 ⚙️/🔌）—— 侧边栏收起态只剩图标，重复就分不出来。
+           结构（class/层级/nav-ico/nav-label）与其它 nav-item 逐字一致。 -->
+      <a class="nav-item" href="#/logs" data-nav="logs">
+        <span class="nav-ico" aria-hidden="true">📜</span><span class="nav-label">日志</span>
+      </a>
+      <a class="nav-item" href="#/settings" data-nav="settings">
+        <span class="nav-ico" aria-hidden="true">⚙️</span><span class="nav-label">设置</span>
+      </a>
+    </nav>
+
+    <div class="sidebar-foot">
+      <span id="status" class="status">…</span>
+    </div>
+  </aside>
+
+  <!-- 手机端：抽屉打开时的遮罩（点了就收起） -->
+  <div id="sidebar-scrim" class="scrim hidden" aria-hidden="true"></div>
+
+  <!-- ==================== 内容区 ==================== -->
+  <main id="main" class="content">
+
+  <!-- ============ 聊天 ============ -->
+  <section id="tab-chat" class="panel">
+    <div class="chatbar">
+      <select id="session-select" title="切换会话"></select>
+      <button id="new-session">+ 新会话</button>
+      <button id="clear-session" title="只清消息，保留会话设置">清空消息</button>
+      <span class="hint" id="session-info"></span>
+    </div>
+    <div id="messages" class="messages"></div>
+    <div class="composer">
+      <textarea id="input" rows="2" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+      <button id="send">发送</button>
+    </div>
+    <p class="hint" id="chat-hint"></p>
+  </section>
+
+  <!-- ============ 会话 ============ -->
+  <section id="tab-session" class="panel hidden">
+    <div class="split">
+      <aside>
+        <div class="row"><button id="new-session-2">+ 新建会话</button></div>
+        <ul id="session-list" class="list"></ul>
+      </aside>
+      <div class="editor">
+        <div id="session-empty" class="empty">左边选一个会话。</div>
+        <form id="session-form" class="hidden">
+          <label>标题 <input id="s-title" /></label>
+          <label>绑定人设（留空 = 用当前人设）
+            <select id="s-persona"><option value="">（当前人设）</option></select>
+          </label>
+          <label>插件用户 ID（留空 = 用全局默认）
+            <input id="s-user-id" placeholder="例如 default；留空则跟随全局设置" />
+          </label>
+          <p class="hint">
+            陪伴插件按<strong>用户</strong>存记忆 / 关系 / 主动消息开关。
+            想让某个会话单独开主动消息，就给它一个<strong>独有的</strong>用户 ID，
+            再到插件面板里对该用户打开主动消息。
+            <strong>同一个 ID 绑到多个会话时，主动消息只会落到最早建的那个。</strong>
+          </p>
+          <label>上下文模式
+            <select id="s-mode">
+              <option value="recent_only">滚动上下文（只留最近 N 条）</option>
+              <option value="rolling_summary">动态上下文（摘要 + 最近原文）</option>
+              <option value="semantic">混合模式（前缀稳定，缓存友好）</option>
+            </select>
+          </label>
+          <p class="hint" id="mode-hint"></p>
+          <label>保护窗口（最近 N 条保留原文） <input id="s-tail" type="number" min="1" /></label>
+          <label>总结触发（超出窗口多少条后总结） <input id="s-trigger" type="number" min="1" /></label>
+          <label>摘要（手动编辑；动态/混合模式会注入） <textarea id="s-summary" rows="4"></textarea></label>
+          <div class="row">
+            <button type="submit">保存</button>
+            <button type="button" id="s-del" class="danger">删除会话</button>
+          </div>
+          <p class="hint" id="session-hint"></p>
+        </form>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 人设 ============ -->
+  <section id="tab-persona" class="panel hidden">
+    <div class="split">
+      <aside>
+        <div class="row">
+          <button id="new-persona">+ 新建</button>
+          <button id="import-persona">导入</button>
+        </div>
+        <ul id="persona-list" class="list"></ul>
+      </aside>
+
+      <div class="editor">
+        <!-- 🔴 手机端：选了人设后"路由到详情"——列表收起，出「← 返回列表」。
+             显隐**只由 `.is-detail` 决定**（CSS 单一事实来源），
+             所以这里**不加** class="hidden"（那会和 !important 打架）。 -->
+        <button type="button" id="persona-back" class="back-btn">← 返回列表</button>
+        <div id="persona-empty" class="empty">左边选一个人设，或新建一个。</div>
+        <form id="persona-form" class="hidden">
+          <div class="row">
+            <input id="p-name" placeholder="名字（必填）" required />
+            <button type="button" id="activate">设为当前</button>
+            <button type="button" id="dup">复制</button>
+            <button type="button" id="export-persona">导出</button>
+            <button type="button" id="del" class="danger">删除</button>
+          </div>
+          <label>描述 <textarea id="p-description" rows="3"></textarea></label>
+          <label>性格 <textarea id="p-personality" rows="3"></textarea></label>
+          <label>场景 <textarea id="p-scenario" rows="2"></textarea></label>
+          <label>创作者备注 <textarea id="p-creator-notes" rows="2"></textarea></label>
+
+          <details>
+            <summary>上游覆盖（留空 = 用全局设置）</summary>
+            <label>API 地址 <input id="p-api-url" placeholder="https://…/v1" /></label>
+            <label>模型 <input id="p-model" placeholder="gemini-3.1-flash-lite" /></label>
+            <label>API Key <input id="p-api-key" type="password" placeholder="留空 = 不变" /></label>
+          </details>
+
+          <div class="row">
+            <button type="submit">保存</button>
+            <button type="button" id="preview">预览提示词</button>
+          </div>
+          <p class="hint">
+            上面 4 个字段就是人设的全部内容，保存时会自动变成提示词。
+          </p>
+        </form>
+      </div>
+    </div>
+
+    <div id="sections-block" class="hidden">
+      <h3>额外片段 <small>（顺序 = order，小的在前；易变内容应靠后）</small></h3>
+      <p class="hint">
+        只有<strong>需要追加额外规则</strong>时才用这里。
+        描述 / 性格 / 场景 / 创作者备注<strong>不在这里重复显示</strong>
+        —— 它们由上面那 4 个字段决定，在这儿改也不会生效。
+      </p>
+      <table class="sections">
+        <thead><tr><th>启用</th><th>标题</th><th>order</th><th>来源</th><th>内容</th><th></th></tr></thead>
+        <tbody id="sections-body"></tbody>
+      </table>
+      <button id="add-section">+ 添加片段</button>
+      <button id="save-sections">保存片段</button>
+    </div>
+  </section>
+
+  <!-- ============ 模型供应商 ============
+       情绪的需求：「把 astrbot 的"模型供应商"模块加进来，我去测试陪伴模型配置」，
+       并明确「UI 做得不好看、功能也不对」→ 照本机 AstrBot v4.27.5 的**两层结构**重做。
+
+       🔴 两层结构（这才是"功能对"的关键；原来是单层 `{id,name,model,base_url,key}`）：
+            provider_sources  ← 端点层：一个 API 端点（id + api_base + key + timeout）
+                  ↑ 1 : N
+            provider          ← 模型层：挂在某个源下面的具体模型，id = `源id/模型id`
+
+       布局照参考站的截图：
+            左「提供商源」列表（id + api_base 两行，右侧删除）
+            右「选中源」三段：设置 / 高级配置…（可折叠）/ 模型
+            「保存配置」在右上
+
+       🔴 只做「对话」一类（`provider_type == "chat_completion"`）：
+          情绪明确说情绪app 不需要 Agent 能力，其余分类（agent/tts/stt/embedding/rerank）
+          **如实不做**，也不摆一排点了没用的页签。
+          省略页签的理由：单元素分类栏没有可切换的对象，留一个孤零零的「对话」
+          等于用一个假控件占位（比不画更糟）。
+
+       🔴 凭据约定（硬要求）：`key` 是**只写**字段 —— 列表/详情接口只回 `key_configured`
+          布尔，输入框**留空 = 不修改**；**绝不把已存的 key 回显到页面**。
+  -->
+  <section id="tab-providers" class="panel hidden">
+    <!-- 左右分栏：复用「人设」页的 .split / aside / .editor（连手机端竖排媒体查询一起复用）。
+         🔴 手机端加了 `.is-detail`：选了源 → 列表收起、只显示右侧（同人设页做法）。 -->
+    <div class="split" id="providers-split">
+
+      <!-- ---------- 左：提供商源 ---------- -->
+      <aside class="providers-aside">
+        <div class="providers-aside-head">
+          <h3>提供商源</h3>
+          <button type="button" id="provider-source-new">+ 新增</button>
+        </div>
+        <!-- 🔴 类型筛选（契约 §5.1）。**默认仍是「对话」**（保持原行为，不悄悄换成"全部"）。
+             ⚠️ 这里**不用 `<select>`**：一是四个选项一眼可见（不必点开才知道能切），
+                二是 `<select>` 在移动端会拉起原生选择器，把"看一眼有几类"变成两次点击。
+             ⚠️ 每个按钮后面**不写死数字**：计数由 JS 用真实数据算，
+                写死就会出现"按钮说 3 个、列表里只有 1 个"的谎话。 -->
+        <div class="providers-filter" id="provider-type-filter" role="group" aria-label="按类型筛选提供商源">
+          <button type="button" class="filter-btn" data-ptype="chat_completion">对话</button>
+          <button type="button" class="filter-btn" data-ptype="text_to_speech">语音合成</button>
+          <button type="button" class="filter-btn" data-ptype="speech_to_text">语音识别</button>
+          <button type="button" class="filter-btn" data-ptype="embedding">嵌入</button>
+          <button type="button" class="filter-btn" data-ptype="*">全部</button>
+        </div>
+        <ul id="provider-source-list" class="list"></ul>
+        <!-- 🔴 空态**不能是白屏**：没有源（或后端还没就绪）时也要看得见一句人话 -->
+        <div id="provider-source-empty" class="empty hidden">还没有提供商源。</div>
+      </aside>
+
+      <!-- ---------- 右：选中源的详情 ---------- -->
+      <div class="editor providers-detail">
+        <button type="button" id="provider-source-back" class="back-btn">← 返回列表</button>
+
+        <!-- 没选源时的空态（照参考站"请选择一个提供商源"，**不是白屏**） -->
+        <div id="provider-source-placeholder" class="empty">
+          <span class="empty-ico" aria-hidden="true">👈</span>
+          <p>请选择一个提供商源</p>
+        </div>
+
+        <!-- 源详情：整块是一张卡片（同 `.modal-box` 的设计语言） -->
+        <div id="provider-source-panel" class="providers-card hidden">
+          <header class="providers-card-head">
+            <div>
+              <h3 id="provider-source-title">—</h3>
+              <p class="hint" id="provider-source-subtitle">—</p>
+            </div>
+            <button type="button" id="provider-save-config">保存配置</button>
+          </header>
+
+          <!-- 🔴 保存/加载/测试的**结果提示**：一条总提示（顶部）+ 一条表单提示。
+               后端未就绪时错误就落在这里，**不静默吞掉**（项目铁律）。 -->
+          <p class="hint" id="providers-hint"></p>
+
+          <!-- ~~~~~ 设置 ~~~~~ -->
+          <section class="providers-block">
+            <h4>设置</h4>
+            <form id="provider-source-form">
+              <div class="field-labeled">
+                <div class="fl-text">
+                  <label for="ps-id">ID</label>
+                  <span class="hint">提供商源唯一 ID（不是提供商 ID）；模型 id 会是 <code>ID/模型</code></span>
+                </div>
+                <div class="fl-ctl"><input id="ps-id" placeholder="例如 syuan" required /></div>
+              </div>
+
+              <div class="field-labeled">
+                <div class="fl-text">
+                  <label for="ps-api-key">API Key</label>
+                  <span class="hint">API 密钥（只写：留空 = 不修改；已存的那把**不会**显示出来）</span>
+                </div>
+                <div class="fl-ctl">
+                  <input id="ps-api-key" type="password" autocomplete="new-password" placeholder="未设置" />
+                </div>
+              </div>
+
+              <div class="field-labeled">
+                <div class="fl-text">
+                  <label for="ps-type">适配器类型</label>
+                  <span class="hint" id="ps-type-hint">决定"这个端点怎么调"（契约 §1 的适配器协议）。</span>
+                </div>
+                <div class="fl-ctl">
+                  <!-- 两个选项 = 我们**能执行**的两种 OpenAI 格式（契约 §5.3）；
+                       其余适配器类型（来自预设）走下面的只读展示，见 #ps-type-adapter。 -->
+                  <select id="ps-type">
+                    <option value="openai_chat_completion">OpenAI Compatible（/chat/completions）</option>
+                    <option value="openai_responses">OpenAI Responses（/responses）</option>
+                  </select>
+                  <!-- 🔴 预设带来的**其他**适配器类型：只读展示 + 如实标注不可执行。
+                       ⚠️ **不做成 `<input disabled>` 或假下拉**：前者会把值藏在表单里、
+                          用户改不掉也复制不出；这里摆明是"展示"，改类型请回上面的下拉。 -->
+                  <div id="ps-type-adapter" class="hidden">
+                    <code id="ps-type-adapter-value">—</code>
+                    <span class="hint" id="ps-type-adapter-note"></span>
+                  </div>
+                  <p class="hint hidden" id="ps-not-executable"></p>
+                </div>
+              </div>
+
+              <div class="field-labeled">
+                <div class="fl-text">
+                  <label for="ps-provider-type">用途分类</label>
+                  <span class="hint">这条源拿来干什么（对话 / 语音合成 / 语音识别 / 嵌入）；决定它出现在左侧哪个筛选里。</span>
+                </div>
+                <div class="fl-ctl">
+                  <!-- 三类与后端 `SUPPORTED_PROVIDER_TYPES` 一致（契约 §1）。
+                       ⚠️ 后端对**不在支持集**的值一律 400，所以这里只列这三类。 -->
+                  <select id="ps-provider-type">
+                    <option value="chat_completion">对话（chat_completion）</option>
+                    <option value="text_to_speech">语音（text_to_speech）</option>
+                    <option value="embedding">嵌入（embedding）</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="field-labeled">
+                <div class="fl-text">
+                  <label for="ps-api-base">API Base URL</label>
+                  <span class="hint">自定义 API 端点 URL，形如 <code>https://…/v1</code></span>
+                </div>
+                <div class="fl-ctl"><input id="ps-api-base" placeholder="https://api.syuan.org/v1" /></div>
+              </div>
+            </form>
+          </section>
+
+          <!-- ~~~~~ 高级配置（可折叠） ~~~~~ -->
+          <details class="providers-block providers-advanced" id="provider-advanced">
+            <summary>高级配置…</summary>
+            <div class="field-labeled">
+              <div class="fl-text">
+                <label for="ps-timeout">超时时间</label>
+                <span class="hint">超时时间，单位为秒。</span>
+              </div>
+              <div class="fl-ctl"><input id="ps-timeout" type="number" min="1" step="1" placeholder="120" /></div>
+            </div>
+
+            <div class="field-labeled">
+              <div class="fl-text">
+                <label for="ps-proxy">代理地址</label>
+                <span class="hint">HTTP/HTTPS 代理地址，格式如 <code>http://127.0.0.1:7890</code>。仅对该提供商生效。</span>
+              </div>
+              <div class="fl-ctl"><input id="ps-proxy" placeholder="（留空 = 不用代理）" /></div>
+            </div>
+
+            <div class="field-labeled">
+              <div class="fl-text">
+                <label for="ps-header-key">自定义请求头</label>
+                <span class="hint">这些键值对会合并进对该端点的请求头（值必须是字符串）。</span>
+              </div>
+              <div class="fl-ctl">
+                <div class="header-rows">
+                  <div id="ps-header-rows"></div>
+                  <p class="hint hidden" id="ps-header-empty">暂无项目</p>
+                  <button type="button" id="ps-header-add">添加更多</button>
+                </div>
+              </div>
+            </div>
+          </details>
+
+          <!-- ~~~~~ 模型 ~~~~~ -->
+          <section class="providers-block">
+            <h4>模型 <small>（已配置的模型 id = <code>源id/模型id</code>）</small></h4>
+
+            <!-- ⚠️ 搜索框**不在这条里**了：它只对「获取模型列表」的候选有意义，
+                 所以跟着候选一起进了 `#models-modal`（见下面的注释）。 -->
+            <div class="row providers-model-bar">
+              <span class="badge" id="ps-model-count">已配置 0</span>
+              <button type="button" id="ps-fetch-models">获取模型列表</button>
+              <button type="button" id="ps-add-custom">自定义模型</button>
+            </div>
+            <!-- 「自定义模型」：内联一行输入（**不用** window.prompt —— 阻塞且不可测） -->
+            <div class="row providers-model-bar hidden" id="ps-custom-wrap">
+              <input id="ps-custom-model" class="ps-search" placeholder="模型 ID，例如 gpt-5.6-sol" />
+              <button type="button" id="ps-custom-add">加上</button>
+            </div>
+
+            <!-- 🔴 「获取模型列表」的结果**不在这里**（情绪 2026-09-21：「获取到的模型，与测试都用弹窗形式发送」）。
+                 搜索框 `#ps-model-search` + 提示 `#ps-available-hint` + 候选 `#ps-available-list`
+                 **整体搬进**下面的 `#models-modal` —— 是"搬家"不是"复制"：
+                 id 若出现两份，`$()` 只会拿到第一份，另一份就成了永远不更新的僵尸节点。
+                 卡片上不留第二处结果区：两处显示同一件事，早晚一处新一处旧。 -->
+
+            <h5>已配置的模型</h5>
+            <ul id="ps-configured-list" class="ps-models"></ul>
+            <div class="empty hidden" id="ps-configured-empty">还没有配置模型，点上面的「自定义模型」加一个。</div>
+          </section>
+
+          <div class="providers-card-foot">
+            <button type="button" id="provider-delete" class="danger">删除该提供商源</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 设置 ============
+       结构照契约 `conductor/CONTRACT.md` §6：**配置文件式**
+           设置
+           ├─ 上游连接（本机直连上游）  ← 本服务自己用的（API 地址/模型/Key）
+           ├─ 会话                      ← 照 GET /api/v1/config-profile 的 schema.session 渲染
+           ├─ 上下文管理策略             ← 照 schema.context 渲染
+           └─ 部署配置（只读）           ← 保留现有 /health 渲染
+
+       🔴 两段配置的**字段一律由后端 schema 驱动**（契约 §4.3：字段元数据放后端，
+          前端照它渲染）—— 所以下面这两块**只有空容器**，一个字段都不写死在这里。
+          在 JS 里再抄一份字段清单 = 早晚和后端漂移，且"漏渲染"会伪装成"没有这项设置"。
+
+       🔴 为什么保留「上游连接」这一段（契约 §6 明确要求保留）：
+          它是**本服务自己直连上游**要用的（含 API Key），与"会话用哪个供应商模型"
+          是两个概念；删掉就没有配 key 的入口了。只是移到最上面并改了标题。
+  -->
+  <section id="tab-settings" class="panel hidden">
+    <h3>上游连接（本机直连上游） <small>（本服务自己用；与下面"选哪个模型"是两回事）</small></h3>
+    <form id="settings-form">
+      <label>API 地址 <input id="s-base-url" placeholder="https://api.syuan.org/v1" /></label>
+      <label>模型
+        <span class="field-row">
+          <input id="s-model" />
+          <button type="button" id="fetch-models" title="从上面那个 API 地址拉取可用模型">获取模型</button>
+        </span>
+      </label>
+      <label id="model-picker-wrap" class="hidden">可选模型
+        <select id="model-picker"></select>
+      </label>
+      <label>API Key <input id="s-api-key" type="password" placeholder="留空 = 不修改" /></label>
+      <div class="row">
+        <button type="submit">保存</button>
+        <button type="button" id="clear-overrides">恢复环境变量默认</button>
+        <button type="button" id="ping">测试连接</button>
+      </div>
+      <p class="hint" id="settings-hint"></p>
+    </form>
+
+    <!-- ~~~~~~~~~~ 配置文件（会话 + 上下文管理策略） ~~~~~~~~~~ -->
+    <h3>配置文件 <small>（字段来自后端 schema，不是前端写死的）</small></h3>
+    <!-- 🔴 页级状态：**读取失败必须落在这里**（项目铁律：绝不让失败看起来像"没有设置"）。
+         成功时它说的是"读到几段/几项"，所以"空"和"错"在界面上永远长得不一样。 -->
+    <p class="hint" id="cfg-hint">正在读取配置…</p>
+
+    <section class="cfg-section" id="cfg-session-section">
+      <header class="cfg-head">
+        <h4>会话</h4>
+        <span class="hint">默认对话/TTS 模型、人格、重试与显示开关</span>
+      </header>
+      <form id="cfg-session-form" class="cfg-form">
+        <!-- 字段由 renderConfigSections() 按 schema.session 注入 -->
+        <div class="cfg-fields" id="cfg-session-fields"></div>
+        <div class="row cfg-actions">
+          <button type="submit" id="cfg-session-save">保存</button>
+          <p class="hint" id="cfg-session-hint"></p>
+        </div>
+      </form>
+    </section>
+
+    <section class="cfg-section" id="cfg-context-section">
+      <header class="cfg-head">
+        <h4>上下文管理策略</h4>
+        <span class="hint">三种上下文模式 + 触发压缩/总结的细项</span>
+      </header>
+      <form id="cfg-context-form" class="cfg-form">
+        <!-- 字段由 renderConfigSections() 按 schema.context 注入 -->
+        <div class="cfg-fields" id="cfg-context-fields"></div>
+        <div class="row cfg-actions">
+          <button type="submit" id="cfg-context-save">保存</button>
+          <p class="hint" id="cfg-context-hint"></p>
+        </div>
+      </form>
+    </section>
+
+    <!-- 恢复默认：后端 `DELETE /api/v1/config-profile` 是**整份配置文件**级的
+         （没有分段参数）→ 所以这里只有一个按钮，确认文案里也如实说"两段一起清"。 -->
+    <div class="row cfg-foot">
+      <button type="button" id="cfg-reset" class="danger">恢复默认</button>
+      <span class="hint">清掉「会话」与「上下文管理策略」的自定义值，回到后端默认（不可撤销）。</span>
+    </div>
+
+    <h3>部署配置（只读）</h3>
+    <pre id="deploy-config" class="preview"></pre>
+  </section>
+
+  <!-- ============ 日志（情绪 2026-09-21 要求） ============
+       🔴 数据源是**内存环形缓冲**（`/api/v1/logs`），不是读 logs/server.log ——
+          那个文件混着 Hypercorn 输出且不受我们控制；内存缓冲还能走**同一条脱敏**（scrub）。
+       🔴 默认**自动刷新**（5s）：这是个"看服务现在在干什么"的窗口，
+          要手点刷新就失去了意义。切走页面时会停（省资源、也不刷无意义的请求）。 -->
+  <section id="tab-logs" class="panel hidden">
+    <h3>服务日志 <small>（最近的运行记录；含插件与上游调用）</small></h3>
+
+    <div class="row logs-toolbar">
+      <label class="logs-inline">级别
+        <select id="logs-level">
+          <option value="">全部</option>
+          <option value="INFO">INFO 及以上</option>
+          <option value="WARNING">WARNING 及以上</option>
+          <option value="ERROR">ERROR 及以上</option>
+        </select>
+      </label>
+      <label class="logs-inline">条数
+        <select id="logs-limit">
+          <option value="100">100</option>
+          <option value="200" selected>200</option>
+          <option value="500">500</option>
+        </select>
+      </label>
+      <label class="logs-inline logs-auto">
+        <input type="checkbox" id="logs-auto" checked /> 自动刷新（5 秒）
+      </label>
+      <button type="button" id="logs-refresh">立即刷新</button>
+      <button type="button" id="logs-copy">复制全部</button>
+    </div>
+
+    <!-- 🔴 提示区**先于列表**存在：读失败要说清原因，不能只给一个空列表
+         （空列表会让用户以为"服务很干净"，那是误导性最强的一种失败）。 -->
+    <p class="hint" id="logs-hint">正在读取…</p>
+    <div id="logs-list" class="logs-list"></div>
+  </section>
+
+  <!-- ============ 插件（情绪报的"没有配置入口"补在这） ============ -->
+  <section id="tab-plugins" class="panel hidden">
+    <h3>插件拓展页 <small>（AstrBot 插件自带的面板）</small></h3>
+    <p class="hint" id="plugins-hint">正在读取…</p>
+    <ul id="plugin-page-list" class="list"></ul>
+
+    <!-- 打开插件页时就地嵌进来（同源 iframe；插件页靠 /static/plugin_page_bridge.js 取数） -->
+    <div id="plugin-frame-wrap" class="frame-wrap hidden">
+      <div class="row frame-bar">
+        <button type="button" id="plugin-frame-back">← 返回插件列表</button>
+        <strong id="plugin-frame-title"></strong>
+        <a id="plugin-frame-open" class="link-btn" target="_blank" rel="noopener">在新标签打开 ↗</a>
+      </div>
+      <iframe id="plugin-frame" class="plugin-frame" title="插件拓展页"></iframe>
+    </div>
+  </section>
+</main>
+</div><!-- /.app -->
+
+<!-- 登录闸门：令牌换会话（HttpOnly cookie，JS 读不到） -->
+<div id="login" class="modal">
+  <div class="modal-box login-box">
+    <h3>情绪app</h3>
+    <p class="hint" id="login-hint">输入访问令牌（首次部署时用 <code>python -m emotion_app token</code> 生成）。</p>
+    <form id="login-form">
+      <label>访问令牌
+        <input id="login-token" type="password" autocomplete="current-password"
+               placeholder="至少 16 字符" required />
+      </label>
+      <div class="row">
+        <button type="submit">进入</button>
+      </div>
+      <p class="hint">登录后由服务端下发 <b>HttpOnly</b> 会话 cookie（默认 24 小时），
+        JS 读不到令牌，刷新页面不用重输。</p>
+    </form>
+  </div>
+</div>
+
+<!-- 导入人设 -->
+<div id="import-modal" class="modal hidden">
+  <div class="modal-box import-box">
+    <div class="row"><h3>导入人设</h3><button id="import-close">关闭</button></div>
+
+    <p class="hint">
+      支持 <b>爱语备份</b>（<code>{"data":{"prompts":{…}}}</code>，一个文件可含多个人设）、
+      SillyTavern 角色卡（PNG/JSON）、以及本程序导出的 JSON。
+    </p>
+
+    <form id="import-form">
+      <label>① 选文件（PNG / JSON）
+        <input id="import-file" type="file" accept=".json,.png,application/json,image/png" />
+      </label>
+
+      <p class="hint">② 或者直接粘贴内容（JSON 文本 / data:image/png;base64,…）</p>
+      <label>
+        <textarea id="import-text" rows="4" placeholder="把角色卡内容粘到这里…"></textarea>
+      </label>
+
+      <label>同名怎么处理
+        <select id="import-conflict">
+          <option value="rename">重命名（保留两者，加 _1、_2）</option>
+          <option value="overwrite">覆盖（替换同名的那张）</option>
+          <option value="skip">跳过（同名的不导入）</option>
+        </select>
+      </label>
+
+      <div class="row">
+        <button type="submit">开始导入</button>
+      </div>
+      <p class="hint" id="import-hint"></p>
+    </form>
+
+    <pre id="import-result" class="preview hidden"></pre>
+  </div>
+</div>
+
+<!-- 选厂商预设（契约 §5.2）：「+ 新增」先弹这个；选中后**只预填**
+     provider / type / provider_type / api_base（id 仍由用户自己填）。
+     ⚠️ 不做 `voice`/`rate`/`embedding_dimensions` 之类专属字段 —— 本轮只做配置层，
+        那些字段**没有消费方**（契约 §7.5 明确不做，不做假能力）。 -->
+<div id="preset-modal" class="modal hidden">
+  <div class="modal-box preset-box">
+    <div class="row"><h3>选择厂商预设</h3><button id="preset-close">关闭</button></div>
+    <p class="hint" id="preset-hint">正在读取厂商预设…</p>
+    <!-- 按 provider_type 分组（对话 / 语音 / 嵌入 / …）；计数由 JS 按真实数据算 -->
+    <div class="preset-groups" id="preset-groups" role="group" aria-label="预设分组"></div>
+    <ul id="preset-list" class="preset-list"></ul>
+    <p class="hint">
+      ⚠️ 预设只是预填，选完仍可修改。标「不可执行」的那些适配器本平台暂时跑不了，
+      但配置可以照常保存（将来支持了就能直接用）。
+    </p>
+    <div class="row">
+      <button type="button" id="preset-skip">不用预设，手动填</button>
+    </div>
+  </div>
+</div>
+
+<!-- 预览弹层 -->
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="row"><h3 id="modal-title">预览</h3><button id="modal-close">关闭</button></div>
+    <pre id="modal-body" class="preview"></pre>
+  </div>
+</div>
+
+<!-- 可用模型（「获取模型列表」的结果）—— 情绪 2026-09-21：「获取到的模型…用弹窗形式发送」。
+     原来是**内联**在右侧源卡片里的，两个问题：
+       ① 候选动辄几十条，把「已配置的模型」（用户真正在用的那份）一路顶到屏幕外；
+       ② 手机上一屏塞不下，用户得先滚过一长串候选才看得见自己配了什么。
+     搬进弹层后卡片只剩"工作列表"，"一次性的查询结果"按需弹出。
+
+     🔴 被搬进来的元素（**同名同 id，不是复制**）：`ps-model-search`（搜索框）
+        / `ps-available-hint`（状态与失败原因）/ `ps-available-list`（候选勾选列表）。
+        `app.js` 里原有的取数、过滤、勾选逻辑**一行都不用改** —— 它们只认 id。
+
+     🔴 「获取」**失败时这个弹层照样打开**，失败原因写在 `#ps-available-hint` 里。
+        绝不允许"失败 → 不弹 → 用户以为点了没反应"（项目铁律：失败不许静默、
+        更不许长得像"没有数据"）。 -->
+<div id="models-modal" class="modal hidden">
+  <div class="modal-box models-box">
+    <div class="row"><h3>可用模型</h3><button type="button" id="models-close">关闭</button></div>
+    <p class="hint" id="models-subtitle">—</p>
+    <input id="ps-model-search" class="ps-search" placeholder="搜索模型或 ID" />
+    <p class="hint" id="ps-available-hint">正在拉取…</p>
+    <ul id="ps-available-list" class="ps-models hidden"></ul>
+    <p class="hint">
+      勾选或点「添加」即写入该源（已配置的会打勾并锁定，不会重复添加）。关掉本窗口不影响添加结果。
+    </p>
+  </div>
+</div>
+
+<!-- 模型测试（`#providers-test-result` 的落点）—— 同上，情绪要求测试结果也走弹窗。
+     🔴 进度（"正在测试 …"）与结果（✅/❌）写进的是**同一个** `#providers-test-result`，
+        弹层在发请求**之前**就打开 —— 否则测试要几秒，用户会以为按钮坏了。
+     ⚠️ 测试结束时**不自动关闭**：失败原因要留在屏幕上给用户看（自动关掉 = 又一次静默失败）。 -->
+<div id="test-modal" class="modal hidden">
+  <div class="modal-box test-box">
+    <div class="row"><h3>模型测试</h3><button type="button" id="test-close">关闭</button></div>
+    <p class="hint" id="test-subtitle">—</p>
+    <pre id="providers-test-result" class="preview"></pre>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
