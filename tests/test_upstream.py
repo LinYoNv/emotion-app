@@ -213,6 +213,71 @@ async def test_backend_raises_on_non_json():
         await c.close()
 
 
+# ---------------------------------------------------------------------------
+# 🔴 上游响应体必须可见（2026-10-08）
+# ---------------------------------------------------------------------------
+
+
+def test_upstream_error_str_includes_body():
+    """`str(exc)` 必须带 body —— 否则日志里看不到上游到底说了什么。
+
+    起因（真 bug）：原来 `UpstreamError` 只 `super().__init__(message)`，
+    把 body 存成**属性**，而所有日志点都是 `logger.error("...%s", exc)`
+    这种**字符串化**用法 ⇒ body 一个字都进不了日志。
+    实测后果：`上游返回 403` / `上游返回的不是 JSON` 各出现 200/378 次，
+    排查时**完全看不到上游响应体** —— 而这两句话的全部诊断价值都在 body 里。
+
+    ⚠️ 这条判据会真的失败：把 `super().__init__(f"{message} | 上游响应体: {detail}")`
+       改回 `super().__init__(message)` 即红。
+    """
+    exc = UpstreamError("上游返回 403", status=403, body='{"error":"额度不足"}')
+    assert "额度不足" in str(exc), f"body 没进 str(exc)：{str(exc)!r}"
+    assert "403" in str(exc)
+    # 属性仍保留（老代码读 exc.body / exc.status 不受影响）
+    assert exc.status == 403
+    assert exc.body == '{"error":"额度不足"}'
+
+
+def test_upstream_error_without_body_has_clean_message():
+    """没有 body 时不能凭空多出一截（别出现 `| 上游响应体: ` 空尾巴）。"""
+    exc = UpstreamError("上游返回的不是 JSON")
+    assert str(exc) == "上游返回的不是 JSON"
+    assert exc.body == ""
+
+
+def test_upstream_error_truncates_long_body():
+    """body 过长要截断并**标注**，不能把整页 HTML 灌进日志。"""
+    exc = UpstreamError("上游返回的不是 JSON", body="x" * 5000)
+    s = str(exc)
+    assert "截断" in s
+    assert len(s) < 1000, f"没截断：{len(s)} 字符"
+
+
+async def test_backend_http_error_message_carries_upstream_body():
+    """端到端：走真 backend 时，日志里能拿到的 message 必须含上游响应体。
+
+    这是上面那条"属性级"判据的**链路级**版本 —— 单测属性绿、链路仍然丢 body
+    是完全可能的（历史上一堆"模块能工作但没接上"的教训）。
+    """
+    payload = {"error": {"message": "No available channel for model X under group CN"}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json=payload)
+
+    c = OpenAIChatBackend(transport=make_transport(handler))
+    await c.open()
+    try:
+        with pytest.raises(UpstreamError) as ei:
+            await c.chat([Message(role="user", content="hi")],
+                         model=TARGET.model, base_url=TARGET.base_url, api_key=TARGET.api_key)
+    finally:
+        await c.close()
+    # 🔴 关键：`logger.error("...%s", exc)` 打的就是 str(exc) —— 必须能读出根因
+    assert "No available channel" in str(ei.value), (
+        f"上游 body 没进异常字符串，日志里会看不到根因：{str(ei.value)!r}"
+    )
+
+
 async def test_backend_stream_parses_sse():
     sse = (
         'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n'

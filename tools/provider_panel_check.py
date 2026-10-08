@@ -40,7 +40,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from browser_check import CHROME, PORT, CDP, _http_json  # noqa: E402
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:6190/"
+BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:6191/"
 
 #: 侧边栏文案（用户要求的原文）
 NAV_LABEL = "模型供应商"

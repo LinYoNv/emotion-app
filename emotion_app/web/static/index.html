@@ -32,6 +32,8 @@
     <nav id="sidebar-nav" class="sidebar-nav" aria-label="主导航">
       <a class="nav-item" href="#/chat" data-nav="chat">
         <span class="nav-ico" aria-hidden="true">💬</span><span class="nav-label">聊天</span>
+        <!-- 未读徽标（主动消息进来时点亮）—— 结构与「插件」那个 badge 逐字一致 -->
+        <span class="nav-badge hidden" id="chat-badge" title="有未读消息">0</span>
       </a>
       <a class="nav-item" href="#/session" data-nav="session">
         <span class="nav-ico" aria-hidden="true">🗂️</span><span class="nav-label">会话</span>
@@ -71,6 +73,25 @@
   <!-- ==================== 内容区 ==================== -->
   <main id="main" class="content">
 
+  <!-- 🔴 手机端顶栏（只有 ≤640px 显示）—— 2026-09-27 修「没有开关，打不开侧边栏」。
+       ## 为什么必须放在 `.content` 里、而不是侧边栏里
+       侧边栏在手机上是一条 `transform: translateX(-100%)` 的抽屉，
+       而**原来唯一的开关 `#sidebar-toggle` 就在抽屉里面** ⇒
+       抽屉关着时开关跟着一起跑到屏幕外（实测 `rect.x = -268`），
+       `document.elementFromPoint` 在那坐标上命中 `null` —— **那里什么都没有**。
+       ⇒ 用户没有任何入口能打开抽屉（情绪截图报的就是这个）。
+       把开关放到内容区，它就**永远在视口里**，与抽屉开合无关。 -->
+  <header id="mobile-bar" class="mobile-bar">
+    <button id="mobile-menu" class="icon-btn" type="button"
+            aria-label="打开导航菜单" aria-controls="sidebar" aria-expanded="false"
+            title="打开导航菜单">
+      <span class="burger" aria-hidden="true"></span>
+    </button>
+    <span class="mobile-bar-title" id="mobile-bar-title">情绪app</span>
+  </header>
+
+  <div class="content-body">
+
   <!-- ============ 聊天 ============ -->
   <section id="tab-chat" class="panel">
     <div class="chatbar">
@@ -101,15 +122,44 @@
           <label>绑定人设（留空 = 用当前人设）
             <select id="s-persona"><option value="">（当前人设）</option></select>
           </label>
-          <label>插件用户 ID（留空 = 用全局默认）
-            <input id="s-user-id" placeholder="例如 default；留空则跟随全局设置" />
+          <label>插件用户 ID（= umo 第三段）
+            <input id="s-user-id" placeholder="例如 sess-a1b2c3d4e5f6" />
           </label>
           <p class="hint">
-            陪伴插件按<strong>用户</strong>存记忆 / 关系 / 主动消息开关。
-            想让某个会话单独开主动消息，就给它一个<strong>独有的</strong>用户 ID，
-            再到插件面板里对该用户打开主动消息。
-            <strong>同一个 ID 绑到多个会话时，主动消息只会落到最早建的那个。</strong>
+            陪伴插件<strong>按这个 ID 认人</strong>：记忆 / 关系 / 主动消息开关都挂在它下面，
+            完整 umo 就是 <code>11:FriendMessage:&lt;它&gt;</code>。
+            新建会话时<strong>自动分配一个独有的</strong>，所以可以直接拿它到陪伴面板里
+            建档、开主动消息。<strong>同一个 ID 绑到多个会话时，主动消息只会落到最早建的那个。</strong>
           </p>
+          <!-- 🔴 这段回答的是"主动消息是不是只能给 default"（情绪 2026-09-27 问）。
+               真相：`default` 只是**存量会话**的回落值，新会话本来就自动分配独有 umo；
+               但光有 umo 还不够 —— 插件那边得**认这个用户**，主动消息才会按它投递。
+               把三步写出来用户照着做就行；否则只能靠猜，而猜错的表现是
+               "主动消息一直落到那条『陪伴（主动消息）』会话"，
+               看起来**像产品不支持**（实际只是没在插件侧建用户）。 -->
+          <details class="umo-howto">
+            <summary>怎么让主动消息落到<strong>这个</strong>会话（而不是 default）</summary>
+            <ol>
+              <li>确认上面的「插件用户 ID」<strong>不是 <code>default</code></strong>
+                  —— 老会话会沿用旧的 <code>default</code>（新建会话才会自动分配），
+                  这时点「换一个专用 umo」即可。</li>
+              <li>点「复制 umo」，拿到 <code>11:FriendMessage:&lt;这个 ID&gt;</code>。</li>
+              <li>到<strong>陪伴插件面板</strong>（插件 → 陪伴 → 拓展页）的
+                  <strong>用户 / 身份</strong>里<strong>添加这个 umo</strong>，
+                  并给它<strong>打开主动消息</strong>。</li>
+            </ol>
+            <p class="hint">
+              ⚠️ 插件侧还没有这个用户时，主动消息会落到<strong>全局兜底 umo</strong>
+              （就是列表里那条「陪伴（主动消息）」会话，绑的是 <code>default</code>）——
+              那是<strong>回落</strong>，不是「只能给 default」。
+              插件侧建好用户后，之后的主动消息就按这个会话投递。
+            </p>
+          </details>
+          <div class="row">
+            <button type="button" id="s-umo-copy">复制 umo</button>
+            <button type="button" id="s-umo-new">换一个专用 umo</button>
+          </div>
+          <p class="hint" id="s-umo-hint"></p>
           <label>上下文模式
             <select id="s-mode">
               <option value="recent_only">滚动上下文（只留最近 N 条）</option>
@@ -175,6 +225,36 @@
           <p class="hint">
             上面 4 个字段就是人设的全部内容，保存时会自动变成提示词。
           </p>
+
+          <!-- 🆕 人设参考图（2026-09-25）—— 情绪「用户能填的就让用户改」。
+               🔴 为什么是"上传"而不是"让用户填路径"：
+                  ① 手机 App 壳上根本没有后端文件系统可填；
+                  ② 让人去改 .env = 要他登服务器改配置再重启，那不叫能改；
+                  ③ 人设是**一对多**的（一张卡一个角色）→ 参考图必须跟着人设走，
+                     全局一个值会让所有角色共用一张脸。
+               ⚠️ 用 `<label for=…>` 包住原生 file input（与 `import-file` 同款做法）：
+                  原生控件在手机上难点、各浏览器文案还不一样，包一层更稳。 -->
+          <div class="ref-block">
+            <span class="ref-title">角色参考图 <small>（生图时固定长相；只作用于自拍类）</small></span>
+            <div class="ref-row">
+              <img id="p-ref-preview" class="ref-thumb hidden" alt="参考图预览" />
+              <div class="ref-side">
+                <span class="hint" id="p-ref-hint">未设置</span>
+                <div class="row">
+                  <label>选择图片
+                    <input id="p-ref-file" type="file"
+                      accept="image/png,image/jpeg,image/webp" />
+                  </label>
+                  <button type="button" id="p-ref-upload" disabled>上传</button>
+                  <button type="button" id="p-ref-delete" class="danger">删除</button>
+                </div>
+              </div>
+            </div>
+            <p class="hint">
+              自拍时<strong>自动带上这张图</strong>，所以同一个角色的五官/画风才稳定。
+              <strong>改图（edit）不会用它</strong> —— 那类请求改的是你当时发的那张图。
+            </p>
+          </div>
         </form>
       </div>
     </div>
@@ -535,9 +615,39 @@
 
   <!-- ============ 插件（情绪报的"没有配置入口"补在这） ============ -->
   <section id="tab-plugins" class="panel hidden">
+    <!-- 🔴 插件**启停**（照真 AstrBot 的 inactivated_plugins）。
+         判据必须真浏览器验："有没有这个元素" 与 "值对不对" 是两件事，
+         `curl` 验不了 JS。 -->
+    <h3>插件启停 <small>（停用的插件不会被加载，也不算加载失败）</small></h3>
+    <p class="hint" id="plugin-switch-hint">正在读取…</p>
+    <div id="plugin-switch-list" class="switch-list"></div>
+    <div class="row">
+      <button type="button" id="plugin-switch-save">保存启停设置</button>
+      <span class="hint" id="plugin-switch-saved"></span>
+    </div>
+
     <h3>插件拓展页 <small>（AstrBot 插件自带的面板）</small></h3>
     <p class="hint" id="plugins-hint">正在读取…</p>
     <ul id="plugin-page-list" class="list"></ul>
+
+    <!-- ==================== 插件详情 ====================
+         照真 AstrBot 的「插件详情页」：点插件行上的「详情」进来，
+         看它**到底注册了什么**（指令 / LLM 工具 / 事件监听器 / 钩子 / 拓展页）
+         + 版本作者 + 出错时的完整堆栈。
+
+         🔴 为什么当初"详情页没了"（2026-09-27 情绪报障）：
+            不是这个块被删了，而是**插件页入口列表被压成 0 高度**
+            （见 app.css 里 `#plugin-page-list` 那段注释的完整取证）。
+         🔴 三种视图（列表 / 拓展页 iframe / 详情）**互斥**由
+            `showPluginsView()` 一处管 —— 各写各的必然漏一条路径。 -->
+    <div id="plugin-detail-wrap" class="hidden">
+      <div class="row frame-bar">
+        <button type="button" id="plugin-detail-back">← 返回插件列表</button>
+        <strong id="plugin-detail-title"></strong>
+        <span class="hint" id="plugin-detail-hint"></span>
+      </div>
+      <div id="plugin-detail-body" class="detail-body"></div>
+    </div>
 
     <!-- 打开插件页时就地嵌进来（同源 iframe；插件页靠 /static/plugin_page_bridge.js 取数） -->
     <div id="plugin-frame-wrap" class="frame-wrap hidden">
@@ -549,6 +659,7 @@
       <iframe id="plugin-frame" class="plugin-frame" title="插件拓展页"></iframe>
     </div>
   </section>
+  </div><!-- /.content-body -->
 </main>
 </div><!-- /.app -->
 

@@ -145,7 +145,7 @@ cd /root/Ai-works/情绪app
 TOK=$(grep '^EMOTION_AUTH_ACCESS_TOKEN=' .env | cut -d= -f2- | tr -d "'\"")
 for t in login_check settings_check logs_check provider_panel_check chat_persona_check \
          plugin_persona_check panel_binding_check mobile_check session_userid_check; do
-  .venv/bin/python tools/$t.py http://127.0.0.1:6190 "$TOK" | tail -2
+  .venv/bin/python tools/$t.py http://127.0.0.1:6191 "$TOK" | tail -2
 done
 
 # 注入验证（判据能不能失败）

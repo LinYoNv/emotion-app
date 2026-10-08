@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -30,6 +31,7 @@ from ..domain.persona_import import (
     to_export_dict,
 )
 from ..domain.persona_repo import PersonaNotFound
+from ..domain import persona_ref as persona_ref_mod
 from ..domain.session_repo import SessionNotFound
 from ..domain.settings import WRITABLE_FIELDS
 from ..infra.logging_setup import get_logger
@@ -60,8 +62,6 @@ async def _save_avatar(persona_id: str, data: bytes) -> str:
         raise ValueError(f"头像过大（{len(data)} > {MAX_AVATAR_BYTES}）")
     name = f"{persona_id}.png"
     # 走 asyncio 的线程池，别在事件循环里做阻塞 IO
-    import asyncio
-
     await asyncio.to_thread((_avatar_dir() / name).write_bytes, data)
     return name
 
@@ -100,6 +100,48 @@ def build_blueprint(require_auth: Any) -> Blueprint:
         from quart import current_app
 
         return current_app.config.get("EMOTION_SESSIONS")
+
+    def _session_payload(s: Any) -> dict[str, Any]:
+        """会话的对外形状 —— **唯一**的一处（六条路由都走它）。
+
+        🔴 为什么要收成一个函数：会话响应在多处被 jsonify（列表/新建/详情/
+           改/清空/已读/换 umo）。各写一遍的话，新增字段必然漏掉其中几处 ——
+           本项目已经因为"同一概念有多条写入路径"栽过三次
+           （供应商类型过滤 / `LLMResponse` 三条转换路径 / 平台元数据三处来源）。
+
+        🆕 在 `to_dict()` 之上多给两个**派生**字段：
+          * `umo`      —— 完整 umo（`11:FriendMessage:<user_id>`）。
+                          ⭐ 情绪 2026-09-26 要的：他拿这个值去陪伴面板建档、
+                          开主动消息（「陪你插件不就是靠 umo 去识别用户的嘛」）。
+                          没绑 user_id 的旧会话 → **空串**（不是编一个假的）。
+          * `platform` —— umo 第一段（平台实例 id），便于面板显示"发到哪个平台"。
+        """
+        d = s.to_dict()
+        uid = str(d.get("user_id") or "")
+        umo = ""
+        if uid:
+            try:
+                # 🔴 **必须复用宿主的唯一权威定义**（`host/astrbot_host/umo.py`）：
+                #    `host/tests/test_umo.py` 有一条判据禁止第二处手写 umo 片段，
+                #    前端更是绝对不能自己拼（它连平台 id 都不知道）。
+                from .plugin_host import ensure_host_on_path
+
+                ensure_host_on_path()
+                from astrbot_host.umo import build_umo
+
+                umo = build_umo(uid)
+            except Exception:  # noqa: BLE001
+                # 插件宿主不可用（如 `plugins.enabled=false`）时**如实留空并留痕**，
+                # 绝不静默返回一个"看起来对"的 umo（那会让用户去陪伴面板
+                # 建一个永远收不到消息的用户）。
+                log.warning(
+                    "计算会话 umo 失败（插件宿主不可用？）—— 该会话的 umo 将为空",
+                    extra={"data": {"session": d.get("id")}},
+                    exc_info=True,
+                )
+        d["umo"] = umo
+        d["platform"] = umo.split(":", 1)[0] if umo else ""
+        return d
 
     # ==================================================================
     # 人设 CRUD
@@ -912,6 +954,189 @@ def build_blueprint(require_auth: Any) -> Blueprint:
         return await send_from_directory(_avatar_dir(), name)
 
     # ==================================================================
+    # 🆕 人设参考图（2026-09-25）—— 情绪「用户能填的就让用户改」
+    # ==================================================================
+    #
+    # 🔴 为什么做成"上传"而不是"让用户填一个路径"：
+    #   ① 手机 App 壳上**根本没有可填的文件系统路径**（那是后端机器的路径）；
+    #   ② 让用户去改 `.env` = 要求他登服务器改配置再重启 —— 那不叫"用户能改"；
+    #   ③ 人设是**一对多**的（一张卡一个角色）→ 参考图必须**跟着人设走**，
+    #      全局一个值会让所有角色共用一张脸。
+    #   → `.env` 的 `EMOTION_IMAGE_PERSONA_REFERENCE` 保留为**全局兜底**
+    #     （只有一个角色时最省事），但不再是唯一入口。
+
+    @bp.post("/personas/<persona_id>/reference")
+    async def upload_persona_reference(persona_id: str):  # type: ignore[no-untyped-def]
+        """上传某个人设的参考图。
+
+        表单字段 `file`（png/jpg/jpeg/webp，≤ `MAX_PERSONA_REF_BYTES`）。
+
+        ⚠️ **先校验再落盘**：格式/大小不对**不能**写进 `data/persona_refs/`
+        （否则磁盘上留一堆永远用不到的文件，而面板显示"已配置"）。
+        """
+        denied = require_auth()
+        if denied is not None:
+            return denied
+        repo, _, _ = _svc()
+
+        try:
+            await repo.get(persona_id)
+        except PersonaNotFound:
+            return _err(f"人设不存在：{persona_id}", "not_found", 404)
+
+        files = await request.files
+        upload = files.get("file") if files else None
+        if upload is None:
+            return _err(
+                "请提供表单字段 `file`（PNG/JPEG/WebP 图片）",
+                "invalid_request_error",
+                400,
+            )
+
+        filename = getattr(upload, "filename", "") or ""
+        suffix = Path(filename).suffix.lower()
+        if suffix not in persona_ref_mod.ALLOWED_SUFFIXES:
+            return _err(
+                f"只支持 {list(persona_ref_mod.ALLOWED_SUFFIXES)}，"
+                f"当前 {suffix or '(无扩展名)'}",
+                "invalid_request_error",
+                400,
+            )
+
+        try:
+            data = upload.read()
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"读取上传文件失败：{exc}", "invalid_request_error", 400)
+        if not isinstance(data, bytes):
+            data = str(data).encode("utf-8")
+        if not data:
+            return _err("上传的文件是空的", "invalid_request_error", 400)
+        if len(data) > persona_ref_mod.MAX_PERSONA_REF_BYTES:
+            return _err(
+                f"参考图过大（{len(data)} > {persona_ref_mod.MAX_PERSONA_REF_BYTES}）",
+                "invalid_request_error",
+                400,
+            )
+
+        # 文件名 = `人设id` + 原扩展名：**一个人设只有一张**，
+        # 重复上传直接覆盖（不累积垃圾文件）。用 id 不用名字 —— 名字可改、可重复。
+        safe_id = persona_id
+        if Path(safe_id).name != safe_id or safe_id.startswith("."):
+            return _err("人设 id 非法", "invalid_request_error", 400)
+        target = persona_ref_mod.ref_dir() / f"{safe_id}{suffix}"
+
+        try:
+            await asyncio.to_thread(target.write_bytes, data)
+        except OSError as exc:
+            # 🔴 写盘失败**必须响亮**（不能"看起来保存成功、其实没落地"）
+            log.warning(
+                "人设参考图落盘失败",
+                extra={"data": {"persona": persona_id, "error": str(exc)}},
+            )
+            return _err(f"参考图保存失败：{exc}", "server_error", 500)
+
+        # 换扩展名时要**清掉旧文件**，否则磁盘留垃圾、且与字段显示不一致
+        old = str(getattr(await repo.get(persona_id), "reference_image_path", "") or "")
+        if old and old != target.name and persona_ref_mod.is_safe_name(old):
+            stale = persona_ref_mod.ref_dir() / old
+            if stale.is_file():
+                try:
+                    await asyncio.to_thread(stale.unlink)
+                    log.info(
+                        "旧人设参考图已清理",
+                        extra={"data": {"persona": persona_id, "file": stale.name}},
+                    )
+                except OSError as exc:  # noqa: BLE001
+                    # 清理失败**不影响新图生效**（新名字已在字段里），但要留痕
+                    log.warning(
+                        "旧人设参考图清理失败",
+                        extra={"data": {"file": stale.name, "error": str(exc)}},
+                    )
+
+        try:
+            updated = await repo.update(
+                persona_id, {"reference_image_path": target.name}
+            )
+        except (PersonaNotFound, ValueError, StorageError) as exc:
+            return _err(f"保存参考图字段失败：{exc}", "invalid_request_error", 400)
+
+        log.info(
+            "人设参考图已上传",
+            extra={"data": {
+                "persona": persona_id,
+                "bytes": len(data),
+                "suffix": suffix,
+            }},
+        )
+        return jsonify({"ok": True, "persona": updated.to_dict()}), 200
+
+    @bp.get("/personas/<persona_id>/reference")
+    async def get_persona_reference(persona_id: str):  # type: ignore[no-untyped-def]
+        """取人设参考图。**需鉴权**（同头像，属私有内容）。"""
+        denied = require_auth()
+        if denied is not None:
+            return denied
+        repo, _, _ = _svc()
+        try:
+            p = await repo.get(persona_id)
+        except PersonaNotFound:
+            return _err(f"人设不存在：{persona_id}", "not_found", 404)
+
+        name = str(getattr(p, "reference_image_path", "") or "")
+        if not name:
+            return _err("该人设没有参考图", "not_found", 404)
+        # 🔴 只允许参考图目录下的**纯文件名**，防路径穿越
+        if not persona_ref_mod.is_safe_name(name):
+            return _err("参考图路径非法", "invalid_request_error", 400)
+        if not (persona_ref_mod.ref_dir() / name).is_file():
+            return _err("参考图文件不存在", "not_found", 404)
+        return await send_from_directory(persona_ref_mod.ref_dir(), name)
+
+    @bp.delete("/personas/<persona_id>/reference")
+    async def delete_persona_reference(persona_id: str):  # type: ignore[no-untyped-def]
+        """删除人设参考图（字段与文件一起清）。
+
+        ⚠️ 即使文件已经不在，也**要把字段清掉** —— 否则面板会一直显示"已配置"
+           而实际生图时读不到（那就是本项目最忌的"看着有、其实没有"）。
+        """
+        denied = require_auth()
+        if denied is not None:
+            return denied
+        repo, _, _ = _svc()
+        try:
+            p = await repo.get(persona_id)
+        except PersonaNotFound:
+            return _err(f"人设不存在：{persona_id}", "not_found", 404)
+
+        name = str(getattr(p, "reference_image_path", "") or "")
+        removed = False
+        if name and persona_ref_mod.is_safe_name(name):
+            path = persona_ref_mod.ref_dir() / name
+            if path.is_file():
+                try:
+                    await asyncio.to_thread(path.unlink)
+                    removed = True
+                except OSError as exc:  # noqa: BLE001
+                    log.warning(
+                        "人设参考图删除失败",
+                        extra={"data": {"persona": persona_id, "error": str(exc)}},
+                    )
+                    return _err(f"参考图删除失败：{exc}", "server_error", 500)
+
+        try:
+            updated = await repo.update(persona_id, {"reference_image_path": ""})
+        except (PersonaNotFound, ValueError, StorageError) as exc:
+            return _err(f"清除参考图字段失败：{exc}", "invalid_request_error", 400)
+
+        log.info(
+            "人设参考图已删除",
+            extra={"data": {"persona": persona_id, "file_removed": removed}},
+        )
+        return jsonify(
+            {"ok": True, "file_removed": removed, "persona": updated.to_dict()}
+        ), 200
+
+    # ==================================================================
     # 提示词片段（人设内的 sections，单独管理便于面板编辑）
     # ==================================================================
 
@@ -958,7 +1183,7 @@ def build_blueprint(require_auth: Any) -> Blueprint:
 
         items = await repo.list()
         return jsonify(
-            {"object": "list", "data": [s.to_dict() for s in items]}
+            {"object": "list", "data": [_session_payload(s) for s in items]}
         ), 200
 
     @bp.post("/sessions")
@@ -991,7 +1216,7 @@ def build_blueprint(require_auth: Any) -> Blueprint:
             user_id=str(body.get("user_id") or ""),
             policy=policy,
         )
-        return jsonify(s.to_dict()), 201
+        return jsonify(_session_payload(s)), 201
 
     @bp.get("/sessions/<session_id>")
     async def get_session(session_id: str):  # type: ignore[no-untyped-def]
@@ -1003,7 +1228,7 @@ def build_blueprint(require_auth: Any) -> Blueprint:
             s = await repo.get(session_id)
         except SessionNotFound:
             return _err(f"会话不存在：{session_id}", "not_found", 404)
-        return jsonify(s.to_dict()), 200
+        return jsonify(_session_payload(s)), 200
 
     @bp.get("/sessions/<session_id>/messages")
     async def get_session_messages(session_id: str):  # type: ignore[no-untyped-def]
@@ -1058,7 +1283,7 @@ def build_blueprint(require_auth: Any) -> Blueprint:
         except (ValueError, Exception) as exc:  # noqa: BLE001
             return _err(f"更新失败：{exc}", "invalid_request_error", 400)
 
-        return jsonify(s.to_dict()), 200
+        return jsonify(_session_payload(s)), 200
 
     @bp.delete("/sessions/<session_id>")
     async def delete_session(session_id: str):  # type: ignore[no-untyped-def]
@@ -1084,7 +1309,78 @@ def build_blueprint(require_auth: Any) -> Blueprint:
         except SessionNotFound:
             return _err(f"会话不存在：{session_id}", "not_found", 404)
         s = await repo.get(session_id)
-        return jsonify({"ok": True, "session": s.to_dict()}), 200
+        return jsonify({"ok": True, "session": _session_payload(s)}), 200
+
+    @bp.post("/sessions/<session_id>/read")
+    async def mark_session_read(session_id: str):  # type: ignore[no-untyped-def]
+        """把该会话标记为**已读**（未读数清零）。
+
+        🔴 谁调它：面板**真的打开了这个会话**时（`selectSession`）。
+           为什么状态必须由服务端记而不是只在前端：未读要跨刷新/跨设备一致
+           —— 手机上跳出来的红点，在电脑上打开该会话后也该消失。
+        """
+        denied = require_auth()
+        if denied is not None:
+            return denied
+        repo = _sessions()
+        if repo is None:
+            return _err("会话服务未就绪", "server_error", 503)
+        try:
+            s = await repo.mark_read(session_id)
+        except SessionNotFound:
+            return _err(f"会话不存在：{session_id}", "not_found", 404)
+        return jsonify({"ok": True, "session": _session_payload(s)}), 200
+
+    @bp.post("/sessions/<session_id>/umo")
+    async def regenerate_session_umo(session_id: str):  # type: ignore[no-untyped-def]
+        """给该会话**换一个新的专属 umo 标签**（= 插件用户 id）。
+
+        🔴 为什么要有这个按钮（而不是让用户自己编一个）：
+           取值有三条硬约束（不能全数字 / 不能含冒号或空白 / 不能撞保留名
+           `scheduler`），它们是**插件源码实测**出来的知识，
+           不该指望用户背下来 —— 服务端一次生成到位。
+
+        ⚠️ **这是"换库"级别的动作**：插件按这个值存记忆/关系/主动消息开关。
+           换掉它，插件那边就是**另一个用户**（旧数据仍在旧标签下、不会丢，
+           但这个会话之后写的东西全落在新标签下）。所以：
+             * 只在用户**显式点击**时执行（不自动、不后台）；
+             * 响应里如实带出 `previous`，让面板能显示"从 X 换成 Y"。
+        """
+        denied = require_auth()
+        if denied is not None:
+            return denied
+        repo = _sessions()
+        if repo is None:
+            return _err("会话服务未就绪", "server_error", 503)
+        try:
+            previous = (await repo.get(session_id)).user_id
+        except SessionNotFound:
+            return _err(f"会话不存在：{session_id}", "not_found", 404)
+
+        s = await repo.update(session_id, {"user_id": await repo.new_umo_user_id()})
+        log.info(
+            "会话换 umo 标签",
+            extra={"data": {"session": session_id, "previous": previous, "now": s.user_id}},
+        )
+        return jsonify({"ok": True, "previous": previous, "session": _session_payload(s)}), 200
+
+    @bp.get("/unread")
+    async def unread_summary():  # type: ignore[no-untyped-def]
+        """未读汇总（侧边栏「聊天」那个圆圈数字的来源）。
+
+        形状：`{"total": N, "sessions": {<session_id>: <未读>}}`
+        ⚠️ 只返回**未读 > 0** 的会话 —— 全量返回会让这个"只为显示一个数字"
+           的接口随会话数线性变大。
+        """
+        denied = require_auth()
+        if denied is not None:
+            return denied
+        repo = _sessions()
+        if repo is None:
+            return _err("会话服务未就绪", "server_error", 503)
+        items = await repo.list()
+        by_id = {s.id: s.unread for s in items if s.unread > 0}
+        return jsonify({"total": sum(by_id.values()), "sessions": by_id}), 200
 
     @bp.post("/sessions/<session_id>/summarize")
     async def summarize_session(session_id: str):  # type: ignore[no-untyped-def]

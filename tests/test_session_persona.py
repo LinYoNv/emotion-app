@@ -432,14 +432,45 @@ async def test_user_id_rejects_inner_whitespace(tmp_path):
         await store.close()
 
 
-async def test_user_id_empty_is_legal(tmp_path):
-    """空串是**合法**的（= 跟随全局），不能报错。"""
+async def test_user_id_is_auto_assigned_when_empty(tmp_path):
+    """🔴 空串不再是"跟随全局" —— 新建会话时**自动分配一个专属 umo 标签**。
+
+    情绪 2026-09-26：「每个会话都带一个唯一标签 umo，这样我就能自己到陪伴那边
+    添加"用户"和测试主动消息等东西了，陪伴插件不就是靠 umo 去识别用户的嘛」
+
+    ⚠️ 这条判据同时守三件事（每一条都能单独失败）：
+      ① 自动分配（不是空串）；
+      ② **两个会话拿到不同的标签**（"唯一"的意义所在 —— 共用一个就退回了
+         旧行为：所有会话在插件眼里是同一个用户）；
+      ③ 标签本身**不违反插件侧的三条约束**（非全数字 / 无冒号空白 / 不是
+         `scheduler`）—— 见 `session_repo._new_umo_user_id` 的 docstring。
+    """
     svc, personas, sessions, settings, store = await _svc(tmp_path)
     try:
         s = await sessions.create(title="会话", user_id="")
-        assert s.user_id == ""
+        assert s.user_id, "空 user_id 应自动分配一个专属标签，而不是留空"
         s2 = await sessions.create(title="会话2", user_id="   ")
-        assert s2.user_id == "", "全空白应规整成空串（跟随全局），而不是报错"
+        assert s2.user_id, "全空白同样走自动分配"
+        assert s.user_id != s2.user_id, "两个会话必须拿到**不同**的 umo 标签"
+
+        for uid in (s.user_id, s2.user_id):
+            assert not uid.isdigit(), f"全数字会被插件当成 QQ 用户：{uid!r}"
+            assert ":" not in uid and not any(c.isspace() for c in uid), uid
+            assert uid.strip().lower() != "scheduler", uid
+
+        # 能用这个标签反查回会话（主动消息投递就靠这条）
+        assert (await sessions.by_user_id(s.user_id)).id == s.id
+    finally:
+        await store.close()
+
+
+async def test_new_umo_user_id_avoids_collision(tmp_path):
+    """`new_umo_user_id()` 不会撞上任何已占用的标签（面板「换一个」用它）。"""
+    svc, personas, sessions, settings, store = await _svc(tmp_path)
+    try:
+        taken = {(await sessions.create(title=f"c{i}")).user_id for i in range(5)}
+        new = await sessions.new_umo_user_id()
+        assert new not in taken, f"生成了已被占用的标签：{new!r}"
     finally:
         await store.close()
 

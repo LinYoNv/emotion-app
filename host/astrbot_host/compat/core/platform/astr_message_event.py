@@ -75,6 +75,51 @@ class MessageChain:
         return self.get_plain_text()
 
 
+def _normalize_message_type(message_obj: Any) -> Any:
+    """把 `message_obj.type` 归一成 `MessageType` —— 照真实现 `:62-74` 逐条。
+
+    真实现原话（`core/platform/astr_message_event.py:62-74`）：
+    ```python
+    message_type = getattr(message_obj, "type", None)
+    if not isinstance(message_type, MessageType):
+        try:
+            message_type = MessageType(str(message_type))
+        except (ValueError, TypeError, AttributeError):
+            logger.warning(
+                f"Failed to convert message type {message_obj.type!r} to MessageType. "
+                f"Falling back to FRIEND_MESSAGE."
+            )
+            message_type = MessageType.FRIEND_MESSAGE
+    ```
+
+    ⚠️ 两处**有意**与真实现不同，都只影响真实现里不存在的情形：
+      ① `message_obj` 为 `None` → 直接给 `FRIEND_MESSAGE`（真实现 4 个参数
+         全必填，没有"没有 message_obj"的事件；这是我们容忍式构造的退路，
+         不为此打 warning）；
+      ② 没有 `type` 属性 → 也给 `FRIEND_MESSAGE` 而不打 warning
+         （真实现走到这条路上，f-string 里的 `message_obj.type` 会先抛
+         `AttributeError`）。
+    """
+    from astrbot_host.compat.core.platform.message_type import MessageType
+
+    if message_obj is None:
+        return MessageType.FRIEND_MESSAGE
+    raw = getattr(message_obj, "type", None)
+    if isinstance(raw, MessageType):
+        return raw
+    if raw is None:
+        return MessageType.FRIEND_MESSAGE
+    try:
+        return MessageType(str(raw))
+    except (ValueError, TypeError, AttributeError):
+        logger.warning(
+            "Failed to convert message type %r to MessageType. "
+            "Falling back to FRIEND_MESSAGE.",
+            raw,
+        )
+        return MessageType.FRIEND_MESSAGE
+
+
 class AstrMessageEvent:
     """一次消息事件（宿主侧）。
 
@@ -108,22 +153,93 @@ class AstrMessageEvent:
 
     def __init__(
         self,
-        *,
         message_str: str = "",
         message_obj: Any = None,
+        platform_meta: Any = None,
+        session_id: str = "",
+        *,
         unified_msg_origin: str = "",
         sender_id: str = "",
         sender_name: str = "",
         self_id: str = "",
-        platform_name: str = "webchat",
+        platform_name: str | None = None,
         platform_id: str = "",
-        is_private: bool = True,
+        is_private: bool | None = None,
         is_admin: bool = True,
-        session_id: str = "",
     ) -> None:
+        """构造事件。
+
+        ⭐⭐ **前 4 个参数的位置顺序照真实现**（`core/platform/astr_message_event.py:37-42`）：
+        `(message_str, message_obj, platform_meta, session_id)` —— 插件就是这么构造的
+        （`proactive_message.py:16792`、`image_runtime.py:20816`，以及两个
+        `SyntheticPrivateWakeEvent` 子类的 `super().__init__(...)`）。
+
+        🔴 2026-09-26 之前这里签名是**关键字-only**，这种位置调用直接
+        `TypeError: AstrMessageEvent.__init__() takes 1 positional argument but 5 were given`，
+        被插件的 `except Exception`（`proactive_message.py:16821`）接住成一行 debug 日志
+        → **整条主动消息装饰链永久不执行**（真机 `logs/serve.out` 里 23 次）。
+
+        **推导规则**：真实现里下面这些字段**都不是入参**，而是各 getter 现读
+        （`:199` self_id · `:205-215` sender · `:255` 消息类型 ·
+        `:126`/`:133` `platform_meta.name`/`.id` · `:75-79` session_id）。
+        显式传入的关键字**优先**（我们自己的派发链路 `umo.py:553` 显式传），
+        没传的才推导：
+
+        | 参数 | 未显式传入时 |
+        |---|---|
+        | `sender_id` | `message_obj.sender.user_id`（真实现只认 `str`，其余给空） |
+        | `sender_name` | `message_obj.sender.nickname`（`None` → 空，非 `str` → `str(...)`） |
+        | `self_id` | `message_obj.self_id` |
+        | `is_private` | `message_obj.type` 是不是 `MessageType.FRIEND_MESSAGE` |
+        | `platform_name` / `platform_id` | `platform_meta.name` / `platform_meta.id` |
+        | `session_id` | 传入值 → `unified_msg_origin` → `message_obj.session_id` |
+        | `unified_msg_origin` | 给了 `platform_meta` 时照真实现 `:75-79` 造 session |
+
+        ⚠️ **未从 `message_obj` / `platform_meta` 推导**的字段（真实现同样不推导，
+           别顺手补）：`message_str`（真实现 `:43` 原样存传入值）、
+           `role`/`is_admin`（真实现 `:46` 恒以 `"member"` 起，由 waking stage 再改）、
+           `is_wake` / `is_at_or_wake_command` / `call_llm` / `plugins_name`。
+
+        ⚠️ `platform_name` / `is_private` 用 `None` 当"没传"的哨兵 ——
+           因为这两个参数**今天有非空默认值**（`"webchat"` / `True`），
+           用空值当哨兵就分不清"没传"与"传了默认值"。其余参数默认值本就是空串。
+        """
         self.message_str = message_str
         self.message_obj = message_obj
-        self.session_id = session_id or unified_msg_origin
+        if platform_meta is not None:
+            # 真实现 `:47` 恒设 `platform_meta`，`:103` 还留了 `platform` 这个
+            # back_compability 别名。⚠️ **只在给了才设**：我们自己的容忍式构造
+            # （无平台，`umo.py:576-577` 是构造后再补）不设，`hasattr` 探测的语义不变。
+            self.platform_meta = platform_meta
+            self.platform = platform_meta
+
+        # ---- 未显式传入的字段：按真实现从 message_obj / platform_meta 推导 ----
+        from astrbot_host.compat.core.platform.message_type import MessageType
+
+        sender = getattr(message_obj, "sender", None)
+        if not sender_id:
+            user_id = getattr(sender, "user_id", None)
+            # 真实现 `get_sender_id` 只认 `str`，其余一律给空（`:205-209`）
+            sender_id = user_id if isinstance(user_id, str) else ""
+        if not sender_name:
+            nickname = getattr(sender, "nickname", None)
+            # 真实现 `get_sender_name`：`None` → `""`，非 `str` → `str(...)`（`:211-219`）
+            sender_name = "" if nickname is None else str(nickname)
+        if not self_id:
+            self_id = getattr(message_obj, "self_id", "") or ""
+        if not platform_id:
+            platform_id = getattr(platform_meta, "id", "") or ""
+        if platform_name is None:
+            # 推导不到（含没给 platform_meta）时用今天的默认值，不是伪造平台名
+            platform_name = getattr(platform_meta, "name", "") or "webchat"
+        message_type = _normalize_message_type(message_obj)
+        if is_private is None:
+            # 真实现 `is_private_chat()` 就是"消息类型是不是 FRIEND"（`:255`）
+            is_private = message_type is MessageType.FRIEND_MESSAGE
+
+        self.session_id = session_id or unified_msg_origin or (
+            getattr(message_obj, "session_id", "") or ""
+        )
         self._sender_id = sender_id
         self._sender_name = sender_name
         self._self_id = self_id
@@ -165,6 +281,20 @@ class AstrMessageEvent:
         self._umo = ""
         if unified_msg_origin:
             self.unified_msg_origin = unified_msg_origin
+        elif platform_meta is not None:
+            # 🔴 真实现 `:75-79` **必建** session，`unified_msg_origin` 就是
+            #    `str(self.session)`（`:106-108`）—— 插件那条主动消息装饰链
+            #    靠它认会话：`main.py:9303` 起，umo 里没有 `":FriendMessage:"`
+            #    就直接 return。不建 session = 把 TypeError 换成
+            #    "钩子拿到空 umo 后静默早退"，症状一模一样。
+            from astrbot_host.compat.core.platform.message_session import MessageSession
+
+            self.session = MessageSession(
+                platform_name=self._platform_id or self._platform_name,
+                message_type=message_type,
+                session_id=self.session_id,
+            )
+            self.session_id = self.session.session_id
 
     # ================= 高频：上下文容器 =================
 

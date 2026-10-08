@@ -76,6 +76,20 @@ class Session:
     #: 消息计数（避免为了显示条数而读全文）
     message_count: int = 0
 
+    #: 🔴 **未读消息数**（情绪 2026-09-26 要的「聊天旁边那个圆圈 3」）。
+    #:
+    #: 语义（**只有一种来源会 +1**，这一点是刻意的）：
+    #:   * **插件主动消息**（`SessionDelivery`）落进某个会话 → +1。
+    #:     那是"用户不在场时进来的东西"，也正是这个提示存在的理由；
+    #:   * 用户自己发起的聊天（`ChatService.record`）→ **不 +1**。
+    #:     他此刻就在这个页面上看着，把它算成"未读"是假阳性。
+    #:     ⚠️ 服务端**无法知道**用户当前打开的是哪个会话（那是纯前端状态），
+    #:        所以判据只能落在"这条消息是不是用户自己触发的"上 ——
+    #:        宁可少报（用户自己聊的不提示），也不要多报（每次聊天都蹦一个红点）。
+    #:
+    #: 清零路径（唯一）：面板打开该会话时调 `mark_read()`。
+    unread: int = 0
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -88,6 +102,7 @@ class Session:
             "summary": self.summary,
             "summarized_upto": self.summarized_upto,
             "message_count": self.message_count,
+            "unread": self.unread,
         }
 
     @classmethod
@@ -104,6 +119,10 @@ class Session:
             summary=str(d.get("summary") or ""),
             summarized_upto=int(d.get("summarized_upto", 0)),
             message_count=int(d.get("message_count", 0)),
+            # ⚠️ 旧数据没有这个字段 → 0（"没有未读"，不是"不知道"）：
+            #    存量会话本来就没有"用户没看过的主动消息"这个概念，
+            #    给它们补一个非 0 的初值反而会在面板上凭空冒红点。
+            unread=max(0, int(d.get("unread", 0) or 0)),
         )
 
 
@@ -139,6 +158,39 @@ def _normalize_user_id(raw: Any, *, session_id: str = "") -> str:
     if any(c.isspace() for c in uid):
         raise ValueError(f"插件用户 ID 不能含空白字符：{uid!r}")
     return uid
+
+
+def _new_umo_user_id() -> str:
+    """给**新会话**生成一个独有的插件用户 id（= umo 的第三段）。
+
+    🔴 为什么每个会话都要有自己的（情绪 2026-09-26 的原话）：
+        「每个会话都带一个唯一标签 umo，这样我就能自己到陪伴那边
+          添加"用户"和测试主动消息等东西了，**陪伴插件不就是靠 umo 去识别用户的嘛**」
+
+       陪伴把**每个用户**的数据（记忆/关系/主动消息开关）挂在
+       `data["users"][<这个值>]` 下 —— 所以"一个会话一个 umo"就等于
+       "陪伴面板里一个会话一个用户"，用户可以直接按这个 umo 去建档、开主动消息。
+
+    ⚠️ **取值必须挑过，不能随便**（三条都是插件源码实测出来的）：
+
+    ① **不能是全数字** —— `page_api.py:17719` 用 `user_id_text.isdigit()`
+       判"是不是 QQ 用户"，命中就走 onebot 那套（`platform_kind="onebot"`）。
+       我们是 webchat，冒充 QQ 会让插件的能力判定走错分支。
+
+    ② **不能含冒号 / 空白** —— umo 是 `A:B:C` 三段，第三段带冒号会被
+       `split(":", 2)` 语义之外的解析截断（见 `_normalize_user_id`）。
+
+    ③ **不能出现 `scheduler`** —— 插件 `tts_tool_sanitizer.py:69` 会把
+       `sender_name == "scheduler"` 当成"定时任务伪事件"（静默降级、文本可能发两次）；
+       `host/astrbot_host/umo.py` 的 `build_inbound_event` 也会**当场抛错**。
+       我们这里的随机段是十六进制，理论上撞不上，但"理论上"不是判据。
+
+    形如 `sess-a1b2c3d4e5f6`（12 位十六进制 = 48 bit）。
+    ⚠️ 用**随机**而不是"会话 id 前 12 位"：会话 id 本身也是随机十六进制，
+       但两者同源会让"用户 id 反推会话 id"变成可能，且将来会话 id 规则一变
+       就会**集体换库**（插件侧数据全对不上）。随机值与它解耦。
+    """
+    return f"sess-{uuid.uuid4().hex[:12]}"
 
 
 class SessionRepository:
@@ -183,12 +235,31 @@ class SessionRepository:
         policy: ContextPolicy | None = None,
         session_id: str = "",
     ) -> Session:
+        """新建会话。
+
+        🔴 **`user_id` 留空 = 自动分配一个该会话专属的 umo 标签**
+           （`sess-xxxxxxxxxxxx`，见 `_new_umo_user_id` 的三条取值约束）。
+
+        为什么默认自动分配（情绪 2026-09-26「每个会话都带一个唯一标签 umo」）：
+          留空时老行为是"所有会话共用全局 `plugins.umo_user_id`（默认 `default`）"
+          —— 三个会话在插件世界里是**同一个用户**，记忆/关系/主动消息开关
+          全是同一份，既不能单独开主动消息，也没法在陪伴面板里按会话建档。
+
+        ⚠️ **存量会话不会被自动改写**（只有 `create` 走自动分配）：
+           把一条已经和插件用户绑定的会话悄悄换成新 umo，会让插件那边的
+           记忆/关系**当场对不上**（等于静默换库）。存量会话要换标签，
+           由用户在面板上显式点「生成专用 umo」——那是一个可见的动作。
+        """
         sessions = await self._load_sessions()
+        uid = _normalize_user_id(user_id, session_id=session_id)
+        if not uid:
+            # 走与 `new_umo_user_id()` **同一份**规则（唯一性检查也在那里）
+            uid = await self.new_umo_user_id()
         s = Session(
             id=session_id or uuid.uuid4().hex,
             title=title or "新会话",
             persona_id=persona_id,
-            user_id=_normalize_user_id(user_id, session_id=session_id),
+            user_id=uid,
             policy=policy or ContextPolicy(),
         )
         s.policy.validate()
@@ -196,6 +267,23 @@ class SessionRepository:
         await self._save_sessions(sessions)
         log.info("会话已创建", extra={"data": {"id": s.id, "user_id": s.user_id}})
         return s
+
+    async def new_umo_user_id(self) -> str:
+        """生成一个**没被任何会话占用**的新 umo 标签（面板「换一个」按钮用）。
+
+        ⚠️ 与 `create()` 里的自动分配是**同一份规则**（`_new_umo_user_id`）——
+           两处各写一套的话，将来约束一变就会漂移：面板生成的值可能违反
+           某条约束，而插件那边**静默**按别的用户处理。
+        """
+        sessions = await self._load_sessions()
+        taken = {s.user_id for s in sessions.values()}
+        for _ in range(8):
+            candidate = _new_umo_user_id()
+            if candidate not in taken:
+                return candidate
+        raise StorageError(
+            "生成会话 umo 标签失败（8 次都撞上已有值）—— 随机源异常，已中止"
+        )
 
     async def by_user_id(self, user_id: str) -> Session | None:
         """按**插件用户 id** 找会话（方案 B：umo 第三段 → 会话）。
@@ -324,8 +412,21 @@ class SessionRepository:
         store = await self._load_messages()
         return [Message.from_dict(d) for d in store.get(session_id, [])]
 
-    async def append(self, session_id: str, new_messages: list[Message]) -> Session:
-        """追加消息并更新会话元数据（一次写入，避免两次持久化）。"""
+    async def append(
+        self,
+        session_id: str,
+        new_messages: list[Message],
+        *,
+        unread_delta: int = 0,
+    ) -> Session:
+        """追加消息并更新会话元数据（一次写入，避免两次持久化）。
+
+        Args:
+            unread_delta: 未读数增量。**只允许 +1 或 0**（见 `Session.unread`
+                的字段注释：只有"插件主动消息"那条路会 +1）。
+                ⚠️ 做一个**夹取**而不是原样加：传负数会把计数压成负数，
+                那是个"看着像 0、其实是坏的"状态。要清零走 `mark_read()`。
+        """
         sessions = await self._load_sessions()
         if session_id not in sessions:
             raise SessionNotFound(session_id)
@@ -357,6 +458,9 @@ class SessionRepository:
         if dropped:
             s.summarized_upto = max(0, s.summarized_upto - dropped)
 
+        if unread_delta > 0:
+            s.unread += int(unread_delta)
+
         await self._store.save_sections(
             {
                 SESSIONS_SECTION: {sid: x.to_dict() for sid, x in sessions.items()},
@@ -364,3 +468,25 @@ class SessionRepository:
             }
         )
         return s
+
+    async def mark_read(self, session_id: str) -> Session:
+        """把某会话的未读数清零（面板真正**打开**这个会话时调）。
+
+        🔴 为什么"清零"必须是**显式**一个方法，而不是 `update({"unread": 0})`：
+           `update()` 的字段白名单是"用户能编辑的东西"，
+           而未读数是**服务端状态**（由投递/打开这两条路径维护）。
+           混进白名单就等于让前端可以随便把它设成任意值 —— 那时候
+           `unread` 就不再是"有多少条没看"，而只是一个前端数字。
+        """
+        sessions = await self._load_sessions()
+        if session_id not in sessions:
+            raise SessionNotFound(session_id)
+        s = sessions[session_id]
+        if s.unread:
+            s.unread = 0
+            await self._save_sessions(sessions)
+        return s
+
+    async def unread_total(self) -> int:
+        """全部会话的未读总数（面板侧边栏那个圆圈的数字）。"""
+        return sum(s.unread for s in (await self._load_sessions()).values())

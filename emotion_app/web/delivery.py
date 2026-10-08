@@ -175,7 +175,7 @@ class SessionDelivery:
 
             # 会话不存在就建一个（插件的主动消息可能是第一句话）
             persona_id = self._current_persona_id()
-            await self._sessions.ensure(
+            session = await self._sessions.ensure(
                 session_id,
                 title=PROACTIVE_SESSION_TITLE,
                 persona_id=persona_id,
@@ -184,8 +184,20 @@ class SessionDelivery:
                 #    而不是孤儿会话（原来用 sha256 造 id，谁都找不到它）。
                 user_id=umo_user_id(umo),
             )
+            # ⚠️ `ensure` 返回的会话 id 可能与我们请求的不同：若这个 umo
+            #    已经绑在某条**用户自己的会话**上，`_resolve_session_id` 会先找到它
+            #    （那条路径返回的就是它的 id，一般一致）；但仓库实现若做了
+            #    规整/迁移，我们要以**它返回的那个**为准，否则消息会写进一条
+            #    刚刚被 ensure 判定为"不存在"的 id（写不进去，静默丢消息）。
+            real_sid = str(getattr(session, "id", "") or session_id)
             await self._sessions.append(
-                session_id, [Message(role=ROLE_ASSISTANT, content=text)]
+                real_sid,
+                [Message(role=ROLE_ASSISTANT, content=text)],
+                # 🔴 **未读 +1**：这是"用户不在场时进来的东西"，
+                #    正是侧边栏那个红点存在的理由（见 `Session.unread` 的注释）。
+                #    ⚠️ 用户自己发起的聊天**不 +1**（他此刻就在页面上看着）——
+                #       那条路径走 `ChatService.record`，压根不传这个参数。
+                unread_delta=1,
             )
         except Exception as exc:  # noqa: BLE001
             # 🔴 记 ERROR 并**如实失败** —— 绝不吞掉后返回 True（伪造送达）
@@ -199,11 +211,11 @@ class SessionDelivery:
             )
             return False
 
-        self._remember(umo=umo, session_id=session_id, text=text)
+        self._remember(umo=umo, session_id=real_sid, text=text)
         logger.info(
             "主动消息已投递：umo=%s → 会话 %s（%d 字）",
             umo,
-            session_id,
+            real_sid,
             len(text),
         )
         return True

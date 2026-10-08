@@ -55,7 +55,10 @@ async def test_settings_rejects_non_writable_fields(store, config):
     await svc.load()
     await svc.update({"server_port": 9999, "auth_access_token": "hacked"})
     # 不该抛异常（宽容），但**绝不生效**
-    assert config.server.port == 6190
+    # 🔴 锁的是"**默认端口**不被运行时设置改掉"这个契约本身，
+    #    620/6191 具体是多少不重要 —— 但改端口时**这条断言必须跟着改**，
+    #    否则它会以"运行时设置竟然能改端口"的假象失败（其实是我的默认值改了）。
+    assert config.server.port == 6191
     assert not hasattr(svc, "server_port")
 
 

@@ -6,6 +6,11 @@ const $ = (id) => document.getElementById(id);
 let state = {
   personas: [], activeId: "", current: null, sections: [],
   sessions: [], currentSessionId: "", currentSession: null,
+  // 未读：`unread` = {会话id: 条数}（后端 `GET /api/v1/unread`），
+  // `unreadTotal` = 侧边栏「聊天」那个圆圈显示的数字。
+  // ⚠️ 只有**插件主动消息**会让它涨（见 `refreshUnread` 的注释）；
+  //    读失败时**保持原值**，绝不清零（否则"读失败"会被显示成"已读完"）。
+  unread: {}, unreadTotal: 0,
   // 模型供应商（两层：provider_sources + provider）—— 契约 docs/ASTRBOT_PROVIDER_CONTRACT.md
   providerSources: [],      // 端点层（列表接口已脱敏）
   selectedSourceId: "",     // 右侧当前展示的源
@@ -46,6 +51,15 @@ let state = {
   cfgModels: [],            // 真实**已配置**的模型（provider_select 的选项来源）
   cfgSourceTypes: {},       // 源 id → provider_type（provider_select 按类型过滤要用）
   cfgModelsError: "",       // 读模型失败的原因：非空时**不许**把"读失败"显示成"没有模型"
+  // 插件启停（`GET /api/v1/plugins` 的整个响应；null = **还没读到**，
+  // 不是"没有插件" —— 保存逻辑靠它判"读没读到"，所以两者必须分开）
+  pluginSwitch: null,
+  // 插件拓展页清单（`GET /api/v1/plugins/pages`；null = 还没读到）
+  pluginPages: null,
+  // 当前打开的插件详情（`GET /api/v1/plugins/<id>` 的响应；null = 没在看详情）
+  pluginDetail: null,
+  // 当前选中的插件 id（详情/拓展页用；空 = 在列表态）
+  pluginCurrentId: "",
 };
 
 const MODE_HINTS = {
@@ -131,7 +145,7 @@ const NAV_LOADERS = {
   chat: () => loadChat(),
   session: () => loadSessions(),
   persona: () => loadPersonas(),
-  plugins: () => loadPluginPages(),
+  plugins: () => Promise.all([loadPluginSwitch(), loadPluginPages()]),
   // ⚠️ 供应商页的 loader 走 `loadProviderSourcesOnce()` 而不是直接调：
   //    `saveProviderSource()` 保存成功后**自己已经 load 过一次**了，
   //    紧接着它调 `selectProviderSource()` 改 hash → 触发 hashchange → applyRoute()
@@ -173,6 +187,18 @@ function showPanel(name) {
     if (a.dataset.nav === name) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
   });
+
+  // 🔴 手机端顶栏标题跟随当前页（2026-09-27 加）。
+  //    手机上抽屉是浮层、关着时看不见导航，若顶栏只写死"情绪app"，
+  //    用户**没法知道自己现在在哪一页** —— 顶栏存在的意义就只剩个汉堡。
+  //    ⚠️ 放在 `showPanel` 这个**唯一**的面板切换点，而不是各 `switchToTab` 调用处：
+  //       十几处调用点各写一遍必然漂移（本项目反复踩）。
+  const bar = $("mobile-bar-title");
+  if (bar) {
+    const active = document.querySelector(`.nav-item[data-nav="${name}"]`);
+    const label = active ? (active.querySelector(".nav-label") || {}).textContent : "";
+    bar.textContent = (label || "").trim() || "情绪app";
+  }
 }
 
 /** 路由总入口：显示页面 + 按需拉数据 + 处理子参数（详情）。 */
@@ -237,7 +263,12 @@ async function applyRoute() {
 
   if (name === "plugins") {
     const [pid, page] = args;
+    // 🔴 三态路由：`#/plugins` = 列表；`#/plugins/<id>` = 详情；
+    //    `#/plugins/<id>/<page>` = 插件拓展页 iframe。
+    //    ⚠️ 详情那条必须**放在前面**判断（`page` 为空就是详情），
+    //       否则 `#/plugins/<id>` 会落进 `else` 被当成"回列表"。
     if (pid && page) openPluginPage(pid, page, { updateHash: false });
+    else if (pid) openPluginDetail(pid, { updateHash: false });
     else closePluginPage();
   }
 
@@ -280,17 +311,30 @@ function isMobile() {
   return window.matchMedia("(max-width: 640px)").matches;
 }
 
+/* 🔴 两个开关的 `aria-expanded` 必须**一起**更新。
+ *
+ * 为什么抽成一个函数：`#sidebar-toggle`（抽屉里）与 `#mobile-menu`（顶栏）是
+ * **同一件事的两个入口**，各自 set 一遍必然漂移（本项目反复踩的
+ * "同一概念多条写入路径"）—— 抽出单一来源，任一路径改状态都走它。 */
+function syncSidebarAria(expanded) {
+  const v = expanded ? "true" : "false";
+  ["sidebar-toggle", "mobile-menu"].forEach((id) => {
+    const el = $(id);
+    if (el) el.setAttribute("aria-expanded", v);
+  });
+}
+
 function openDrawer() {
   $("sidebar").classList.remove("collapsed");
   document.querySelector(".app").classList.add("drawer-open");
   $("sidebar-scrim").classList.remove("hidden");
-  $("sidebar-toggle").setAttribute("aria-expanded", "true");
+  syncSidebarAria(true);
 }
 
 function closeDrawer() {
   document.querySelector(".app").classList.remove("drawer-open");
   $("sidebar-scrim").classList.add("hidden");
-  $("sidebar-toggle").setAttribute("aria-expanded", "false");
+  syncSidebarAria(false);
 }
 
 function toggleSidebar() {
@@ -304,18 +348,29 @@ function toggleSidebar() {
   const app = document.querySelector(".app");
   app.classList.toggle("collapsed");
   const collapsed = app.classList.contains("collapsed");
-  $("sidebar-toggle").setAttribute("aria-expanded", collapsed ? "false" : "true");
+  syncSidebarAria(!collapsed);
   try { localStorage.setItem("emotion_sidebar_collapsed", collapsed ? "1" : "0"); } catch (e) {}
 }
 
 $("sidebar-toggle").onclick = toggleSidebar;
 $("sidebar-scrim").onclick = closeDrawer;
 
+/* 🔴 手机顶栏的汉堡开关 —— 2026-09-27 修「没有开关，打不开侧边栏」。
+ *
+ * 为什么需要第二个开关：侧边栏里那个 `#sidebar-toggle` 住在抽屉**内部**，
+ * 而手机端抽屉是 `translateX(-100%)` 跑到屏幕外的（实测 rect.x=-268）
+ * ⇒ 抽屉关着时**用户手上没有任何入口**能把导航拉出来。
+ * 顶栏这个开关在 `.content` 里，永远在视口内。
+ *
+ * ⚠️ 两个开关共用同一个 `toggleSidebar()` / `openDrawer()` / `closeDrawer()` ——
+ *    不另写一份开关逻辑（两份必然漂移，本项目踩过：同一概念多条路径）。 */
+if ($("mobile-menu")) $("mobile-menu").onclick = toggleSidebar;
+
 // 记住桌面端的收起状态（刷新后保持）
 try {
   if (localStorage.getItem("emotion_sidebar_collapsed") === "1" && !isMobile()) {
     document.querySelector(".app").classList.add("collapsed");
-    $("sidebar-toggle").setAttribute("aria-expanded", "false");
+    syncSidebarAria(false);
   }
 } catch (e) {}
 
@@ -617,7 +672,109 @@ async function selectPersona(id, opts) {
 
   state.sections = (p.prompt_sections || []).map((s) => ({ ...s }));
   renderSections();
+  renderPersonaRef(p);
 }
+
+/* ================= 人设参考图（2026-09-25） =================
+ *
+ * 🔴 情绪：「用户能填的就让用户改」—— 参考图不该只存在于 `.env` 里
+ *    （那要求用户登服务器改配置再重启，手机壳上更是不可能）。
+ *
+ * 三级优先（后端 `domain/persona_ref.py` 是唯一判据）：
+ *   ① 模型显式给的路径 → ② **本页传的这张（per-persona）** → ③ `.env` 全局兜底
+ *   → 所以本页的图**优先于** `.env`，只在"没上传"时才轮到全局那份。
+ *
+ * ⚠️ 预览走 `GET /personas/<id>/reference` 时**不能**用 `?t=时间戳` 之外的缓存参数，
+ *    但必须带时间戳：同一路径换了图（覆盖上传）后浏览器会拿磁盘缓存显示旧图
+ *    （aitag 踩过同类坑：删除后仍从缓存回 200）。后端已发 `no-cache`，
+ *    这里再加一道时间戳，双保险。
+ */
+function personaRefUrl(id) {
+  return `/api/v1/personas/${encodeURIComponent(id)}/reference?t=${Date.now()}`;
+}
+
+function renderPersonaRef(p) {
+  const img = $("p-ref-preview");
+  const hint = $("p-ref-hint");
+  const del = $("p-ref-delete");
+  const up = $("p-ref-upload");
+  // 换人设时把上一张的暂存清掉（否则会把 A 的图传到 B 上）
+  $("p-ref-file").value = "";
+  up.disabled = true;
+
+  if (p && p.has_reference_image) {
+    img.src = personaRefUrl(p.id);
+    img.classList.remove("hidden");
+    hint.textContent = `已设置：${p.reference_image_path || "(文件名未知)"}`;
+    del.disabled = false;
+  } else {
+    // 🔴 清 `src` 之外还要移除属性：`src=""` 在某些浏览器会去请求当前页面 URL
+    img.removeAttribute("src");
+    img.classList.add("hidden");
+    hint.textContent = "未设置（生图时不会固定长相）";
+    del.disabled = true;
+  }
+}
+
+/** 当前选中的人设（列表里的对象，可能不是最新 —— 上传后要用返回值刷新）。 */
+function refreshPersonaInState(p) {
+  const i = state.personas.findIndex((x) => x.id === p.id);
+  if (i >= 0) state.personas[i] = p;
+  if (state.current && state.current.id === p.id) state.current = p;
+  renderPersonaRef(p);
+}
+
+$("p-ref-file").onchange = () => {
+  const f = $("p-ref-file").files && $("p-ref-file").files[0];
+  $("p-ref-upload").disabled = !f;
+  if (f) $("p-ref-hint").textContent = `待上传：${f.name}（${Math.round(f.size / 1024)} KB）`;
+};
+
+$("p-ref-upload").onclick = async () => {
+  if (!state.current) return;
+  const f = $("p-ref-file").files && $("p-ref-file").files[0];
+  // ⚠️ 没选文件就**明确说**，不静默 return（本项目铁律：失败必须看得见）
+  if (!f) { toast($("p-ref-hint"), "请先选择一张图片", true); return; }
+  const fd = new FormData();
+  fd.append("file", f);
+  $("p-ref-upload").disabled = true;
+  try {
+    // ⚠️ 上传要走 `fetch` + FormData（不能用 `api()` —— 那个只发 JSON）
+    const r = await fetch(`/api/v1/personas/${encodeURIComponent(state.current.id)}/reference`, {
+      method: "POST", body: fd, credentials: "same-origin",
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((d.error && d.error.message) || `HTTP ${r.status}`);
+    $("p-ref-file").value = "";
+    $("p-ref-upload").disabled = true;
+    // 🔴 成功后**重新渲染持久状态**，不要往这个元素里塞"已上传" ——
+    //    `#p-ref-hint` 的**唯一含义**是"当前配置是什么"。
+    //    塞瞬时文案会把它盖掉，用户传完反而看不到"现在用的是哪张图"
+    //    （实测踩到：真浏览器判据里 hint 变成 '已上传'，
+    //     「已设置：xxx.png」消失 —— 判据抓的就是这个）。
+    //    反馈由**预览图出现**给出，那比一行字更直接。
+    refreshPersonaInState(d.persona);
+  } catch (e) {
+    $("p-ref-upload").disabled = false;
+    // 失败**必须留下**（错误信息是有用的，不还原成状态文案）
+    toast($("p-ref-hint"), "上传失败：" + e.message, true);
+  }
+};
+
+$("p-ref-delete").onclick = async () => {
+  if (!state.current) return;
+  if (!confirm("删除这个角色的参考图？（生图将不再固定长相）")) return;
+  try {
+    const d = await api("DELETE", `/api/v1/personas/${state.current.id}/reference`);
+    // 同上：重新渲染持久状态，而不是塞"已删除"
+    refreshPersonaInState(d.persona);
+    if (!d.file_removed) {
+      // ⚠️ 字段清了但文件本就不在 —— 这种情况要**说一句**，
+      //    否则用户会以为"我明明删了它怎么没反应"（其实是对的，只是没什么可删）
+      toast($("p-ref-hint"), "已清除配置（参考图文件本就不存在）");
+    }
+  } catch (e) { toast($("p-ref-hint"), "删除失败：" + e.message, true); }
+};
 
 //: 🔴 与后端 `prompt.PERSONA_CORE_TITLES` **逐字一致**（4 个）。
 //:
@@ -946,9 +1103,48 @@ async function loadSessions() {
     state.sessions = d.data || [];
     renderSessionList();
     renderSessionSelect();
+    renderUnreadBadge();
     if (state.currentSessionId) selectSession(state.currentSessionId);
   } catch (e) {
     $("session-list").innerHTML = `<li>加载失败：${e.message}</li>`;
+  }
+}
+
+/* ---------------- 未读（侧边栏「聊天」那个圆圈） ----------------
+ *
+ * 🔴 语义（与后端 `Session.unread` 的注释是**同一份约定**）：
+ *   只有**插件主动消息**（陪伴在她自己的时间发过来的那些）会 +1；
+ *   用户自己发的消息不算 —— 他此刻就在这个页面上看着。
+ *   打开某个会话（`selectSession`）→ 该会话清零。
+ *
+ * ⚠️ 为什么要**轮询**：主动消息是插件在服务端后台产生的，
+ *    浏览器这边没有任何事件可听（我们不做 WebSocket / SSE 推送）。
+ *    30 秒一轮与状态栏那次刷新共用节奏，代价是一个很小的 GET。
+ *    ⚠️ 离开页面也要继续（用户就是为了"不在时也能看到红点"才要它），
+ *       所以**不像日志页那样停表**。
+ */
+async function refreshUnread() {
+  try {
+    const d = await api("GET", "/api/v1/unread");
+    state.unread = d.sessions || {};
+    state.unreadTotal = d.total || 0;
+    renderUnreadBadge();
+    renderSessionList();
+  } catch (e) {
+    // 静默：这只是个提示徽标，读不到就不显示，绝不用它打断用户
+    // （⚠️ 但**不把已有数字清零** —— 那会把"读失败"伪装成"已读完"）
+  }
+}
+
+function renderUnreadBadge() {
+  const el = $("chat-badge");
+  if (!el) return;
+  const n = state.unreadTotal || 0;
+  if (n > 0) {
+    el.textContent = n > 99 ? "99+" : String(n);
+    el.classList.remove("hidden");
+  } else {
+    el.classList.add("hidden");
   }
 }
 
@@ -998,6 +1194,15 @@ function renderSessionList() {
     meta.className = "badge";
     meta.textContent = `${s.message_count} 条 · ${s.policy.mode}`;
     li.appendChild(meta);
+    // 未读小标（与消息数那个 badge 并排；只在该会话有未读时出现）
+    const unread = (state.unread || {})[s.id] || s.unread || 0;
+    if (unread > 0) {
+      const u = document.createElement("span");
+      u.className = "badge unread-badge";
+      u.textContent = String(unread);
+      u.title = `${unread} 条未读`;
+      li.appendChild(u);
+    }
     if (s.id === state.currentSessionId) li.classList.add("active");
     li.onclick = () => { state.currentSessionId = s.id; selectSession(s.id); switchToTab("chat"); };
     ul.appendChild(li);
@@ -1032,10 +1237,19 @@ async function selectSession(id) {
   $("session-form").classList.remove("hidden");
 
   $("s-title").value = s.title || "";
-  // 🔴 插件用户 ID（方案 B）：主动消息靠它找到"该落到哪个会话"。
+  // 🔴 插件用户 ID = **umo 第三段**（方案 B）：陪伴按它认人，
+  //    记忆/关系/主动消息开关都挂在这一个值下面。
   //    ⚠️ 用 `??` 而不是 `||`：只有 null/undefined 才回落空串 ——
-  //       空串本身是**合法且有含义**的值（= 跟随全局），不能被当成"缺失"。
+  //       空串本身仍然是**有意义**的（存量会话还没绑标签，走全局默认）。
   $("s-user-id").value = s.user_id ?? "";
+  // 把**完整 umo** 显示出来（后端算好的，前端绝不自己拼 ——
+  // 平台 id 属于宿主 `host/astrbot_host/umo.py` 的唯一定义）。
+  if ($("s-umo-hint")) {
+    toast(
+      $("s-umo-hint"),
+      s.umo ? `完整 umo：${s.umo}` : "这个会话还没有 umo（保存一个用户 ID 后就有了）",
+    );
+  }
   $("s-mode").value = s.policy.mode;
   $("s-tail").value = s.policy.protected_tail;
   $("s-trigger").value = s.policy.summary_trigger;
@@ -1060,6 +1274,53 @@ async function selectSession(id) {
   renderChatPersonaHint();
   await loadHistory(id);
   refreshSessionInfo();
+  await markSessionRead(id);
+}
+
+/** 把某个会话标记为已读（清掉它的未读徽标）。
+ *
+ * 🔴 **放在 `selectSession` 里**（而不是"点一下列表项"那个监听器里）：
+ *    选中有四个入口（下拉 / 列表点击 / 路由带 id / 新建后选中），
+ *    挂在监听器上会漏掉另外三个 —— 那种"某些路径不生效"的 bug
+ *    在本项目已经出现过一次（登录浮层的迟到解锁）。
+ *
+ * 🔴🔴 **不要用前端缓存决定"要不要发这个请求"**（真浏览器判据抓到的 bug）：
+ *    我第一版写的是 `if (!(state.unread || {})[id]) return;` —— 本意是省一次
+ *    请求，实际制造了一个**永远修不好的未读**：
+ *      刷新页面 → `state.unread` 是空的（还没轮询）→ 选中会话时守卫直接 return
+ *      → **不发清零**；而 `refreshUnread()` 随后又把服务端的 1 拉回来
+ *      → 用户明明打开了这条会话，红点却一直亮着（要到下次轮询才可能消）。
+ *    实测证据（`tools/session_umo_unread_check.py` 判据⑧）：
+ *      `{hidden: False, text: '1', total: 1}` —— 打开会话后红点仍在。
+ *    → 正确做法：**服务端才是未读的事实源**，前端缓存只用于渲染。
+ *      清零是幂等的（服务端 `if s.unread: ...` 才写盘），该发就发。
+ *
+ * ⚠️ 失败**不弹窗**：已读只是个徽标状态，读接口挂了不该打断聊天。
+ *    但也不假装成功 —— 不删本地数字，下次轮询会如实把它拿回来。
+ */
+async function markSessionRead(id) {
+  if (!id) return;
+  try {
+    const d = await api("POST", `/api/v1/sessions/${id}/read`);
+    // ⭐ 用**服务端返回的会话**更新本地状态（而不是自己减一）：
+    //    自己减一在"本地有 1、服务端有 2"时会把 2 显示成 0（假清零）。
+    const s = d && d.session;
+    if (s) {
+      const i = state.sessions.findIndex((x) => x.id === s.id);
+      if (i >= 0) state.sessions[i] = s;
+      if (state.currentSession && state.currentSession.id === s.id) {
+        state.currentSession = s;
+      }
+    }
+    if (state.unread) delete state.unread[id];
+    // 未读总数**重新问服务端**（只在这一个动作后问，代价极小，
+    // 换来的是"别的会话也一起被算对"——自己减一做不到这件事）
+    const u = await api("GET", "/api/v1/unread");
+    state.unread = u.sessions || {};
+    state.unreadTotal = u.total || 0;
+    renderUnreadBadge();
+    renderSessionList();
+  } catch (e) { /* 见上：不打断，不清零 */ }
 }
 
 async function loadHistory(id) {
@@ -1078,7 +1339,40 @@ function refreshSessionInfo() {
   const s = state.currentSession;
   const el = $("session-info");
   if (!s) { el.textContent = "无状态模式（不存历史）"; return; }
-  el.textContent = `${s.policy.mode} · 窗口 ${s.policy.protected_tail} · ${s.message_count} 条`;
+  // 🔴 会话专属 umo 的提醒（2026-09-27，情绪问「主动消息只能给到 default 吗」）。
+  //
+  // 背景：新建会话会自动分配 `sess-<hex>`，但**存量会话**（建在该功能之前）
+  // 仍沿用全局 `default`。两者在列表里**长得一样**（都只是一行标题），
+  // 用户于是会以为"主动消息只能发给 default"—— 实际只是那条会话没换过标签。
+  //
+  // ⚠️ 判据**不用 `=== "default"` 硬编码**：全局回落值是配置项
+  //    （`plugins.umo_user_id`，服务端可改），写死字面量会在配置一改后静默说错话。
+  //    改用两条**现场可取得**的条件（任一成立即视为"共用/兜底"）：
+  //      ① 这个 umo 被**多条**会话共用（≥2）→ 插件眼里它们是同一个用户；
+  //      ② 这个 umo **不是**本会话独有形状（`sess-<hex>`）→ 它来自全局回落
+  //         或用户手填，都不保证独属本条会话。
+  //    ⚠️ 只写 ① 会漏掉真实场景（实测踩到）：`default` 只挂在**一条**会话上时
+  //       ① 不成立，可它依然是**全局兜底**（别的会话将来也会落进来，
+  //       插件的主动消息也只会认它）—— 那正是用户困惑的那条。
+  const uid = String(s.user_id || "");
+  const ownShape = /^sess-[0-9a-f]{12}$/.test(uid);
+  const sharedBy = uid
+    ? state.sessions.filter((x) => String(x.user_id || "") === uid).length
+    : 0;
+  const shared = !uid || !ownShape || sharedBy > 1;
+  const why = !uid
+    ? "它没有插件用户 ID（会落到全局兜底 umo）"
+    : (sharedBy > 1
+        ? `umo「${uid}」被 ${sharedBy} 条会话共用`
+        : `umo「${uid}」不是本条会话专属（全局兜底 / 手填值）`);
+  el.textContent = shared
+    ? `${s.policy.mode} · 窗口 ${s.policy.protected_tail} · ${s.message_count} 条 · ⚠️ ${why}`
+    : `${s.policy.mode} · 窗口 ${s.policy.protected_tail} · ${s.message_count} 条 · umo ${uid}`;
+  el.classList.toggle("warn", shared);
+  el.title = shared
+    ? "这种会话在陪伴插件眼里不是独立用户：主动消息可能落到别处（或全局那条兜底会话）。"
+      + "到「会话」页点「换一个专用 umo」可以给本条分配独立的。"
+    : "";
 }
 
 $("session-select").onchange = (e) => selectSession(e.target.value);
@@ -1156,6 +1450,61 @@ $("s-del").onclick = async () => {
     refreshSessionInfo();
   } catch (e) { alert("删除失败：" + e.message); }
 };
+
+/* ---- umo（插件用户 ID）：复制 / 换一个 ----------------------------------
+ *
+ * ⭐ 这一组的存在理由（情绪 2026-09-26 的原话）：
+ *    「每个会话都带一个唯一标签 umo，这样我就能自己到陪伴那边添加"用户"
+ *      和测试主动消息等东西了，陪伴插件不就是靠 umo 去识别用户的嘛」
+ *   → 面板必须让人**看得见、复制得走**这个标签（不再要求用户登服务器改 .env）。
+ */
+
+/** 拼完整的 umo（`11:FriendMessage:<user_id>`）。
+ *
+ * 🔴 **不在前端硬拼字面量**：格式的唯一定义处在宿主
+ *    `host/astrbot_host/umo.py`（那里有判据禁止第二处手写）。
+ *    前端拿的是后端 `GET /api/v1/sessions/<id>` 里已经算好的 `umo` 字段
+ *    —— 见本文件的 `selectSession` 与 `api_admin` 的会话响应。
+ */
+function currentUmo() {
+  const s = state.currentSession;
+  if (!s) return "";
+  return s.umo || "";
+}
+
+$("s-umo-copy") && ($("s-umo-copy").onclick = async () => {
+  const umo = currentUmo();
+  if (!umo) return toast($("s-umo-hint"), "这个会话还没有 umo", true);
+  try {
+    await navigator.clipboard.writeText(umo);
+    toast($("s-umo-hint"), `已复制：${umo}`);
+  } catch (e) {
+    // 剪贴板 API 在非 https / 未聚焦时会拒绝 —— 如实提示，
+    // 并把值显示出来让用户手动选（别只报一句"失败"）。
+    toast($("s-umo-hint"), `复制失败，请手动选：${umo}`, true);
+  }
+});
+
+$("s-umo-new") && ($("s-umo-new").onclick = async () => {
+  if (!state.currentSession) return;
+  const before = currentUmo();
+  if (!confirm(
+    "换一个专用 umo？\n\n" +
+    "陪伴插件按这个值认人：换掉之后，这个会话在插件眼里就是**另一个用户**。\n" +
+    "旧标签下的记忆/关系不会丢（还挂在旧标签下），但之后写的东西都记到新标签下。\n\n" +
+    `当前：${before}`
+  )) return;
+  try {
+    const d = await api("POST", `/api/v1/sessions/${state.currentSession.id}/umo`);
+    state.currentSession = d.session;
+    const i = state.sessions.findIndex((x) => x.id === d.session.id);
+    if (i >= 0) state.sessions[i] = d.session;
+    $("s-user-id").value = d.session.user_id ?? "";
+    renderSessionList();
+    renderSessionSelect();
+    toast($("s-umo-hint"), `已换成 ${d.session.umo}`);
+  } catch (e) { toast($("s-umo-hint"), "换 umo 失败：" + e.message, true); }
+});
 
 /* ================= 设置 ================= */
 async function loadSettings() {
@@ -1374,7 +1723,10 @@ async function loadConfigProfile() {
     // 顺带把"已配置的模型"拉回来（provider_select 的选项来源）
     await loadConfigModels();
     const n = Object.keys(state.cfgProfile).length;
-    let msg = `已读取配置（${n} 段：会话 / 上下文管理策略）。字段由后端 schema 提供。`;
+    // ⚠️ 段名要跟着 `SECTIONS` 走：后端多一段而这里写死两段，就成了**假信息**
+    //    （本页只渲染会话/上下文两段，插件段在「插件」页里管）。
+    let msg = `已读取配置（${n} 段：${Object.keys(state.cfgProfile).join(" / ")}；`
+      + `本页渲染「会话」「上下文」，插件启停在「插件」页）。字段由后端 schema 提供。`;
     if (state.cfgModelsError) msg += ` ⚠️ ${state.cfgModelsError}`;
     toast(hint, msg, !!state.cfgModelsError);
   } catch (e) {
@@ -1521,6 +1873,17 @@ function makeConfigInput(f, value) {
     el.placeholder = "每行一个模型 id，例如 fast/gemini-3.5-flash";
     return el;
   }
+  if (t === "string_list") {
+    // 通用字符串数组（如插件停用名单）：每行一项。
+    // ⚠️ 取值方式与 `provider_multi` 一样，但**类型名必须分开** ——
+    //    `provider_multi` 的语义是"模型 id 列表"，判据（`test_schema_shape_is_renderable`）
+    //    也要求每种类型都有对应的渲染分支。
+    const el = document.createElement("textarea");
+    el.rows = 3;
+    el.value = Array.isArray(value) ? value.join("\n") : "";
+    el.placeholder = "每行一项，例如 astrbot_plugin_x.main";
+    return el;
+  }
   if (t === "text") {
     const el = document.createElement("textarea");
     el.rows = 3;
@@ -1598,6 +1961,8 @@ function collectConfigChanges(section, fields) {
     else if (f.type === "int") v = el.value === "" ? f.default : parseInt(el.value, 10);
     else if (f.type === "float") v = el.value === "" ? f.default : parseFloat(el.value);
     else if (f.type === "provider_multi") {
+      v = el.value.split("\n").map((x) => x.trim()).filter(Boolean);
+    } else if (f.type === "string_list") {
       v = el.value.split("\n").map((x) => x.trim()).filter(Boolean);
     } else v = el.value;
 
@@ -3066,6 +3431,160 @@ $("modal").onclick = (e) => { if (e.target.id === "modal") $("modal").classList.
  *   ⚠️ 同源 iframe：cookie 会带上，所以插件页的 fetch 天然是已登录的。
  */
 
+/* ---------------- 插件启停（照真 AstrBot 的 inactivated_plugins） ----------------
+ *
+ * 🔴 三条设计取舍（都会直接影响"用户看到的对不对"）：
+ *
+ * ① **勾选框显示的是"已保存的意图"，不是"当前运行态"**。
+ *    若跟着运行态走：用户取消勾选 → 保存 → 运行态还没变（要重启）→
+ *    勾选框自己跳回去，用户会以为"没保存成功"。
+ *    所以：勾选 = 保存的名单，旁边**另用状态标签**说"现在跑没跑"。
+ *
+ * ② **"需重启生效"是后端算的**（`restart_required` = 保存集合 != 运行集合），
+ *    不是这里写死的 true —— 所以重启后再打开这一页，它会自己消失。
+ *    我们**没有**做"保存即生效"：真 AstrBot 的 `turn_on_plugin` 也是
+ *    `await self.reload(plugin_name)`（要重载），我们照它，如实在界面上说明。
+ *
+ * ③ **失败不许显示成"没有插件"**：接口 503（宿主没起来）时，
+ *    提示里写清原因并**清空列表** —— 绝不保留上一次的旧列表。
+ */
+
+/** 读插件清单 + 已保存的启停名单（进 `#/plugins` 时调）。 */
+async function loadPluginSwitch() {
+  const hint = $("plugin-switch-hint");
+  const host = $("plugin-switch-list");
+  try {
+    const d = await api("GET", "/api/v1/plugins");
+    state.pluginSwitch = d;
+    renderPluginSwitch();
+    hint.style.color = "";
+  } catch (e) {
+    // 🔴 读失败 → 说清原因 + 清空（不把"没读到"显示成"没有插件"）
+    state.pluginSwitch = null;
+    host.innerHTML = "";
+    hint.textContent = `读取插件清单失败：${e.message}`;
+    hint.style.color = "var(--danger)";
+  }
+}
+
+/** 按 `state.pluginSwitch` 重画勾选列表 + 提示。 */
+function renderPluginSwitch() {
+  const d = state.pluginSwitch;
+  const hint = $("plugin-switch-hint");
+  const host = $("plugin-switch-list");
+  host.innerHTML = "";
+  if (!d) return;
+
+  const plugins = d.plugins || [];
+  if (!plugins.length) {
+    hint.textContent = "没有发现任何插件（检查 plugins.plugin_dirs）—— 这不是「读取失败」。";
+    return;
+  }
+
+  const STATE_TEXT = {
+    loaded: "运行中",
+    inactivated: "已停用（未加载）",
+    failed: "加载失败",
+    not_loaded: "未加载",
+  };
+  for (const p of plugins) {
+    const row = document.createElement("label");
+    row.className = "switch-row";
+    row.dataset.pluginId = p.id;
+    row.dataset.modulePath = p.module_path;
+
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.className = "switch-cb";
+    // 勾选 = 启用（= 不在停用名单里）；这里用的是**保存的意图**
+    cb.checked = p.enabled_saved !== false;
+    row.appendChild(cb);
+
+    const name = document.createElement("span");
+    name.className = "switch-name";
+    name.textContent = p.name || p.id;
+    row.appendChild(name);
+
+    const id = document.createElement("span");
+    id.className = "switch-id";
+    id.textContent = p.module_path;
+    row.appendChild(id);
+
+    const st = document.createElement("span");
+    const bad = p.state === "failed";
+    st.className = "switch-state" + (bad ? " bad" : "");
+    st.textContent = STATE_TEXT[p.state] || p.state;
+    // 失败原因要看得见（否则用户只知道"没跑"，不知道"为什么"）
+    if (bad && p.error) st.title = p.error;
+    row.appendChild(st);
+
+    // 🔴 「详情」按钮：这是**唯一**进详情页的入口（照真 AstrBot：点卡片进详情）。
+    //    ⚠️ 必须 `type="button"` + `preventDefault()` + `stopPropagation()`：
+    //       整行是 `<label>`，点它**会切换那个勾选框** ——
+    //       不挡的话"看详情"会顺手把插件停用/启用（静默改配置，本项目最忌）。
+    const detail = document.createElement("button");
+    detail.type = "button";
+    detail.className = "link-btn switch-detail";
+    detail.textContent = "详情";
+    detail.onclick = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      go(`plugins/${encodeURIComponent(p.id)}`);
+    };
+    row.appendChild(detail);
+
+    if (bad && p.error) {
+      const err = document.createElement("small");
+      err.className = "switch-err";
+      err.textContent = p.error;
+      row.appendChild(err);
+    }
+    host.appendChild(row);
+  }
+
+  // ---- 提示（生效时机 + 对不上的名单项）----
+  const parts = [`共 ${plugins.length} 个插件。取消勾选 = 停用（不加载、不初始化、也不算失败）。`];
+  if (d.restart_required) {
+    parts.push("⚠️ 有改动**还没生效**：需要重启服务（./run.sh serve）后才会应用。");
+  } else {
+    parts.push("当前设置与运行状态一致（无需重启）。");
+  }
+  if ((d.unmatched || []).length) {
+    parts.push(`⚠️ 名单里有对不上任何插件的项（拼写错误？）：${d.unmatched.join(", ")}`);
+  }
+  hint.textContent = parts.join(" ");
+  hint.style.color = d.restart_required || (d.unmatched || []).length ? "var(--danger)" : "";
+}
+
+/** 保存启停设置（整体替换停用名单）。 */
+async function savePluginSwitch() {
+  const saved = $("plugin-switch-saved");
+  const d = state.pluginSwitch;
+  if (!d) {
+    toast(saved, "还没读到插件清单，无法保存。", true);
+    return;
+  }
+  // 未勾选 = 停用 → 提交的就是停用名单（用后端给的 module_path，不自己拼）
+  const off = [];
+  document.querySelectorAll("#plugin-switch-list .switch-row").forEach((row) => {
+    const cb = row.querySelector("input.switch-cb");
+    if (cb && !cb.checked) off.push(row.dataset.modulePath);
+  });
+  try {
+    const out = await api("PUT", "/api/v1/plugins/inactivated", {
+      inactivated_plugins: off,
+    });
+    state.pluginSwitch = out;
+    renderPluginSwitch();          // 用后端回来的真值重画（不假设自己写对了）
+    toast(saved, `已保存：停用 ${off.length} 个插件。` +
+      (out.restart_required ? "重启服务后生效。" : "（当前状态已一致）"));
+  } catch (e) {
+    toast(saved, `保存失败：${e.message}`, true);
+  }
+}
+
+$("plugin-switch-save").onclick = savePluginSwitch;
+
 async function loadPluginPages() {
   const ul = $("plugin-page-list");
   const hint = $("plugins-hint");
@@ -3117,24 +3636,313 @@ function openPluginPage(pluginId, pageName, opts) {
   $("plugin-frame-title").textContent = meta ? (meta.title || pageName) : pageName;
   $("plugin-frame-open").href = url;
   $("plugin-frame").src = url;
-  $("plugin-frame-wrap").classList.remove("hidden");
-  $("plugin-page-list").classList.add("hidden");
-  $("plugins-hint").classList.add("hidden");
+  state.pluginCurrentId = pluginId;
+  showPluginsView("frame");
 
   if (!(opts && opts.updateHash === false)) {
     go(`plugins/${encodeURIComponent(pluginId)}/${encodeURIComponent(pageName)}`);
   }
 }
 
+/* ==================== 插件详情 ====================
+ *
+ * 照真 AstrBot 的「插件详情页」（`GET /api/v1/plugins/by-id`，见
+ * `docs/ASTRBOT_插件管理页_调研.md` §2）：它按
+ * `page / skill / command / llm_tool / listener / hook` 六类渲染「插件行为」。
+ *
+ * 🔴 为什么这页值得存在（不是抄界面）：我们的插件是**跑在兼容层上的**，
+ *    "某个插件到底注册上了什么"是我们最常要回答的问题 ——
+ *    以前只能看 `handler_count` 一个**数字**，看不出"注册的是哪几条指令"。
+ *    本项目最贵的 bug 类型是**静默失败**（插件 catch 成一行 info 日志），
+ *    所以"逐条列出来"本身就是判据。
+ *
+ * ⚠️ 六类里 `skill` 我们**没有**对应体系 → 后端返回空数组，这里也如实不显示
+ *    （绝不显示一个永远空的分类，那会让用户以为"坏了"）。
+ */
+
+/** 六类的标题与渲染顺序（照真实现 `PLUGIN_COMPONENT_TYPE_ORDER`）。 */
+const PLUGIN_COMPONENT_GROUPS = [
+  ["page", "页面"],
+  ["skill", "技能"],
+  ["command", "指令/指令组"],
+  ["llm_tool", "LLM 工具"],
+  ["listener", "事件监听器"],
+  ["hook", "钩子"],
+];
+
+/** 打开某个插件的详情（`#/plugins/<id>`）。 */
+async function openPluginDetail(pluginId, opts) {
+  const wrap = $("plugin-detail-wrap");
+  const body = $("plugin-detail-body");
+  const hint = $("plugin-detail-hint");
+  $("plugin-detail-title").textContent = pluginId;
+  state.pluginCurrentId = pluginId;
+  showPluginsView("detail");
+
+  // 🔴 每次进入都**清空并说明正在读** —— 绝不保留上一个插件的残留内容
+  //    （否则用户以为看到的是当前插件的，其实还没加载完）。
+  body.innerHTML = "";
+  hint.textContent = "正在读取…";
+  hint.style.color = "";
+
+  try {
+    const d = await api("GET", `/api/v1/plugins/${encodeURIComponent(pluginId)}`);
+    // ⚠️ 异步回来时用户可能已经切走/返回了 —— 迟到的响应**不许**改写当前视图
+    if (state.pluginCurrentId !== pluginId) return;
+    state.pluginDetail = d;
+    $("plugin-detail-title").textContent = d.name || d.id || pluginId;
+    renderPluginDetail(d);
+    hint.textContent = "";
+  } catch (e) {
+    if (state.pluginCurrentId !== pluginId) return;
+    hint.textContent = `读取失败：${e.message}`;
+    hint.style.color = "var(--danger)";
+    body.innerHTML = "";
+  }
+
+  if (!(opts && opts.updateHash === false)) {
+    go(`plugins/${encodeURIComponent(pluginId)}`);
+  }
+}
+
+/** 画一个「键: 值」小行（空值**如实显示**为「—」，不隐藏 —— 隐藏会让人以为字段不存在）。 */
+function detailRow(label, value, opts) {
+  const row = document.createElement("div");
+  row.className = "detail-row";
+  const k = document.createElement("span");
+  k.className = "detail-k";
+  k.textContent = label;
+  const v = document.createElement("span");
+  v.className = "detail-v";
+  if (opts && opts.mono) v.classList.add("mono");
+  if (value === undefined || value === null || value === "") {
+    v.textContent = "—";
+    v.classList.add("muted");
+  } else {
+    v.textContent = String(value);
+  }
+  row.append(k, v);
+  return row;
+}
+
+/** 渲染一个组件分类（`components` 里 type 相同的那批）。 */
+function renderComponentGroup(title, items) {
+  const box = document.createElement("section");
+  box.className = "detail-group";
+  const h = document.createElement("h4");
+  h.textContent = `${title}（${items.length}）`;
+  box.appendChild(h);
+
+  const list = document.createElement("div");
+  list.className = "detail-items";
+  for (const c of items) {
+    const it = document.createElement("div");
+    it.className = "detail-item";
+    const head = document.createElement("div");
+    head.className = "detail-item-head";
+    const nm = document.createElement("strong");
+    nm.textContent = c.name || c.cmd || "（无名）";
+    head.appendChild(nm);
+    // 类型徽标（`指令组` / `正则匹配` / `事件监听器` …）
+    if (c.display_type) {
+      const badge = document.createElement("span");
+      badge.className = "detail-badge";
+      badge.textContent = c.display_type;
+      head.appendChild(badge);
+    }
+    if (c.has_admin) {
+      const badge = document.createElement("span");
+      badge.className = "detail-badge admin";
+      badge.textContent = "需管理员";
+      head.appendChild(badge);
+    }
+    it.appendChild(head);
+
+    for (const [k, val] of [["指令", c.cmd], ["触发", c.event_type_h],
+                            ["说明", c.description], ["处理函数", c.handler_name]]) {
+      if (val === undefined || val === null || val === "") continue;
+      it.appendChild(detailRow(k, val, { mono: k === "指令" || k === "处理函数" }));
+    }
+    // 子指令（指令组的树）—— 有才画，逐层缩进
+    if (Array.isArray(c.subcommands) && c.subcommands.length) {
+      const sub = document.createElement("div");
+      sub.className = "detail-sub";
+      for (const s of c.subcommands) {
+        const line = document.createElement("div");
+        line.className = "detail-sub-line";
+        line.textContent = `↳ ${s.cmd || s.name || "?"}` +
+          (s.description && s.description !== "无描述" ? ` — ${s.description}` : "");
+        sub.appendChild(line);
+      }
+      it.appendChild(sub);
+    }
+    list.appendChild(it);
+  }
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "hint";
+    empty.textContent = "（没有）";
+    list.appendChild(empty);
+  }
+  box.appendChild(list);
+  return box;
+}
+
+/** 按 `GET /api/v1/plugins/<id>` 的响应画详情。 */
+function renderPluginDetail(d) {
+  const body = $("plugin-detail-body");
+  body.innerHTML = "";
+
+  // ---- ① 概览 ----
+  const info = document.createElement("section");
+  info.className = "detail-group";
+  const h = document.createElement("h4");
+  h.textContent = "信息";
+  info.appendChild(h);
+  info.appendChild(detailRow("显示名", d.name));
+  info.appendChild(detailRow("插件 ID", d.id, { mono: true }));
+  info.appendChild(detailRow("模块路径", d.module_path, { mono: true }));
+  info.appendChild(detailRow("版本", d.version));
+  info.appendChild(detailRow("作者", d.author));
+  info.appendChild(detailRow("简介", d.desc));
+  info.appendChild(detailRow("状态", d.state_text || d.state));
+  info.appendChild(detailRow("目录", d.dir_name, { mono: true }));
+  if (d.error) info.appendChild(detailRow("错误", d.error));
+  body.appendChild(info);
+
+  // ---- ② 完整堆栈（失败时才有；**单独一块**，别塞进"错误"那一行） ----
+  if (d.traceback) {
+    const tb = document.createElement("section");
+    tb.className = "detail-group";
+    const th = document.createElement("h4");
+    th.textContent = "完整堆栈";
+    tb.appendChild(th);
+    const pre = document.createElement("pre");
+    pre.className = "detail-pre";
+    pre.textContent = d.traceback;
+    tb.appendChild(pre);
+    body.appendChild(tb);
+  }
+
+  // ---- ③ 计数（一眼看清"注册上了多少东西"） ----
+  const counts = document.createElement("section");
+  counts.className = "detail-group";
+  const ch = document.createElement("h4");
+  ch.textContent = "注册数量";
+  counts.appendChild(ch);
+  const grid = document.createElement("div");
+  grid.className = "detail-counts";
+  for (const [label, val] of [
+    ["事件处理器", d.handler_count],
+    ["LLM 工具（已绑实例）", d.llm_tool_bind_count],
+    ["Web API", d.web_api_count],
+    ["定时任务", d.task_count],
+  ]) {
+    const cell = document.createElement("div");
+    cell.className = "detail-count";
+    const num = document.createElement("strong");
+    num.textContent = val === undefined || val === null ? "—" : String(val);
+    const lab = document.createElement("span");
+    lab.textContent = label;
+    cell.append(num, lab);
+    grid.appendChild(cell);
+  }
+  counts.appendChild(grid);
+  // ⚠️ 这个暗示必须写出来：工具数为 0 而插件"有工具"= 执行必错（本项目踩过）
+  if (d.llm_tool_bind_count === 0) {
+    const warn = document.createElement("p");
+    warn.className = "hint";
+    warn.textContent = "⚠️ 没有绑定任何 LLM 工具。若这个插件本该有工具，说明它注册的工具没有被绑上插件实例 —— 调用时必然失败。";
+    counts.appendChild(warn);
+  }
+  body.appendChild(counts);
+
+  // ---- ④ 插件行为（六类，按真实现的顺序） ----
+  const comps = Array.isArray(d.components) ? d.components : [];
+  const bh = document.createElement("h4");
+  bh.className = "detail-section-title";
+  bh.textContent = `插件行为（共 ${comps.length} 项）`;
+  body.appendChild(bh);
+  if (!comps.length) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "暂无行为 —— 这个插件没有注册指令、工具或事件监听器。";
+    body.appendChild(empty);
+  } else {
+    for (const [type, title] of PLUGIN_COMPONENT_GROUPS) {
+      const items = comps.filter((c) => c.type === type);
+      // 🔴 空分类**不画**（除了我们确实支持的几类）：画一堆"（没有）"等于噪音
+      if (!items.length) continue;
+      body.appendChild(renderComponentGroup(title, items));
+    }
+  }
+
+  // ---- ⑤ README（有才画） ----
+  if (d.readme) {
+    const rd = document.createElement("section");
+    rd.className = "detail-group";
+    const rh = document.createElement("h4");
+    rh.textContent = "README" + (d.readme_truncated ? "（已截断）" : "");
+    rd.appendChild(rh);
+    const pre = document.createElement("pre");
+    pre.className = "detail-pre readme";
+    pre.textContent = d.readme;
+    rd.appendChild(pre);
+    body.appendChild(rd);
+  }
+}
+
+/** 显示/隐藏「插件启停」那块（打开插件页/详情时让位）。 */
+function setPluginSwitchVisible(visible) {
+  for (const id of ["plugin-switch-hint", "plugin-switch-list"]) {
+    const el = $(id);
+    if (el) el.classList.toggle("hidden", !visible);
+  }
+}
+
+/**
+ * 插件页的**三视图互斥** —— 唯一入口。
+ *
+ * 🔴 为什么必须收敛成一处（2026-09-27 修的真实缺陷）：
+ *    以前"谁可见"散在 `openPluginPage()` 与 `closePluginPage()` 两处各写一半，
+ *    `closePluginPage()` 只还原了列表/hint，**没还原成对的可见性状态**，
+ *    而 `openPluginPage()` 里那句 `go(...)` 还会**再触发一次路由**
+ *    → `applyRoute` → `openPluginPage(updateHash:false)` → 又走一遍显示逻辑。
+ *    只要任何一条路径漏掉一半，用户就会看到"详情页没了"这种
+ *    **没有任何报错**的空白（本项目最贵的 bug 类型）。
+ *
+ * 现在改成：**任何**切换都只调这一个函数，三种视图在一个地方被同时决定。
+ * 新增视图时只改这里 —— 这比"记得在 N 个地方都补一行"可靠。
+ *
+ * @param {"list"|"frame"|"detail"} which
+ */
+function showPluginsView(which) {
+  // 三块主体：互斥
+  $("plugin-frame-wrap").classList.toggle("hidden", which !== "frame");
+  $("plugin-detail-wrap").classList.toggle("hidden", which !== "detail");
+  $("plugin-page-list").classList.toggle("hidden", which !== "list");
+  $("plugins-hint").classList.toggle("hidden", which !== "list");
+  // 启停那块只在**列表态**显示（其余两态整个面板让给主体）
+  setPluginSwitchVisible(which === "list");
+
+  if (which !== "frame") {
+    // 清 src：否则插件页的定时器/连接继续在后台跑
+    $("plugin-frame").src = "about:blank";
+  }
+  if (which !== "detail") {
+    // 离开详情就丢掉缓存，并清 id —— 迟到的详情响应靠它判断"用户已经走了"
+    state.pluginDetail = null;
+  }
+  if (which === "list") state.pluginCurrentId = "";
+}
+
+/** 回到插件列表（唯一的"返回"实现）。 */
 function closePluginPage() {
-  $("plugin-frame-wrap").classList.add("hidden");
-  $("plugin-page-list").classList.remove("hidden");
-  $("plugins-hint").classList.remove("hidden");
-  // 清 src：否则插件页的定时器/连接继续在后台跑
-  $("plugin-frame").src = "about:blank";
+  showPluginsView("list");
 }
 
 $("plugin-frame-back").onclick = () => go("plugins");
+$("plugin-detail-back").onclick = () => go("plugins");
 
 /* ================= 启动 ================= */
 
@@ -3195,12 +4003,22 @@ $("login-form").onsubmit = async (e) => {
 function boot() {
   hideLogin();
   refreshStatus();
+  refreshUnread();
   // 先预热人设/会话（聊天页要用它们渲染下拉），再按当前 hash 落地页面。
   Promise.all([loadPersonas().catch(() => {}), loadSessions().catch(() => {})])
     .then(() => applyRoute())
     .catch(() => applyRoute());
   if (!window.__emotionTimer) {
     window.__emotionTimer = setInterval(refreshStatus, 30000);
+  }
+  // 🔴 未读**单独一个定时器**，且**只开一次**（`boot()` 可能被多次调用：
+  //    登录成功 / 迟到解锁都会走它）—— 漏了这个守卫会叠出 N 个定时器。
+  //
+  // ⚠️ 与状态栏那个 30 秒不同步：主动消息到达的时刻是插件决定的，
+  //    我们只能轮询；两者共用一个定时器会让"未读出现"的延迟变成
+  //    最长 60 秒（两个 tick 才轮到一次），用户等不起。
+  if (!window.__emotionUnreadTimer) {
+    window.__emotionUnreadTimer = setInterval(refreshUnread, 15000);
   }
 }
 

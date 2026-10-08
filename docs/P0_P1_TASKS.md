@@ -1059,7 +1059,15 @@ please switch to Gemini 3.7 Flash"），而 `.env` 里的 `gemini-3.1-flash-lite
   而**日志里两串看起来完全相同**，极难排查。前端 `trim()` 挡不住 API 直调/脚本/表单自动填充。
 * **冒号直接拒绝**（不是替换）：`umo` 是 `A:B:C` 三段，user id 里带冒号会让
   `split(":", 2)` **截断**第三段 → 又是"看起来对、实际错位"。
-* **空串合法**：语义是"跟随全局设置"（向后兼容），不是错误。
+* ⚠️ **空串的含义在 2026-09-26 变了**（情绪：「每个会话都带一个唯一标签 umo，
+  这样我就能自己到陪伴那边添加"用户"和测试主动消息等东西了」）：
+  * **`create()` 留空** → **自动分配**一个专属标签（`sess-<12位十六进制>`）；
+  * **存量会话**的 `user_id` 仍是空串（**不静默改写** —— 那等于换库），
+    它们照旧回落全局 `plugins.umo_user_id`；面板上显示为空并提示
+    「保存一个用户 ID 后就有了」，用户可点「换一个专用 umo」显式迁移。
+  * 取值三条硬约束（都来自插件源码实测，见 `session_repo._new_umo_user_id`）：
+    非全数字（`page_api.py:17719` 用 `isdigit()` 判 QQ 用户）、
+    不含冒号/空白、不撞 `scheduler`（`tts_tool_sanitizer.py:69`）。
 
 ## 4. 判据与注入验证
 
@@ -1108,7 +1116,7 @@ please switch to Gemini 3.7 Flash"），而 `.env` 里的 `gemini-3.1-flash-lite
 ## 5. 端到端取证（真服务 / 真插件 / 真库）
 
 ```
-$ .venv/bin/python tools/proactive_multisession_check.py http://127.0.0.1:6190 "$TOKEN"
+$ .venv/bin/python tools/proactive_multisession_check.py http://127.0.0.1:6191 "$TOKEN"
 ✅ ① 三个会话各自绑定独立的插件用户 ID
 ✅ ② 接口读回的 user_id 与会话一一对应（不串台）
 ✅ ③ 插件按各自的 user_id 建档（三个 umo 互不相同）
@@ -1117,7 +1125,7 @@ $ .venv/bin/python tools/proactive_multisession_check.py http://127.0.0.1:6190 "
       非 e2e 的 user 计数变化=无；（核对 1 个已有 user：{'default': 6}）
 ✅ ⑤ 三个会话的消息互不污染
 
-$ .venv/bin/python tools/session_userid_check.py http://127.0.0.1:6190 "$TOKEN"
+$ .venv/bin/python tools/session_userid_check.py http://127.0.0.1:6191 "$TOKEN"
 ✅ ⓪ 自建测试会话（判据不依赖预存数据）  → id=89a020557b524f149a5e12b422ed7354
 ✅ ① 会话页有「插件用户 ID」输入框
 ✅ ② 选中会话后回填它绑的 user_id      value='chkecc9eedeb1'

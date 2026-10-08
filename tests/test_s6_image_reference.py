@@ -625,8 +625,14 @@ def test_persona_reference_falls_back_cleanly_when_unset(tmp_path):
 
     assert r.success is True, r
     assert "parameters" not in cap.last["body"]
-    assert not any("人设固定参考图" in m for m in logs), (
-        f"没配人设图却声称用了它：{logs}"
+    # 🔴 用与真实日志**一致**的子串。
+    #    ⚠️ 2026-09-25 踩到：这条原来写的是 `"人设固定参考图"`，而日志文案后来
+    #       改成了「使用配置的固定参考图」→ **这个断言永远不可能为真**，
+    #       变成了假判据（注入 ⑤ 因此抓不住）。
+    #       **通则：断言里的字面串必须与产品里真正会打的串对齐**；
+    #       写"否定式"判据时尤其危险 —— 它永远绿，看不出自己失效了。
+    assert not any("固定参考图" in m for m in logs), (
+        f"没配参考图却声称用了它：{logs}"
     )
 
 
@@ -654,7 +660,12 @@ def test_persona_reference_missing_file_is_loud_not_silent(tmp_path):
 
 
 def test_persona_reference_use_is_logged(tmp_path, caplog):
-    """🔴 **留痕判据**：参考图从哪来的必须有日志（本项目最贵的一课）。"""
+    """🔴 **留痕判据**：参考图从哪来的必须有日志（本项目最贵的一课）。
+
+    ⚠️ 2026-09-25 加强：参考图现在有**三级来源**（模型显式 / 人设自己 / 全局兜底），
+       光断言"有一行日志"已经不够 —— 必须能**区分是哪一级**，
+       否则用户报"画得不像"时无从判断是"人设图没上传"还是"全局兜底在顶"。
+    """
     caplog.set_level(logging.INFO, logger="emotion_app.domain.image_tool")
     cap = _Capture()
     backend = _backend(cap)
@@ -672,8 +683,15 @@ def test_persona_reference_use_is_logged(tmp_path, caplog):
             await client.close()
 
     asyncio.run(go())
-    msgs = [r.getMessage() for r in caplog.records]
-    assert any("人设固定参考图" in m for m in msgs), msgs
+    recs = [r for r in caplog.records if "固定参考图" in r.getMessage()]
+    assert recs, [r.getMessage() for r in caplog.records]
+    # 全局兜底那条必须**点名 source=global** —— 这是"哪一级生效"的唯一现场证据。
+    # ⚠️ 取值层级是 `record.data["source"]`：本项目所有结构化日志都走
+    #    `extra={"data": {...}}`（见 `logging_setup` 的 JsonFormatter / TextFormatter），
+    #    不是 `extra={"source": ...}` —— 写错层级会得到一个"永远为 None"的假判据。
+    assert (getattr(recs[0], "data", None) or {}).get("source") == "global", (
+        f"日志没标出参考图来源：{[getattr(r, 'data', None) for r in recs]}"
+    )
 
 
 def test_set_persona_reference_switches_default(tmp_path):
@@ -699,3 +717,82 @@ def test_set_persona_reference_switches_default(tmp_path):
     assert r.success is True, r
     got = cap.last["body"]["parameters"]["director_reference_images"][0]
     assert got == reference_data_uri(str(b)), "换过之后用的还是旧的人设图"
+
+
+# ===========================================================================
+# 7. 🆕 网络类异常**必须给出可诊断的文本**（2026-09-25 实测补）
+# ===========================================================================
+#
+# 🔴 起因：真环境复跑 `tools/ref_image_live_check.py` 时看到
+#     「生图端点连接失败：」**后面什么都没有**。
+#     查根因：`httpx` 的网络类异常 `str()` **可以是空串**
+#     （实测 `ConnectError`/`ReadError`/`RemoteProtocolError`/`ConnectTimeout`
+#       等 8 个类的 `str(cls(""))` 全是 `''`）。
+#     → 用户既不知道是超时、被重置、还是 DNS 挂了。
+#     这是本项目最贵那类 bug（**静默失败**）的变体：有报错，但报错里**没有信息**。
+
+
+def test_describe_never_returns_empty():
+    """`_describe()` 对"空消息异常"也必须给出内容（退化链：str → repr → 类名）。"""
+    import httpx
+
+    from emotion_app.domain.image_gen import _describe
+
+    for cls in (
+        httpx.ConnectError,
+        httpx.ReadError,
+        httpx.WriteError,
+        httpx.RemoteProtocolError,
+        httpx.ConnectTimeout,
+        httpx.ReadTimeout,
+        httpx.PoolTimeout,
+    ):
+        got = _describe(cls(""))
+        assert got.strip(), f"{cls.__name__} 渲染成了空串 —— 用户看不到任何线索"
+        # 退化到 repr 时应当能看出是哪个类（否则"有内容"也没用）
+        assert cls.__name__ in got, f"{cls.__name__} 的退化文本里看不出异常类型：{got!r}"
+
+    # 有正常消息时**原样透传**（不要无谓地套 repr）
+    assert _describe(httpx.ConnectError("connection reset")) == "connection reset"
+
+
+def test_connect_error_message_is_not_empty(tmp_path):
+    """端到端：连接类异常 → 工具返回的 `actual_error` 里必须有可诊断信息。"""
+    import httpx
+
+    from emotion_app.domain.backends import OpenAIImageBackend
+    from emotion_app.domain.image_gen import ImageClient, ImageTarget
+    from emotion_app.domain.image_tool import ImageToolService
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        # ⚠️ 传**空消息**——正是真环境里出现的那种（httpx 的 str() 为空）
+        raise httpx.ConnectError("")
+
+    async def go():
+        client = ImageClient(transport=httpx.MockTransport(boom))
+        await client.open()
+        try:
+            backend = OpenAIImageBackend(
+                client, ImageTarget(base_url="https://img/v1", api_key="k", model="m")
+            )
+            svc = ImageToolService(backend, output_dir=tmp_path / "out")
+            return await svc({"prompt": "画", "kind": "text2img", "send": False})
+        finally:
+            await client.close()
+
+    r = asyncio.run(go())
+    assert r.success is False
+    # ⚠️ 我第一版断言 `status == "connect_failed"` —— **查清后确认断言是错的、代码是对的**：
+    #    `_failure_result` 只为 `provider_policy_refusal`/`timeout`/`download_failed`/
+    #    `reference_unreadable` 开了专门分支，`connect_failed` **有意**落到通用 `error`
+    #    （对用户措辞一样是"这次没画出来"）。
+    #    `connect_failed` 这个更精确的码在**日志**里（`extra.data.code`），供排查用。
+    #    （本项目铁律：断言失败先查清哪个值才对，别条件反射改代码。）
+    assert r.status == "error", r.status
+    assert r.actual_error.strip(), "actual_error 是空的 —— 排查时没有任何线索"
+    assert "ConnectError" in r.actual_error, (
+        f"退化文本里看不出异常类型：{r.actual_error!r}"
+    )
+    assert len(r.actual_error) > len("生图端点连接失败："), (
+        f"只有前缀没有内容：{r.actual_error!r}"
+    )

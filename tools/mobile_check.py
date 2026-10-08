@@ -65,7 +65,7 @@ class CDP:
 
 
 def main() -> int:
-    base = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:6190/"
+    base = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:6191/"
     token = sys.argv[2] if len(sys.argv) > 2 else ""
     if not token:
         print("❌ 需要令牌参数")

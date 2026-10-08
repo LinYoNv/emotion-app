@@ -117,6 +117,8 @@ class PersonaRepository:
             "name", "description", "personality", "scenario",
             "creator_notes", "avatar_path",
             "api_url", "api_key", "model", "prompt_sections",
+            # 🆕 人设参考图（面板上传后写这个字段，2026-09-25）
+            "reference_image_path",
         }
         for key, value in patch.items():
             if key not in allowed:

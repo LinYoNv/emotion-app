@@ -41,7 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from browser_check import CHROME, PORT, CDP  # noqa: E402
 
-BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:6190/").rstrip("/")
+BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:6191/").rstrip("/")
 
 #: 陪伴面板的插件页路径（与我们 `plugin_pages_web` 的挂载形状一致）。
 #: ⚠️ **必须以 `/` 结尾**：插件页用相对路径取资源，少斜杠会打到上一级 → 白屏。

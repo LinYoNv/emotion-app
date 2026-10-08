@@ -25,6 +25,8 @@ import httpx
 
 from ..infra.logging_setup import get_logger
 from . import image_gen
+from . import persona_ref as persona_ref_mod
+from . import tool_context
 from .image_gen import ImageError, save_image
 from .ports import ImageBackend
 from .tools import ToolParam, ToolRegistry, ToolResult, ToolSpec
@@ -131,10 +133,13 @@ class ImageToolService:
         不用改这里（情绪：「接口别写死了」）。
 
         Args:
-            persona_reference: 🆕 **人设固定参考图**（2026-09-25）。`selfie` 且模型
-                没给 `reference_image_path` 时**自动带上它** —— 否则同一个角色
-                每次画出来都不一样。只在 `selfie` 上生效（`edit` 的语义是
-                "改用户给的那张图"，拿它兜底会静默换掉语义）。
+            persona_reference: 🆕 **全局人设固定参考图**（2026-09-25）。
+                优先级**最低**的那一级 —— 只在"模型没给路径"且"当前人设
+                也没上传自己的参考图"时才用它。每次画同一个角色长得都不一样
+                是它要解决的问题；但只有一个角色时用它最省事。
+                只在 `selfie` 上生效（`edit` 的语义是"改用户给的那张图"，
+                拿它兜底会静默换掉语义）。
+                ⚠️ 人设自己那份（面板上传的）优先于它 —— 见 `domain/persona_ref.py`。
         """
         self._backend = backend
         self._out_dir = Path(output_dir)
@@ -212,18 +217,38 @@ class ImageToolService:
 
         # ⚠️ edit 必须有参考图 —— 缺了要明确拒绝，不能让模型编路径
         ref = str(args.get("reference_image_path") or "").strip()
-        # 🆕 人设固定参考图兜底：**只给 selfie**。
+        # 🆕 人设参考图兜底：**只给 selfie**（2026-09-25 起是三级优先）。
         #    * 为什么不做 `edit`：edit 的语义是"改用户给的那张图"，
         #      拿角色参考图兜底会**静默换掉语义**（画出来完全不是用户要改的图）。
         #    * 为什么不做 `text2img`：那是风景/物件，注入角色参考图会画错东西。
-        if not ref and kind == image_gen.KIND_SELFIE and self._persona_reference:
-            ref = self._persona_reference
-            # 🔴 **必须留痕**：这是"参考图从哪来的"唯一现场证据
-            #    （本项目最贵的一课就是参考图被静默丢弃/替换）
-            log.info(
-                "selfie 未指定参考图，使用人设固定参考图",
-                extra={"data": {"configured_chars": len(ref)}},
-            )
+        #
+        #    🔴 **三级优先**（唯一判据在 `persona_ref.resolve_persona_reference`）：
+        #       ① 模型显式给的路径（上面 `ref`，非空就不再往下走）
+        #       ② 当前人设自己的图 —— 面板上传的，**per-persona**
+        #       ③ 全局 `EMOTION_IMAGE_PERSONA_REFERENCE`（兜底）
+        #    ⚠️ ②③ 的取值来源不同，日志里必须能区分 —— 否则用户报"画得不像"
+        #       时无从判断是"人设图没上传"还是"全局兜底在顶"。
+        ref_source = "explicit" if ref else ""
+        if not ref and kind == image_gen.KIND_SELFIE:
+            persona = tool_context.get_persona()
+            persona_ref = persona_ref_mod.resolve_persona_reference(persona)
+            if persona_ref:
+                ref = persona_ref
+                ref_source = "persona"
+            elif self._persona_reference:
+                ref = self._persona_reference
+                ref_source = "global"
+            if ref:
+                # 🔴 **必须留痕**：这是"参考图从哪来的"唯一现场证据
+                #    （本项目最贵的一课就是参考图被静默丢弃/替换）
+                log.info(
+                    "selfie 未指定参考图，使用配置的固定参考图",
+                    extra={"data": {
+                        "source": ref_source,
+                        "persona": getattr(persona, "id", "") if persona else "",
+                        "configured_chars": len(ref),
+                    }},
+                )
         if kind == image_gen.KIND_EDIT and not ref:
             return ToolResult(
                 status="invalid_args",

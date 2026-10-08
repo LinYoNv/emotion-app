@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from datetime import datetime
 
 import pytest
 
@@ -17,6 +19,7 @@ from emotion_app.infra.config import (
 from emotion_app.infra.logging_setup import (
     REDACTED,
     JsonFormatter,
+    TextFormatter,
     is_sensitive_key,
     scrub,
     scrub_text,
@@ -207,3 +210,35 @@ def test_json_formatter_redacts():
     payload = json.loads(formatter.format(record))
     assert payload["data"]["api_key"] == REDACTED
     assert "supersecret" not in formatter.format(record)
+
+
+# ---------------------------------------------------------------------------
+# 文本日志必须带日期（2026-10-08）
+# ---------------------------------------------------------------------------
+
+
+def _record(msg: str = "x") -> logging.LogRecord:
+    return logging.LogRecord(
+        name="test", level=logging.INFO, pathname="", lineno=0,
+        msg=msg, args=(), exc_info=None,
+    )
+
+
+def test_text_formatter_includes_full_date():
+    """🔴 文本日志必须带**完整日期**。
+
+    起因：原来只打 `%H:%M:%S`，而 `logs/serve.out` 是 `nohup >>` 追加的、
+    **横跨多天含多次重启** ⇒ 判不出"这条是历史残留还是当前仍在发生"。
+    这个断言会真的失败：把格式串改回 `%H:%M:%S` 即红。
+    """
+    line = TextFormatter().format(_record("hello"))
+    # 必须能同时看到日期和时间
+    assert re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ", line), line
+    # 且日期就是**今天**（不能打出一个固定的假日期）
+    assert datetime.now().strftime("%Y-%m-%d") in line
+
+
+def test_text_formatter_starts_with_timestamp_not_level():
+    """格式不能被改回"没有时间戳"的形态（防回退）。"""
+    line = TextFormatter().format(_record("hello"))
+    assert line.startswith(datetime.now().strftime("%Y-%m-%d"))

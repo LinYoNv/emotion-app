@@ -180,6 +180,83 @@ def test_send_by_session_swallows_port_error_but_reports_failure():
 
 
 # ---------------------------------------------------------------------------
+# 二·补、🔴 **失败必须留日志**（2026-09-29 补）
+#
+# 为什么要单独一组：上面三条只断言**返回值**。我做了注入验证 ——
+# 把 `except` 里那句 `logger.error(...)` 删掉、换成 `pass`（**静默失败**），
+# **11 条判据全绿**。也就是说"投递失败但一个字都不记"这种状态，
+# 在测试里是完全不可见的。
+#
+# 后果为什么最重（本项目铁律「静默失败比报错贵」）：
+#   `send_by_session` 是插件【主动消息】的落点。它失败且不记日志时，
+#   用户看到的是"伴侣一直没找我"，而日志里**连一行线索都没有** ——
+#   根本无从排查。这与 aitag「参考图被静默丢弃」是同型事故。
+#
+# ⚠️ 判据的写法要点：**断言日志内容里有 umo 和异常类型**，
+#    而不是只断言"有 ERROR" —— 只查级别的话，一条 `logger.error("failed")`
+#    也能过，那种日志对排查没有价值（项目正则：日志要能定位到"哪条消息、什么错"）。
+# ---------------------------------------------------------------------------
+def test_port_error_must_be_logged_not_swallowed(caplog):
+    """🔴 端口抛异常 → 必须记 **ERROR**，且日志里能定位到 umo 与异常类型。
+
+    （注入验证：删掉这句 logger.error 后，本文件其余 11 条判据全绿 ⇒ 这条是必要的）
+    """
+    from astrbot_host.compat.core.platform.message_session import MessageSession
+    from astrbot_host.compat.core.platform.message_type import MessageType
+    from astrbot_host.platform_manager import build_platform_manager
+
+    delivery = _RecordingDelivery(raises=RuntimeError("上游通道断了"))
+    inst = build_platform_manager(delivery=delivery).get_insts()[0]
+    session = MessageSession("11", MessageType.FRIEND_MESSAGE, "u1")
+
+    with caplog.at_level("ERROR"):
+        result = asyncio.run(inst.send_by_session(session, "CHAIN"))
+
+    assert result is False
+    errors = [r for r in caplog.records if r.levelno >= 40]
+    assert errors, (
+        "端口投递抛异常却**没有任何日志** —— 静默失败。"
+        "用户只会看到「伴侣一直没找我」，而日志里没有线索可查。"
+    )
+    text = " ".join(r.getMessage() for r in errors)
+    assert "11:FriendMessage:u1" in text, (
+        f"ERROR 日志里没有 umo ⇒ 无法定位是哪条会话的消息丢了：{text!r}"
+    )
+    assert "RuntimeError" in text or "上游通道断了" in text, (
+        f"ERROR 日志里没有异常信息 ⇒ 无法判断失败原因：{text!r}"
+    )
+
+
+def test_missing_port_must_be_logged_not_silent(caplog):
+    """🔴 端口未注入（我们自己的接线错误）→ 必须记 **WARNING**。
+
+    ⚠️ 这条对应的是**我们自己**的装配失误，不是插件的问题：
+       投递端口没接上时插件功能会整体降级，而"降级"如果没日志，
+       就退化成本项目最贵的那类 bug（能力缺失但不喊）。
+    """
+    from astrbot_host.compat.core.platform.message_session import MessageSession
+    from astrbot_host.compat.core.platform.message_type import MessageType
+    from astrbot_host.platform_manager import build_platform_manager
+
+    inst = build_platform_manager(delivery=None).get_insts()[0]
+    session = MessageSession("11", MessageType.FRIEND_MESSAGE, "3412642082")
+
+    with caplog.at_level("WARNING"):
+        result = asyncio.run(inst.send_by_session(session, "CHAIN"))
+
+    assert result is False
+    warns = [r for r in caplog.records if r.levelno >= 30]
+    assert warns, (
+        "投递端口未注入却**没有任何日志** —— 装配缺口被静默了。"
+        "这正是「能力缺口不在启动时喊」的同型问题。"
+    )
+    text = " ".join(r.getMessage() for r in warns)
+    assert "投递端口未注入" in text or "端口未注入" in text, (
+        f"WARNING 没说明是端口未注入 ⇒ 排查时看不出根因：{text!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 三、Context 接线（插件实际拿到的东西）
 # ---------------------------------------------------------------------------
 def test_context_exposes_platform_manager():

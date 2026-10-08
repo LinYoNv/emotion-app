@@ -34,10 +34,69 @@
   /** 我们挂载插件 API 的前缀（与 emotion_app/web/app.py 保持一致）。 */
   var EXT_PREFIX = "/api/plugins/extensions";
 
-  function apiUrl(endpoint, params) {
+  /* ------------------------------------------------------------------
+   * 🔴 本页属于哪个插件（2026-09-27 补的**根因修复**）
+   *
+   * 服务端注入页面时把插件目录名写进 `<meta name="emotion-plugin-id">`
+   * （`astrbot_host/plugin_pages.py` 的 `inject_page_context`）。
+   *
+   * ## 为什么需要它（改成实测的根因，不是给日志降噪）
+   *
+   * 插件的候选列表（`companion-panel/app.js:6702`）是：
+   *
+   *     page/x → x → /x → <插件名>/page/x → /<插件名>/page/x
+   *
+   * 垫片从前只拿得到**没有插件名**的 `page/x`，拼出来是
+   * `/api/plugins/extensions/page/x` → **必然 404** → 靠插件自己一级级重试。
+   * 实测日志里成组的「插件路由未命中」（19 条，每组 3 条 = 前三级）就是这么来的。
+   *
+   * ⚠️ **真损失不是噪音**：`一起房间` 的 `launcher.js:47` 只生成
+   *    `page/x` **一种候选且没有重试** ⇒ 它**永远 404**、页面永远取不到数。
+   *
+   * ✅ 有了插件名，垫片把**任何**形状的候选都折算成
+   *    `<插件名>/page/x`（我们的派发器要的正是这个）→ 一次命中。
+   *
+   * ⚠️ 读不到 meta（老页面/别的宿主）→ 退回原行为（原样拼），
+   *    插件那边的重试逻辑仍在，**不会更差**。
+   * ------------------------------------------------------------------ */
+
+  var PLUGIN_ID = (function readMeta() {
+    try {
+      var el = document.querySelector('meta[name="emotion-plugin-id"]');
+      var v = el && el.getAttribute("content");
+      return v ? String(v).trim().replace(/^\/+|\/+$/g, "") : "";
+    } catch (e) {
+      return "";
+    }
+  })();
+
+  /**
+   * 把插件给的 endpoint 折算成我们派发器认识的形状。
+   *
+   * 派发器（`astrbot_host/dispatch.py`）的路径是 `<插件名>/<子路径>`，
+   * 所以这里把候选的三种前缀都剥掉，再补上插件名：
+   *
+   *   "page/x"                  → "<插件名>/page/x"
+   *   "/page/x"                 → "<插件名>/page/x"
+   *   "x"                       → "<插件名>/x"      （裸形状）
+   *   "<插件名>/page/x"          → 原样（已带名，别重名）
+   *   "<别的插件名>/page/x"      → 原样（**跨插件调用要尊重**，不硬掰）
+   */
+  function normalizeEndpoint(endpoint) {
     var raw = String(endpoint == null ? "" : endpoint).trim();
-    // 候选里既有 "page/x" 也有 "/plugin/page/x" —— 统一成一个绝对路径
     raw = raw.replace(/^\/+/, "");
+    if (!PLUGIN_ID || !raw) return raw;
+
+    var firstSeg = raw.split("/")[0];
+    // 已经带插件名（含别的插件名）→ 原样，不重复补
+    if (firstSeg === PLUGIN_ID || /^astrbot_plugin_|^astrbot_/.test(firstSeg)) {
+      return raw;
+    }
+    return PLUGIN_ID + "/" + raw;
+  }
+
+  function apiUrl(endpoint, params) {
+    var raw = normalizeEndpoint(endpoint);
     var url = EXT_PREFIX + "/" + raw;
     if (params && typeof params === "object") {
       var qs = new URLSearchParams();

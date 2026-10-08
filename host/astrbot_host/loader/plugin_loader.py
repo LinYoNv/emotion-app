@@ -29,6 +29,7 @@ import importlib.util
 import logging
 import sys
 import traceback
+import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,59 @@ logger = logging.getLogger("astrbot.host.loader")
 
 #: 插件元数据文件名（照真实现 `PLUGIN_METADATA_FILENAMES`）
 METADATA_FILENAMES = ("metadata.yaml", "metadata.yml")
+
+#: 插件入口模块名（真实现是 `<插件目录>/main.py`，`discover()` 也按它判据）
+ENTRY_MODULE_NAME = "main"
+
+#: 真 AstrBot 的插件模块路径前缀。真实现 `star_manager.py:1115`：:
+#:
+#:     path = "data.plugins." if not reserved else "astrbot.builtin_stars."
+#:     path += root_dir_name + "." + module_str
+#:
+#: 我们**不从这儿加载**（我们的顶层包名就是插件目录名，见本模块头部的差异说明），
+#: 但停用名单里允许出现这个前缀 —— 这样把生产 AstrBot 的
+#: `shared_preferences.inactivated_plugins` 原样抄过来就能用。
+REAL_ASTRBOT_MODULE_PREFIX = "data.plugins."
+
+
+def entry_module_path(dir_name: str) -> str:
+    """插件的**入口模块路径** —— 我们宿主的"插件身份"的唯一定义。
+
+    它同时是：`star_map` 的键、handler 的 `handler_module_path`、
+    `@filter.llm_tool` 工具的 `handler_module_path`、以及停用名单里的元素。
+    四处必须是**同一个字符串**，所以只在这里拼一次。
+    """
+    return f"{dir_name}.{ENTRY_MODULE_NAME}"
+
+
+def normalize_module_path(raw: Any) -> str:
+    """把停用名单里的一个元素归一成 `entry_module_path()` 的形状。
+
+    🔴 **这是"名单元素算不算命中"的唯一判据** —— 加载器与面板都调它，
+       别处不许再写第二套 `in ...` 比较（本项目"同一概念多条写入路径"踩过 3 次）。
+
+    接受三种写法（都能用，这是**输入归一**，不是三套判据）：
+
+    | 写法 | 来源 |
+    |---|---|
+    | `astrbot_plugin_x.main` | 我们自己的规范写法（面板写出来的就是它） |
+    | `astrbot_plugin_x` | 只写目录名 → 补上入口模块 |
+    | `data.plugins.astrbot_plugin_x.main` | **真 AstrBot 的写法**，可直接抄 |
+
+    Returns:
+        归一后的模块路径；空串 = 这一项没有意义（调用方据此报"对不上任何插件"）。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text.startswith(REAL_ASTRBOT_MODULE_PREFIX):
+        text = text[len(REAL_ASTRBOT_MODULE_PREFIX):]
+    if not text:
+        return ""
+    if "." not in text:
+        # 只有一段 = 插件目录名 → 补入口模块（`discover()` 也要求 `main.py` 存在）
+        return entry_module_path(text)
+    return text
 
 
 @dataclass
@@ -79,10 +133,38 @@ class PluginRecord:
     #: ⚠️ 光有元数据还不够 —— 页面 HTML 在 `<插件>/pages/<name>/index.html`，
     #:    要宿主**提供页面路由**才打得开（这正是"插件没有配置入口"的根因）。
     pages: list[dict[str, str]] = field(default_factory=list)
+    #: 🔴 是否因**停用名单**被跳过（真实现 `inactivated_plugins`）。
+    #: 停用与"加载失败"是**两条不同的路径**：停用的插件不 import、不实例化、
+    #: 不 `initialize()`，并且**不计入失败**（真实现 `star_manager.py:1240`
+    #: 只把 `star_cls` 置 None，再打一行 "Plugin %s is disabled."）。
+    inactivated: bool = False
+
+    @property
+    def module_path(self) -> str:
+        """本插件在宿主里的模块身份（= `star_map` 的键 / handler 的归属）。"""
+        return entry_module_path(self.dir_name)
+
+    @property
+    def state(self) -> str:
+        """插件当前状态的**唯一判据**（报告、面板、日志都用它）。
+
+        四种取值，互斥且穷尽：
+          * `"inactivated"` —— 在停用名单里，我们**没碰过它**（不是失败）
+          * `"failed"`      —— 真出错了（import/实例化失败）
+          * `"loaded"`      —— 加载成功
+          * `"not_loaded"`  —— 既没加载也没报错（不该出现，出现即为异常状态）
+        """
+        if self.inactivated:
+            return "inactivated"
+        if self.error:
+            return "failed"
+        if self.instance is not None:
+            return "loaded"
+        return "not_loaded"
 
     @property
     def ok(self) -> bool:
-        return not self.error and self.instance is not None
+        return self.state == "loaded"
 
 
 @dataclass
@@ -90,18 +172,27 @@ class LoadReport:
     """一次加载的结果汇总。"""
 
     records: list[PluginRecord] = field(default_factory=list)
+    #: 🔴 停用名单里**对不上任何插件目录**的元素（拼错 / 插件已删）。
+    #: 必须能看见 —— 静默忽略会让用户以为"已经停用了"，其实一点作用都没有。
+    unmatched_inactivated: list[str] = field(default_factory=list)
 
     @property
     def loaded(self) -> list[PluginRecord]:
-        return [r for r in self.records if r.ok]
+        return [r for r in self.records if r.state == "loaded"]
 
     @property
     def failed(self) -> list[PluginRecord]:
-        return [r for r in self.records if not r.ok]
+        """⚠️ **不含**被停用的（那是两条不同的路径，见 `PluginRecord.inactivated`）。"""
+        return [r for r in self.records if r.state == "failed"]
+
+    @property
+    def inactivated(self) -> list[PluginRecord]:
+        return [r for r in self.records if r.state == "inactivated"]
 
     def summary(self) -> str:
         lines = [
-            f"插件加载：成功 {len(self.loaded)} / 失败 {len(self.failed)}",
+            f"插件加载：成功 {len(self.loaded)} / 失败 {len(self.failed)}"
+            + (f" / 已停用 {len(self.inactivated)}" if self.inactivated else ""),
         ]
         for r in self.records:
             if r.ok:
@@ -110,8 +201,15 @@ class LoadReport:
                     f"handlers={r.handler_count} web_api={r.web_api_count} "
                     f"tasks={r.task_count} llm_tools_bound={r.llm_tool_bind_count}"
                 )
+            elif r.inactivated:
+                lines.append(f"  ⏸ {r.name}（{r.module_path}）→ 已停用，跳过加载")
             else:
                 lines.append(f"  ❌ {r.name}（{r.dir_name}）→ {r.error}")
+        if self.unmatched_inactivated:
+            lines.append(
+                f"  ⚠️ 停用名单里有 {len(self.unmatched_inactivated)} 项对不上任何插件"
+                f"（拼写错误？）：{', '.join(self.unmatched_inactivated)}"
+            )
         return "\n".join(lines)
 
 
@@ -130,6 +228,7 @@ class PluginLoader:
         plugin_dirs: list[str | Path],
         *,
         mirror_root: str | Path | None = None,
+        inactivated: list[str] | None = None,
     ) -> None:
         """
         Args:
@@ -145,6 +244,15 @@ class PluginLoader:
 
                 ⚠️ 不传也能用（保持骨架的简单性），但加载期间若检测到源目录
                 被改写，会打**响亮 warning**（见 `write_guard`）。
+            inactivated: 🔴 **停用名单**（照真实现 `star_manager.py:1087`
+                `inactivated_plugins = await sp.global_get("inactivated_plugins", [])`）。
+
+                元素是**模块路径**，三种写法都收（见 `normalize_module_path`）。
+                命中 = **不 import、不实例化、不调用 `initialize()`**，
+                且**不计入失败** —— 停用与"加载失败"是两条不同的路径。
+
+                ⚠️ 名单本身由**装配层**（`emotion_app/web/plugin_host.py`）从配置读出来
+                再传进来：`host/` 不许反向依赖 `emotion_app`（单向依赖铁律）。
         """
         self.requested_dirs = [Path(d) for d in plugin_dirs]
         self.plugin_dirs = list(self.requested_dirs)
@@ -159,8 +267,24 @@ class PluginLoader:
             # 从镜像加载（**不再碰源目录**）
             self.plugin_dirs = [Path(mirror_root).resolve()]
 
+        #: 归一后的停用名单（集合，只用于成员判断）。
+        #: ⚠️ 归一化只在这里做一次 —— 判据单一，见 `is_inactivated`。
+        self.inactivated: set[str] = {
+            p for p in (normalize_module_path(x) for x in (inactivated or ())) if p
+        }
+
         self.records: dict[str, PluginRecord] = {}
         self._context: Context | None = None
+
+    # ---- 停用判据（**只此一份**）----
+
+    def is_inactivated(self, module_path: str) -> bool:
+        """该模块路径是否在停用名单里。
+
+        🔴 加载器、加载报告、面板**都调这里**；
+           别处不许再写 `x in inactivated_plugins` 之类的第二套比较。
+        """
+        return module_path in self.inactivated
 
     # ---- 扫描 ----
 
@@ -207,8 +331,24 @@ class PluginLoader:
             rec = await self.load_one(path)
             self.records[path.name] = rec
             report.records.append(rec)
-            if not rec.ok and fail_fast:
+            if not rec.ok and not rec.inactivated and fail_fast:
                 raise RuntimeError(f"插件 {path.name} 加载失败：{rec.error}")
+
+        # 🔴 名单里"对不上任何插件"的元素要**响亮**报出来（拼错 / 插件已删）。
+        #    静默忽略会让用户以为"已经停用了"，其实一点作用都没有 ——
+        #    正是本项目最忌的那类静默失败。
+        #    ⚠️ `only=` 是调试用的部分加载，那时 records 本来就不全 → 不算 unmatched。
+        if not only:
+            discovered = {r.module_path for r in report.records}
+            report.unmatched_inactivated = sorted(self.inactivated - discovered)
+            if report.unmatched_inactivated:
+                logger.warning(
+                    "停用名单里有 %d 项对不上任何插件目录（拼写错误？）：%s；"
+                    "已发现的插件模块路径：%s",
+                    len(report.unmatched_inactivated),
+                    ", ".join(report.unmatched_inactivated),
+                    ", ".join(sorted(discovered)),
+                )
 
         return report
 
@@ -217,6 +357,41 @@ class PluginLoader:
         rec = PluginRecord(name=path.name, dir_name=path.name, path=path)
         try:
             self._ensure_on_sys_path(path.parent)
+
+            # ---- 只读元数据（不执行任何插件代码）----
+            # ⚠️ 顺序上必须先读它：停用的插件也要能报出自己的**显示名/版本**给面板，
+            #    否则面板只能显示目录名（用户认不出是哪个插件）。
+            meta = self._read_metadata(path)
+            rec.name = meta.get("name") or path.name
+            rec.version = str(meta.get("version") or "")
+            rec.author = str(meta.get("author") or "")
+            rec.desc = str(meta.get("desc") or "")
+            rec.pages = _normalize_pages(meta.get("pages"))
+
+            # 🔴🔴 **停用名单命中 → 到此为止**（照真实现 `star_manager.py:1087/1218/1251`）。
+            #
+            #    "不加载"在这里的含义（逐条对应真机那四类噪音）：
+            #      * 不 `import` → 不会再有 `插件加载失败：meme_manager →
+            #        No module named 'requests'`；
+            #      * 不实例化、不 `initialize()` → 不会再有
+            #        `initialize() 失败：gemini_content_keeper` /
+            #        `initialize() 超时：media_parser`；
+            #      * handler 根本没注册 → 不会再有
+            #        `LLM 钩子执行失败：prompt_tools.main_process_llm_request`。
+            #
+            #    ⚠️ 位置必须在 `_check_name_conflict` **之前**：那个函数会抛异常
+            #       （"模块名冲突"）—— 抛了就变成 `failed`，
+            #       而停用的插件**不该出现在失败清单里**（这是判据之一）。
+            if self.is_inactivated(rec.module_path):
+                rec.inactivated = True
+                logger.info(
+                    "插件 %s 已停用（名单命中 %s）→ 跳过加载：不 import、不实例化、"
+                    "不调用 initialize()，也**不计入失败**",
+                    rec.name,
+                    rec.module_path,
+                )
+                return rec
+
             self._check_name_conflict(path.name)
 
             # 🔴 **归属标注**：插件在自己的 `__init__` 里调
@@ -225,13 +400,6 @@ class PluginLoader:
             #    否则登记物无法归属到插件，加载报告只能报累计值。
             if self._context is not None:
                 self._context.set_current_plugin(path.name)
-
-            meta = self._read_metadata(path)
-            rec.name = meta.get("name") or path.name
-            rec.version = str(meta.get("version") or "")
-            rec.author = str(meta.get("author") or "")
-            rec.desc = str(meta.get("desc") or "")
-            rec.pages = _normalize_pages(meta.get("pages"))
 
             # ⚠️ **不用"前后差值"统计 handler**（实测踩到）：
             #    插件模块已 import 过时，`importlib` 不会重新执行装饰器
@@ -270,6 +438,9 @@ class PluginLoader:
                     "插件 %s 实例化 TypeError，尝试无 config 回退：%s", rec.name, exc
                 )
                 rec.instance = star_cls(context=self._context)
+
+            # 🔴 实例化**之后**才有实例可填 —— 这一步决定插件之间能不能互相找到对方。
+            self._fill_star_runtime(star_cls, rec, module)
 
             # 🔴🔴 **把 handler 绑定到插件实例**（照真实现 `star_manager.py:1260-1271`）。
             #
@@ -441,7 +612,7 @@ class PluginLoader:
 
         # ⚠️ 入口模块：真 AstrBot 用 `main.py`；同时把 main 挂成包属性，
         #    这样 `_find_star_class` 能在包命名空间里看到插件类。
-        main_name = f"{name}.main"
+        main_name = entry_module_path(name)
         if main_name in sys.modules:
             if was_loaded:
                 # 重复加载 → reload 保持新鲜（这才是 reload 的正当用途）
@@ -460,7 +631,70 @@ class PluginLoader:
                 continue
             if not hasattr(pkg, attr):
                 setattr(pkg, attr, getattr(main_mod, attr))
+
+        # 🔴 注册 `data.plugins.<dir>` 别名（W5，2026-10-08 修）
+        #    ⚠️ 本方法是 `@staticmethod` —— 用**类名**调用，别写 `self.`（实测 NameError）
+        PluginLoader._register_real_astrbot_alias(name, pkg, main_mod)
         return pkg
+
+    @staticmethod
+    def _register_real_astrbot_alias(
+        dir_name: str, pkg: Any, main_mod: Any
+    ) -> None:
+        """把插件注册成**真 AstrBot 的模块路径** `data.plugins.<dir>[.main]`。
+
+        ## 为什么必须做（W5 的真根因）
+        插件之间会**互相调用**，写法是硬编码真 AstrBot 的模块路径，例如：
+            `importlib.import_module("data.plugins.astrbot_plugin_private_companion.main")`
+        （实测本项目里这类写法 **40 处**，散在 5 个插件中。）
+
+        而我们的顶层包名是**目录名本身**（`astrbot_plugin_private_companion`，
+        见本模块头部说明）⇒ 上面那种 import **100% ModuleNotFoundError**。
+        ⚠️ 多数调用点写了两级候选或遍历 `sys.modules` 兜底（那些能活），
+           但**只写 `data.plugins.…` 一处**的地方就是**纯失败**。
+
+        ## 为什么用别名而不是改成真 AstrBot 的加载方式
+        改加载方式要动 `sys.path` 策略与全部插件内部绝对 import，风险大；
+        而**注册一个同对象的别名**是纯增量：插件拿到的还是**同一个模块对象**，
+        `isinstance` / 全局状态 / `id()` 全都一致（实测三种 import 写法都指向同一对象）。
+
+        ## 为什么必须逐级 `setdefault`
+        🔴 `data/` 是**隐式命名空间包**（`__file__` 为 None），
+        **不会自动在 `sys.modules` 里建中间层条目**。
+        实测踩到：只写 `sys.modules[alias] = main_mod` 后，
+        `setattr(sys.modules["data.plugins.astrbot_plugin_demo"], ...)` → **KeyError**。
+        ⇒ 必须逐级确保父包存在。
+
+        ⚠️ 只注册**别名**，不改 `pkg.__name__`（改了会让 `star_map` / handler
+           的 `handler_module_path` 与新名字脱节 —— 那是"同一概念多条写入路径"）。
+        """
+        parts = [*REAL_ASTRBOT_MODULE_PREFIX.rstrip(".").split("."), dir_name]
+        try:
+            # 1) 逐级确保父包在 sys.modules 里（命名空间包不会自动建）
+            for i in range(1, len(parts) + 1):
+                sys.modules.setdefault(".".join(parts[:i]), types.ModuleType(".".join(parts[:i])))
+            # 2) 逐级挂属性：data.plugins.<dir> → 真 pkg
+            sys.modules[".".join(parts)] = pkg  # 关键：用**真对象**覆盖占位
+            for i in range(1, len(parts)):
+                parent = sys.modules[".".join(parts[:i])]
+                setattr(parent, parts[i], sys.modules[".".join(parts[: i + 1])])
+            # 3) 入口模块别名：`data.plugins.<dir>.main` → 真 main_mod
+            main_alias = f"{'.'.join(parts)}.{ENTRY_MODULE_NAME}"
+            sys.modules[main_alias] = main_mod
+            # 把 main 挂成别名包的属性（`from data.plugins.<dir> import main` 也能用）
+            setattr(pkg, ENTRY_MODULE_NAME, main_mod)
+            logger.debug(
+                "已注册真 AstrBot 别名：%s → %s（跨插件调用可命中）",
+                ".".join(parts),
+                getattr(pkg, "__name__", "?"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 别名是**锦上添花**，失败不该让插件加载失败 —— 但**不许静默**。
+            logger.warning(
+                "注册真 AstrBot 模块别名失败（该插件的跨插件调用仍会失败）：%s: %s",
+                ".".join(parts),
+                exc,
+            )
 
     @staticmethod
     def _find_star_class(module: Any) -> type | None:
@@ -518,7 +752,7 @@ class PluginLoader:
             return 0
         n = 0
         for handler in star_handlers_registry.get_handlers_by_module_name(
-            f"{dir_name}.main"
+            entry_module_path(dir_name)
         ):
             raw = (
                 handler.handler.func
@@ -558,7 +792,7 @@ class PluginLoader:
         """
         from astrbot_host.registry import llm_tools
 
-        module_path = f"{dir_name}.main"
+        module_path = entry_module_path(dir_name)
         n = 0
         for spec in llm_tools.func_list:
             handler = getattr(spec, "handler", None)
@@ -734,6 +968,66 @@ class PluginLoader:
         md.root_dir_name = rec.dir_name
         md.activated = True
 
+    @staticmethod
+    def _fill_star_runtime(star_cls: type, rec: PluginRecord, module: Any) -> None:
+        """把**运行时对象**写进 star_map：`star_cls`（实例）+ `module`（模块）。
+
+        ⭐⭐ **为什么必须有**（照真实现 `star_manager.py:1222-1231` + `:1243`）::
+
+            metadata.star_cls = metadata.star_cls_type(context=..., config=...)
+            ...
+            metadata.module = module
+
+        这两个字段是插件**跨插件互调**的唯一入口 —— 插件加载完就靠它们找
+        "谁是我的同伴"。四种读法里有三种直接依赖本函数（第四种 `sys.modules[...]`
+        与本函数无关）：
+
+        | 读法 | 实测出处 |
+        |---|---|
+        | `get_all_stars()` → `md.star_cls.memory_companion` | 陪伴 `memory_companion_adapter.py:538` |
+        | `get_all_stars()` → `md.module.get_memory_companion_bridge()` | 陪伴 `memory_companion_adapter.py:892` |
+        | `get_registered_star(name)` → `md.star_cls` | 记忆插件 `companion_page_bridge.py:786` |
+
+        🔴 **实测后果（对照实验，唯一变量 = 补不补这两个字段）**：
+
+            原样           → 陪伴 `_memory_companion_bridge()` = None（reason=bridge_missing）
+            补上两字段后   → 找到桥，`capability_state=available`、`contract_version=3`
+
+        ⚠️ 这个 bug 的**症状形态**正是本项目最贵的那类：插件把它 catch 成
+           一行 info 日志（`[MemoryCompanion] capability probe degraded`），
+           **读我们自己的源码永远看不出来** —— 所以判据必须落在
+           `_memory_companion_bridge() is not None` 这种**端到端**上
+           （见 `host/tests/test_star_metadata.py`）。
+
+        🔴 **实例化失败时不许填假对象**：照真实现语义，`rec.instance is None`
+        （例如插件 import 失败 / 被禁用）时 `star_cls` **保持 `None`** ——
+        `star_manager.py:1240` 的 `else: metadata.star_cls = None` 就是这个意思，
+        而且 `star.py:21` 的类文档原话是「当 activated 为 False 时，star_cls 可能
+        为 None，**请不要在插件未激活时调用 star_cls 的方法**」。
+        插件侧对此有明确语义（`_memory_companion_presence()` 的
+        `"loaded": getattr(metadata, "star_cls", None) is not None`）——
+        填个能跑的样子反而会**伪造"已加载"** 。
+
+        ⚠️ **不要**把 `_bind_handlers_to_instance` / `_bind_llm_tools_to_instance`
+           也改到这里：它们读的是 handler registry 里的 `StarHandlerMetadata`，
+           与 `StarMetadata` **不是同一种对象**（见它们各自的 docstring）。
+        """
+        md: StarMetadata | None = star_map.get(star_cls.__module__)
+        if md is None:
+            # 理论上到不了（`_fill_star_metadata` 已在前面建过条目）；
+            # 真到了就如实补一条，不静默跳过。
+            logger.warning(
+                "star_map 里没有 %s 的条目，运行时字段将新建（可能加载顺序被改动过）",
+                star_cls.__module__,
+            )
+            md = StarMetadata(star_cls_type=star_cls, module_path=star_cls.__module__)
+            star_map[star_cls.__module__] = md
+            star_registry.append(md)
+        # ⚠️ `rec.instance` 为 None 时**就是 None**（照真实现 `star_manager.py:1240`
+        #    的 `else: metadata.star_cls = None`）—— 不伪造一个"能跑的样子"。
+        md.star_cls = rec.instance
+        md.module = module
+
 
 def _normalize_pages(raw: Any) -> list[dict[str, str]]:
     """把 `metadata.yaml` 的 `pages:` 归一成 `[{"name","title"}]`。
@@ -789,4 +1083,11 @@ def _lite_yaml(text: str) -> dict[str, Any]:
     return out
 
 
-__all__ = ["LoadReport", "PluginLoader", "PluginRecord"]
+__all__ = [
+    "ENTRY_MODULE_NAME",
+    "LoadReport",
+    "PluginLoader",
+    "PluginRecord",
+    "entry_module_path",
+    "normalize_module_path",
+]

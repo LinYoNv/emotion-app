@@ -138,6 +138,14 @@ def mount_plugin_page_routes(app: Any, service: Any, require_auth: Any) -> None:
             data = inject_page_context(
                 html,
                 is_dark=True,
+                # 🔴 告诉垫片"本页属于哪个插件"（2026-09-27 补的**根因修复**）。
+                #    插件自己的候选列表最后一级才是 `<插件名>/page/x`，
+                #    垫片从前只拿得到裸 `page/x` → 拼出来必然 404 → 靠插件盲试重试。
+                #    ⚠️ 「一起房间」`launcher.js:47` **只有一种候选且无重试** ⇒
+                #       它永远 404（页面报「未找到该路由」）—— 这才是真损失。
+                #    服务端注入时把插件名给它，垫片就能一次命中。
+                plugin_id=plugin_id,
+                page_name=page_name,
                 # 🔴 注入**我们自己的**桥接垫片（同源 HTTP 版）。
                 #    不给它，插件页会报「未检测到 AstrBot 官方插件 Page 桥接」→ 白屏。
                 bridge_src="/static/plugin_page_bridge.js",
@@ -188,7 +196,24 @@ def mount_plugin_page_routes(app: Any, service: Any, require_auth: Any) -> None:
             —— 请求会打到**根路径**，不加这条就只有 404。
         """
         if plugin_dir in RESERVED_PREFIXES:
-            # 正常不该走到这（具体路由优先），但显式挡一道更安全
+            # 正常不该走到这（具体路由优先），但显式挡一道更安全。
+            #
+            # 🔴 **必须留日志**（本项目铁律：凡是过滤/丢弃用户输入的分支都要留痕）。
+            #    2026-09-27 实测事故：插件拓展页 `qzone-companion` 硬编码
+            #    `/api/plug/<插件名>/page/status`，而那时我们**没有**这条路由 →
+            #    请求落到这里、被 `api` 这个保留前缀**静默**挡成 404
+            #    （连鉴权都没走到，所以无 cookie 也是 404 而不是 401）——
+            #    日志里因此**一条痕迹都没有**，故障的可见度为零。
+            #    ⇒ 现在这里会打一行，并直接把"可能是缺兼容路由"写在文案里。
+            #    ⚠️ 只记 `plugin_dir`（**框架命名空间名**），不把整条路径灌进日志：
+            #       这条分支也会被扫描器噪音打到，全文记录会把日志淹掉。
+            logger.warning(
+                "被保留前缀挡下的插件根路径请求：%s %s（保留前缀 %r，"
+                "可能是缺兼容路由 —— 例如插件页硬编码的 /api/plug/<插件名>/page）",
+                request.method,
+                plugin_dir,
+                plugin_dir,
+            )
             return jsonify({"error": "not found", "type": "not_found"}), 404
 
         denied = require_auth()

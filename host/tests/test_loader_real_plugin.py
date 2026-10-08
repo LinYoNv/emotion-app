@@ -143,3 +143,73 @@ def test_plugin_logger_works(loaded):
     """插件要有自己的 logger（`Star.__init__` 的副作用）。"""
     inst = loaded.records[0].instance
     assert inst.logger is not None
+
+
+# ---------------------------------------------------------------------------
+# 🔴 W5：真 AstrBot 模块别名（跨插件互调）
+# ---------------------------------------------------------------------------
+
+
+def test_real_astrbot_module_alias_is_registered(loaded):
+    """插件必须能用**真 AstrBot 的模块路径**被 import 到。
+
+    ## 为什么（W5 的真根因）
+    插件之间互相调用的写法是硬编码真 AstrBot 的路径，例如：
+        `importlib.import_module("data.plugins.astrbot_plugin_private_companion.main")`
+    实测本项目里这类写法 **40 处**。而我们的顶层包名是**目录名本身**
+    ⇒ 这些 import 以前 **100% ModuleNotFoundError**，多数调用点靠候选/兜底活着，
+    但只写一处的地方就是纯失败（静默降级）。
+
+    ⚠️ 这条判据会真的失败：注释掉 `_register_real_astrbot_alias` 的调用即红。
+    """
+    import importlib
+
+    alias = "data.plugins.astrbot_plugin_private_companion.main"
+    mod = importlib.import_module(alias)  # 拿不到就抛 ModuleNotFoundError = 判据失败
+    rec = loaded.records[0]
+    # 🔴 必须是**同一个对象**（不是复制品）—— 否则插件里的全局状态会分成两份
+    assert mod is rec.module.main, (
+        "别名指向了另一个模块对象 —— 插件全局状态会被劈成两份"
+    )
+
+
+def test_alias_supports_from_import(loaded):
+    """`from data.plugins.X.main import Y` 这种写法也必须能用。
+
+    只注册 `sys.modules` 条目还不够 —— `from ... import` 会走包属性链，
+    所以中间层包必须逐级 `setdefault` 并挂好属性。
+    （实测踩到：命名空间包不会自动建中间层条目 → KeyError。）
+
+    ⚠️ **这里比的是「别名模块里的类」而不是 `loaded.records[0].star_cls`。**
+       原因（实测踩到，我第一版就栽在这）：插件在**全量跑**时会被重载过
+       （`test_compat_regressions.py` 会 `clear()` 注册表并重新加载），
+       于是 `rec.star_cls` 可能是**上一次加载**的类对象，而别名模块里是新的
+       ⇒ `assert A is B` 报出 `'X' is 'X'` 这种**看着像废话的失败**
+       （单跑绿、全量红 —— 正是"判据依赖跨测试漂移的进程级状态"）。
+       **不变量应该取「同一时刻现场能取到的」**：别名模块 ⇄ `rec.module.main`。
+    """
+    import importlib
+
+    alias_mod = importlib.import_module(
+        "data.plugins.astrbot_plugin_private_companion.main"
+    )
+    ns: dict = {}
+    exec(
+        "from data.plugins.astrbot_plugin_private_companion.main import PrivateCompanionPlugin",
+        ns,
+    )
+    assert ns["PrivateCompanionPlugin"] is alias_mod.PrivateCompanionPlugin
+    # 且别名模块必须与记录里的 main 是同一个对象（这才是别名的定义）
+    assert alias_mod is loaded.records[0].module.main
+
+
+def test_alias_does_not_change_canonical_module_name(loaded):
+    """别名**不许**改掉插件的规范模块名。
+
+    `star_map` / handler 的 `handler_module_path` 都按规范名索引
+    （`entry_module_path()`）；`__name__` 一旦被改，两套索引就脱节了
+    —— 那正是"同一概念多条写入路径"。
+    """
+    rec = loaded.records[0]
+    assert rec.module.__name__ == "astrbot_plugin_private_companion"
+    assert rec.module.main.__name__ == "astrbot_plugin_private_companion.main"

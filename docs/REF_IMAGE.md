@@ -95,10 +95,22 @@ cd /root/Ai-works/情绪app
 ## 5. 还没做的（诚实边界）
 
 - **`edit` 只取一张源图**：插件支持多张主输入图，我们目前单张。
-- **人设级参考图未接**：插件有 `photo_persona_reference_image_path`（角色固定参考图），
-  我们的 `image_tool` 只接受模型每次传的 `reference_image_path`。
-  想让"她每次都长得一样"，应把人设的参考图作为默认值接进来。
 - **vibe 模式未实现**：账号没额度，实现了也用不了。
+- ~~人设级参考图未接~~ → ✅ **已接**（§6 与 §7）。
+
+### ✅ 官方文档背书（2026-09-25 补，来自作者发的 wiki）
+
+「**改图原图缺失时按设计失败关闭，不应悄悄生成一张新图**」——
+这句话在官方 wiki 里**独立出现三处**：
+`guide/troubleshooting.md`、`guide/bug-fixing.md`、`guide/media-integrations.md`。
+与我们的 `reference_unreadable` **硬失败**、`edit` 缺路径**照旧拒绝**完全一致。
+
+⚠️ **wiki 对 NAI 的参考图协议零覆盖**：`director` / `vibe` / `精准参考` /
+`reference_strength` / `information_extracted` 在全部 wiki 里 **0 命中**
+（两个子代理独立 grep 验证）。因为 wiki 把「NAI 参考图走哪个模型」
+**划给了 `astrbot_plugin_nai_image` 扩展**去适配。
+→ 本文 §2 那两条（NAI 5 不支持精准参考、vibe 无额度）是**我们这台网关**
+（`api.syuan.org`）的性质，**不是陪伴体系的承诺**；引用时要说清这一点。
 
 ---
 
@@ -154,5 +166,109 @@ EMOTION_IMAGE_PERSONA_REFERENCE='/path/to/角色图.png'
 
 * **真正的角色图要你自己放** —— 仓库里/本机没有现成的人设参考图，
   代码只负责把它接上（`photo_persona_reference_image_path` 在插件里也是空的）。
-* **按人设自动切换**：现在只有一个全局默认值。多个人设各配一张图需要上层调
-  `set_persona_reference()`（接口已留好，暂无人调用）。
+  → 现在**在面板上上传**（§7），不需要再改 `.env`。
+
+---
+
+## 7. 🆕 per-persona 参考图：**面板上传**（2026-09-25 下午）
+
+> 情绪 2026-09-25：「**你判断一下嘛，用户能填的就让用户改**」
+
+### 为什么从 `.env` 改成"面板上传"
+
+§6 那版只有 `EMOTION_IMAGE_PERSONA_REFERENCE` **一个**全局入口。三个问题：
+
+1. **手机 App 壳上没有文件系统路径可填** —— 那是**后端机器**的路径；
+2. 让用户改 `.env` = 要求他**登服务器改配置再重启** —— 那不叫"用户能改"；
+3. 人设是**一对多**的（一张卡一个角色）→ 全局一个值会让**所有角色共用一张脸**。
+
+### 三级优先（**唯一判据**在 `domain/persona_ref.py`）
+
+```
+① 模型显式给的 reference_image_path   （最高，在 image_tool.py）
+② 人设自己的 reference_image_path     ← 面板上传的，per-persona
+③ 全局 EMOTION_IMAGE_PERSONA_REFERENCE（兜底：只有一个角色时最省事）
+```
+
+⚠️ **每一级都打日志点名 `source`**（`explicit`/`persona`/`global`）——
+   用户报"画得不像"时，必须能一眼看出是"人设图没上传"还是"全局兜底在顶"。
+
+### 面板操作
+
+`人设` 页 → 选中一个角色 → **角色参考图** → 选图片 → 上传。支持 png/jpg/jpeg/webp，≤12 MB。
+图上会显示缩略预览；删除按钮清字段与文件。
+
+### 存储
+
+| 项 | 值 |
+|---|---|
+| 落盘目录 | `data/persona_refs/`（与人设数据同源 → 备份 `data/` 一起带走） |
+| 字段 | `Persona.reference_image_path`，存**纯文件名**（防路径穿越；同 `avatar_path` 的理由） |
+| 命名 | `<人设id><扩展名>` —— 一个人设**只有一张**，重传覆盖（用 id 不用名字：名字可改可重） |
+| 换扩展名 | 旧文件**自动清掉**（否则磁盘留垃圾、且与字段不一致） |
+
+### 代码位置
+
+| 文件 | 改了什么 |
+|---|---|
+| `emotion_app/domain/persona_ref.py` | 🆕 落盘目录 + `resolve_persona_reference()`（**唯一**判据）+ `is_safe_name()` |
+| `emotion_app/domain/tool_context.py` | 🆕 请求级"当前人设"（`ContextVar`，按 asyncio 任务隔离） |
+| `emotion_app/domain/persona.py` | 新字段 `reference_image_path` + 进 `to_dict`/`from_dict`（否则重启即丢） |
+| `emotion_app/domain/persona_repo.py` | `update()` 白名单放行该字段 |
+| `emotion_app/domain/chat.py` | 工具执行前后用 `tool_context.tool_scope()` 包住（**非流式 + 流式两条路**） |
+| `emotion_app/web/api_admin.py` | 🆕 `POST/GET/DELETE /personas/<id>/reference`（**三条都要求鉴权**） |
+| `emotion_app/web/static/{index.html,app.js,app.css}` | 面板控件（缩略图 + 上传 + 删除） |
+
+### 🛠 为什么用 `ContextVar` 而不是成员变量
+
+工具 handler 的签名是 `Callable[[dict], Awaitable[ToolResult]]` —— **只有参数**，
+没有"这一轮是哪个会话/哪个人设"。三条路：
+
+| 做法 | 为什么不选 |
+|---|---|
+| `ImageToolService._current_persona` 成员变量 | 🔴 **并发下会串**：两个会话同时生图，后一个改掉前一个的人设 → **画错脸**；且单测串行跑**看不出来** |
+| 改 `ToolHandler` 签名加 `persona=` | 要动 `ToolRegistry` / 所有注册点 / 所有测试，收益一样 |
+| ✅ `ContextVar` | 天生按 asyncio 任务隔离 → 无竞态；不改协议；测试可直接设 |
+
+⚠️ **只包 `execute` 那一句**，不要把 `yield` 也包进去：async generator 没有自己的
+context 副本（PEP 567 只给 Task 发），`yield` 期间挂着会让"当前人设"暴露到**调用方**的上下文里。
+
+### 判据
+
+| 层 | 文件 | 条数 | 覆盖 |
+|---|---|---|---|
+| 函数 | `tests/test_s6_image_reference.py` §6 | 8 | 兜底/显式优先/不漏进 edit 与 text2img/未配不崩/读不到响亮失败/**日志点名 source**/切人设 |
+| **真 HTTP** | `tests/test_persona_ref_http.py` | **15** | 三条路由**都鉴权**（反向：未登录 401）/ 上传→字段+文件+可服务 / 换扩展名清旧文件 / 删除清两处 / 文件已丢仍能清字段 / 拒非法扩展名·空文件·超限·缺字段·人设不存在 / **路径穿越** / 名字安全契约 |
+| **端到端** | `tests/test_persona_ref_e2e.py` | **5** | ⭐ **换人设→发出去的图跟着换** / 无人设回落全局 / 人设优先于全局 / 事后不残留上下文 / edit 不吃人设图 |
+| 接线 | `tests/test_assembly.py` | 6 | 路由都在 / 白名单放行 / 序列化往返 / chat 两条路都设上下文 / `complete()` 真传 `persona=` |
+| 真浏览器 | `tools/persona_ref_panel_check.py` | **17** | 控件在 / 真 UI 选图→按钮解禁 / 上传后后端真有 / **预览图 naturalWidth>0**（不是破图）/ 删除回到未设置 / 零 JS 报错 |
+
+**注入验证**：`tools/inject_persona_ref_check.py` **23 组**（第一代 10 + 第二代 13）。
+
+### 🔴 这个功能让我踩到的两个坑（值得记）
+
+1. **真浏览器判据抓出一个真缺陷**：我原来在上传成功后往状态行塞"已上传"，
+   而那个元素（`#p-ref-hint`）的**唯一含义**是"当前配置是什么" ——
+   瞬时文案把它盖掉，用户传完反而**看不到现在用的是哪张图**。
+   → 改成重新渲染持久状态，反馈由**预览图出现**给出（比一行字更直接）。
+   17 条判据里 ⑦c/⑨b 两条就是抓这个的。
+
+2. **注入脚本自己有致命缺陷，害我丢了一行 `require_auth()`**：
+   第一版把"注入前"的哈希**只放内存**，然后我被 10 分钟墙钟杀掉 ——
+   杀掉时源码正停在**注入态** → 下次运行时"注入前"读到的就是**已改坏的文件**
+   → 结尾"还原校验 ✅ 逐字节一致"是**假绿**（比对的是它自己的注入产物）。
+   直到全量测试报 `POST 未鉴权也能上传：500` 才暴露。
+   ✅ **已修**：基线**落盘**到 `tools/.inject_persona_ref_baseline.json` +
+   启动时**自检残留**（不一致就拒绝运行）+ 注册 SIGTERM/SIGINT 抢救还原。
+   **通则：任何"改了再还原"的工具，基线必须落盘到工具之外** ——
+   否则"还原成功"这句话本身就无法被验证。
+
+### 复核命令
+
+```bash
+cd /root/Ai-works/情绪app
+.venv/bin/python -m pytest tests/test_persona_ref_http.py tests/test_persona_ref_e2e.py -q   # 20 passed
+.venv/bin/python -m pytest tests/test_assembly.py -q                                          # 19 passed
+.venv/bin/python tools/persona_ref_panel_check.py                                             # 17/17（真浏览器）
+.venv/bin/python tools/inject_persona_ref_check.py                                            # 23 组全抓住
+```

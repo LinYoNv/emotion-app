@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from dataclasses import dataclass, field
 from collections.abc import AsyncIterator
@@ -15,6 +16,7 @@ from ..infra.config import Config
 from ..infra.logging_setup import get_logger
 from . import context as context_mod
 from . import prompt as prompt_mod
+from . import tool_context
 from .message import ROLE_ASSISTANT, ROLE_USER, Message, from_upstream_message
 from .persona import Persona
 from .session_repo import Session
@@ -32,6 +34,41 @@ from .upstream import (
 )
 
 log = get_logger(__name__)
+
+
+def _accepts_session_id(hook: Any) -> bool:
+    """钩子能不能收 `session_id=` 这个关键字参数（**按签名判断**）。
+
+    🔴 为什么不用 `except TypeError` 兜底（本项目踩过的坑）：
+       宽 `except` 会把**钩子内部**抛的 `TypeError` 也当成"签名不匹配"，
+       然后拿老签名重跑一遍 → 真因被换成一个看起来合理、实际无关的结果。
+       这里在**绑定那一刻**就把结论定下来，此后每次调用都不再猜。
+
+    ⚠️ 判 **keyword-only**（新形状是 `async (messages, *, session_id="")`）：
+       要求对方**能按关键字收**它，而不是"按位置能收" ——
+       否则一个 `async (messages, something_else)` 的钩子会被塞进会话 id。
+       `inspect.signature` 对 `**kwargs` 同样报 True（那确实收得下）。
+
+    ⚠️ 签名读不出来（内置函数/被装饰器包成 C 对象）→ **按老形状处理**：
+       老形状是"什么都不传"，是更保守的那一边（不会给钩子塞个它没要的参数）。
+    """
+    if hook is None:
+        return False
+    try:
+        sig = inspect.signature(hook)
+    except (TypeError, ValueError):
+        return False
+    for name, param in sig.parameters.items():
+        if param.kind is param.VAR_KEYWORD:
+            # `**kwargs` 确实收得下 `session_id=`
+            return True
+        if name != "session_id":
+            continue
+        # 纯 POSITIONAL_ONLY 收不下关键字参数 —— 我们只按关键字调
+        if param.kind is param.POSITIONAL_ONLY:
+            return False
+        return True
+    return False
 
 
 class ChatError(Exception):
@@ -103,29 +140,60 @@ class ChatService:
         #: ⚠️ 领域层**不依赖**插件宿主：这里只认这个**函数协议**，
         #:    具体实现（跑 AstrBot 钩子）由装配层注入（照项目"领域层只依赖 Protocol"的约定）。
         self._llm_hook: Any = None
+        #: 钩子能不能收 `session_id=`（`bind_llm_hook` 时按签名定一次，见
+        #: `_accepts_session_id`）。⚠️ 老的一参数钩子仍然是 False —— 兼容。
+        self._llm_hook_takes_session: bool = False
         self._bg_tasks: set[asyncio.Task] = set()   # 后台任务（防被 GC 回收）
 
     def bind_llm_hook(self, hook: Any) -> None:
         """注入 LLM 钩子端口（P0-4）。
 
-        `hook` 形状：`async (messages) -> list[Message] | None`；
+        `hook` 形状：`async (messages, *, session_id="") -> list[Message] | None`；
         传 `None` = 关闭（**默认**，即完全不启用插件钩子 —— 聊天行为不变）。
+
+        ⚠️ **老的一参数形状 `async (messages)` 继续可用**（`_apply_llm_hook` 按
+           签名判断能不能收 `session_id`，收不了就不传）——
+           不这么做的话，`plugin_host.apply_llm_hooks` 加参数那一刻
+           所有老钩子（含测试里的）会当场 `TypeError`。
         """
         self._llm_hook = hook
+        self._llm_hook_takes_session = _accepts_session_id(hook)
 
-    async def _apply_llm_hook(self, messages: list[Message]) -> list[Message]:
+    async def _apply_llm_hook(
+        self, messages: list[Message], session_id: str = ""
+    ) -> list[Message]:
         """跑 LLM 钩子（P0-4）。**未注入或出错都原样返回**，绝不影响聊天。
 
-        ⚠️ 三条设计取舍：
+        Args:
+            session_id: 本次聊天属于哪个会话。**必须传** —— 钩子要用它决定
+                "这次是哪个插件用户"（umo 第三段）。不传的后果是插件按全局
+                `default` 算记忆/关系/被动状态 → **多会话串台**（2026-09-26 修的真 bug）。
+
+        ⚠️ 四条设计取舍：
           1. **未注入 → 直接返回**（默认关闭，聊天行为与以前完全一致）；
           2. **钩子返回 None → 视为"没改"**（插件常只改 `req` 的字段而不返回）；
           3. **钩子抛错 → 记 ERROR 并原样返回**（插件是可选增强，
-             它的故障不能让用户聊不了天）—— 但**必须响亮**，不许静默。
+             它的故障不能让用户聊不了天）—— 但**必须响亮**，不许静默；
+          4. **老的一参数钩子照旧能用** —— 按 `inspect.signature` 判断能否收
+             `session_id`，**不用宽 `except TypeError` 兜底**：那会把
+             "钩子内部自己抛的 TypeError"也一并咽掉，
+             把一个真 bug 换成一条看起来合理的"签名不匹配"
+             （本项目踩过：宽 except 让错误信息离根因三层）。
         """
         if self._llm_hook is None:
             return messages
         try:
-            out = await self._llm_hook(messages)
+            # ⚠️ `getattr` 带默认 `None` 而不是直接取属性：有些调用方
+            #    （含老测试）用 `ChatService.__new__` 绕过 `__init__`
+            #    再直接塞 `_llm_hook` —— 那时缓存位不存在，这里**现算一次**
+            #    （与 `bind_llm_hook` 同一份规则，不另写一套）。
+            takes_session = getattr(self, "_llm_hook_takes_session", None)
+            if takes_session is None:
+                takes_session = _accepts_session_id(self._llm_hook)
+            if takes_session:
+                out = await self._llm_hook(messages, session_id=session_id)
+            else:
+                out = await self._llm_hook(messages)
         except Exception:  # noqa: BLE001
             log.error("LLM 钩子执行失败（本次按未注入处理）", exc_info=True)
             return messages
@@ -479,7 +547,10 @@ class ChatService:
         session, history, summary = await self.prepare_session(req)
         messages = self.build_messages(req, history=history, summary=summary)
         # ⭐ P0-4：让插件在**发给模型之前**改提示词（记忆/人设注入靠这个）
-        messages = await self._apply_llm_hook(messages)
+        # 🔴 **必须传 `session_id`**：钩子要用它决定"这次是哪个插件用户"
+        #    （umo 第三段 = 插件 `data["users"]` 的键）。不传的后果是
+        #    **所有会话的记忆/关系/被动状态都按全局 `default` 算** → 串台。
+        messages = await self._apply_llm_hook(messages, req.session_id)
 
         body_extra = apply_nested_params({}, req.custom_params) if req.custom_params else None
 
@@ -503,7 +574,9 @@ class ChatService:
         )
 
         # ⭐ 工具循环：模型要调工具 → 执行 → 把结果回填 → 再问一次
-        result = await self._run_tool_loop(target, messages, result, body_extra)
+        result = await self._run_tool_loop(
+            target, messages, result, body_extra, persona=req.persona
+        )
 
         # 持久化（失败不影响已拿到的回复）
         if req.persist and session is not None:
@@ -566,6 +639,8 @@ class ChatService:
         messages: list[Message],
         first: ChatResult,
         body_extra: dict[str, Any] | None,
+        *,
+        persona: Persona | None = None,
     ) -> ChatResult:
         """执行工具调用并把结果回填，再取一次模型回复。
 
@@ -590,13 +665,19 @@ class ChatService:
         dispatch = self.dispatch
 
         # ⚠️ 用**下发方式**解析（而不是写死 tool_calls 结构）
-        for call in dispatch.extract_calls(first):
-            result = await self._tools.execute(call, call_counts=counts)
-            payloads.append({"tool": call.name, "status": result.status})
-            # 收集图片等附件（非流式返回必须带上，否则用户看不到图）
-            attachments.extend(_extract_attachments(result))
-            # 同样用下发方式渲染回填消息（function calling → role=tool；标签 → user）
-            tool_msgs.append(dispatch.render_result(result, call_id=call.id))
+        #
+        # 🆕 工具执行前把"当前人设"放进请求级上下文（2026-09-25）：
+        #    人设参考图这类**per-persona** 的能力需要知道这一轮是哪个角色。
+        #    用 ContextVar 而不是成员变量 —— 两个会话并发生图时，
+        #    成员变量会被后一个请求改掉 → **画错脸**，而且单测看不出来（串行）。
+        with tool_context.tool_scope(persona=persona):
+            for call in dispatch.extract_calls(first):
+                result = await self._tools.execute(call, call_counts=counts)
+                payloads.append({"tool": call.name, "status": result.status})
+                # 收集图片等附件（非流式返回必须带上，否则用户看不到图）
+                attachments.extend(_extract_attachments(result))
+                # 同样用下发方式渲染回填消息（function calling → role=tool；标签 → user）
+                tool_msgs.append(dispatch.render_result(result, call_id=call.id))
 
         log.info(
             "工具执行完毕，回填结果",
@@ -673,7 +754,8 @@ class ChatService:
         session, history, summary = await self.prepare_session(req)
         messages = self.build_messages(req, history=history, summary=summary)
         # ⭐ P0-4：与 `complete()` 同款（**流式也要注入**，否则"流式聊天没有记忆"）
-        messages = await self._apply_llm_hook(messages)
+        # 🔴 同样**必须传 `session_id`**（理由见 `complete()` 那处）
+        messages = await self._apply_llm_hook(messages, req.session_id)
         body_extra = apply_nested_params({}, req.custom_params) if req.custom_params else None
 
         log.info(
@@ -724,7 +806,12 @@ class ChatService:
                 counts: dict[str, int] = {}
                 tool_msgs: list[Message] = []      # ⚠️ 必须先初始化（曾漏掉 → NameError）
                 for call in calls:
-                    result = await self._tools.execute(call, call_counts=counts)
+                    # 🆕 与 `_run_tool_loop` 同款：把当前人设放进请求级上下文。
+                    #    ⚠️ **只包 `execute` 这一句**，不要把 `yield` 也包进去 ——
+                    #    async generator 没有自己的 context 副本（PEP 567 只给 Task 发），
+                    #    `yield` 期间把作用域挂着会让"当前人设"暴露在**调用方的上下文**里。
+                    with tool_context.tool_scope(persona=req.persona):
+                        result = await self._tools.execute(call, call_counts=counts)
                     # 把结果带给上层（上层负责推图/渲染）
                     yield StreamChunk(
                         finish_reason="tool_executed",

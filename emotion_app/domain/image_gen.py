@@ -99,6 +99,26 @@ def reference_data_uri(source: str, *, max_bytes: int = MAX_IMAGE_BYTES) -> str:
     return f"data:image/{mime};base64,{base64.b64encode(blob).decode()}"
 
 
+def _describe(exc: BaseException) -> str:
+    """把异常渲染成**一定有内容**的一句话。
+
+    🔴 为什么需要它（2026-09-25 实测踩到）：
+       `httpx` 的网络类异常（`ConnectError`/`ReadError`/`RemoteProtocolError`/
+       `ConnectTimeout`…）**`str()` 可以是空串** ——
+       实测这 8 个类的 `str(cls(""))` **全是 `''`**。
+       于是用户看到的是「生图端点连接失败：」后面**什么都没有**
+       （真环境复跑 `ref_image_live_check.py` 时就是这么出现的），
+       既不知道是超时、被重置、还是 DNS 挂了。
+
+    ✅ 退化链：`str(exc)` → 空则用 `repr(exc)` → 再空则用类名。
+       永远给出一段**可诊断**的文字（本项目最贵的一课：静默失败比报错贵）。
+    """
+    text = str(exc).strip()
+    if text:
+        return text
+    return repr(exc) or type(exc).__name__
+
+
 class ImageError(Exception):
     """生图失败。"""
 
@@ -354,11 +374,15 @@ class ImageClient:
             # ⚠️ 生图**慢且波动大**（NAI 实测 7~26 秒）—— 超时要单独编码，
             #    这样上层能给出"稍后重试"而不是"失败"的措辞。
             raise ImageError(
-                f"生图超时（{target.timeout if hasattr(target,'timeout') else '?'}）：{exc}",
+                f"生图超时（{target.timeout if hasattr(target,'timeout') else '?'}）："
+                f"{_describe(exc)}",
                 code="timeout",
             ) from exc
         except httpx.HTTPError as exc:
-            raise ImageError(f"生图端点连接失败：{exc}", code="connect_failed") from exc
+            raise ImageError(
+                f"生图端点连接失败：{_describe(exc)}",
+                code="connect_failed",
+            ) from exc
 
         if resp.status_code >= 400:
             detail = resp.text[:300]

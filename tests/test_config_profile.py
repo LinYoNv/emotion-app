@@ -89,6 +89,9 @@ def test_schema_shape_is_renderable():
             assert f["type"] in (
                 "string", "int", "float", "bool", "enum", "text",
                 "provider_select", "provider_multi", "persona_select",
+                # 🆕 2026-09-27：通用字符串数组（插件停用名单用）。
+                #    `app.js` 的 `makeConfigInput` 有对应分支，判据不漏。
+                "string_list",
             ), f["type"]
             if f["type"] == "enum":
                 assert f["options"], f"enum 字段 {f['key']} 没有选项"

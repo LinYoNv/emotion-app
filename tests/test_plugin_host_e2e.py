@@ -58,6 +58,13 @@ async def _app_with_plugins(tmp_path: Path, **kw):
     store = build_store(cfg.storage)
     await store.open()
     app = create_app(cfg, store, AuthManager(access_token=TOKEN))
+    # 🔴 **配置文件也必须落在临时目录**（2026-09-27 实测踩到）。
+    #    `plugins.inactivated_plugins` 是**用户能在面板改的持久设置**，
+    #    读生产那份 ⇒ 本文件的 `loaded >= 11` 判据会随用户的启停设置漂移：
+    #    情绪在面板停用 4 个插件后，这两条 e2e 判据立刻**假红**
+    #    （产品是对的，是判据把"用户设置"当成了"加载能力"）。
+    #    指到临时路径 ⇒ 名单为空 ⇒ 判据确定；写盘也只写临时文件。
+    app.config["EMOTION_CONFIG_PROFILE_PATH"] = str(tmp_path / "config_profile.json")
     svc = app.config["EMOTION_PLUGIN_HOST"]
     report = await svc.start()
     return app, store, svc, report
@@ -79,6 +86,12 @@ def test_host_loads_plugins_through_service(tmp_path):
         app, store, svc, report = await _app_with_plugins(tmp_path)
         try:
             assert report is not None, "宿主启动失败（看日志）"
+            # ⚠️ `>= 11` 的前提是**这份 fixture 没有任何插件被停用**（名单走临时配置文件）。
+            #    先断这一条，`11` 这个数字才有确定含义；否则用户改一下面板设置，
+            #    这条判据就会以"加载能力退化"的样子假红（2026-09-27 实测踩到）。
+            assert report.inactivated == [], (
+                f"这份 fixture 的停用名单必须为空，实得 {report.inactivated}"
+            )
             assert report.loaded >= 11, f"只加载了 {report.loaded} 个\n{report.summary()}"
             # ⚠️ 判"插件有没有加载"必须用 `loaded_plugins`，**不能用 `mounted`** ——
             #    image_companion / content_companion 注册 **0 条 Web API**，
@@ -826,6 +839,82 @@ def test_injects_bridge_shim_into_page_html(tmp_path):
     assert "<title>x</title>" in out
 
 
+def test_injects_plugin_id_meta_into_page_html(tmp_path):
+    """🔴 页面 HTML 里必须注入**插件身份** meta（2026-09-27 根因修复）。
+
+    守两个后果，都是实测出来的：
+
+    ① **「一起房间」永远取不到数**：它 `launcher.js:47` 只生成
+       `page/x` **一种候选、且没有重试**，垫片从前不知道插件名 ⇒
+       拼成 `/api/plugins/extensions/page/x` ⇒ **必然 404** ⇒ 页面报
+       「未找到该路由」。（其余插件有 6 级候选重试，只是刷日志。）
+    ② 日志里成组的「插件路由未命中」（实测 19 条，每组 3 条）。
+
+    ⚠️ meta 必须在垫片 `<script>` **之前** —— 垫片是同步脚本，
+       执行时立刻读它；顺序反了就永远读不到（等于没注入，且**静默**）。
+    """
+    from astrbot_host.plugin_pages import inject_page_context
+
+    html = "<!doctype html><html><head><title>x</title></head><body></body></html>"
+    out = inject_page_context(
+        html,
+        is_dark=True,
+        bridge_src="/static/plugin_page_bridge.js",
+        plugin_id="astrbot_plugin_together_companion",
+        page_name="一起房间",
+    )
+
+    assert '<meta name="emotion-plugin-id" content="astrbot_plugin_together_companion">' in out, (
+        "插件身份 meta 没注入 —— 垫片只能盲试候选（一起房间会永远 404）"
+    )
+    assert '<meta name="emotion-plugin-page"' in out, "页面名 meta 没注入"
+    # 🔴 顺序：meta 必须早于垫片脚本
+    assert out.index("emotion-plugin-id") < out.index("plugin_page_bridge.js"), (
+        "meta 排在垫片后面 —— 垫片执行时读不到它（静默失效）"
+    )
+    # 仍不能破坏插件自己的内容，也仍要注入桥与主题
+    assert "<title>x</title>" in out
+    assert '<meta name="color-scheme" content="dark">' in out
+    assert out.index("plugin_page_bridge.js") < out.index("</head>")
+
+
+def test_plugin_id_meta_is_escaped_and_optional(tmp_path):
+    """插件名要转义；不给 `plugin_id` 时**不注入**（既有调用点行为不变）。"""
+    from astrbot_host.plugin_pages import inject_page_context
+
+    html = "<!doctype html><html><head></head><body></body></html>"
+    # 不给 plugin_id → 不注入身份 meta（向后兼容，别把既有调用点弄坏）
+    plain = inject_page_context(html, bridge_src="/static/plugin_page_bridge.js")
+    assert "emotion-plugin-id" not in plain, "没给 plugin_id 却注入了身份 meta"
+
+    # 含引号的名字必须被转义（否则撑破 meta → 垫片读不到 → 又回到盲试）
+    nasty = inject_page_context(
+        html, plugin_id='ev"il<x>&y', page_name="p", bridge_src="/x.js"
+    )
+    assert 'content="ev&quot;il&lt;x&gt;&amp;y"' in nasty, (
+        f"属性值没被正确转义：{nasty[:200]}"
+    )
+
+
+def test_page_route_passes_plugin_id_into_injection(tmp_path):
+    """🔴 装配判据：页面路由必须把 `plugin_id` **传进** `inject_page_context`。
+
+    第一层（注入函数会写 meta）修好了，第二层不接线照样白搭 ——
+    这正是本项目「模块能工作 ≠ 被接上了」那类缺口。
+    源码级断言（要真起服务取页面代价大，而这个缺口的形态就是"少传一个参数"）。
+    """
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parent.parent
+        / "emotion_app" / "web" / "plugin_pages_web.py"
+    ).read_text(encoding="utf-8")
+    assert "plugin_id=plugin_id," in src, (
+        "页面路由没把 plugin_id 传给 inject_page_context —— 垫片仍拿不到插件名"
+    )
+    assert "page_name=page_name," in src, "没把 page_name 传进去"
+
+
 def test_panel_static_assets_are_not_cached(tmp_path):
     """🔴 **面板静态资源必须 `no-cache`**（实测事故，代价很大）。
 
@@ -927,6 +1016,261 @@ def test_plugin_page_root_relative_api_works(tmp_path):
             assert r.status_code == 401
         finally:
             await svc.stop()
+            await store.close()
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# ③e `/api/plug/<path>` —— 真实现的 **legacy** 前缀（插件页 JS 硬编码那条）
+#
+# 🔴 现场（`docs/插件拓展页_API_404_诊断.md`）：`qzone-companion/app.js:1`
+#    写死 `const API = "/api/plug/astrbot_plugin_content_companion/page"`，
+#    而真 AstrBot 4.27.5 **确实有**这条
+#    （`dashboard/api/plugins.py:1506`，GET/POST）。我们漏了它 ⇒
+#    `GET /api/plug/astrbot_plugin_content_companion/page/status` → 404，
+#    且是**被我们自己的保留前缀守卫静默挡掉**的（无日志、连鉴权都没走到）。
+#
+# 本组判据守四件事（缺一条这类问题就会复发）：
+#   ① 新路由**已鉴权**（未登录 401）—— 本项目真事故：漏 `require_auth()`
+#      → 未登录返 200，而服务绑 `0.0.0.0` = 公网可读；
+#   ② 未登录时**不许**是"路由不存在"的形状（否则插件页又把 404 当终态）；
+#   ③ 已登录时**与 `/api/plugins/extensions/...` 走同一个派发器**
+#      —— 判据落在"两条路由收到的 `plugin_path` 完全一致"上，
+#      而不是"两条都返回 200"（那样复制第二份实现也能过）；
+#   ④ 保留前缀被挡时**有日志**（否则下次同类故障还是零可见度）。
+# ---------------------------------------------------------------------------
+
+
+class _RecordingHost:
+    """假宿主：只记录 `call_api` 收到了什么，不真跑插件。
+
+    ⚠️ 为什么用假的而不是真插件：本组判据问的是**装配层**的问题
+      （路由挂没挂、鉴权在不在、两条路由是否同源），
+      用真插件会让判据随插件版本漂移，且"两条路由传参一致"这件事
+      在假宿主上能被**逐字**断言。
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.report = None
+
+    async def call_api(self, plugin_path, *, request_obj=None, method="GET", username=None):
+        self.calls.append((plugin_path, method))
+        return {"ok": True, "echo_path": plugin_path, "echo_method": method}
+
+
+def _app_with_recording_host(tmp_path: Path):
+    """挂好路由 + 换成假宿主的 app（不启动真插件宿主，判据才确定）。"""
+    cfg = _cfg(tmp_path, enabled=True, mount=True)
+    store = build_store(cfg.storage)
+    app = create_app(cfg, store, AuthManager(access_token=TOKEN))
+    app.config["EMOTION_CONFIG_PROFILE_PATH"] = str(tmp_path / "config_profile.json")
+    svc = app.config["EMOTION_PLUGIN_HOST"]
+    host = _RecordingHost()
+    svc.host = host  # 直接替换：`signature` 只看 `service.host is None` 与否
+    return app, store, svc, host
+
+
+def test_legacy_plug_prefix_requires_auth(tmp_path):
+    """① `/api/plug/...` 必须**先鉴权**（未登录 401，不是 200/404）。
+
+    🔴 本项目真事故：新增 API 路由漏 `require_auth()` → 未登录返 **200**，
+       而服务绑 `0.0.0.0` ⇒ 公网可读。
+    """
+    async def run():
+        app, store, svc, host = _app_with_recording_host(tmp_path)
+        try:
+            client = app.test_client()
+            r = await client.get(
+                "/api/plug/astrbot_plugin_private_companion/page/overview"
+            )
+            assert r.status_code == 401, (
+                f"未登录打 /api/plug/... 竟然返回 {r.status_code}！"
+                "（插件 API 成了后门）"
+            )
+            # 未鉴权**绝不能**派发出去
+            assert host.calls == [], f"未鉴权也派发了：{host.calls}"
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_legacy_plug_prefix_is_not_404_when_unauthenticated(tmp_path):
+    """② 未登录时**不许**返回"路由不存在"那种形状 —— 那样插件页无法区分
+       "没登录"与"这条路由不存在"，会把 401 当成终态放弃重试。
+
+    ⚠️ 对照组是**改之前**的样子：`{"error":"not found","type":"not_found"}`，41 字节
+       （出处只有 `plugin_pages_web.py` 的保留前缀守卫）。这条判据就是钉死它。
+    """
+    async def run():
+        app, store, svc, host = _app_with_recording_host(tmp_path)
+        try:
+            client = app.test_client()
+            r = await client.get(
+                "/api/plug/astrbot_plugin_content_companion/page/status"
+            )
+            assert r.status_code != 404, (
+                f"未登录仍然是 404 —— 说明请求又落回兜底路由的保留前缀守卫"
+                f"（plugin_pages_web.py 的 RESERVED_PREFIXES），"
+                f"/api/plug 这条精确路由没生效"
+            )
+            body = await r.get_json()
+            assert body.get("type") != "not_found", (
+                f"body 还是'路由不存在'的形状：{body}（正是改之前那个 41 字节 body）"
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_legacy_plug_prefix_dispatches_identically(tmp_path):
+    """③⭐ 核心判据：两条前缀**走同一个派发器**，收到的 `plugin_path` **完全一致**。
+
+    🔴 为什么不断言"两条都 200"：那样**复制第二份实现**也能过，
+       而本项目铁律是"同一概念不许有两条会漂移的写入路径"
+       （已复发 3 次）。所以判据落在**传进宿主的参数逐字相同**上。
+    """
+    async def run():
+        app, store, svc, host = _app_with_recording_host(tmp_path)
+        try:
+            client = app.test_client()
+            head = {"Authorization": f"Bearer {TOKEN}"}
+            path = "astrbot_plugin_content_companion/page/status"
+
+            r_new = await client.get(f"/api/plugins/extensions/{path}", headers=head)
+            r_old = await client.get(f"/api/plug/{path}", headers=head)
+
+            assert r_new.status_code == 200, f"新前缀 {r_new.status_code}"
+            assert r_old.status_code == 200, (
+                f"legacy 前缀 {r_old.status_code} —— 插件页硬编码的 /api/plug 没通"
+            )
+            # ①② 两次派发收到的 plugin_path / method **逐字相同**
+            assert len(host.calls) == 2, f"派发次数不对：{host.calls}"
+            assert host.calls[0] == host.calls[1] == (path, "GET"), (
+                f"两条前缀进宿主的参数不一致：{host.calls}"
+            )
+            # ③ 响应体也一致（同一 handler 的产出，不是两个长得像的实现）
+            assert await r_new.get_json() == await r_old.get_json()
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_legacy_plug_prefix_supports_post(tmp_path):
+    """legacy 前缀的 **POST** 同样要通（`qzone-companion` 的发布按钮就是 POST）。
+
+    真 legacy 那条只登记 GET/POST；我们取五种（见 `app.py` 的注释：
+    两条路由**指向同一个派发器**，方法集不同就是又一条会漂移的差异）。
+    """
+    async def run():
+        app, store, svc, host = _app_with_recording_host(tmp_path)
+        try:
+            client = app.test_client()
+            head = {"Authorization": f"Bearer {TOKEN}"}
+            path = "astrbot_plugin_content_companion/page/action"
+            r = await client.post(
+                f"/api/plug/{path}", json={"action": "publish"}, headers=head
+            )
+            assert r.status_code == 200, f"POST {r.status_code}"
+            assert host.calls == [(path, "POST")], host.calls
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_legacy_plug_prefix_returns_404_with_hint_for_unknown_route(tmp_path):
+    """反向判据：**插件没登记**的路由仍要 404 + 相近提示（不是一律 200）。
+
+    ⚠️ 这条防的是"为了修 404 干脆放行一切" —— 那样插件 API 变成任意转发口。
+    """
+    async def run():
+        app, store, svc, host = _app_with_recording_host(tmp_path)
+        try:
+            call_count = {"n": 0}
+
+            async def _boom(plugin_path, **_kw):
+                call_count["n"] += 1
+                raise LookupError(f"插件未登记该路由：{plugin_path}")
+
+            host.call_api = _boom  # type: ignore[method-assign]
+            client = app.test_client()
+            head = {"Authorization": f"Bearer {TOKEN}"}
+            r = await client.get(
+                "/api/plug/astrbot_plugin_private_companion/page/nope", headers=head
+            )
+            assert r.status_code == 404, f"期望 404，得到 {r.status_code}"
+            assert call_count["n"] == 1, "没有真去问宿主（可能被硬编码 404 挡住）"
+            body = await r.get_json()
+            assert body.get("status") == "error", body
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_reserved_prefix_block_is_logged(tmp_path, caplog):
+    """④🔴 保留前缀挡下的请求**必须留日志**（改之前完全静默，见诊断报告 §2.4）。
+
+    为什么这条最值钱：那次故障在日志里**零痕迹** —— `plugin_pages_web.py`
+    的守卫在鉴权**之前** return，连"插件根路径路由未命中"那条 warning
+    都打不到。用户只能凭一张截图报障。
+
+    ⚠️ 判据直接复刻**改之前**的现场形状：`/api/<非 plug>/...`
+      （`plugin_dir="api"` 命中 `RESERVED_PREFIXES`）。
+      改之前 `/api/plug/...` 就是这么被静默 404 的；
+      现在 `/api/plug/...` 被新的精确路由接走（⇒ 401/200），
+      而**其它**没登记的 `/api/...` 仍然落到守卫上 —— 那时候必须留痕。
+
+    ⚠️ 注意**不能**拿 `/static/...` 造现场：它有自己更具体的路由
+      （`/static/<path:filename>`）先命中，根本走不到这个守卫
+      （实测：返回 404 但一条日志都没有 —— 会变成假判据）。
+    """
+    async def run():
+        cfg = _cfg(tmp_path, enabled=True, mount=True)
+        store = build_store(cfg.storage)
+        app = create_app(cfg, store, AuthManager(access_token=TOKEN))
+        app.config["EMOTION_CONFIG_PROFILE_PATH"] = str(tmp_path / "config_profile.json")
+        try:
+            client = app.test_client()
+
+            # ---- 前置（**不满足就是失败，不许跳过**）----
+            # 兜底路由必须在路由表里，否则本判据测的根本不是那个守卫。
+            rules = {str(r) for r in app.url_map.iter_rules()}
+            assert "/<plugin_dir>/<path:rest>" in rules, (
+                f"兜底路由没挂上，判据测试的不是守卫：{sorted(rules)[:6]}"
+            )
+            # 同一个 `api` 前缀下，**精确**的 `/api/plug` 路由必须存在
+            # （它才是这次交付的东西；否则本判据会与失败现场混在一起）。
+            assert "/api/plug/<path:plugin_path>" in rules, (
+                "/api/plug 这条精确路由没挂上 —— 本次交付没生效"
+            )
+
+            unregistered = "/api/legacy-not-registered/page/status"
+            with caplog.at_level("WARNING", logger="emotion_app.plugins"):
+                r = await client.get(unregistered)
+            assert r.status_code == 404, (
+                f"{unregistered} 期望落到保留前缀守卫（404），实得 {r.status_code} —— "
+                "判据的前置不成立"
+            )
+            hits = [
+                rec.getMessage()
+                for rec in caplog.records
+                if "被保留前缀挡下" in rec.getMessage()
+            ]
+            assert hits, (
+                "保留前缀挡下的请求**没有任何日志** —— 这正是那次 404 "
+                f"零可见度的成因。实得日志：{[r.getMessage()[:50] for r in caplog.records]}"
+            )
+            assert "api" in hits[0], f"日志没说清是哪个保留前缀：{hits[0]}"
+            assert "兼容路由" in hits[0], (
+                f"日志没提示'可能是缺兼容路由'，下次还是会查半天：{hits[0]}"
+            )
+        finally:
             await store.close()
 
     asyncio.run(run())

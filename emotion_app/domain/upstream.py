@@ -25,12 +25,39 @@ log = get_logger(__name__)
 
 
 class UpstreamError(Exception):
-    """上游调用失败。"""
+    """上游调用失败。
+
+    🔴 **`body` 必须出现在 `str(exc)` 里**（2026-10-08 修的真 bug）：
+      原来这里只 `super().__init__(message)`，而把 `body`/`status` 存成**属性**，
+      于是 `str(exc)` **永远不含 body**。而所有日志点写的都是
+      `logger.error("...%s", exc)` 这种**字符串化**用法 ⇒
+      **上游到底回了什么，一个字都没进日志。**
+
+      实测后果：`上游返回 403`（200 次）与 `上游返回的不是 JSON`（378 次）
+      这两条**高频**错误，排查时**完全看不到上游响应体** ——
+      而这两句话的**全部诊断价值就在 body 里**（403 是"额度/权限"还是"渠道组不对"？
+      "不是 JSON"是网关 HTML 错误页还是 SSE 被截断？）。
+      这与 aitag「参考图被静默丢弃」同型：**拿不到证据的 bug 最贵。**
+
+      ⇒ 修法：把 body 摘要**拼进 message**（即进入 `str()`），
+        同时**保留属性**（读 `exc.body` / `exc.status` 的老代码不受影响）。
+      ⚠️ body 上限 500 字符（与 `backends.py` 的 `[:500]` 一致），
+        过日志出口时仍会走 `scrub()` —— 多打 body 不会泄漏密钥。
+    """
+
+    #: `str(exc)` 里最多带多少字符的 body（避免把整页 HTML 灌进日志）
+    BODY_IN_MESSAGE_LIMIT = 500
 
     def __init__(self, message: str, *, status: int | None = None, body: str = ""):
-        super().__init__(message)
         self.status = status
         self.body = body
+        detail = (body or "").strip()
+        if detail:
+            if len(detail) > self.BODY_IN_MESSAGE_LIMIT:
+                detail = detail[: self.BODY_IN_MESSAGE_LIMIT] + "…(截断)"
+            super().__init__(f"{message} | 上游响应体: {detail}")
+        else:
+            super().__init__(message)
 
 
 #: 上游拒答话术（借鉴陪伴插件的 `DEFAULT_SENSITIVE_REPLACEMENT_KEYWORDS`）。

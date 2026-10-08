@@ -46,7 +46,17 @@ SCHEMA_VERSION = 1
 
 SECTION_SESSION = "session"
 SECTION_CONTEXT = "context"
-SECTIONS: tuple[str, ...] = (SECTION_SESSION, SECTION_CONTEXT)
+#: 🆕 **插件段**（2026-09-27）：插件宿主的**启停名单**。
+#:
+#: 🔴 为什么放这里（而不是 `.env` 或 `data/cmd_config.json`）：
+#:   真 AstrBot 把 `inactivated_plugins` 放在 `shared_preferences`（`data_v4.db`
+#:   的 preferences 表）—— 那是一个**面板能改、重启后仍在**的落盘位置；
+#:   我们对应的东西就是本 store（面板配置的唯一落盘处：原子写 + 损坏另存 +
+#:   未知键保留 + 逐字段校验）。放 `.env` 面板改不动（且要从 HTTP 路由写 600
+#:   权限的密钥文件），放 `cmd_config.json` 则是**发明一个真实现没有的落点**、
+#:   还会污染插件可见的 `get_config()`。
+SECTION_PLUGINS = "plugins"
+SECTIONS: tuple[str, ...] = (SECTION_SESSION, SECTION_CONTEXT, SECTION_PLUGINS)
 
 #: 上下文模式的合法取值（**我们已有的三种**，不是 AstrBot 的那套）。
 #: ⚠️ 这三条是 `domain/chat` 里既有的组装逻辑，**本配置文件只是它们的"默认值来源"**，
@@ -227,6 +237,19 @@ SPECS: dict[str, tuple[FieldSpec, ...]] = {
             minimum=2, maximum=1000,
         ),
     ),
+    SECTION_PLUGINS: (
+        # 🔴 元素是**模块路径**（`<插件目录名>.main`），判据在
+        #    `astrbot_host.loader.plugin_loader.normalize_module_path`（只此一份）。
+        #    这里**只校验"是字符串数组"**，不校验插件存不存在 ——
+        #    后者要扫插件目录，属于宿主加载器的职责（它会把对不上的项**响亮**报出来）。
+        FieldSpec(
+            "inactivated_plugins", "停用的插件", "string_list", [],
+            hint="名单里的插件**不会被加载**（不 import、不实例化、不 initialize），"
+                 "也**不算加载失败**。改完需要重启服务才生效。"
+                 "元素写法：插件目录名 或 <目录名>.main 或真 AstrBot 的 "
+                 "data.plugins.<目录名>.main。",
+        ),
+    ),
 }
 
 
@@ -304,6 +327,20 @@ def _coerce(spec: FieldSpec, value: Any) -> Any:
                 f"{spec.label}（{key}）必须是字符串数组", field_name=key
             )
         return [v.strip() for v in value if v.strip()]
+
+    if spec.type == "string_list":
+        # 通用字符串数组（如插件停用名单）。⚠️ 去重但**保留书写顺序** ——
+        # 顺序对用户有意义（他按自己的理解排的），我们没理由重排。
+        if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+            raise ConfigProfileError(
+                f"{spec.label}（{key}）必须是字符串数组", field_name=key
+            )
+        out: list[str] = []
+        for v in value:
+            s = v.strip()
+            if s and s not in out:
+                out.append(s)
+        return out
 
     if spec.type in ("string", "text") or spec.type.endswith("_select"):
         if not isinstance(value, str):
@@ -496,6 +533,7 @@ __all__ = [
     "FieldSpec",
     "SCHEMA_VERSION",
     "SECTION_CONTEXT",
+    "SECTION_PLUGINS",
     "SECTION_SESSION",
     "SECTIONS",
     "SPECS",

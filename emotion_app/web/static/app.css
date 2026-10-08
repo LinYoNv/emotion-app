@@ -87,6 +87,12 @@ body {
   font-size: 11.5px; color: var(--muted);
 }
 .status { color: var(--muted); font-size: 11.5px; }
+
+/* 🔴 会话信息栏里的「共用 umo」提示（2026-09-27）。
+ * 为什么需要色差：这条信息与"窗口 N 条"那种中性状态混在一起时，
+ * 用户**看不见**它（情绪的实际困惑正是被这行埋掉的：他以为主动消息只能给 default）。
+ * ⚠️ 用暖黄而不是红：这不是错误，是"你该知道的事实 + 一个可选动作"。 */
+#session-info.warn { color: #e8c07d; }
 .status.ok::before { content: "● "; color: #9ece6a; }
 .status.bad::before { content: "● "; color: var(--danger); }
 
@@ -120,7 +126,20 @@ button.danger:hover { border-color: var(--danger); color: var(--danger); }
 }
 .link-btn:hover { border-bottom-color: var(--accent); }
 
-.content { flex: 1; min-width: 0; min-height: 0; display: flex; }
+.content { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+
+/* 手机端顶栏（含汉堡开关）。
+ * 🔴 默认**隐藏**：桌面端开关在侧边栏里（那里位置正好），不需要第二条入口。
+ *    只有 `@media (max-width: 640px)` 才显示 —— 见文件下方那段。
+ * ⚠️ 它必须放在 `.content` 里（抽屉**之外**）：
+ *    手机端侧边栏是 `translateX(-100%)` 的抽屉，开关若住在里面就会
+ *    跟着跑到屏幕外（实测 `rect.x=-268`、`elementFromPoint` 命中 null），
+ *    用户**完全打不开**导航 —— 情绪 2026-09-27 截图报的就是这个。 */
+.mobile-bar { display: none; }
+.mobile-bar-title { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 内容体：顶栏下面那块，撑满剩余高度（面板自己管滚动） */
+.content-body { flex: 1; min-width: 0; min-height: 0; display: flex; }
+
 .panel { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 16px; gap: 12px; overflow: auto; }
 .hidden { display: none !important; }
 
@@ -141,6 +160,22 @@ button.danger:hover { border-color: var(--danger); color: var(--danger); }
   border-radius: 8px; padding: 10px; resize: none; font: inherit;
 }
 .hint { color: var(--muted); font-size: 12px; margin: 0; }
+
+/* 「怎么让主动消息落到这个会话」的折叠说明（会话页）。
+ * ⚠️ 用它而不是又一段平铺 `.hint`：会话页本来字段就多，再堆三行说明
+ *    会把这个**次要但关键**的步骤淹掉（情绪的实际困惑正是这个）。 */
+.umo-howto {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: #0f1116; padding: 8px 10px; font-size: 12.5px;
+}
+.umo-howto > summary { cursor: pointer; color: var(--fg); font-weight: 500; }
+.umo-howto > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.umo-howto[open] > summary { margin-bottom: 6px; }
+.umo-howto ol { margin: 0; padding-left: 20px; color: var(--muted); }
+.umo-howto li { margin: 3px 0; }
+.umo-howto code { background: #1a1f28; padding: 1px 4px; border-radius: 4px; font-size: 12px; }
+.umo-howto strong { color: var(--fg); }
+.umo-howto .hint { margin-top: 6px; }
 
 /* 生成图片 */
 .gen-image {
@@ -172,6 +207,15 @@ button.danger:hover { border-color: var(--danger); color: var(--danger); }
 .list li:hover { border-color: var(--accent); }
 .list li.active { border-color: var(--accent); background: #202737; }
 .list li .badge { color: var(--accent); font-size: 11px; margin-left: 6px; }
+/* 未读小标：与会话列表里那个"N 条 · mode"并排，用 danger 色区分开。
+   ⚠️ 做成**实心圆角胶囊**而不是只改文字色 —— 会话列表是唯一能看出
+      "哪条会话有未读"的地方，必须一眼可辨（侧边栏收起态只剩图标，
+      那边只能靠 nav-badge 那个总数）。 */
+.list li .badge.unread-badge {
+  background: var(--danger); color: #10131a; font-weight: 700;
+  border-radius: 9px; padding: 0 6px; line-height: 18px; min-width: 18px;
+  text-align: center; margin-left: 6px;
+}
 .empty { color: var(--muted); padding: 24px; text-align: center; }
 
 form { display: flex; flex-direction: column; gap: 10px; }
@@ -228,6 +272,35 @@ table.sections tr.empty-row td { color: var(--muted); text-align: center; font-s
 }
 #import-result { margin-top: 10px; max-height: 40vh; }
 
+/* 🆕 人设参考图（2026-09-25）
+   ------------------------------------------------------------------------
+   结构：`.ref-block > .ref-title + .ref-row > (缩略图 + .ref-side(状态/按钮))`。
+   ⚠️ 缩略图固定成 72×72 + `object-fit: cover` —— 参考图可能是 1:1、3:4 或 16:9，
+      不固定的话这段高度会随图变，人设表单在手机上会上下跳。 */
+.ref-block {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ref-title { color: var(--muted); font-size: 13px; }
+.ref-title small { color: var(--muted); font-weight: 400; font-size: 12px; }
+.ref-row { display: flex; gap: 10px; align-items: flex-start; }
+.ref-thumb {
+  width: 72px; height: 72px; flex: 0 0 72px;
+  object-fit: cover; border-radius: 6px;
+  border: 1px solid var(--border); background: #0f1116;
+}
+.ref-side { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 1; }
+.ref-side .hint { word-break: break-all; }
+/* 窄屏：按钮要够大（触控目标 ≥44px，见下面移动端一节的原则②） */
+@media (max-width: 640px) {
+  .ref-side button { min-height: 40px; }
+  .ref-side .row { gap: 6px; }
+}
+
 h3 { font-size: 14px; margin: 6px 0; }
 h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 
@@ -260,7 +333,21 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 
 /* ---------- 手机 ---------- */
 @media (max-width: 640px) {
-  /* --- 侧边栏 → 抽屉（默认收起，汉堡点开）--- */
+  /* --- 手机端顶栏：**唯一**的抽屉开关（侧边栏里那个跟着抽屉一起藏起来） --- */
+  .mobile-bar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px;
+    min-height: 52px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  /* 侧边栏里那个开关在手机上**没有意义**（它随抽屉移动），但也不必隐藏 ——
+     抽屉打开时它正好当"关闭"用，位置也对。这里只把它的可点面积放大到 44px
+     以符合触控最小尺寸（原本 32×40）。 */
+  .sidebar-head .icon-btn { width: 40px; height: 40px; }
+
+  /* --- 侧边栏 → 抽屉（默认收起，由顶栏的汉堡打开）--- */
   .sidebar {
     position: fixed; left: 0; top: 0; bottom: 0;
     width: min(78vw, 280px);
@@ -405,8 +492,112 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   border: 1px solid var(--border); border-radius: var(--radius);
   background: #fff;   /* 插件面板多为浅色主题，白底不会闪 */
 }
+#plugin-page-list {
+  /* 🔴 **永不收缩**：插件页入口是这一页的主功能，绝不能因为上面那块
+     （启停列表）变高就被压成 0 高。2026-09-27 实测：只给启停列表
+     `min-height:0` 而不加这一行时，矮窗口（900×470）下入口列表仍会被压到 41px。 */
+  flex: 0 0 auto;
+}
 #plugin-page-list li { display: flex; align-items: center; gap: 10px; cursor: pointer; }
 #plugin-page-list li .pid { color: var(--muted); font-size: 11.5px; margin-left: auto; }
+
+/* ==================== 插件启停（inactivated_plugins） ==================== */
+/* 🔴 `#plugin-switch-list` 与 `#plugin-page-list` 的 flex 三件套
+   —— 2026-09-27 情绪报「插件详情页怎么没了」的**真根因**（真浏览器实测整条链）：
+
+     ① `.switch-row` 是 `<label>`，被本文件上面那条**全局**
+        `label{display:flex;flex-direction:column;…}`（约 :187）命中；
+        而它自己只写了 `display:flex; align-items:center`，**没写方向**
+        ⇒ 每行被排成**竖排**：实测 **126px/行** × 14 个插件 = **1810px**。
+     ② 面板 `.panel` 是 `flex-direction:column; overflow:auto`，被上面那个 1810px
+        撑到 `scrollHeight 2058 > clientHeight 757` ⇒ flex 开始**压缩子项**。
+     ③ `#plugin-switch-list{overflow:visible}` ⇒ `min-height:auto` 解析为**内容高**
+        ⇒ 压不动；而 `#plugin-page-list`（`.list` 带 `overflow:auto`）的
+        `min-height:auto` 解析为 **0** ⇒ **它被压成 0 高**。
+        实测：`scrollH=134` 但 `offsetHeight=0` —— **内容都在 DOM 里、就是高度 0**，
+        所以接口 /api/v1/plugins/pages 返回 3 条、`curl` 全绿，
+        **而用户在面板上什么都看不见**（这正是「详情页没了」）。
+
+   修法（单变量实验择优，5 个视口全绿；只改方向或只限高在矮窗会复发）：
+     * `.switch-row` **显式**声明 `flex-direction:row`（不再继承全局 label 的方向）；
+     * 启停列表 `min-height:0` → 允许被压缩，配 `overflow-y:auto` 自己滚；
+     * 入口列表 `flex:0 0 auto` → **永不收缩**，不再依赖邻居的尺寸。
+   ⚠️ 别把 `.switch-row` 的 `flex-direction` 删掉 —— 删了就退回每行 126px。 */
+.switch-list {
+  display: flex; flex-direction: column; gap: 4px; margin: 0 0 4px;
+  /* 可被压缩（否则 flex 只能去压别人）；内容多时自己滚，不把面板撑爆 */
+  flex: 0 1 auto; min-height: 0; overflow-y: auto;
+}
+.switch-row {
+  display: flex; flex-direction: row; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px;
+  font-size: 13px; cursor: pointer;
+}
+.switch-row:hover { border-color: var(--accent); }
+.switch-cb { width: 16px; height: 16px; flex: 0 0 auto; cursor: pointer; }
+.switch-name { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 模块路径 = 停用名单里**元素的原文** —— 用户要看得见我们到底按什么匹配 */
+.switch-id {
+  color: var(--muted); font-size: 11.5px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.switch-state {
+  margin-left: auto; flex: 0 0 auto;
+  font-size: 11.5px; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 9px; padding: 0 7px;
+}
+.switch-state.bad { color: var(--danger); border-color: var(--danger); }
+/* 「详情」按钮：`.switch-state` 用了 `margin-left:auto` 把它推到最右，
+   这里要把它留在状态标签**右边**且不换行（手机端会 wrap，是预期）。 */
+.switch-detail { flex: 0 0 auto; font-size: 11.5px; padding: 2px 8px; }
+/* 失败原因另起一行（不挤掉状态标签，也不被省略号吃掉） */
+.switch-err {
+  flex-basis: 100%; color: var(--danger); font-size: 11.5px;
+  word-break: break-word; padding-left: 26px;
+}
+
+/* ==================== 插件详情 ==================== */
+.detail-body {
+  flex: 1; min-height: 0; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.detail-group {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 10px 12px; background: var(--panel);
+}
+.detail-group h4 { margin: 0 0 8px; font-size: 13.5px; }
+.detail-section-title { margin: 4px 0 0; font-size: 14px; }
+.detail-row { display: flex; gap: 10px; align-items: baseline; padding: 2px 0; font-size: 13px; }
+.detail-k { flex: 0 0 auto; width: 132px; color: var(--muted); font-size: 12.5px; }
+.detail-v { flex: 1 1 auto; min-width: 0; word-break: break-word; }
+.detail-v.mono, .detail-pre {
+  font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px;
+}
+.detail-v.muted { color: var(--muted); }
+.detail-items { display: flex; flex-direction: column; gap: 8px; }
+.detail-item {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 7px 9px; background: #20242e;
+}
+.detail-item-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 3px; }
+.detail-badge {
+  font-size: 11px; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 9px; padding: 0 7px;
+}
+.detail-badge.admin { color: var(--danger); border-color: var(--danger); }
+.detail-sub { margin-top: 5px; padding-left: 10px; border-left: 2px solid var(--border); }
+.detail-sub-line { font-size: 12.5px; color: var(--muted); font-family: ui-monospace, Menlo, Consolas, monospace; }
+.detail-pre {
+  margin: 0; padding: 9px 10px; max-height: 40vh; overflow: auto;
+  background: #161922; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  white-space: pre-wrap; word-break: break-word; color: var(--fg);
+}
+.detail-pre.readme { max-height: 50vh; }
+.detail-counts { display: flex; gap: 18px; flex-wrap: wrap; }
+.detail-count { display: flex; flex-direction: column; gap: 1px; }
+.detail-count strong { font-size: 19px; font-weight: 600; }
+.detail-count span { font-size: 11.5px; color: var(--muted); }
 
 /* 细节控件 */
 .list li:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
@@ -753,6 +944,12 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 }
 .logs-inline {
   display: inline-flex;
+  /* 🔴 **必须显式写方向**：上面有条全局 `label{flex-direction:column}`（约 :187），
+     而这些是 `<label>` 当工具条用（文本 + 下拉/勾选框要**并排**）。
+     漏了这行的实测后果（2026-09-27 真浏览器量的）：`dir=column`、
+     文本与控件上下堆叠、每个标签高 **65px**，而同一行的按钮只有 33px
+     —— 整条工具条被撑成两根高，看着像坏了。补上后回到 36px、真并排。 */
+  flex-direction: row;
   align-items: center;
   gap: 0.35rem;
   font-size: 0.9rem;

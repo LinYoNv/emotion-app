@@ -35,6 +35,20 @@ class StarMetadata:
 
     star_cls_type: type | None = None
     module_path: str = ""
+    #: 🔴 插件**实例**（不是类！类在 `star_cls_type`）—— 照真实现
+    #: `core/star/star.py:42`。插件靠它**跨插件互调**：实测陪伴的
+    #: `_memory_companion_bridge()` 会读 `get_all_stars()` 里的
+    #: `metadata.star_cls.memory_companion`（`memory_companion_adapter.py:538`），
+    #: 记忆插件面板桥也读它（`companion_page_bridge.py:786`）。
+    #: ⚠️ **插件被禁用/实例化失败时为 `None`** —— 照真实现
+    #: `star_manager.py:1240`（`else: metadata.star_cls = None`），
+    #: 别填假对象：插件对此有明确语义（`presence["loaded"] is False`）。
+    star_cls: Any | None = None
+    #: 🔴 插件**模块对象** —— 照真实现 `core/star/star.py:44` +
+    #: 赋值处 `star_manager.py:1243`（`metadata.module = module`）。
+    #: 插件从它取桥：`getattr(metadata.module, "get_memory_companion_bridge")`
+    #: （`memory_companion_adapter.py:892`）。
+    module: Any | None = None
     name: str = ""
     author: str = ""
     desc: str = ""

@@ -222,6 +222,50 @@ def create_app(
     def _chat_or_none() -> ChatService | None:
         return app.config.get("EMOTION_CHAT")
 
+    def _effective_model(req_model: str = "") -> str:
+        """🔴 **响应里该回显哪个模型名** —— 全局**唯一**的解析处（2026-09-27 修）。
+
+        ## 修的是什么（情绪报障）
+        「我切了对话模型怎么聊天那还是用着 `gemini-3.1-flash-lite`」
+
+        实测：**实际请求上游用的确实是他切的新模型**（`chat.py:322` 的
+        `resolve_target` 优先级是对的：人设覆盖 > 请求指定 > **运行时设置** > 环境变量），
+        **但响应体里回显的是旧名字** —— 因为这里原来写
+
+            "model": req.model or config.upstream.model
+
+        而 **`config` 是服务启动那一刻的快照**（来自 `.env`）：
+        * `.env` 里 `EMOTION_UPSTREAM_MODEL=gemini-3.1-flash-lite`（启动值）
+        * 用户在面板切成 `gemini-3.8-flash-high` → 写进**运行时设置**（`EMOTION_SETTINGS`）
+        ⇒ `config.upstream.model` **永远**是旧值，面板里那个模型名标签就是假的。
+
+        🔴 **为什么这是最坏的那类 bug**：模型标签**唯一**的用途就是告诉用户
+        "这条回复是谁生成的"。它说错话时，用户会去改一个**本来就对**的地方
+        （他就是这么来报障的），而真因在另一个文件里。
+
+        ⚠️ **同一个概念原来有 3 条写入路径**（非流式 / 流式 envelope / 另一条流式分支）
+        —— 本项目踩过 3 次的「同一概念多条写入路径」。
+        所以抽成**这一个函数**，三处都调它。
+
+        ⚠️ 优先级必须与 `chat.py:resolve_target` **一致**，否则又会出现
+        "实际用 A、回显 B"。这里**直接复用它**（而不是再写一遍）——
+        两处各写一份必然漂移，那正是这个 bug 的成因。
+
+        ⚠️ `req_model`（调用方显式指定的 `model` 字段）位置保持**和原来一样**：
+           调用方说了就用它的 —— 那是 OpenAI 客户端语义，不该被这次修复改掉。
+        """
+        if req_model:
+            return req_model
+        chat = _chat_or_none()
+        if chat is not None:
+            try:
+                # 传空 persona / 空 override ⇒ 得到"全局默认"，与真正发请求时同源
+                return chat.resolve_target(None).model
+            except Exception:  # noqa: BLE001
+                # 解析失败不能把响应搞挂 —— 但**必须留日志**（静默失败最贵）
+                log.warning("解析生效模型名失败，回落到启动配置", exc_info=True)
+        return config.upstream.model
+
     def _api_key_from_request() -> str | None:
         """从 Authorization 头取上游 key（OpenAI 客户端的用法）。
 
@@ -241,33 +285,36 @@ def create_app(
     async def _session_user_id(svc: Any, session_id: str) -> str:
         """取该会话绑定的**插件用户 id**（方案 B）；取不到返回空串。
 
-        🔴 为什么不能只读配置：插件的 `data["users"]` 按 user_id 分，
-           "哪个会话开主动消息"就是"哪个 user 的开关为真"。
-           所有会话共用一个 `"default"` 的话，**三个会话只能同开同关** ——
-           这正是情绪要的场景做不到的原因。
+        🔴 **规则本体只有一份**：`plugin_host.session_user_id()`。
+           这里只是把"从哪个对象拿会话仓库"接上（`svc._sessions`）——
+           **绝不在本文件复刻一遍判定**，否则它与钩子那条路径会漂移，
+           而漂移的表现正是 2026-09-26 那个真 bug：
+           派发记到用户 A、注入按用户 B 算（两边各自看起来都正常）。
 
         ⚠️ 任何取不到的情况都返回空串（不抛）：
            无 session_id / 无会话仓库 / 会话不存在 / 会话没绑 →
            调用方回落全局 `plugins.umo_user_id`（**行为与以前一致**）。
         """
-        sid = str(session_id or "").strip()
-        if not sid:
-            return ""
-        sessions = getattr(svc, "_sessions", None)
-        if sessions is None:
-            return ""
-        try:
-            session = await sessions.get(sid)
-        except Exception:  # noqa: BLE001 — 会话不存在不该让聊天崩掉
-            return ""
-        return str(getattr(session, "user_id", "") or "")
+        from emotion_app.web.plugin_host import session_user_id
 
-    async def _plugin_first_reply(
+        return await session_user_id(getattr(svc, "_sessions", None), session_id)
+
+    async def _plugin_first_reply_payload(
         text: str, *, svc: Any, req: Any
-    ) -> Any:
-        """把用户这轮输入派发给插件；**有产出就返回 OpenAI 格式响应**。
+    ) -> tuple[dict[str, Any], Any] | None:
+        """把用户这轮输入派发给插件；**有产出就返回 OpenAI 格式 payload**。
 
         返回 `None` = "插件没说话，请照常走 LLM"。
+
+        🔴 **为什么返回 payload 而不是 `jsonify(...)` 的响应**（2026-09-26 实测踩到）：
+           流式分支要在**上游没被调用之前**就决定"这轮交给谁"，而它是在
+           `async def sse()` 生成器里跑的 —— **Quart 的请求/app 上下文在
+           响应迭代开始后就不在了**（`RuntimeError: Not within an app context`）。
+           所以 `jsonify()` 必须留在仍有上下文的**路由函数**里调用。
+           （原来只有非流式一个调用方、且它在路由函数体里，所以看不出来。）
+
+        Returns:
+            `(payload, dispatch_result)`；插件没接管时 `(None, None)`。
 
         🔴 判定"插件有没有说话"的依据（缺一不可，否则会**吞掉正常聊天**）：
           1. `result.emitted` 非空 —— 插件产出了回复内容；
@@ -316,7 +363,7 @@ def create_app(
         # 🔴 判定"插件有没有说话"**只在这一处实现**
         #    （`plugin_host.plugin_reply_text`）—— 集成层与单测共用同一份规则，
         #    避免"测试里复刻一份规则"导致的自证式假通过。
-        from emotion_app.web.plugin_host import plugin_reply_text
+        from emotion_app.web.plugin_host import plugin_reply_non_text, plugin_reply_text
 
         content = plugin_reply_text(res)
         if content is None:
@@ -328,7 +375,8 @@ def create_app(
             "id": rid,
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": req.model or config.upstream.model,
+            # 🔴 走**唯一**的解析处（原来直接读启动快照 `config` ⇒ 回显旧模型名）
+            "model": _effective_model(req.model),
             "choices": [
                 {
                     "index": 0,
@@ -341,9 +389,50 @@ def create_app(
                 "executed": len(res.executed or []),
                 "errors": [{"handler": n, "error": e} for n, e in (res.errors or [])],
                 "stopped": bool(res.stopped),
+                # 🔴 **插件产出里被降级掉的部分**（图/语音/文件…）。
+                #
+                # 为什么必须写进 payload：`plugin_reply_text()` 只返回**文本**，
+                #   非文本段在流式分支里**没有对应通道**。若不如实标注，
+                #   流式分支就只能**静默丢弃**插件发的图 —— 正是本项目最贵的
+                #   那类 bug（参考图裸 base64 事故：无日志、无报错，
+                #   用户只能凭感觉报障）。
+                # ⚠️ 判据只此一份（`plugin_reply_non_text`），别处不许再判一遍。
+                "non_text": plugin_reply_non_text(res),
             },
         }
-        return jsonify(payload), 200
+        return payload, res
+
+    async def _plugin_content_from_payload(
+        payload: dict[str, Any]
+    ) -> str | None:
+        """从插件 payload 里取**那段文本**；取不到返回 `None`。
+
+        🔴 **只取文本，别的字段如实忽略** —— 但**不静默**：
+           非文本段（图/语音/文件）在流式分支里**没有对应通道**，
+           所以这里打一条 `log.info` 说明"未透传附件"。
+           本项目最贵的 bug 就是静默丢弃（参考图裸 base64 事故）。
+
+        Returns:
+            文本；拿不到时 `None`（调用方按"插件没接管"处理，回落 LLM）。
+        """
+        choices = payload.get("choices")
+        text = ""
+        if isinstance(choices, list) and choices:
+            message = (choices[0] or {}).get("message") or {}
+            text = str(message.get("content") or "")
+        if not text.strip():
+            return None
+
+        # 🔴 **非文本内容在流式分支没有通道 —— 如实说出来，不许静默丢**
+        non_text = (payload.get("plugin_dispatch") or {}).get("non_text") or []
+        if non_text:
+            kinds = "、".join(str(x.get("type", "?")) for x in non_text)
+            log.info(
+                "插件回复含非文本内容（%s）：流式分支未透传附件，本条只发了文本；"
+                "需要附件请用非流式（stream=false）",
+                kinds,
+            )
+        return text
 
     def _last_user_text(req: Any) -> str:
         """取本次请求里**最后一条**用户消息的纯文本。
@@ -380,10 +469,10 @@ def create_app(
         if denied is not None:
             return denied
 
-        svc = _chat_or_none()
-        model = config.upstream.model
-        if svc is not None:
-            model = svc.resolve_target(None).model
+        # 🔴 走**唯一**的解析处（这里原来自己写了一遍 `svc.resolve_target(...)` ——
+        #    与响应回显那几处是**同一逻辑的两份实现**，正是它们漂移出了
+        #    "实际用新模型、回显旧模型名" 那个 bug。现在共用一个函数。）
+        model = _effective_model()
 
         return jsonify(
             {
@@ -441,16 +530,21 @@ def create_app(
             #    插件会产出回复；这时**不再调 LLM**（真实现同款语义：
             #    `_has_send_oper`/有结果 就不再走默认 LLM 链路）。
             #    没有插件产出 → 原样回落 LLM，聊天行为**完全不变**。
-            plugin_reply = await _plugin_first_reply(
+            plugin_reply = await _plugin_first_reply_payload(
                 _last_user_text(req), svc=svc, req=req
             )
             if plugin_reply is not None:
-                return plugin_reply
+                return jsonify(plugin_reply[0]), 200
 
             try:
                 result = await svc.complete(req)
             except UpstreamError as exc:
-                log.warning("上游失败", extra={"data": {"status": exc.status}})
+                # 🔴 必须把 body 一并记进日志（2026-10-08）：`exc.status` 只说"403"，
+                #    而**为什么 403** 全在 body 里（额度？权限？渠道组不对？）。
+                log.warning(
+                    "上游失败",
+                    extra={"data": {"status": exc.status, "body": exc.body[:500]}},
+                )
                 return _openai_error(f"上游调用失败：{exc}", "upstream_error", 502)
             except ChatError as exc:
                 return _openai_error(str(exc), "invalid_request_error", 400)
@@ -482,6 +576,34 @@ def create_app(
             return jsonify(payload), 200
 
         # ---- 流式 ----
+        #
+        # ⭐⭐ **先给插件一次机会**（与非流式分支**同一处判定**，2026-09-26 补）。
+        #
+        # 🔴 为什么这条曾经完全缺失（真 bug，差分实验实测）：
+        #    派发**只写在非流式分支里**（上面的 `if not req.stream:`），
+        #    而面板聊天**永远走流式**（`static/app.js` 发 `stream: true`）
+        #    → 用户在面板里说的每一句话，插件**一次都没收到过**：
+        #      没建档、没 umo、记忆/关系/被动状态管线拿不到用户的话。
+        #    而对照判据 `tools/proactive_multisession_check.py` 用的是
+        #    `"stream": False` —— **判据只覆盖了不被使用的那条路**，
+        #    所以它全绿。教训：判据要盯**用户真正走的那条路**。
+        #
+        # 🔴 **必须在返回 SSE 响应【之前】跑**（就在这里，不是放在 `sse()` 里）：
+        #    实测踩到 —— 生成器一开跑，Quart 的 app/请求上下文就没了
+        #    （`RuntimeError: Not within an app context`），而派发链路要读
+        #    `app.config` / 会话仓库并打日志。正解是**在还有上下文的时候算完**，
+        #    而不是往生成器里塞 `jsonify` 去"绕过"它。
+        #    行为上完全等价：派发本来就必须发生在"调上游之前"。
+        #
+        # ⚠️ 插件接管时**不许再调上游**（下面会跳过 `svc.stream(req)`），
+        #    否则用户会收到两条互相矛盾的回复。
+        plugin_reply = await _plugin_first_reply_payload(
+            _last_user_text(req), svc=svc, req=req
+        )
+        plugin_content: str | None = None
+        if plugin_reply is not None:
+            plugin_content = await _plugin_content_from_payload(plugin_reply[0])
+
         async def sse() -> AsyncIterator[str]:
             """SSE 生成器。**逐块 yield，不缓冲整段。**
 
@@ -496,7 +618,8 @@ def create_app(
                     "id": rid,
                     "object": "chat.completion.chunk",
                     "created": created,
-                    "model": req.model or config.upstream.model,
+                    # 🔴 走**唯一**的解析处（原来直接读启动快照 `config` ⇒ 回显旧模型名）
+            "model": _effective_model(req.model),
                     "choices": [
                         {"index": 0, "delta": delta, "finish_reason": finish}
                     ],
@@ -506,42 +629,59 @@ def create_app(
                 # 首个 chunk 带 role（与 OpenAI 惯例一致）
                 yield frame(envelope({"role": "assistant", "content": ""}))
 
-                # 🔴 **必须完整消费生成器，不能 break**。
-                #    实测踩到：最初这里 `if chunk.done: break`，
-                #    结果生成器被提前抛弃 → `ChatService.stream()` 尾部的
-                #    **持久化逻辑永远不执行** → 流式聊天永远不存历史。
-                #    （判据：这里 break 是"省一点循环"换"功能静默失效"，不划算。）
-                async for chunk in svc.stream(req):
-                    if chunk.done:
-                        continue          # 只忽略该 chunk，不中断循环
-                    if chunk.delta or chunk.reasoning_delta:
-                        delta: dict = {}
-                        if chunk.delta:
-                            delta["content"] = chunk.delta
-                        if chunk.reasoning_delta:
-                            delta["reasoning_content"] = chunk.reasoning_delta
-                        yield frame(envelope(delta))
-                    if chunk.finish_reason:
-                        yield frame(envelope({}, chunk.finish_reason))
-                    # ⭐ 工具产出的图片：用**独立事件**推给客户端
-                    #    （OpenAI 协议没有"图"这个 delta，所以用并列字段，
-                    #      标准客户端会忽略它，我们的面板会渲染）
-                    for tc in chunk.tool_call_deltas or []:
-                        if tc.get("status") == "success":
-                            yield frame({
-                                "id": rid,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": req.model or config.upstream.model,
-                                "images": tc.get("data", {}).get("urls", []),
-                                "kind": tc.get("data", {}).get("kind", ""),
-                                "caption": tc.get("data", {}).get("caption", ""),
-                                "choices": [],
-                            })
+                # ⚠️ **派发已经在上面的路由函数体里做完了**（`plugin_reply` /
+                #    `plugin_content`）—— **不在生成器里做**：
+                #    生成器一开跑就没有 Quart 的 app/请求上下文了（实测
+                #    `RuntimeError: Not within an app context`）。
+                #    这里只负责按结果**选一条路走**，逻辑上仍在"调上游之前"。
+                if plugin_content is None:
+                    # 🔴 **必须完整消费生成器，不能 break**。
+                    #    实测踩到：最初这里 `if chunk.done: break`，
+                    #    结果生成器被提前抛弃 → `ChatService.stream()` 尾部的
+                    #    **持久化逻辑永远不执行** → 流式聊天永远不存历史。
+                    #    （判据：这里 break 是"省一点循环"换"功能静默失效"，不划算。）
+                    async for chunk in svc.stream(req):
+                        if chunk.done:
+                            continue          # 只忽略该 chunk，不中断循环
+                        if chunk.delta or chunk.reasoning_delta:
+                            delta: dict = {}
+                            if chunk.delta:
+                                delta["content"] = chunk.delta
+                            if chunk.reasoning_delta:
+                                delta["reasoning_content"] = chunk.reasoning_delta
+                            yield frame(envelope(delta))
+                        if chunk.finish_reason:
+                            yield frame(envelope({}, chunk.finish_reason))
+                        # ⭐ 工具产出的图片：用**独立事件**推给客户端
+                        #    （OpenAI 协议没有"图"这个 delta，所以用并列字段，
+                        #      标准客户端会忽略它，我们的面板会渲染）
+                        for tc in chunk.tool_call_deltas or []:
+                            if tc.get("status") == "success":
+                                yield frame({
+                                    "id": rid,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    # 🔴 走**唯一**的解析处（原来直接读启动快照 `config` ⇒ 回显旧模型名）
+            "model": _effective_model(req.model),
+                                    "images": tc.get("data", {}).get("urls", []),
+                                    "kind": tc.get("data", {}).get("kind", ""),
+                                    "caption": tc.get("data", {}).get("caption", ""),
+                                    "choices": [],
+                                })
+                else:
+                    # 插件接管 → 把它的文本用**既有 SSE 帧格式**发出去。
+                    # ⚠️ 形状照本生成器一贯的写法：带 role 的空 delta（已在上面发过）
+                    #    → content delta → finish_reason="stop"；结束的
+                    #    `data: [DONE]` 由下面**共用的那一行**补上（不重复发）。
+                    yield frame(envelope({"content": plugin_content}))
 
                 yield frame(envelope({}, "stop"))
             except UpstreamError as exc:
-                log.warning("流式中断", extra={"data": {"status": exc.status}})
+                # 🔴 同非流式路径：body 必须进日志（2026-10-08）
+                log.warning(
+                    "流式中断",
+                    extra={"data": {"status": exc.status, "body": exc.body[:500]}},
+                )
                 yield frame({"error": {"message": f"上游调用失败：{exc}", "type": "upstream_error"}})
             except Exception:  # noqa: BLE001 — 流里必须兜住，否则连接半开
                 log.exception("流式处理异常")
@@ -713,7 +853,12 @@ def _mount_plugin_routes(
     config: Config,
     require_auth: Any,
 ) -> None:
-    """挂载 `/api/plugins/extensions/<path:plugin_path>`（照真实现的路由形状）。
+    """挂载插件 Web API 的**两条**通配路由（照真实现，共用同一个派发器）。
+
+        ① `/api/plugins/extensions/<path:plugin_path>` —— 真实现的新形状
+           （`plugins.py:379-421`，五种方法）；
+        ② `/api/plug/<path:plugin_path>` —— 真实现的 **legacy** 形状
+           （`plugins.py:1506`），插件页 JS 里硬编码的那条。
 
     🔴 **为什么用"一条通配路由"而不是逐条注册**：
        插件路由支持 Flask 风格参数（`<x>` / `<path:x>`），要在 Quart 里逐条
@@ -722,7 +867,10 @@ def _mount_plugin_routes(
        `@router.get("/plugins/extensions/{plugin_path:path}")`），
        我们照此办理，复用**已验证与真实现逐字相同**的匹配器。
 
-    ⚠️ 五种 HTTP 方法都注册 —— 真实现同样是 GET/POST/PUT/PATCH/DELETE 五条。
+    ⚠️ 五种 HTTP 方法都注册 —— 真实现的新形状同样是 GET/POST/PUT/PATCH/DELETE 五条。
+
+    🔴 **两条路由的 handler 体必须只有一份**（`_dispatch_plugin_api`）：
+       它们是"同一个概念的两个 URL 前缀"，复制一份逻辑就等着漂移。
     """
     from .plugin_host import PluginHostService
     from .plugin_routes import not_found_payload, to_quart_response
@@ -743,6 +891,19 @@ def _mount_plugin_routes(
     #:    「还没有读取到可用的主回复人格文本」—— 那句文案是**误诊**
     #:    （它叫用户去触发一次对话，但缺这个仓库时触发也修不好）。
     service.personas = app.config.get("EMOTION_PERSONAS")
+    #: 🔴 **存储后端**：`context.conversation_manager` 靠它才能让插件
+    #:    存取自己那份对话历史（主动消息存档）。
+    #:    缺了它，插件每轮主动消息都会报「主动消息写入会话历史失败」
+    #:    → 存不下自己刚说过的话 → 下一轮读不到上文 → **可能重复话题**
+    #:    （情绪 2026-09-27 明确要求修的那条）。
+    service.store = app.config.get("EMOTION_STORE")
+    #: 🔴 **配置文件路径**（插件启停名单落在 `config_profile` 的 `plugins` 段）。
+    #:    ⚠️ 与 `_backend_getter` 同款用回调：本函数在 `create_app` 里执行，
+    #:       而测试是在 `create_app(...)` **之后**才设 `EMOTION_CONFIG_PROFILE_PATH`
+    #:       —— 直接取值会读到一个还不存在的覆盖（测试就会写进项目的 `data/`）。
+    service._config_profile_path = lambda: app.config.get(  # noqa: SLF001
+        "EMOTION_CONFIG_PROFILE_PATH"
+    )
     app.config["EMOTION_PLUGIN_HOST"] = service
 
     # ⭐ P0-4：把插件宿主接成 ChatService 的 **LLM 钩子端口**。
@@ -756,8 +917,21 @@ def _mount_plugin_routes(
 
     methods = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 
-    @app.route("/api/plugins/extensions/<path:plugin_path>", methods=methods)
-    async def plugin_extension(plugin_path: str):  # type: ignore[no-untyped-def]
+    async def _dispatch_plugin_api(plugin_path: str) -> Any:
+        """把一次插件 Web API 调用**派发给宿主**（本条路由唯一的写入路径）。
+
+        🔴 **为什么抽成内部函数**（本项目铁律：同一概念不许有两条会漂移的写入路径）：
+           交付时 `/api/plugins/extensions/...`（真实现形状）与
+           `/api/plug/...`（真实现的 **legacy** 形状，见下）必须做**同一件事**。
+           复制第二份"鉴权 → 判空 → 派发 → 报错"的逻辑，
+           就是"同一概念多条写入路径"的第 4 次复发 —— 改一处忘一处。
+           ⇒ 两条路由**都只调这个函数**。
+
+        ⚠️ **鉴权刻意留在这里的第一行**：它不是"顺手的礼貌"，
+           而是"把 URL 直接打进来"这条链路的**唯一闸门**
+           （本项目真事故：新增 API 路由漏 `require_auth()`
+            → 未登录返 200，而服务绑 `0.0.0.0` = 公网可读运行日志）。
+        """
         # 复用主服务的鉴权（会话 cookie 或 Bearer 令牌）
         denied = require_auth()
         if denied is not None:
@@ -815,6 +989,39 @@ def _mount_plugin_routes(
 
         return await to_quart_response(result)
 
+    @app.route("/api/plugins/extensions/<path:plugin_path>", methods=methods)
+    async def plugin_extension(plugin_path: str):  # type: ignore[no-untyped-def]
+        """真实现的**新**形状（`plugins.py:379-421`，五种方法都有）。"""
+        return await _dispatch_plugin_api(plugin_path)
+
+    # ------------------------------------------------------------------
+    # `/api/plug/<path:plugin_path>` —— 真实现的 **legacy 形状**（缺它 = 404）
+    #
+    # 🔴 为什么必须有（2026-09-27 实测，见 `docs/插件拓展页_API_404_诊断.md`）：
+    #    插件页 JS **硬编码** `const API = "/api/plug/<插件名>/page"`，
+    #    这不是作者的错 —— 真 AstrBot 4.27.5 确实有这条
+    #    （`dashboard/api/plugins.py:1506`
+    #     `@legacy_router.api_route("/api/plug/{plugin_path:path}", methods=["GET","POST"])`），
+    #    内存插件页的注释也写着 *"the /api/plug route is available across
+    #    dashboard versions"*。我们只实现了 `/api/plugins/extensions` 那条 ⇒
+    #    `qzone-companion`（`astrbot_plugin_content_companion`）整页取不到数。
+    #
+    # ⚠️ **方法集与真实现不同，这是有意的**：
+    #    真 legacy 那条只有 GET/POST，但隔壁 `/api/plugins/extensions/...` 是五种。
+    #    两条路由**指向同一个派发器**，若方法集不同，同一个插件路由
+    #    （如 `page/action` 用 PUT）换个前缀就会从"能调"变成"404" ——
+    #    那是**又一条会漂移的差异**，且方向上只会让兼容面变小。
+    #    ⇒ 取**五种**（与 `/api/plugins/extensions/...` 一致），
+    #      兼容面严格是超集；请求最终仍由宿主按插件**自己登记的方法**匹配
+    #      （`web_router.match_registered_web_api`），所以放宽外层不会放行
+    #      插件没登记的方法（`test_wrong_method_404` 仍守着这条）。
+    # ------------------------------------------------------------------
+
+    @app.route("/api/plug/<path:plugin_path>", methods=methods)
+    async def plugin_extension_legacy(plugin_path: str):  # type: ignore[no-untyped-def]
+        """legacy 前缀 —— 与上面那条**共用同一个派发器**（不许有第二份实现）。"""
+        return await _dispatch_plugin_api(plugin_path)
+
     # ------------------------------------------------------------------
     # 插件**拓展页**（情绪报的「插件没有配置入口」就是缺了这一段）
     #
@@ -830,3 +1037,161 @@ def _mount_plugin_routes(
     from .plugin_pages_web import mount_plugin_page_routes
 
     mount_plugin_page_routes(app, service, require_auth)
+
+    # ------------------------------------------------------------------
+    # 插件**启停**（照真 AstrBot 的 `inactivated_plugins`）
+    #
+    # 为什么要有：真 AstrBot 能把某个插件停掉（`star_manager.turn_off_plugin`），
+    # 我们以前**没有这个能力** ⇒ 不想让它跑的插件只能一直跑：
+    #   * `prompt_tools` 每轮 LLM 请求一条 ERROR（它用的是旧版 dict API）；
+    #   * `meme_manager` 每次启动一条 import 失败；
+    #   * `gemini_content_keeper` / `media_parser` 初始化失败/超时。
+    #
+    # 🔴 两条路由都**必须**先 `require_auth()`（本项目真事故：
+    #    我加的 `/api/v1/logs` 漏了它 → 未登录返 200，而服务绑 0.0.0.0
+    #    = 公网可读运行日志）。这里的读接口会吐出全部插件名与错误信息，
+    #    写接口能改配置 —— 更不能漏。
+    #
+    # 🔴 生效时机**如实**：保存后需要**重启服务**才会应用（真 AstrBot 的
+    #    `turn_on_plugin` 同样是 `await self.reload(plugin_name)`）。
+    #    所以响应里带 `restart_required`，面板上会明写这一句 —— 不糊过去。
+    # ------------------------------------------------------------------
+
+    @app.get("/api/v1/plugins")
+    async def list_all_plugins():  # type: ignore[no-untyped-def]
+        """列出**全部**插件及其状态（含失败的、被停用的）。"""
+        denied = require_auth()
+        if denied is not None:
+            return denied
+        if service.host is None:
+            # ⚠️ **不返回空列表**：空列表 = "一个插件都没有"，那是另一回事
+            #    （本项目最贵的 bug 类型：把"读失败/没起来"显示成"没有"）。
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": "插件宿主未启动（请看服务日志里的原因）",
+                            "type": "unavailable",
+                        }
+                    }
+                ),
+                503,
+            )
+        return jsonify(service.plugin_activation_view()), 200
+
+    @app.put("/api/v1/plugins/inactivated")
+    async def set_inactivated_plugins():  # type: ignore[no-untyped-def]
+        """保存停用名单（**整体替换**）。
+
+        body：`{"inactivated_plugins": ["<目录名>.main", ...]}`
+
+        ⚠️ 用"整体替换"而不是逐个开关：面板本来就展示全部插件，
+           整份提交没有"两个请求各改一半"的竞态；而且它天然幂等 ——
+           真机判据（发两次同样的 body，磁盘内容逐字相同）能直接验。
+        """
+        denied = require_auth()
+        if denied is not None:
+            return denied
+
+        from ..domain.config_profile import ConfigProfileError
+
+        body = await request.get_json(silent=True)
+        if not isinstance(body, dict) or "inactivated_plugins" not in body:
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": "请求体必须是 JSON 对象且带 inactivated_plugins 字段",
+                            "type": "bad_request",
+                            "field": "inactivated_plugins",
+                        }
+                    }
+                ),
+                400,
+            )
+        try:
+            view = service.save_inactivated(body["inactivated_plugins"])
+        except ConfigProfileError as exc:
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": str(exc),
+                            "type": "invalid_config_profile",
+                            "field": exc.field_name,
+                        }
+                    }
+                ),
+                400,
+            )
+        return jsonify(view), 200
+
+    # ------------------------------------------------------------------
+    # 插件**详情**（照真 AstrBot 的 `GET /api/v1/plugins/by-id`）
+    #
+    # 🔴 为什么需要它（不是"抄个人家有的界面"）：
+    #    我们的插件跑在**兼容层**上，"这个插件到底注册上了什么"是最常要回答的
+    #    问题 —— 此前面板只能显示 `handler_count` 一个**数字**，
+    #    看不出"注册的是哪几条指令、有没有 LLM 工具"。
+    #    本项目最贵的 bug 类型是**静默失败**（插件把兼容层缺口 catch 成一行
+    #    info 日志），所以"逐条列出来"本身就是判据。
+    #
+    # ⚠️ 路由形状与真实现一致：`GET /api/v1/plugins/<plugin_id>`。
+    #    真实现还有 `/api/v1/plugins/by-id?plugin_id=` 的别名，我们**不**加 ——
+    #    没有调用方需要它，多一条就多一个要维护的入口。
+    #
+    # 🔴 参数名用 `<plugin_id>` 而不是真实现的 `<plugin_id:path>`：
+    #    插件 id 是**目录名**，不含 `/`；用 `path` 会把 `/api/v1/plugins/a/b`
+    #    也吞进来，和拓展页路由撞车。
+    # ------------------------------------------------------------------
+
+    @app.get("/api/v1/plugins/<plugin_id>")
+    async def plugin_detail(plugin_id: str):  # type: ignore[no-untyped-def]
+        """一个插件的详情（信息 + 注册数量 + 六类"插件行为" + README）。"""
+        # 🔴 第一行必须鉴权（本项目真事故：漏了它 → 未登录也能读，
+        #    而服务绑 0.0.0.0）。这条会吐出插件的**完整堆栈**，更不能漏。
+        denied = require_auth()
+        if denied is not None:
+            return denied
+
+        host = service.host
+        if host is None:
+            # ⚠️ **不返回空详情**：那会把"宿主没起来"显示成"这个插件没内容"
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": "插件宿主未启动（请看服务日志里的原因）",
+                            "type": "unavailable",
+                        }
+                    }
+                ),
+                503,
+            )
+
+        detail = host.plugin_detail(plugin_id)
+        if detail is None:
+            # 列出可用的 id —— 只说"没有"会让用户不知道自己拼错了哪个字
+            available = sorted(service.plugin_activation_ids())
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": f"没有这个插件：{plugin_id}",
+                            "type": "not_found",
+                            "available": available,
+                        }
+                    }
+                ),
+                404,
+            )
+
+        readme = host.plugin_readme(plugin_id)
+        if readme is None:
+            # 如实为空（照真实现：没有 README 就是没有）
+            detail["readme"] = None
+            detail["readme_truncated"] = False
+        else:
+            detail["readme"], detail["readme_truncated"] = readme
+
+        return jsonify(detail), 200

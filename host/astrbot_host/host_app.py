@@ -71,6 +71,13 @@ class HostReport:
     #: 可访问的**插件拓展页**（`metadata.yaml` 声明了 `pages:` 且入口 HTML 存在）。
     #: ⚠️ 只有元数据不算数 —— 必须宿主提供页面路由才打得开（见 `plugin_pages.py`）。
     pages: list[Any] = field(default_factory=list)
+    #: 🔴 **被停用名单跳过的插件**（模块路径）。
+    #: 与 `failed` 是**两条不同的路径**：停用的插件不 import、不实例化、
+    #: 不 initialize，也**不算失败**（照真实现 `star_manager.py:1240`）。
+    #: 单独列出来 = 「状态报告里可区分」（本项目铁律：不静默）。
+    inactivated: list[str] = field(default_factory=list)
+    #: 停用名单里**对不上任何插件目录**的元素（拼错 / 插件已删）—— 必须能看见。
+    unmatched_inactivated: list[str] = field(default_factory=list)
 
     @property
     def mounted_count(self) -> int:
@@ -86,7 +93,9 @@ class HostReport:
     def summary(self) -> str:
         lines = [
             f"插件宿主：已加载 {self.loaded} · 已挂载 API {self.mounted_count} "
-            f"· 已初始化 {len(self.initialized)} · 拓展页 {len(self.pages)}",
+            f"· 已初始化 {len(self.initialized)} · 拓展页 {len(self.pages)}"
+            # ⚠️ 只在非空时加这一段 —— 名单为空时的日志必须与加这个能力**之前逐字一致**
+            + (f" · 已停用 {len(self.inactivated)}" if self.inactivated else ""),
         ]
         if self.failed:
             lines.append(f"  加载失败 {len(self.failed)}：")
@@ -94,6 +103,16 @@ class HostReport:
         if self.init_failed:
             lines.append(f"  初始化失败 {len(self.init_failed)}：")
             lines += [f"    ❌ {n} → {e}" for n, e in self.init_failed]
+        if self.inactivated:
+            lines.append(
+                f"  已停用 {len(self.inactivated)}（按名单跳过，**不算失败**）："
+            )
+            lines += [f"    ⏸ {m}" for m in self.inactivated]
+        if self.unmatched_inactivated:
+            lines.append(
+                "  ⚠️ 停用名单里有对不上任何插件的项（拼写错误？）："
+                + ", ".join(self.unmatched_inactivated)
+            )
         if self.source_writes:
             lines.append(f"  ⚠️ 源码目录被改动 {len(self.source_writes)} 处：")
             lines += [
@@ -120,10 +139,15 @@ class PluginHost:
         auto_initialize: bool = True,
         initialize_timeout: float = 20.0,
         mirror_root: str | Path | None = None,
+        inactivated: list[str] | None = None,
     ) -> None:
         self.plugin_dirs = [Path(d) for d in plugin_dirs]
         #: 传给加载器的镜像目录（`None` = 不镜像，直接在源目录加载）
         self.mirror_root = mirror_root
+        #: 🔴 传给加载器的**停用名单**（模块路径，三种写法都收 —— 见
+        #: `PluginLoader.normalize_module_path`）。由装配层从配置读出来再传进来：
+        #: 单向依赖铁律 —— `host/` 不许反过来 import `emotion_app`。
+        self.inactivated = list(inactivated or ())
         #: 加载器的镜像结果（启动后才有值）
         self.mirror_report: Any = None
         self.auto_initialize = auto_initialize
@@ -170,6 +194,7 @@ class PluginHost:
         self.loader = PluginLoader(
             plugin_dirs=self.plugin_dirs,
             mirror_root=self.mirror_root,
+            inactivated=self.inactivated,
         )
         self.mirror_report = getattr(self.loader, "mirror_report", None)
         load_report = await self.loader.load_all(ports=ports or HostPorts())
@@ -181,6 +206,10 @@ class PluginHost:
             (r.dir_name, (r.error or "").strip().splitlines()[-1] if r.error else "")
             for r in load_report.failed
         ]
+        # 🔴 停用的插件**单独一列**（不进 `loaded`、也不进 `failed`）——
+        #    状态报告里必须能区分"没跑"是因为停用，还是因为坏了。
+        self.report.inactivated = [r.module_path for r in load_report.inactivated]
+        self.report.unmatched_inactivated = list(load_report.unmatched_inactivated)
         self.report.mounted = self._collect_apis(load_report)
 
         # 🔴 **拓展页发现**：只收集"入口 HTML 真的存在"的页。
@@ -294,7 +323,374 @@ class PluginHost:
             )
         return out
 
+    # ---- 插件清单（面板「插件启停」用） ----
+
+    def plugins_view(self) -> list[dict[str, Any]]:
+        """**全部**插件的状态清单（含失败的与被停用的）。
+
+        🔴 与 `report.loaded_plugins` 的区别：那个只有加载成功的；
+           这里要给用户看"**为什么**这个插件没跑" —— 所以四种状态都要在
+           （`state` 的取值见 `PluginRecord.state`，判据只那一份）。
+
+        每项形状（`id`/`module_path` 是同一件东西的两种写法：
+        前者给人看，后者是停用名单里的元素）：
+
+            {"id": 目录名, "module_path": "<目录名>.main", "name": 显示名,
+             "version": ..., "state": "loaded|failed|inactivated|not_loaded",
+             "error": "..."}
+        """
+        if self.loader is None:
+            return []
+        out: list[dict[str, Any]] = []
+        for rec in self.loader.records.values():
+            out.append(
+                {
+                    "id": rec.dir_name,
+                    "module_path": rec.module_path,
+                    "name": rec.name,
+                    "version": rec.version,
+                    "state": rec.state,
+                    "error": (rec.error or "").strip().splitlines()[-1]
+                    if rec.error
+                    else "",
+                }
+            )
+        return out
+
     # ---- 调用（Web 层用它派发） ----
+
+    # ---- 插件详情（面板「插件详情」用） ----
+
+    #: 事件类型 → 中文（**逐字照真实现** `plugin_service.py:99-109` 的
+    #: `translated_event_type`）。少一项就会让详情页显示成 `EventType.xxx`。
+    EVENT_TYPE_ZH: dict[str, str] = {
+        "AdapterMessageEvent": "平台消息下发时",
+        "OnLLMRequestEvent": "LLM 请求时",
+        "OnLLMResponseEvent": "LLM 响应后",
+        "OnAgentBeginEvent": "Agent 开始运行时",
+        "OnAgentDoneEvent": "Agent 运行完成后",
+        "OnDecoratingResultEvent": "回复消息前",
+        "OnCallingFuncToolEvent": "函数工具",
+        "OnAfterMessageSentEvent": "发送消息后",
+        "OnPluginErrorEvent": "插件报错时",
+    }
+
+    #: 组件类型顺序（**逐字照真实现** `plugin_service.py:45-52` 的
+    #: `PLUGIN_COMPONENT_TYPE_ORDER`）。面板按它分组渲染。
+    COMPONENT_TYPE_ORDER: tuple[str, ...] = (
+        "page", "skill", "command", "llm_tool", "listener", "hook",
+    )
+
+    def _handlers_of(self, module_path: str) -> list[Any]:
+        """取某插件注册的全部 handler —— **含子模块**。
+
+        🔴 **不能用注册表的 `get_handlers_by_module_name()`**（它是**精确**相等，
+           见 `registry.py:131-145` 那段说明），也不能拿 `module_path` 直接加后缀。
+
+        ⚠️ 这里有个**只看数量发现不了**的坑（我第一版就踩了）：
+           `module_path` 是 `<目录名>.main`，若按 `<目录名>.main.` 做前缀，
+           **子模块 `<目录名>.atrelay` 永远匹配不上**。而当时总数看起来是对的
+           （113 == 113）—— 因为少的那 1 个 handler 被 1 个 `page` 组件
+           **恰好补平**了。**数量相等 ≠ 组成正确**。
+           判据必须是"某个具体名字在不在"，见
+           `host/tests/test_plugin_detail.py::test_real_companion_components`。
+
+        所以前缀取**顶层包名**（= `PluginRecord.dir_name`），与加载器
+        `_count_plugin_handlers`（用 `dir_name`）**同一口径** ——
+        两边算的必须是同一个集合，否则详情页与 `handler_count` 会长期不一致。
+        """
+        from astrbot_host.registry import star_handlers_registry
+
+        package = module_path.split(".")[0]   # `<目录名>.main` → `<目录名>`
+        prefix = f"{package}."
+        return [
+            h
+            for h in star_handlers_registry.all_handlers()
+            if h.handler_module_path == package
+            or h.handler_module_path.startswith(prefix)
+        ]
+
+    def plugin_detail(self, plugin_id: str) -> dict[str, Any] | None:
+        """一个插件的详情（照真实现 `GET /api/v1/plugins/by-id` 的形状）。
+
+        Args:
+            plugin_id: 插件**目录名**（`PluginRecord.dir_name`，面板上的 `id`）。
+
+        Returns:
+            详情 dict；**没有这个插件时返回 `None`**（由调用方转 404 ——
+            不许在这里编一个空壳返回，那会让"插件不存在"看起来像"插件没内容"）。
+        """
+        from astrbot_host.registry import EventType
+
+        if self.loader is None:
+            return None
+        rec = self.loader.records.get(plugin_id)
+        if rec is None:
+            return None
+
+        # 🔴 `partial` 拆包：本项目踩过 —— `functools.partial.__module__` **恒为
+        #    `'functools'`**（不是被包函数的模块），按 `__module__` 判归属时
+        #    重载后永远匹配不上。这里判归属用的是注册表里的 `handler_module_path`
+        #    （在**注册时**就记下了），所以不受这个坑影响；下面这条 `_unwrap`
+        #    只用于读函数名（显示用），照旧先拆包。
+        def _unwrap(fn: Any) -> Any:
+            return getattr(fn, "func", fn)
+
+        handlers = self._handlers_of(rec.module_path)
+
+        components: list[dict[str, Any]] = []
+
+        # ---- page：来自 metadata.yaml 的 `pages:`（已校验入口 HTML 存在） ----
+        for page in rec.pages or []:
+            page_name = page.get("name", "")
+            components.append(
+                {
+                    "type": "page",
+                    "name": page.get("title") or page_name,
+                    "title": page.get("title") or page_name,
+                    "page_name": page_name,
+                    "description": "Plugin Page entry",
+                    "plugin_name": rec.dir_name,
+                    "plugin_id": rec.dir_name,
+                }
+            )
+
+        # ---- command / listener / hook：按事件类型 + 过滤器分类 ----
+        try:
+            from astrbot_host.compat.core.star.filter.command import CommandFilter
+            from astrbot_host.compat.core.star.filter.command_group import (
+                CommandGroupFilter,
+            )
+            from astrbot_host.compat.core.star.filter.permission import (
+                PermissionType,
+                PermissionTypeFilter,
+            )
+            from astrbot_host.compat.core.star.filter.regex import RegexFilter
+        except Exception:  # noqa: BLE001 — 兼容层缺类时**如实降级**，不静默装作没有
+            CommandFilter = CommandGroupFilter = RegexFilter = None  # type: ignore[assignment]
+            PermissionTypeFilter = PermissionType = None  # type: ignore[assignment]
+
+        def _cmd_of(flt: Any) -> str:
+            """过滤器 → 指令名（照真实现的 `cmd` 字段）。"""
+            if CommandGroupFilter is not None and isinstance(flt, CommandGroupFilter):
+                return flt.group_name
+            if CommandFilter is not None and isinstance(flt, CommandFilter):
+                # `parent_command_names` 里是父级链，拼出完整指令名
+                parents = [p for p in (flt.parent_command_names or []) if p]
+                if parents:
+                    return " ".join(parents) + " " + flt.command_name
+                return flt.command_name
+            return ""
+
+        def _is_admin(flt: Any) -> bool:
+            if PermissionTypeFilter is None or PermissionType is None:
+                return False
+            return (
+                isinstance(flt, PermissionTypeFilter)
+                and flt.permission_type == PermissionType.ADMIN
+            )
+
+        for h in handlers:
+            et = h.event_type
+            filters = list(h.event_filters or [])
+            zh = self.EVENT_TYPE_ZH.get(et.name, et.name)
+            base = {
+                "name": h.handler_name,
+                "description": (h.desc or "").strip() or "无描述",
+                "event_type": et.name,
+                "event_type_h": zh,
+                "handler_name": h.handler_name,
+                "handler_full_name": h.handler_full_name,
+            }
+
+            if et == EventType.OnCallingFuncToolEvent:
+                # LLM 工具（function calling）。真实现用 `cmd:"自动触发"`。
+                # ⚠️ `_handler_obj` 是**临时**字段（下面拿去工具表里认配对，
+                #     `pop` 掉后才出函数）—— 它不进最终响应（函数对象不可 JSON 化）。
+                components.append({**base, "type": "llm_tool",
+                                   "cmd": "自动触发", "display_type": "无",
+                                   "_handler_obj": _unwrap(h.handler)})
+                continue
+
+            if et == EventType.AdapterMessageEvent:
+                cmd_flts = [f for f in filters
+                            if CommandFilter is not None and isinstance(f, CommandFilter)]
+                grp_flts = [f for f in filters
+                            if CommandGroupFilter is not None and isinstance(f, CommandGroupFilter)]
+                rgx_flts = [f for f in filters
+                            if RegexFilter is not None and isinstance(f, RegexFilter)]
+
+                if grp_flts:
+                    flt = grp_flts[0]
+                    components.append({
+                        **base, "type": "command", "display_type": "指令组",
+                        "cmd": _cmd_of(flt) or "未知",
+                        "has_admin": any(_is_admin(f) for f in filters),
+                        "subcommands": [
+                            {"name": _unwrap(getattr(s, "handler", s)).__name__
+                             if hasattr(s, "handler") else str(getattr(s, "command_name", "")),
+                             "cmd": _cmd_of(s) or "未知"}
+                            for s in (getattr(flt, "sub_command_filters", None) or [])
+                        ],
+                    })
+                    continue
+
+                if cmd_flts:
+                    flt = cmd_flts[0]
+                    components.append({
+                        **base, "type": "command", "display_type": "指令",
+                        "cmd": _cmd_of(flt) or "未知",
+                        "has_admin": any(_is_admin(f) for f in filters),
+                    })
+                    continue
+
+                if rgx_flts:
+                    components.append({
+                        **base, "type": "command", "display_type": "正则匹配",
+                        "cmd": getattr(rgx_flts[0], "regex", "") or "未知",
+                        "has_admin": any(_is_admin(f) for f in filters),
+                    })
+                    continue
+
+                components.append({**base, "type": "listener",
+                                   "display_type": "事件监听器", "cmd": "未知"})
+                continue
+
+            # 其余事件类型 = 钩子（照真实现）
+            components.append({**base, "type": "hook", "display_type": zh})
+
+        # ---- llm_tool：第二条来源（工具表本身）+ 给已有的补 `active` ----
+        # 🔴 **去重键必须是 handler 函数对象本身，不能是名字**（我第一版就按名字，
+        #    实测抓到的假象）：同一件事在两侧的名字**不一样** ——
+        #      handler 侧 `handler_name` = `memory_companion_recall_tool`
+        #      工具表侧  `spec.name`      = `memory_companion_recall`
+        #    按名去重会**一个都不命中** → 同一个工具被列两遍（实测 7 个变 14 个）。
+        #    实测两侧的 `getattr(handler, "func", handler)` 是**同一个对象**
+        #    （`id()` 完全相同），所以用它当键。
+        #
+        # 工具表更权威的两件事：① 真实签名与描述（handler 的 `desc` 常为空）；
+        # ② `active`（这个工具当前有没有被停用）—— handler 侧没有这个概念。
+        tool_by_handler_id: dict[int, Any] = {}
+        tool_manager = None
+        # 🔴 用 `get_llm_tool_manager()`（真实现里 `Context` 就是这个方法名，
+        #    见 `context.py:358` 返回 `provider_manager.llm_tools`）——
+        #    **不要**去摸 `context.llm_tools` 这种属性，它不存在（我第一版就写错了）。
+        if self.context is not None:
+            getter = getattr(self.context, "get_llm_tool_manager", None)
+            if callable(getter):
+                try:
+                    tool_manager = getter()
+                except Exception:  # noqa: BLE001
+                    logger.exception("取 LLM 工具管理器失败（详情页的工具清单会不完整）")
+        if tool_manager is not None:
+            for spec in getattr(tool_manager, "func_list", []) or []:
+                owner = getattr(spec, "handler_module_path", None)
+                raw = getattr(spec, "handler", None)
+                unwrapped = _unwrap(raw)
+                if owner is None:
+                    # 归属不明 → 拿 handler 的模块路径兜底（先拆 partial）
+                    owner = getattr(unwrapped, "__module__", None)
+                if owner != rec.module_path:
+                    continue
+                tool_by_handler_id[id(unwrapped)] = spec
+
+        # 给 handler 侧已列出的 llm_tool 补上工具表才有的信息
+        for c in components:
+            if c["type"] != "llm_tool":
+                continue
+            # ⚠️ 这里用 `getattr` 读 `_handler_obj`、**不 pop** ——
+            #    临时字段的统一清除只交给下面**那一个**地方（单一职责）。
+            #    原先这里顺手 pop，后果是那个"兜底清除"**永远走不到**
+            #    ⇒ 它成了不可达代码 = 没有防护。这是注入验证当场抓到的：
+            #    把兜底那块删掉，测试全绿（因为删的是一段永不执行的代码）。
+            spec = tool_by_handler_id.pop(
+                id(_unwrap(c.get("_handler_obj"))), None
+            )
+            if spec is None:
+                continue
+            if (getattr(spec, "description", "") or "").strip():
+                c["description"] = spec.description.strip()
+            c["active"] = bool(getattr(spec, "active", True))
+
+        # 工具表里**多出来**的（没有对应 handler 注册）也要列 —— 它们照样能被调用，
+        # 漏掉就是"详情页少了东西"（本项目最忌的静默缺失）。
+        for spec in tool_by_handler_id.values():
+            components.append({
+                "type": "llm_tool",
+                "name": spec.name,
+                "description": (getattr(spec, "description", "") or "").strip() or "无描述",
+                "cmd": "自动触发",
+                "display_type": "无",
+                "event_type": EventType.OnCallingFuncToolEvent.name,
+                "event_type_h": self.EVENT_TYPE_ZH.get("OnCallingFuncToolEvent", ""),
+                "handler_name": spec.name,
+                "active": bool(getattr(spec, "active", True)),
+            })
+
+        # ---- skill：我们没有技能体系 → **如实为空**（不编造） ----
+        # （真实现读 `SkillManager().list_skills()`；我们没有对应物。）
+
+        # 🔴 **兜底清除下划线开头的临时字段**（`_handler_obj` 是函数对象，
+        #    留在响应里会让 `jsonify` 直接抛 `TypeError: not JSON serializable`）。
+        #    ⚠️ 不能只依赖"上面那条 pop 一定跑到" —— 没有配对上的工具会走到别的
+        #    分支，那种情况下 pop 不会执行。这里统一扫一遍，保证**任何**路径都干净。
+        for c in components:
+            for k in [k for k in c if k.startswith("_")]:
+                c.pop(k, None)
+
+        # ---- 排序（照真实现 PLUGIN_COMPONENT_TYPE_ORDER） ----
+        order = {t: i for i, t in enumerate(self.COMPONENT_TYPE_ORDER)}
+        components.sort(key=lambda c: order.get(c["type"], 99))
+
+        state_text = {
+            "loaded": "运行中",
+            "inactivated": "已停用（未加载）",
+            "failed": "加载失败",
+            "not_loaded": "未加载",
+        }.get(rec.state, rec.state)
+
+        return {
+            "id": rec.dir_name,
+            "name": rec.name,
+            "display_name": rec.name,
+            "module_path": rec.module_path,
+            "dir_name": rec.dir_name,
+            "version": rec.version,
+            "author": rec.author,
+            "desc": rec.desc,
+            "state": rec.state,
+            "state_text": state_text,
+            "error": (rec.error or "").strip().splitlines()[-1] if rec.error else "",
+            "traceback": rec.traceback or "",
+            "handler_count": rec.handler_count,
+            "llm_tool_bind_count": rec.llm_tool_bind_count,
+            "web_api_count": rec.web_api_count,
+            "task_count": rec.task_count,
+            "pages": list(rec.pages or []),
+            "inactivated": rec.inactivated,
+            "components": components,
+        }
+
+    def plugin_readme(self, plugin_id: str, *, limit: int = 200_000) -> tuple[str, bool] | None:
+        """读插件的 `README.md`（照真实现 `plugin_service.py:1924-1981` 只找它）。
+
+        Returns:
+            `(内容, 是否被截断)`；插件不存在或没有 README 时返回 `None`
+            （**如实为空** —— 不编造内容，也不给一个"空的 README"）。
+        """
+        if self.loader is None:
+            return None
+        rec = self.loader.records.get(plugin_id)
+        if rec is None:
+            return None
+        for name in ("README.md", "readme.md"):
+            p = Path(rec.path) / name
+            if p.is_file():
+                text = p.read_text(encoding="utf-8", errors="replace")
+                if len(text) > limit:
+                    return text[:limit], True
+                return text, False
+        return None
 
     async def call_api(
         self,

@@ -515,3 +515,315 @@ def test_handlers_are_bound_to_plugin_instance(tmp_path, monkeypatch):
     assert getattr(h.handler.args[0], "marker", None) == "instance-marker", (
         "partial 绑定的第一个参数应当是插件**实例**（不是类）"
     )
+
+
+# ---------------------------------------------------------------------------
+# BUG-7：`AstrMessageEvent(...)` 只认关键字 → 插件的 4 位置参数构造整链失效
+# ---------------------------------------------------------------------------
+def _platform_instance():
+    """取一个**真平台实例**（`meta()` 返回真 `PlatformMetadata`，不是替身）。
+
+    插件调用点传的第三个参数就是它：`platform.meta()`
+    （`_get_platform_for_session` 从 `context.platform_manager` 里按 id 找出来）。
+    """
+    from astrbot_host.platform_manager import build_platform_manager
+
+    return build_platform_manager().get_insts()[0]
+
+
+def _plugin_shaped_message_obj(*, message_type, session_id):
+    """照 `proactive_message.py:16779-16791` 造一个 `message_obj`。
+
+    ⚠️ 逐字段照抄那一段（`sender` 只给 `user_id`、`nickname` 保持 `None`、
+        `message_str` 是空串）—— **别"补全"成更完整的对象**，
+        否则就检不出插件真实形状下的推导结果。
+    """
+    from astrbot_host.compat.core.platform.astrbot_message import (
+        AstrBotMessage,
+        MessageMember,
+    )
+
+    message_obj = AstrBotMessage()
+    message_obj.type = message_type
+    message_obj.self_id = str(session_id)
+    message_obj.session_id = str(session_id)
+    message_obj.message_id = "private_companion_proactive_deadbeef"
+    message_obj.sender = MessageMember(user_id=message_obj.session_id)
+    message_obj.message = []
+    message_obj.message_str = ""
+    message_obj.raw_message = None
+    return message_obj
+
+
+def test_event_signature_keeps_plugin_positional_order():
+    """🔴 前 4 个参数必须是**位置参数**，名字与顺序照真实现。
+
+    真实现 `core/platform/astr_message_event.py:37-42`：
+    ```python
+    def __init__(self, message_str: str, message_obj: AstrBotMessage,
+                 platform_meta: PlatformMetadata, session_id: str) -> None:
+    ```
+
+    为什么单列一条：插件**所有**构造点都按位置传（实测 `data/plugin_src` 里 2 处），
+    而**我们自己一处都不按位置传**（`umo.py:553` 全是关键字）——
+    所以"只跑我们自己的判据"永远看不出这个形状漂移，BUG-7 就是这么漏到真机日志的。
+
+    ⚠️ 把 `*`（keyword-only 分隔符）加回签名里，这条判据立即红。
+    """
+    import inspect
+
+    from astrbot_host.compat.core.platform.astr_message_event import AstrMessageEvent
+
+    params = list(inspect.signature(AstrMessageEvent.__init__).parameters.values())[1:]
+    head = params[:4]
+    assert [p.name for p in head] == [
+        "message_str",
+        "message_obj",
+        "platform_meta",
+        "session_id",
+    ], f"前 4 个参数的名字/顺序与真实现不一致：{[p.name for p in head]}"
+    for p in head:
+        assert p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD, (
+            f"`{p.name}` 是 {p.kind} —— 真实现这 4 个是位置参数，"
+            "插件按位置传（会 TypeError: takes 1 positional argument but 5 were given）"
+        )
+    for p in params[4:]:
+        assert p.kind is inspect.Parameter.KEYWORD_ONLY, (
+            f"`{p.name}` 不是 keyword-only —— 它是**我们自己的**扩展参数（真实现没有），"
+            "允许按位置传入会让位置语义跟着漂移"
+        )
+
+
+def test_plugin_positional_construction_derives_every_field():
+    """逐字照抄插件那种 **4 位置参数**构造：不抛错，且推导出的字段全对。
+
+    出处（两处逐字相同）：
+      * `data/plugin_src/astrbot_plugin_private_companion/proactive_message.py:16792`
+      * `data/plugin_src/astrbot_plugin_image_companion/image_runtime.py:20816`
+    ```python
+    event = AstrMessageEvent("", message_obj, platform.meta(), message_obj.session_id)
+    ```
+    真机证据（`logs/serve.out`，**23 次**）：
+        `WARNING astrbot: [主动消息] 主动消息主链生成失败:
+         AstrMessageEvent.__init__() takes 1 positional argument but 5 were given`
+    → 异常被 `proactive_message.py:16821` 的 `except Exception` 接住成一行 debug 日志，
+      「主动消息装饰 hooks」整条链**永久不执行**。
+
+    ⚠️ 光"不抛错"不算修好：`unified_msg_origin` 必须真的有值 ——
+       装饰链的 `bridge_proactive_chat_outbound`（`main.py:9303`）拿 umo 里
+       没有 `":FriendMessage:"` 就**静默 return**，症状与 TypeError 一模一样。
+    """
+    from astrbot_host.compat.core.platform.astr_message_event import AstrMessageEvent
+    from astrbot_host.compat.core.platform.message_type import MessageType
+
+    platform = _platform_instance()
+    meta = platform.meta()
+    message_obj = _plugin_shaped_message_obj(
+        message_type=MessageType.FRIEND_MESSAGE, session_id="u-1"
+    )
+
+    # ↓↓↓ 与插件那一行**逐字同形** ↓↓↓
+    event = AstrMessageEvent("", message_obj, platform.meta(), message_obj.session_id)
+
+    assert event.get_message_str() == "", "真实现 `:43` 原样存传入的 message_str"
+    assert event.get_sender_id() == "u-1", "应从 `message_obj.sender.user_id` 推导（真 `:205-209`）"
+    assert event.get_self_id() == "u-1", "应从 `message_obj.self_id` 推导（真 `:199`）"
+    assert event.get_sender_name() == "", "nickname 为 None 时真实现给空串（真 `:211-219`）"
+    assert event.get_session_id() == "u-1"
+    assert event.is_private_chat() is True, "`FriendMessage` 必须判成私聊（真 `:255`）"
+    assert event.get_platform_name() == meta.name == "webchat"
+    assert event.get_platform_id() == meta.id == "11"
+    assert event.unified_msg_origin == f"{meta.id}:FriendMessage:u-1", (
+        "无 umo 入参时必须照真实现 `:75-79` 从 platform_meta.id + 消息类型 + "
+        "session_id 造 session（`:106-108` 的 umo 就是 `str(self.session)`）"
+    )
+    # 真实现 `:47` 设 `platform_meta`、`:103` 留 `platform` 别名（插件 `tts_tool_sanitizer.py:50` 读它）
+    assert event.platform_meta is meta
+    assert event.platform is event.platform_meta
+
+    # 🔴 回环：插件是"umo → MessageSession → 4 位置参数构造事件"，
+    #    装饰链再拿 `event.unified_msg_origin` 去查用户数据
+    #    （`main.py:9303` → `_proactive_chat_bridge_user`）—— 必须逐字还原，差一段就查不到。
+    from astrbot_host.compat.core.platform.message_session import MessageSession
+
+    session = MessageSession.from_str("11:FriendMessage:sess-abc123def456")
+    obj2 = _plugin_shaped_message_obj(
+        message_type=session.message_type, session_id=session.session_id
+    )
+    ev = AstrMessageEvent("", obj2, platform.meta(), obj2.session_id)
+    assert ev.unified_msg_origin == "11:FriendMessage:sess-abc123def456"
+
+
+def test_plugin_positional_construction_group_message_is_not_private():
+    """同一形状的**群消息**分支：`is_private` 真的读了 `message_obj.type`。
+
+    照真实现 `:255`，`is_private_chat()` 就是"消息类型是不是 FRIEND"。
+    ⚠️ 把推导写成恒 `True`（例如忘了读 `message_obj.type`），这条立即红。
+    """
+    from astrbot_host.compat.core.platform.astr_message_event import AstrMessageEvent
+    from astrbot_host.compat.core.platform.message_type import MessageType
+
+    platform = _platform_instance()
+    message_obj = _plugin_shaped_message_obj(
+        message_type=MessageType.GROUP_MESSAGE, session_id="g-1"
+    )
+
+    event = AstrMessageEvent("", message_obj, platform.meta(), message_obj.session_id)
+
+    assert event.is_private_chat() is False
+    assert event.unified_msg_origin == "11:GroupMessage:g-1"
+    assert event.get_session_id() == "g-1"
+    assert event.get_sender_id() == "g-1"
+
+
+def test_is_private_and_session_id_derive_without_session():
+    """没有 session（无 umo / 无 platform_meta）时，推导链**照样**要生效。
+
+    ⚠️ 为什么单列一条：给了 `platform_meta` 时 `is_private_chat()` 读的是
+       `session.message_type`（真实现 `:255` 也是这么读的）—— **看不到 `_is_private`
+       这个推导结果**。而 `is_private_chat()` 插件实测调 72 次：
+       关键字构造（如插件自造事件）一旦把群消息恒判成私聊，走的就是另一条分支。
+    同理 `session_id` 的推导链也是"传入值 → umo → `message_obj.session_id`"。
+    """
+    from astrbot_host.compat.core.platform.astr_message_event import AstrMessageEvent
+    from astrbot_host.compat.core.platform.message_type import MessageType
+
+    friend = _plugin_shaped_message_obj(
+        message_type=MessageType.FRIEND_MESSAGE, session_id="u-1"
+    )
+    group = _plugin_shaped_message_obj(
+        message_type=MessageType.GROUP_MESSAGE, session_id="g-1"
+    )
+
+    assert AstrMessageEvent(message_str="", message_obj=friend).is_private_chat() is True
+    assert AstrMessageEvent(message_str="", message_obj=group).is_private_chat() is False, (
+        "群消息被判成私聊 —— `is_private` 没有从 `message_obj.type` 推导"
+    )
+    assert AstrMessageEvent(message_str="", message_obj=group).get_session_id() == "g-1", (
+        "没传 session_id/umo 时应退到 `message_obj.session_id`"
+    )
+
+
+def test_explicit_keywords_win_over_derivation():
+    """显式关键字**优先**于从 `message_obj` / `platform_meta` 推导。
+
+    为什么必须守：我们自己的派发链路（`umo.py:553-568`）**全部显式传**这些字段，
+    且平台三件套必须与 umo 第一段同源 —— 推导若盖掉显式值，
+    umo 会写进另一个平台的会话（本项目踩过的"孤儿会话"静默数据分裂）。
+    """
+    from astrbot_host.compat.core.platform.astr_message_event import AstrMessageEvent
+    from astrbot_host.compat.core.platform.message_type import MessageType
+
+    platform = _platform_instance()
+    message_obj = _plugin_shaped_message_obj(
+        message_type=MessageType.FRIEND_MESSAGE, session_id="derived-sid"
+    )
+
+    # ① 不给 platform_meta：显式值原样生效（`is_private=False` 也不能被 FRIEND 覆盖）
+    ev = AstrMessageEvent(
+        "显式正文",
+        message_obj,
+        sender_id="explicit-sender",
+        sender_name="显式昵称",
+        self_id="explicit-bot",
+        platform_name="explicit-platform",
+        platform_id="explicit-id",
+        is_private=False,
+        session_id="explicit-sid",
+    )
+    assert ev.get_message_str() == "显式正文"
+    assert ev.get_sender_id() == "explicit-sender"
+    assert ev.get_sender_name() == "显式昵称"
+    assert ev.get_platform_name() == "explicit-platform"
+    assert ev.get_platform_id() == "explicit-id"
+    assert ev.is_private_chat() is False, "显式 is_private=False 被 message_obj.type 盖掉了"
+    assert ev.get_session_id() == "explicit-sid", "显式 session_id 被 message_obj.session_id 盖掉了"
+    # ⚠️ `self_id` 两个来源的优先级**本来就是真实现那样**（`:199` 现读 message_obj）：
+    #    显式值只进缓存字段；`get_self_id()` 仍是 message_obj 优先。这不是"被盖掉"。
+    assert ev._self_id == "explicit-bot"
+    assert ev.get_self_id() == "derived-sid"
+
+    # ② 给了 platform_meta：显式平台三件套仍优先，且 umo 第一段用**显式** platform_id
+    ev2 = AstrMessageEvent(
+        "",
+        message_obj,
+        platform.meta(),
+        "explicit-sid",
+        platform_name="explicit-platform",
+        platform_id="explicit-id",
+    )
+    assert ev2.get_platform_name() == "explicit-platform"
+    assert ev2.get_platform_id() == "explicit-id", "显式 platform_id 被 platform_meta.id 盖掉了"
+    assert ev2.unified_msg_origin == "explicit-id:FriendMessage:explicit-sid"
+
+
+def test_tolerant_keyword_only_construction_unchanged():
+    """我们自己的容忍式构造（无 `message_obj` / 无 `platform_meta`）行为**不变**。
+
+    ⚠️ 这是 BUG-7 修复的**安全边界**：真实现 4 个参数全必填，
+       "没有 message_obj 的事件"在真 AstrBot 里根本构造不出来 ——
+       对它没有"真实现行为"可对齐，所以必须保持原样（不是照真实现改）。
+       `host/tests` 里大量判据（含本文件 BUG-2/BUG-3）都走这个形状。
+    """
+    from astrbot_host.compat.core.platform.astr_message_event import AstrMessageEvent
+
+    ev = AstrMessageEvent()
+
+    assert ev.get_platform_name() == "webchat", "没给平台时的默认值不变"
+    assert ev.get_platform_id() == "webchat", "空 id 仍退化成平台类型名（今天的行为）"
+    assert ev.get_sender_id() == ""
+    assert ev.get_sender_name() == ""
+    assert ev.get_self_id() == ""
+    assert ev.get_session_id() == ""
+    assert ev.unified_msg_origin == ""
+    assert ev.is_private_chat() is True
+    assert getattr(ev, "platform_meta", None) is None, "没给平台就**不设**这个属性（保持 hasattr 语义）"
+
+
+def test_plugin_sources_construct_event_only_with_supported_shape():
+    """扫 `data/plugin_src` 里全部 `AstrMessageEvent(...)` 构造点，形状必须被签名接受。
+
+    为什么要"扫源码"：我们自己的代码**一处都不按位置传**，所以位置形状的漂移
+    在单测里永远看不见（BUG-7 就这样漏到真机，被插件的宽 `except` 吞成一行 debug）。
+    这条判据把那次扫描固化下来 —— 插件将来换形状（少传/多传参数）当场红。
+
+    ⚠️ 用 `ast` 而不是正则：正则会把文档字符串/注释里的同名片段算进来。
+    """
+    import ast
+    import inspect
+
+    from astrbot_host.compat.core.platform.astr_message_event import AstrMessageEvent
+
+    src_root = Path(__file__).resolve().parent.parent.parent / "data" / "plugin_src"
+    if not src_root.is_dir():
+        pytest.skip(f"插件源码目录不存在：{src_root}")
+
+    sig = inspect.signature(AstrMessageEvent.__init__)
+    sites: list[str] = []
+    bad: list[str] = []
+    for path in sorted(src_root.rglob("*.py")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if "AstrMessageEvent(" not in text:
+            continue
+        for node in ast.walk(ast.parse(text, filename=str(path))):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if (getattr(func, "id", None) or getattr(func, "attr", None)) != "AstrMessageEvent":
+                continue
+            where = f"{path.relative_to(src_root)}:{node.lineno}"
+            sites.append(f"{where}（位置参数 {len(node.args)} 个）")
+            try:
+                sig.bind(
+                    None,
+                    *[object()] * len(node.args),
+                    **{k.arg: object() for k in node.keywords if k.arg},
+                )
+            except TypeError as exc:
+                bad.append(f"{where}: {exc}")
+
+    assert sites, (
+        f"在 {src_root} 里一个 `AstrMessageEvent(` 构造点都没扫到 —— "
+        "扫描逻辑失效（零命中不是证据，是判据坏了）"
+    )
+    assert not bad, "插件的构造形状我们的签名接不住：\n" + "\n".join(bad)

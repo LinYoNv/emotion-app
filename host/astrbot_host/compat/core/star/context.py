@@ -49,14 +49,92 @@ _LLM_GENERATE_RESERVED = frozenset({"chat_provider_id"})
 
 
 class ConversationManagerPort(Protocol):
-    """会话历史管理端口。"""
+    """会话/对话历史端口（🔴 **照真 AstrBot `ConversationManager` 的真实契约**）。
 
-    async def get_history(self, umo: str, limit: int = 20) -> list[dict[str, Any]]:
-        """取某会话的历史消息（OpenAI 格式）。"""
+    ## 为什么重写过（2026-09-27 第八轮续）
+
+    本 Protocol **原来只有 `get_history()` / `append()` 两个方法** —— 那是按
+    "我们以为插件会怎么用"猜的。实测（读插件全部调用点 + 真源码）：
+    插件**从来不用这两个名字**，它用的是真实现的这几个：
+
+        get_curr_conversation_id(umo) -> str | None
+        get_conversation(umo, cid, create_if_not_exists=False) -> Conversation | None
+        new_conversation(umo, platform_id=None, content=None, title=None, persona_id=None) -> str
+        update_conversation(umo, conversation_id=None, history=None, title=None,
+                            persona_id=None, token_usage=None) -> None
+        add_message_pair(cid, user_message, assistant_message) -> None
+
+    调用点（实测，共 15 处）：
+      * `proactive_message.py:4919/4922/18810/18821/18823` —— **主动消息存档**（本次要修的）
+      * `main.py:3494/3498`、`private_image.py:6460/6462`、`user_memory.py:9604/9607`、
+        `daily_state.py:10583/10586`、`llm_tool_actions.py:8440/8443` —— 读"这个 umo
+        当前用哪个对话、那个对话的人设是什么"。
+
+    ⇒ **契约写错 = 永远没人能实现它**（缺口不是"忘了注入"，是**接口本身就是错的**）。
+    原 `ConversationManagerPort` 里的 `get_history`/`append` 两个方法
+    **一个调用点都没有**（全库 grep 为 0），已删除 —— 留着只会误导下一个人。
+
+    ## 数据形状（照真实现，别自己发明）
+
+    * `Conversation`（`core/db/po.py:558`）字段：
+      `platform_id / user_id / cid / history / title / persona_id /
+       created_at / updated_at / token_usage`；
+    * ⚠️ **`history` 是「JSON 字符串」不是 list**（真实现
+      `_convert_conv_from_v2_to_v1` 里 `json.dumps(...)`）——
+      插件侧就有 `isinstance(raw_history, str)` 的分支在读它
+      （`proactive_message.py:18813`），返回 list 会让那边**静默**走成空历史；
+    * `cid` 是 **uuid 字符串**；`new_conversation` 的**第一个位置参数是
+      `platform_id`**（不是 title！插件为此写了两层 `TypeError` 兜底，
+      见 `proactive_message.py:4935-4944`）。
+    """
+
+    async def get_curr_conversation_id(self, unified_msg_origin: str) -> str | None:
+        """该 umo 当前选中的对话 id；没有则 `None`（**不自动创建**）。"""
         ...
 
-    async def append(self, umo: str, message: dict[str, Any]) -> None:
-        """追加一条消息。"""
+    async def get_conversation(
+        self,
+        unified_msg_origin: str,
+        conversation_id: str,
+        create_if_not_exists: bool = False,
+    ) -> Any | None:
+        """取一个对话对象（形状见 docstring 上文）；不存在且未要求创建时返回 `None`。"""
+        ...
+
+    async def new_conversation(
+        self,
+        unified_msg_origin: str,
+        platform_id: str | None = None,
+        content: list[dict[str, Any]] | None = None,
+        title: str | None = None,
+        persona_id: str | None = None,
+    ) -> str:
+        """新建对话并把该 umo 的"当前对话"切到它；返回新的 `cid`。"""
+        ...
+
+    async def update_conversation(
+        self,
+        unified_msg_origin: str,
+        conversation_id: str | None = None,
+        history: list[dict[str, Any]] | None = None,
+        title: str | None = None,
+        persona_id: str | None = None,
+        token_usage: int | None = None,
+    ) -> None:
+        """更新对话（`conversation_id` 为空时取该 umo 当前的）。"""
+        ...
+
+    async def add_message_pair(
+        self,
+        cid: str,
+        user_message: Any,
+        assistant_message: Any,
+    ) -> None:
+        """往 `cid` 的对话里追加「用户+助手」一对消息。
+
+        ⚠️ 真实现里对话不存在会**抛异常**（`Conversation with id ... not found`），
+           我们也照此 —— 静默丢弃会让插件的"存档成功"变成假象。
+        """
         ...
 
 

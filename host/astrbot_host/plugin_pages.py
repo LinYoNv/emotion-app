@@ -184,14 +184,20 @@ def guess_mimetype(path: Path) -> str:
 
 
 def inject_page_context(
-    html: str, *, is_dark: bool = True, bridge_src: str | None = None
+    html: str,
+    *,
+    is_dark: bool = True,
+    bridge_src: str | None = None,
+    plugin_id: str = "",
+    page_name: str = "",
 ) -> str:
-    """往页面 HTML 的 `<head>` 里注入两样东西（顺序都不能错）。
+    """往页面 HTML 的 `<head>` 里注入三样东西（顺序都不能错）。
 
     ① `<meta name="color-scheme">` —— 照真实现注入主题提示。
-    ② 🔴 **桥接垫片的 `<script src>`** —— 必须**最早**加载。
+    ② 🔴 **本页属于哪个插件**（`<meta name="emotion-plugin-id">`）—— 2026-09-27 补。
+    ③ 🔴 **桥接垫片的 `<script src>`** —— 必须**最早**加载。
 
-    为什么②必须存在（实测结论）：
+    为什么③必须存在（实测结论）：
         插件页 JS 有两条取数路径：
           ① `window.AstrBotPluginPage` 桥（`.apiGet/.apiPost/.ready`）——**首选**
           ② HTTP 直连（`HTTP_API` 硬编码）—— 仅 standalone/`?debug_http=1` 模式
@@ -202,6 +208,22 @@ def inject_page_context(
            而那个模式要求 `?debug_http=1` 或 standalone 标记，两者都没有
            → 抛「未检测到 AstrBot 官方插件 Page 桥接」→ **页面空白**。
 
+    为什么②必须存在（2026-09-27 实测的**根因修复**，不是给日志降噪）：
+        插件的候选列表是 `page/x` → `x` → `/x` → **`<插件名>/page/x`** → …
+        （`companion-panel/app.js:6702`）。垫片从前只拿得到**没有插件名**的
+        `page/x`，只能拼成 `/api/plugins/extensions/page/x` → **必然 404**，
+        然后靠插件自己一级一级重试。日志里于是出现成组的「插件路由未命中」
+        （实测 19 条，每组 3 条 = 它试的前三级）。
+
+        ⚠️ **更严重的后果不是噪音**：`一起房间` 的 `launcher.js:47`
+        **只生成 `page/x` 一种候选、且没有重试** ⇒ 它**永远 404**
+        （实测页面报「未找到该路由」），永远取不到数。
+
+        ✅ 根因修法：**服务端在注入时就把"本页属于哪个插件"告诉垫片**
+        （这个信息只有服务端有），垫片据此把候选**直接补全**成
+        `<插件名>/page/x` —— 一次命中，不再靠盲试。
+        ⚠️ **不改插件代码**（那是别人的东西，插件一升级就丢）。
+
     ⚠️ 只做**最小注入**：不动插件自己的任何 script/style。
     """
     head_end = _find_head_end(html)
@@ -209,10 +231,29 @@ def inject_page_context(
         return html
 
     parts = [f'<meta name="color-scheme" content="{"dark" if is_dark else "light"}">']
+    if plugin_id:
+        # ② 必须在③**之前**：垫片是同步脚本，执行时立刻读这两个 meta。
+        # ⚠️ 属性值要转义 —— 插件目录名理论上不该含引号，但**不许假设**
+        #    （含引号会撑破 meta 标签 → 垫片读不到 → 又回到盲试）。
+        parts.append(
+            f'<meta name="emotion-plugin-id" content="{_attr_escape(plugin_id)}">'
+            f'<meta name="emotion-plugin-page" content="{_attr_escape(page_name)}">'
+        )
     if bridge_src:
         # 放在最前：插件的 app.js 在自己的 `<script>` 里立刻就会查这个全局
         parts.append(f'<script src="{bridge_src}"></script>')
     return html[:head_end] + "".join(parts) + html[head_end:]
+
+
+def _attr_escape(value: object) -> str:
+    """HTML 属性值转义（`&` 必须先转，否则 `&quot;` 会被二次转义）。"""
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
 
 
 def _find_head_end(html: str) -> int | None:

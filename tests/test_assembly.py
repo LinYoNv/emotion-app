@@ -193,3 +193,95 @@ def test_persona_reference_env_key_is_wired():
     )
     cfg2 = load_config({"EMOTION_AUTH_ACCESS_TOKEN": "t" * 32})
     assert cfg2.image.persona_reference == ""
+
+
+# ===========================================================================
+# 🆕 per-persona 参考图（2026-09-25，情绪「用户能填的就让用户改」）
+# ===========================================================================
+#
+# 这一组守的是**接线**，不是函数：
+#   * 「面板能传」→ 路由真的挂上了；
+#   * 「传了真的生效」→ 路由写进 `Persona.reference_image_path`，且
+#     `PersonaRepository.update` 的**白名单**放行这个字段；
+#   * 「生图时真的用上」→ 工具执行前把当前人设放进 `tool_context`。
+#
+# 🔴 为什么每条都要有（注入验证的教训）：
+#   上一轮 `inject_persona_ref_check.py` 第一轮 **3/10 没抓住** ——
+#   因为判据只测了函数、没测接线。这里把接线逐条钉死。
+
+
+def test_persona_reference_routes_are_registered():
+    """面板要能传/取/删 —— 三条路由都必须在 `api_admin` 里。
+
+    ⚠️ 这里**只**断言"路由声明存在"。鉴权与真实行为在
+       `tests/test_persona_ref_http.py` 里用**真 HTTP** 验
+       —— 曾经我在这里写过一句 `... or True` 恒真断言（等于没断言），
+       已删掉：**判据只有"验过"和"失败"两种**。
+    """
+    from emotion_app.web import api_admin
+
+    src = inspect.getsource(api_admin)
+    for needle in (
+        '@bp.post("/personas/<persona_id>/reference")',
+        '@bp.get("/personas/<persona_id>/reference")',
+        '@bp.delete("/personas/<persona_id>/reference")',
+    ):
+        assert needle in src, f"人设参考图缺路由：{needle}"
+
+
+def test_persona_reference_field_is_writable():
+    """🔴 字段必须进 `PersonaRepository.update` 的**白名单**。
+
+    ⚠️ 抽掉白名单里那一行 → 上传接口返回 200、`Persona` 也有该字段，
+       **但值永远存不进去**（`if key not in allowed: continue` 静默跳过）。
+       这正是"看着成功、其实没生效"那类最贵的 bug。
+    """
+    from emotion_app.domain.persona_repo import PersonaRepository
+
+    src = inspect.getsource(PersonaRepository.update)
+    assert '"reference_image_path"' in src, (
+        "PersonaRepository.update 的白名单没放行 reference_image_path —— "
+        "面板上传后字段写不进去（且不报错）"
+    )
+
+
+def test_persona_reference_serialized_roundtrip():
+    """字段必须进 `to_dict` / `from_dict`，否则**重启就丢**（面板显示也看不到）。"""
+    from emotion_app.domain.persona import Persona
+
+    p = Persona(name="x", reference_image_path="abc.png")
+    d = p.to_dict()
+    assert d.get("reference_image_path") == "abc.png"
+    assert d.get("has_reference_image") is True, "面板靠这个布尔画预览"
+    back = Persona.from_dict(d)
+    assert back.reference_image_path == "abc.png", "存进去又读不回来 = 重启即丢"
+
+
+def test_tool_execution_sets_persona_context():
+    """🔴 **本组的核心**：工具执行前必须把当前人设放进请求级上下文。
+
+    没有这一步 → `ImageToolService` 永远看不到人设 → per-persona 参考图
+    **完全失效**，而所有模块级单测照样全绿（它们直接构造函数调，
+    绕过了 chat 这条真实路径）。
+    """
+    from emotion_app.domain.chat import ChatService
+
+    src = inspect.getsource(ChatService)
+    assert "tool_context.tool_scope(" in src, (
+        "ChatService 执行工具时没设置人设上下文 —— "
+        "人设参考图在真实链路上永远取不到"
+    )
+    # 两条路径都要有：非流式 `_run_tool_loop` 与流式。漏一条 = 那条模式失效。
+    assert src.count("tool_context.tool_scope(") >= 2, (
+        "只包了一条路径：非流式与流式**都要**设置（漏的那条模式下参考图失效）"
+    )
+
+
+def test_nonstream_tool_loop_receives_persona():
+    """`_run_tool_loop` 必须真的收到 `persona=`（不是只声明了参数）。"""
+    from emotion_app.domain.chat import ChatService
+
+    src = inspect.getsource(ChatService.complete)
+    assert "persona=req.persona" in src, (
+        "complete() 没把 req.persona 传进工具循环 —— 参数白加了"
+    )

@@ -1,35 +1,57 @@
 # 情绪app
 
-> 自用的「虚拟聊天伙伴」后端。**形态参照爱语，机制参照陪伴插件**。
-> 后端部署在自己的电脑/服务器上，**手机只是 WebView 套壳**。
+> 自用的「虚拟聊天伙伴」**后端**。**形态参照爱语，机制参照陪伴插件**。
+> 后端跑在自己的电脑/服务器上，**手机是前端**（当前形态：爱语 App 改配置直连，见 `docs/APP_PLAN.md`）。
+
+| | |
+|---|---|
+| 技术栈 | Python 3.12 + **Quart/Hypercorn** + SQLite + **零构建原生 HTML/JS 面板** |
+| 端口 | 本地 **6191**（外部 NAT `31818 → 6191`） |
+| 判据 | **1142 passed, 1 deselected** |
+| 接口 | **67 条路由** → 详见 **`docs/API.md`** |
+| 下一步 | 手机 App 接入 → **`docs/APP_PLAN.md`** |
+
+---
+
+## 这是什么
+
+一个**宿主**：让 `astrbot_plugin_private_companion`（「我会永远陪着你」陪伴插件）
+**以为自己在 AstrBot 上跑**。
+
+> 🎯 **路线已定，不再重新论证**：
+> 「**类似 AstrBot 的底子做后端 + 爱语 UI 做前端 App**」。
+> **不搬也不剥，造宿主管兼容** —— **不改插件源码**（插件升级了也不用改我们）。
+>
+> 权威定位：`../爱语/docs/PLATFORM_POSITIONING.md`
+
+**四条已打通的链路**：
+
+| 链路 | 说明 |
+|---|---|
+| 命令派发 | 用户在面板说话 → 派发给插件 |
+| LLM 钩子 | 插件在发给模型前改提示词（记忆/人设注入靠它） |
+| 模型端口 | 插件通过我们调上游 LLM |
+| 投递端口 | 插件的**主动消息**落到我们的会话里 |
 
 ---
 
 ## 当前状态
 
-**S0–S3 + S6 + S6b + 宿主合体 已完成**（**421 项测试全绿**）✅ ｜ 🎯 **定位见 `../爱语/docs/PLATFORM_POSITIONING.md`**
-
-| 阶段 | 内容 | 状态 |
-|---|---|---|
-| **S0** | 目录 + 配置 + 日志 + SQLite 存储抽象 + `/health` + 鉴权 | ✅ **完成** |
-| **S1** | 领域模型 + 提示词组装 + 上游客户端 + `/v1/*`（含 SSE 流式） | ✅ **完成** |
-| **S2** | 人设 CRUD + 运行时设置 + **面板**（可改配置、预览提示词） | ✅ **完成** |
-| **S3** | 会话存储 + **三种上下文模式** + 多轮记忆 | ✅ **完成** |
-| **宿主合体** | AstrBot 插件**装 + 跑 + 挂**：266 个 Web API 真挂在 `/api/plugins/extensions/<path>` | ✅ **完成**（09-20） |
-| S4 | 长期记忆（跨会话） | ⏳ P3 优先 |
-| **主动消息** | 它主动找你（**差距分析里的最高优先**） | ⏳ **P1** |
-| **情绪/关系状态** | 会累、会生气 | ⏳ P2 |
-| **S6b** | 总结自动化（**后台静默总结**，不阻塞回复） | ✅ **完成** |
-| **事件派发** | 插件的消息 handler（`@filter.command` 等）**还没有入口** | ⏳ **宿主下一步** |
-| S5 | 接口预留（不实现陪伴对接） | ⏳ |
-| S6 | 面板 + App 端改配置 | ⏳ |
-| S7 | 手机 WebView 套壳 | ⏳ |
-
-> **插件宿主**（可选，默认关）：`.env` 设 `EMOTION_PLUGINS_ENABLED=true` 即启用，
-> 从 `/opt/astrbot/data/plugins` 加载 11 个插件、挂载 266 个 API。
-> ⚠️ 两个必须知道的点（**实测事故，详见 `host/README.md` §8**）：
-> ① 插件会**回写自己的源码目录**（会改坏别人 AstrBot 的生产配置）→ 已用**源码镜像**隔离；
-> ② 某个插件的 `initialize()` 会联网下载 26MB 字体 → 已加**超时隔离**（启动 181.6s → 20.8s）。
+| 能力 | 状态 |
+|---|---|
+| 后端主干（配置/存储/鉴权/日志） | ✅ |
+| `/v1/*` OpenAI 兼容（含 SSE 流式） | ✅ |
+| 人设 CRUD + 片段 + 导入导出 + 参考图 | ✅ |
+| 会话 + 三种上下文模式 + 多轮记忆 + 总结自动化 | ✅ |
+| **面板**（零构建原生 HTML/JS） | ✅ |
+| **AstrBot 插件宿主**（装/跑/挂） | ✅ 已加载 **9** 个插件 · 挂载 **268** 个 API |
+| **插件面板 + 详情页 + 拓展页** | ✅ |
+| **主动消息**（插件发、我们投递） | ✅ 已开（克制档 3 条/天） |
+| **未读徽标** | ✅（只有插件主动消息 +1） |
+| **每会话唯一 umo** | ✅ `sess-<12位十六进制>` |
+| 生图（含参考图） | ✅ |
+| 手机 App 接入 | 📋 **计划已定**（`docs/APP_PLAN.md`），未开始 |
+| 真实语音（TTS/ASR） | ⏳ 只有配置层 |
 
 ---
 
@@ -37,59 +59,53 @@
 
 ```bash
 # 1) 建虚拟环境
-python3 -m venv .venv          # 需要 python3.12-venv 包
-.venv/bin/pip install -e ".[dev]"
+python3 -m venv .venv                # 需要 python3.12-venv 包
+.venv/bin/pip install -e ".[dev]"    # 4 个运行时依赖，很轻
 
 # 2) 准备配置（含令牌与上游 key，已被 .gitignore 挡住）
 cp .env.example .env && chmod 600 .env
-.venv/bin/python -m emotion_app token    # 生成令牌 → 填进 .env
+.venv/bin/python -m emotion_app token     # 生成令牌 → 填进 .env
 
 # 3) 部署前自检（不合法会明确报错并非零退出）
 ./run.sh check
 
 # 4) 起服务
 ./run.sh serve
-# → 面板 http://127.0.0.1:6190/    健康检查 /health
+# → 面板 http://127.0.0.1:6191/     健康检查 /health
 ```
 
-**后台常驻**（脱离终端，会话结束也不退出）：
+**后台常驻**（脱离终端）：
+```bash
+setsid nohup ./run.sh serve >> logs/serve.out 2>&1 < /dev/null &
+```
+⚠️ **用 `&` 起服务后，别在同一个 shell 里跑后续命令**（cwd 会失效）。
+
+**停机**：
+```bash
+ss -ltnp | grep 6191        # 取 pid
+kill <pid>
+```
+🔴 **绝不要 `pkill -f "emotion_app serve"`** —— 它会匹配到**发起命令的那行 shell**，
+连自己的会话一起杀（本项目踩过 5 次的头号惯犯）。
+
+---
+
+## 🔴 一个必须知道的配置陷阱
+
+**模型名有两处来源，运行时的会覆盖 `.env` 的**：
 
 ```bash
-cd /root/Ai-works/情绪app
-setsid nohup ./run.sh serve > logs/server.log 2>&1 < /dev/null &
+./run.sh check   # 显示 gemini-3.1-flash-lite ← 这是【.env 启动值】
 ```
 
-打开 `http://127.0.0.1:6190/` 后会看到**登录框** —— 输入 `.env` 里的
-`EMOTION_AUTH_ACCESS_TOKEN` 即可。登录后服务端下发 **HttpOnly** 会话 cookie
-（默认 `EMOTION_AUTH_SESSION_TTL_HOURS=168` 小时），刷新不用重输，
-令牌**不落 localStorage**。
-
-### 命令
-
-| 命令 | 作用 |
-|---|---|
-| `./run.sh serve` | 启动服务（自动加载 `.env`） |
-| `./run.sh check` | 只校验配置（部署前自检） |
-| `./run.sh token` | 生成一个合规令牌（32 位 hex） |
-
-> `.env` 由 `run.sh` 注入环境变量；应用本身**只读环境变量**，不解析 `.env` 文件。
-
-### 环境变量
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `EMOTION_SERVER_HOST` | `127.0.0.1` | 监听地址。**`0.0.0.0` = 对整个网络开放**，见下方安全提醒 |
-| `EMOTION_SERVER_PORT` | `6190` | 监听端口 |
-| `EMOTION_SERVER_HTTPS_ONLY` | `false` | 会话 cookie 是否带 `Secure`。**挂了 TLS 反代后必须改 `true`**；本机 http 下若设 true，浏览器会**直接不收 cookie**（表现为"点了登录没反应"） |
-| `EMOTION_AUTH_ACCESS_TOKEN` | **无（必填）** | 访问令牌，**≥16 字符**，否则拒绝启动 |
-| `EMOTION_AUTH_SESSION_TTL_HOURS` | `24` | 登录会话有效期（1–168） |
-| `EMOTION_STORAGE_BACKEND` | `sqlite` | `sqlite` / `json`（json 未实现） |
-| `EMOTION_STORAGE_SQLITE_PATH` | `data/emotion.db` | 数据库路径 |
-| `EMOTION_UPSTREAM_BASE_URL` | `https://api.syuan.org/v1` | 上游地址 |
-| `EMOTION_UPSTREAM_API_KEY` | 空 | 上游密钥 |
-| `EMOTION_UPSTREAM_MODEL` | `gemini-3.1-flash-lite` | 模型 |
-| `EMOTION_LOGGING_LEVEL` | `INFO` | 日志级别 |
-| `EMOTION_LOGGING_JSON` | `false` | JSON 日志 |
+但**实际生效的**是运行时设置（面板里改过的）：
+```bash
+TOKEN=$(grep -m1 '^EMOTION_AUTH_ACCESS_TOKEN' .env | cut -d= -f2- | tr -d '"')
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:6191/v1/models
+# → {"id": "gemini-3.8-flash-high"}   ← 这个才是真正用的
+```
+⇒ **判断"现在用哪个模型"要看 `/v1/models` 或 `settings.upstream.model`，别抄 `.env`。**
+（本项目曾因"回显启动快照而非运行时值"产生过一个 bug。）
 
 ---
 
@@ -102,11 +118,11 @@ setsid nohup ./run.sh serve > logs/server.log 2>&1 < /dev/null &
 | 层 | Protocol | 当前实现 | 可换成 |
 |---|---|---|---|
 | 对话上游 | `ChatBackend` | `OpenAIChatBackend` | 陪伴的 provider / 其他协议 |
-| 生图后端 | `ImageBackend` | `OpenAIImageBackend`（OpenAI 兼容） | NAI / ComfyUI / SD WebUI / 陪伴的生图插件 |
-| 工具下发 | `ToolDispatch` | `FunctionCallDispatch`（默认） | `TextTagDispatch`（退路）或陪伴的工具协议 |
+| 生图后端 | `ImageBackend` | `OpenAIImageBackend`（OpenAI 兼容） | NAI / ComfyUI / SD WebUI |
+| 工具下发 | `ToolDispatch` | `FunctionCallDispatch`（默认） | `TextTagDispatch`（退路） |
 
 **用 `typing.Protocol`（结构化类型）**：实现方**不需要继承我们的类** ——
-这对"对接别人的框架"很关键（陪伴插件的类不会继承我们的基类）。
+这对"对接别人的框架"很关键（插件不会继承我们的基类）。
 
 ### 工具下发方式（可配置）
 
@@ -114,9 +130,8 @@ setsid nohup ./run.sh serve > logs/server.log 2>&1 < /dev/null &
 EMOTION_IMAGE_DISPATCH=function_call   # 默认：原生 function calling（实测可用）
 EMOTION_IMAGE_DISPATCH=text_tag        # 退路：文本标签（照爱语，但更宽容）
 ```
-
-⭐ **为什么默认用 function calling**：实测爱语的 `<generate_image:描述>` 标签
-**容易被截断**（正则 `^<...>$` 要求独占整行 + 流式半截失效 + 失败静默）。
+⭐ **为什么默认 function calling**：实测爱语的 `<generate_image:描述>` 标签
+**容易被截断**（正则要求独占整行 + 流式半截失效 + **失败静默**）。
 详见 `../爱语/docs/IMAGE_TOOL_DISPATCH.md`。
 
 ---
@@ -125,236 +140,176 @@ EMOTION_IMAGE_DISPATCH=text_tag        # 退路：文本标签（照爱语，但
 
 | 项 | 约定 | 判据 |
 |---|---|---|
-| 绑定 | **默认 `127.0.0.1`**；`0.0.0.0` 是显式选择 | 启动日志出现 `exposed: true` + **WARNING 告警** |
-| 令牌 | **必填且 ≥16 字符** | 否则 `check`/`serve` 都以 exit=2 退出 |
-| 令牌存储 | **只存摘要**（hmac+sha256） | 实例上不留明文引用 |
+| 绑定 | **默认 `127.0.0.1`**；`0.0.0.0` 是显式选择 | 启动日志 `exposed: true` + **WARNING** |
+| 令牌 | **必填且 ≥16 字符** | 否则 `check`/`serve` 都 exit=2 |
+| 令牌存储 | **只存摘要**（hmac+sha256） | 实例上不留明文 |
 | 会话 | HttpOnly + SameSite=Lax | JS 读不到 |
-| **登录限流** | **10 次失败 / 5 分钟 / 来源** → **429** | 限流期间**正确令牌也拒绝**（否则形同虚设） |
-| **日志** | **主动脱敏**，密钥打不出来 | 见 `infra/logging_setup.py`；有回归测试 |
-| 密钥 | 只走环境变量/本地文件，**不进 git** | `.gitignore` 已挡 |
+| **登录限流** | **10 次失败 / 5 分钟** → **429** | 限流期间**正确令牌也拒绝**（否则形同虚设） |
+| **日志** | **主动脱敏** | `infra/logging_setup.py`，有回归测试 |
+| 密钥 | 只走环境变量/本地文件 | `.gitignore` 已挡 |
 
-### ⚠️ 绑 `0.0.0.0` 意味着什么（2026-09-19 情绪确认要对外）
+### ⚠️ 绑 `0.0.0.0` 意味着什么
 
-对**整个网络**开放，**任何人都能访问登录接口**。需要清楚代价：
+对**整个网络**开放。需要清楚代价：
 
-1. **唯一屏障是那个 32 位 hex 令牌**（128 bit 熵，穷举不现实）。限流是**纵深防御，不是主要屏障**。
-2. **明文 http 下会话 cookie 可被嗅探** → 公网暴露**必须**挂 TLS 反代，并把
+1. **唯一屏障是那个 128 bit 令牌**（穷举不现实）。限流是**纵深防御，不是主要屏障**。
+2. **明文 http 下 cookie 可被嗅探** ⇒ 公网暴露**必须**挂 TLS 反代 +
    `EMOTION_SERVER_HTTPS_ONLY=true`。
-3. **限流记录在内存里，重启即清空** —— 它挡不住"重启服务再爆破"的循环攻击，
-   只能减缓单次会话内的暴力尝试。
-4. 单人自用场景下窗口刻意宽松（10 次/5 分钟），因为**误锁自己比被爆破更现实**。
+3. **限流记录在内存里，重启即清空** —— 挡不住"重启再爆破"的循环。
+4. 单人自用场景刻意宽松（10 次/5 分钟），因为**误锁自己比被爆破更现实**。
 
-> 公网暴露的推荐做法：`Caddy/Nginx` 终止 TLS → `reverse_proxy 127.0.0.1:6190`，
-> 这样后端仍然只听本机（把 `EMOTION_SERVER_HOST` 改回 `127.0.0.1`），
-> 既对外可用又不直接暴露进程。
+> 推荐做法：`Caddy/Nginx` 终止 TLS → `reverse_proxy 127.0.0.1:6191`，
+> 把 `EMOTION_SERVER_HOST` 改回 `127.0.0.1` —— 既对外可用又不直接暴露进程。
 
 ---
 
-## 接口（OpenAI 兼容）
+## 接口
+
+> **完整接口文档（67 条路由 + 字段级说明 + 客户端注意事项）→ `docs/API.md`**
+
+最常用的四个：
 
 | 接口 | 说明 |
 |---|---|
-| `POST /v1/chat/completions` | 聊天补全（支持 `stream: true` → SSE） |
-| `GET /v1/models` | 模型列表 |
-| `GET /health` | 存活自检（免鉴权、脱敏） |
-| `GET /api/v1/status` | 运行状态（需鉴权） |
-| `POST /api/v1/auth/login` | 令牌换会话 |
-| `GET/POST /api/v1/personas` | 人设列表 / 新建 |
-| `POST /api/v1/personas/import` | ⭐ **导入人设**（爱语备份 / SillyTavern 卡 / PNG）；**支持一个文件多人设** |
-| `GET /api/v1/personas/export` | ⭐ **导出全部**为爱语备份格式 |
-| `GET /api/v1/personas/<id>/export?format=` | 导出单张（`aiyu` 爱语格式 / `sillytavern` 角色卡） |
-| `GET /api/v1/personas/<id>/avatar` | 人设头像（**需鉴权**） |
-| `GET/PATCH/DELETE /api/v1/personas/<id>` | 人设读 / 改 / 删 |
-| `POST /api/v1/personas/<id>/activate` | 设为当前人设 |
-| `POST /api/v1/personas/<id>/duplicate` | 复制角色卡 |
-| `GET /api/v1/personas/<id>/preview` | ⭐ **预览组装后的 system prompt** |
-| `PUT /api/v1/personas/<id>/sections` | 替换提示词片段 |
-| `GET/POST /api/v1/sessions` | 会话列表 / 新建 |
-| `GET/PATCH/DELETE /api/v1/sessions/<id>` | 会话读 / 改（含策略）/ 删 |
-| `GET /api/v1/sessions/<id>/messages` | 会话消息（`?limit=N`） |
-| `POST /api/v1/sessions/<id>/clear` | 清消息但保留会话 |
-| `POST /api/v1/sessions/<id>/summarize` | 手动触发总结（正常是后台自动） |
-| `GET /api/v1/images/<file>` | ⭐ 取回生成的图片（**需鉴权**，防路径穿越） |
-| `GET /api/v1/context-modes` | 可选上下文模式 |
-| `GET/PATCH /api/v1/settings` | 运行时业务配置 |
-| `DELETE /api/v1/settings/overrides` | 恢复环境变量默认 |
+| `POST /v1/chat/completions` | **聊天**（支持 `stream: true` → SSE） |
+| `GET /v1/models` | 模型列表（**回的是运行时生效的模型**） |
+| `GET /health` | 存活自检（**免鉴权**、脱敏） |
+| `GET /api/v1/status` | 运行状态 ⚠️ **只认 cookie，用令牌会 401** |
 
-🔑 **鉴权**：`/v1/*` 与 `/api/v1/*` **统一** —— 会话 cookie **或**访问令牌作为 Bearer 均可。
+**鉴权**：`Authorization: Bearer <EMOTION_AUTH_ACCESS_TOKEN>`
+（`/v1/*` 与 `/api/v1/*` 都接受令牌；**唯一例外是 `/api/v1/status`**）。
 
-### 功能差距
-
-我们 vs 陪伴插件的**结构化差距统计** → `../爱语/docs/FEATURE_GAP_ANALYSIS.md`
-
-> ⭐ 关键结论：陪伴 ~280,000 行里 **~54% 是群聊/多用户/平台**（单人**不需要**，不计缺口）。
-> 单人相关约 130,000 行 → 我们代码量完成度 ~5%，但**核心闭环 100% 可用**
-> （它大量代码花在 1,719 个配置项与边界情况上）。
-
----
-
-### 面板
-
-浏览器打开 `http://127.0.0.1:6190/`（**原生 HTML/JS，零构建工具**）。
-
-⭐ **布局：可收起的侧边栏 + hash 路由**（2026-09-20 重构，取代原来的顶栏 tab）：
-
-* 桌面：点左上汉堡 → 侧边栏收成 **60px 图标条**（状态记在 `localStorage`，刷新保持）
-* 手机：侧边栏是**抽屉**（默认滑出，点汉堡滑入 + 遮罩，点遮罩收回）
-* 每页都是真 URL（`#/chat`、`#/persona/<id>`…）——**可后退、可刷新、可分享**
-* 手机端人设**点开即路由到详情**（列表收起 + 出现「← 返回列表」）
-
-| 页面 | 能做什么 |
-|---|---|
-| **聊天** | 流式对话（带当前人设 + **会话历史**）、切换/新建会话、**渲染生成的图片** |
-| **会话** | 会话列表、**三种上下文模式**、保护窗口、摘要编辑 |
-| **人设** | 建/改/删/复制角色卡、**导入（爱语备份 / ST 角色卡）**、**编辑提示词片段**、**预览组装结果** |
-| **插件** | 🆕 **打开 AstrBot 插件自带的拓展页**（陪伴面板 / QQ 空间与书柜 / 一起房间），同源 iframe 内嵌 |
-| **设置** | 改上游地址/模型/key（**不改环境变量**）、测试连接、看部署配置 |
-
-⚠️ **静态资源一律 `no-cache`**（踩过的大坑）：面板是零构建的原生页面，
-过去 `send_from_directory` 默认 `max-age=12 小时` → **改完前端，用户手机上还是旧的**，
-表现为「移动端适配没生效 / 导入按钮没有」——**代码其实早就生效了**。
-现在靠 ETag 走 304，开销可忽略。另注意 `Quart(__name__, static_folder=None)`：
-Quart 内置的 `/static` 路由会**静默盖掉**我们的 no-cache 版本（实测）。
-
-⭐ **可用任意 OpenAI 客户端直连**（已用官方 `openai` SDK 实测）：
-
-```python
-from openai import OpenAI
-c = OpenAI(base_url="http://127.0.0.1:6190/v1", api_key="<你的访问令牌>")
-r = c.chat.completions.create(model="gemini-3.1-flash-lite",
-                              messages=[{"role": "user", "content": "你好"}])
-```
-
-也可直接用 Cherry Studio 等 GUI 客户端。
+⚠️ 流式请求出错时**先返 200 再在流里发 error 帧** ⇒ 客户端必须检查流内 `error` 字段。
 
 ---
 
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest -q
+.venv/bin/python -m pytest tests host/tests -q -p no:cacheprovider \
+  --deselect tests/test_plugin_host_e2e.py::test_router_matches_real_implementation_live
+# → 1142 passed, 1 deselected
 ```
+⚠️ 那条 `--deselect` 是**项目惯例**（它要真连上游，不适合放进回归）。
 
-**421 项**（主项目；另有 host 的 35 项单独跑，见 `host/README.md`），
-重点覆盖**失败路径**（不静默降级）：
+### 判据文化（**本项目最特别的地方**）
 
-- 无令牌 / 令牌过短 / 端口非法 / 端口非数字 / 上游 URL 非法 → **全部拒绝启动**
+> 🔴 **单测全绿 + 接口全绿 + 页面能打开 —— 全都不算证据。**
+
+1. **每条判据必须能"真的失败"** —— 写完要做**注入验证**（故意改坏源码，确认判据会红）
+   现成工具：`tools/inject_*_check.py`（含落盘基线 + 自动还原）
+2. **判据只有"验过"和"失败"两种，没有"跳过"**
+3. **清单类能力用「集合比较」不是「数量比较」**
+   （踩过：详情页该列 113 项，`113 == 113` 看着自洽，其实**少 1 个 handler、被 1 个 page 补平**）
+4. **判据输入要自造或显式钉住**，别依赖用户可改的持久设置
+5. **断言失败先查清"哪个值才是对的"** —— 本项目**两次**是断言错、代码对
+
+### 重点覆盖的失败路径（部分）
+
+- 无令牌 / 令牌过短 / 端口非法 / URL 非法 → **全部拒绝启动**
 - 未鉴权访问 → **401**（不是 200 空数据）
-- **插件源码目录不得被改动**（实测事故：插件回写自己的源码目录，会改坏 AstrBot 生产配置）
-- **插件 `initialize()` 挂住必须有超时**（实测：某插件联网下载字体，把启动卡了 181.6 秒）
-- 导入模式非法 / 缺字段 / 类型错 → **明确报错**
-- **密钥不得出现在日志**（含回归测试）
-- **诊断字段不得被过度脱敏**（实测踩过：`token_configured` 被打成 `***REDACTED***`）
-- **时间片段必须排在 system 最末**（踩过：排最前会毁掉稳定前缀 → 上游缓存永不命中）
-- 上游拒答话术 → **换模型重试**
-- 流中途出错 → **明确告知客户端**，不静默结束
-- **任意 Bearer 不能放行**（必须就是访问令牌）
-- **实体 id 不得被脱敏**（踩过：32 位 hex 的 uuid 被当密钥打掉）
-- 不可运行时改的字段 → **明确告知被忽略**，不静默吞掉
+- **插件源码目录不得被改动**（实测事故：插件回写自己的源码目录）
+- **插件 `initialize()` 挂住必须有超时**（实测：某插件联网下载字体，启动卡 181.6 秒）
+- **密钥不得出现在日志** + **诊断字段不得被过度脱敏**（`token_configured` 被打成 `***`）
 - **流式生成器必须被完整消费**（踩过：`break` 导致流式永远不存历史）
-- **预算裁剪所有模式都生效**（踩过：滚动模式跳过预算 → 长会话打爆上游）
-- **会话不存在要报错**，不静默返回空列表
-- **工具协议字段必须透传**（踩过：漏 `tool_calls`/`tool_call_id` → 上游 400，闭环断掉）
-- **每轮最多调一次工具**（实测上游会重复调用）
-- **换后端不改领域层**（用一个"假后端"验证）
-- **未知的下发方式要报错**，不静默退回默认
-- **两条路径都要带图**（踩过：非流式漏附件 → 图生成了用户看不到）
-- **工具执行后要二次请求**（踩过：流式只有图没正文）
-- **总结失败不推进游标**（否则那段对话永远不被总结）
-- **后台任务必须被强引用持有**（asyncio 只持弱引用，否则会被 GC）
-- **装配测试**：能力必须真的被 `__main__` 接上（踩过：模块+单测全绿但忘记绑线）
-- **登录失败限流**：超限返 **429**，且限流期间**正确令牌也拒绝**（只挡错令牌 = 形同虚设）
-- **限流按来源隔离**：一个 IP 被限不得影响其它 IP（否则一个人能锁死所有人）
-- **登录成功清空失败计数**（否则偶尔打错会累积到被锁）· **窗口过期自动恢复**（避免永久封禁自己）
-- **`https_only` 真的作用到 cookie 的 `Secure` 标志**（设错 → 浏览器不收 cookie → "点登录没反应"）
+- **流中途出错要明确告知客户端**，不静默结束
+- **任意 Bearer 不能放行**（必须就是访问令牌）
+- **装配测试**：能力必须真的被 `__main__` 接上（踩过：模块+单测全绿但忘绑线）
+- **投递失败必须留日志**（踩过：删掉日志后 11 条判据全绿，而用户只看到"伴侣不找我"）
 
 ### 真浏览器验证（`curl` 验不了 JS）
 
 ```bash
 TOKEN=$(grep '^EMOTION_AUTH_ACCESS_TOKEN=' .env | cut -d= -f2- | tr -d "'")
 
-# 生图是否真的渲染进气泡（含正文）
-.venv/bin/python tools/browser_check.py http://127.0.0.1:6190/ "$TOKEN" "画一只戴墨镜的柯基"
-
-# 登录闸门 5 项判据
-.venv/bin/python tools/login_check.py http://127.0.0.1:6190/ "$TOKEN"
-
-# 手机端可用性（真手机视口 @3x）
-.venv/bin/python tools/mobile_check.py http://127.0.0.1:6190/ "$TOKEN"
+.venv/bin/python tools/mobile_sidebar_check.py http://127.0.0.1:6191/ "$TOKEN"  # 手机侧边栏
+.venv/bin/python tools/session_umo_hint_check.py …                            # umo 提示
+.venv/bin/python tools/plugin_detail_check.py …                               # 插件详情页
+.venv/bin/python tools/mobile_check.py …                                      # 无横向溢出
+.venv/bin/python tools/login_check.py …                                       # 登录闸门 6 项
 ```
-
-| 判据 | 内容 |
-|---|---|
-| `browser_check.py` | 图片节点**存在且已加载**（`naturalWidth > 0`）**且**有正文 |
-| `login_check.py` | ①未登录登录框可见 ②错令牌停在框内并提示 ③对令牌进入 ④**刷新免重输** ⑤令牌不落浏览器存储 ⑥**登录态迟到生效时自动解锁** |
-| `mobile_check.py` | ①**无横向溢出** ②触控目标 ≥40px ③人设页**单列堆叠** ④片段表**转卡片且有内容** ⑤输入框 ≥16px（防 iOS 自动放大） |
-
-> 🔴 **`login_check.py` 的第 4 项抓到了一个真 bug**：浮层在 HTML 里默认可见
-> （fail-closed 设计），但"刷新时 cookie 仍有效"这条路径**不经过表单提交** →
-> 没人调 `hideLogin()` → 数据其实已加载，用户却被永久挡在登录框上。
-> **这是纯前端路径问题，`curl` 和单测都发现不了。**
->
-> 🔴 **第 6 项（2026-09-20 新增）抓到了同类的第二个入口**：页面加载时没登录 →
-> 之后 cookie 才生效（别的标签页登录 / SSO）→ 切回本页。原来**永远卡在登录框**
-> （数据接口其实已经通了）。修的时候我还踩了一个"接线"坑：把
-> `visibilitychange` 监听写进了 `boot()`，而**没登录时根本不会调 `boot()`**
-> → 监听器从没装上、修复形同虚设（已按 `test_assembly.py` 的思路改成模块作用域注册）。
+（都是真 headless Chrome + CDP **真点击**，`.click()` 会掩盖遮挡类 bug。）
 
 ---
 
 ## 目录结构
 
 ```
-emotion_app/
-├── infra/          配置 · 日志（含脱敏）
-├── storage/        存储抽象 + SQLite 实现 + 工厂
-├── web/            Quart 应用 · 鉴权 · 管理 API · 面板(static/)
-│                   plugin_host(装配) · plugin_routes(插件 API) · plugin_pages_web(插件页)
-├── domain/         Persona · Message · 提示词组装 · 设置
-│                   Context(三模式) · Session(会话仓库)
-│                   ports(可替换接口) · backends(实现) · tools · image_*
-└── __main__.py     入口（serve / check / token）
-
-host/               AstrBot 兼容宿主（并列交付物；emotion_app **可选**依赖它）
-├── astrbot_host/   shadow(影子包) · compat(兼容层) · loader(加载器)
-│                   host_app(装配) · plugin_pages(拓展页) · source_mirror · write_guard
-└── tests/          35 项单测 + 3 个差分验证工具
+情绪app/
+├── run.sh                      # 入口（加载 .env 后跑 python -m emotion_app）
+├── .env / .env.example         # 配置（.env 不进 git）
+├── pyproject.toml              # 依赖（quart/hypercorn/aiosqlite/httpx）
+├── emotion_app/                # ★ 主代码
+│   ├── domain/                 #   业务逻辑
+│   │   ├── chat.py             #   聊天主链（含 resolve_target 模型解析）
+│   │   ├── conversation_manager.py  # 插件"对话历史"端口实现
+│   │   ├── settings.py         #   运行时设置（覆盖 .env）
+│   │   └── persona*.py         #   人设
+│   ├── web/                    #   HTTP 层
+│   │   ├── app.py              #   路由 + 鉴权闸门 + _effective_model()
+│   │   ├── delivery.py         #   ★ 插件主动消息的投递端口
+│   │   ├── plugin_host.py      #   ★ 插件宿主装配
+│   │   └── static/             #   面板前端（index.html / app.js / app.css）
+│   ├── infra/                  #   配置、供应商预设、日志
+│   └── storage/                #   SQLite 存储
+├── host/astrbot_host/          # ★ AstrBot 兼容层
+│   ├── compat/                 #   影子包：注册成顶层 `astrbot`
+│   └── platform_manager.py     #   ★ send_by_session（插件主动消息出口）
+├── data/                       # 🔴 真实数据（不进 git）
+│   ├── emotion.db(+wal/shm)    #   聊天记录/会话/人设
+│   ├── plugins/                #   插件运行时数据
+│   ├── plugin_src/             #   插件源码镜像（92M，自包含）
+│   └── images/                 #   生成的图
+├── docs/                       # 文档（API.md / APP_PLAN.md / …）
+├── tests/ + host/tests/        # 判据（1142 条）
+└── tools/                      # 诊断/验证脚本（含注入验证）
 ```
 
-**硬约束**（防止重蹈陪伴插件 `page_api.py` 31,646 行的覆辙）：
-单文件 **≤1,500 行**、配置项 **<60**、Web 层**只做协议转换**。
+---
+
+## 插件宿主
+
+`.env` 设 `EMOTION_PLUGINS_ENABLED=true` 启用。
+
+⚠️ **两个必须知道的点**（实测事故，详见 `host/README.md` §8）：
+
+1. 插件会**回写自己的源码目录**（会改坏别人 AstrBot 的生产配置）
+   → 已用**源码镜像**隔离（`EMOTION_PLUGINS_MIRROR_SOURCES=true`）
+2. 某插件 `initialize()` 会联网下载 26MB 字体 → 已加**超时隔离**（启动 181.6s → 20.8s）
+
+**插件目录**：`EMOTION_PLUGINS_PLUGIN_DIRS` 默认指向 `/opt/astrbot/data/plugins`。
+⚠️ **换设备时**若没有 AstrBot，改指向 `data/plugin_src`（已镜像好的自包含副本）。
+
+**停用/启用插件**：面板可改，落点是 `data/config_profile.json` 的 `plugins.inactivated_plugins`。
+⚠️ **保存即落盘，但需重启服务才生效。**
 
 ---
 
 ## 设计文档
 
-| 文档 | 位置 |
+| 文档 | 内容 |
 |---|---|
-| 🎯 **下一步规划（先看这份）** | **`docs/NEXT_STEPS.md`** |
-| **宿主（AstrBot 兼容层）** | `host/README.md` |
-| **框架设计（主文档）** | `../爱语/docs/BACKEND_FRAMEWORK.md` |
-| 人设与提示词体系（实测） | `../爱语/docs/PERSONA_PROMPT_SYSTEM.md` |
-| 架构可行性 | `../爱语/docs/ARCHITECTURE_THIN_CLIENT.md` |
-| 陪伴插件技术栈参照 | `../爱语/docs/REF_ASTRBOT_COMPANION_STACK.md` |
-| 功能差距分析（对陪伴） | `../爱语/docs/FEATURE_GAP_ANALYSIS.md` |
-
-### 关键决策记录
-
-| 决策 | 内容 | 日期 |
-|---|---|---|
-| 技术栈 | Python + Quart/Hypercorn + 原生 HTML/JS + 可插拔存储 | 09-18 |
-| 存储 | **SQLite**（情绪拍板） | 09-18 |
-| 形态 | 后端在电脑，**手机只是 WebView 套壳** | 09-18 |
-| 与陪伴插件 | 🔴 **暂不集成，留接口**（作者在做新框架） | 09-18 |
-| 第一版范围 | **聊天 + 人设** | 09-18 |
-| 第一版记忆 | **只要会话内上下文** | 09-18 |
-| 上下文模式 | **照爱语三模式**（滚动/动态/混合） | 09-18 |
-| 多用户 | ❌ 不做（一人用，但**角色卡可以有多张**） | 09-18 |
-| 生图 | OpenAI 兼容 `/images/generations` | 09-18 |
+| **`docs/API.md`** | **接口文档**（67 条路由 + 字段 + 注意事项） |
+| **`docs/APP_PLAN.md`** | **手机 App 接入计划**（下一步任务） |
+| `docs/GAP_TO_GOAL.md` | 离最终目标还差什么 |
+| `docs/NEXT_STEPS.md` | 规划 |
+| `host/README.md` | 兼容层细节 |
+| `docs/WIKI_REVIEW_结论.md` | 陪伴插件 wiki 审读结论 |
 
 ---
 
 ## 上游
 
-实测：`api.syuan.org`（备选 `ai-api.syuan.org`；`aiapi.syuan.org` 是 404）是
-**new-api 系、完全兼容 OpenAI、无需适配层**。
+OpenAI 兼容即可。当前实测配置见 `.env`（`api.syuan.org`）。
+⚠️ **key 按渠道组隔离**：用 A 组 key 调 B 组模型会 **503**（`No available channel`），100% 确定性。
+
+---
+
+## 已知问题
+
+| # | 项 | 状态 |
+|---|---|---|
+| 1 | 服务曾**"无声消失"约 2 小时**（6191 未监听、无 traceback、磁盘正常） | ⚠️ **死因未查明**，留意 |
+| 2 | `tts` 宿主能力未接 | 启动自检会报，**设计内**的如实降级 |
+| 3 | 三个功能缺口（生图到 UI / `/sticker` / TTS-ASR） | 见 `docs/APP_PLAN.md` §4 |
+| 4 | 未提交 git 的改动较多 | 作者要求"先本地验证、不急着提交" |

@@ -99,6 +99,21 @@ class Persona:
     api_key: str = ""
     model: str = ""
 
+    #: 🆕 **人设参考图**（2026-09-25，情绪「用户能填的就让用户改」）。
+    #: 这个角色生图（`kind=selfie`）时的固定参考图 —— 否则同一个角色每次画出来都不一样。
+    #:
+    #: 存**纯文件名**（落在 `data/persona_refs/`），理由同 `avatar_path`：
+    #: 不把宿主机目录结构写进数据，整个 `data/` 搬走依然有效。
+    #:
+    #: 🔴 **为什么是 per-persona 而不是全局一个**：人设是**一对多**的
+    #: （见类 docstring），切角色就该换脸；全局单值会让所有角色共用一张参考图。
+    #: 全局那份（`EMOTION_IMAGE_PERSONA_REFERENCE`）**降为兜底**。
+    #:
+    #: ⚠️ 它**不是**爱语 `PersonaInfo` 的 6 字段之一（那是照抄的原始结构，
+    #: 见 `docs/PERSONA_IMPORT_FORMAT.md`）—— 这是我们自己的扩展字段。
+    #: 导入/导出时它跟着走（否则换个机器参考图就丢了）。
+    reference_image_path: str = ""
+
     def validate(self) -> None:
         if not self.name or not self.name.strip():
             raise ValueError("Persona.name 不能为空")
@@ -130,6 +145,8 @@ class Persona:
             "api_url": self.api_url,
             "model": self.model,
             "api_key_configured": bool(self.api_key),
+            "reference_image_path": self.reference_image_path,
+            "has_reference_image": bool(self.reference_image_path),
         }
         if include_secrets:
             d["api_key"] = self.api_key
@@ -153,6 +170,7 @@ class Persona:
             api_url=d.get("api_url", ""),
             api_key=d.get("api_key", ""),
             model=d.get("model", ""),
+            reference_image_path=d.get("reference_image_path", ""),
         )
 
     # ---- 提示词组装 ----

@@ -83,6 +83,119 @@ def plugin_reply_text(result: Any) -> str | None:
     return None
 
 
+def _component_type_name(comp: Any) -> str:
+    """取消息段类型名（`"image"` / `"record"` / `"Plain"`…）。
+
+    ⚠️ **三种取法按序**（宿主兼容层里 `type` 是 `ComponentType` 枚举，
+       但插件也可能塞裸 dict 或自定义对象）：
+       `comp.type.value` → `comp.type` → `type(comp).__name__`。
+    """
+    t = getattr(comp, "type", None)
+    if t is None and isinstance(comp, dict):
+        t = comp.get("type")
+    if t is None:
+        return type(comp).__name__
+    return str(getattr(t, "value", t))
+
+
+def plugin_reply_non_text(result: Any) -> list[dict[str, str]]:
+    """列出插件回复里**不是文本**的部分（`[{"type": "image"}, …]`）。
+
+    🔴 存在的唯一理由：**流式分支没有附件通道**（图片只能走非流式的
+       `attachments`/`images` 字段，见 `web/app.py`）。而 `plugin_reply_text()`
+       只返回文本 —— 于是"插件发了张图"在流式下就**没有下文**了。
+
+    本项目最贵的一类 bug 就是这种"静默丢弃"（参考图裸 base64 事故：
+    无日志、无报错，用户只能凭感觉报障）。所以：
+      * 这里把"被降级掉的是什么"**如实列出来**（只列类型名，不搬运内容）；
+      * 调用方（流式分支）据此打 `log.info`，非流式分支据此标进响应体。
+
+    ⚠️ **判据只此一份**：别处不许再各写一套"怎么算非文本"
+       （本项目「同一概念多条写入路径」的坑，已出现 3 次）。
+
+    Returns:
+        非文本段的列表；全是文本（或没有产出）时返回 `[]`。
+    """
+    if result is None:
+        return []
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in getattr(result, "emitted", None) or []:
+        # 大多数产出是 `MessageEventResult`（`MessageChain` 子类）；
+        # 它也接受裸 list（插件的两种写法都有）。
+        chain = getattr(item, "chain", None)
+        if chain is None:
+            chain = item if isinstance(item, (list, tuple)) else []
+        for comp in chain:
+            name = _component_type_name(comp)
+            if name.lower() in ("plain", "text"):
+                continue          # 文本 —— 正文那条通道已经带了
+            if name in seen:
+                continue
+            seen.add(name)
+            out.append({"type": name})
+    return out
+
+
+async def session_user_id(sessions: Any, session_id: str) -> str:
+    """取该会话绑定的**插件用户 id**（方案 B）；取不到返回空串。
+
+    🔴 **这是「会话 → 插件用户 id」的【唯一】判据**，两条路径共用它：
+       * `web/app.py` 的**消息派发**（`_plugin_first_reply_payload` → `dispatch_message`）；
+       * `web/plugin_host.py` 的**LLM 钩子**（`apply_llm_hooks`）。
+
+    为什么必须共用一份（2026-09-26 修的真 bug）：钩子那边原来直接取
+    `config.plugins.umo_user_id`（全局 `default`），于是**同一次聊天里**
+    插件"建档时"用的是会话 A 的 user_id、"注入记忆/关系/被动状态时"
+    用的是全局 `default` —— 两个用户的数据混在一起，
+    而**两边各自都看起来正常**（正是本项目
+    「同一概念有多条写入路径 → 判据要抽成一个函数」那类坑）。
+
+    ⚠️ 取不到的每一种情况都返回空串（**不抛**），由调用方回落全局
+       `plugins.umo_user_id`（**行为与以前一致**）：
+       无 session_id / 无会话仓库 / 会话不存在 / 会话没绑。
+
+    🔴 **但"存储坏了"不能混进"没绑"里静默处理**：前者回落会把这次聊天
+       悄悄记到全局 `default` 名下（串进别人的记忆/关系），是最难查的一类脏数据。
+       所以只有 `SessionNotFound` 才按"没绑"静默处理，其它异常**记 ERROR**。
+    """
+    sid = str(session_id or "").strip()
+    if not sid or sessions is None:
+        return ""
+    try:
+        session = await sessions.get(sid)
+    except Exception as exc:  # noqa: BLE001 — 见下：只有"会话不存在"才是预期输入
+        from emotion_app.domain.session_repo import SessionNotFound
+
+        if not isinstance(exc, SessionNotFound):
+            logger.error(
+                "读取会话 %r 的插件用户 id 失败（本条按【未绑定】处理 → 会回落全局 id）",
+                sid,
+                exc_info=True,
+            )
+        return ""
+    return str(getattr(session, "user_id", "") or "")
+
+
+def fallback_user_id(config: Any) -> str:
+    """取"没有会话绑定"时回落的插件用户 id（全局 `plugins.umo_user_id`）。
+
+    ⚠️ 与 `session_user_id()` 是**同一件事的两半**（有绑定 → 会话的；没有 → 全局的），
+       两处调用方都走这两个函数，不各写一份 `or "default"`。
+    """
+    plugins = getattr(config, "plugins", None)
+    return str(getattr(plugins, "umo_user_id", "") or "default")
+
+
+async def resolve_user_id(config: Any, sessions: Any, session_id: str) -> str:
+    """**派发与钩子共用的"这次该用哪个插件用户 id"**。
+
+    顺序：会话绑的 `Session.user_id` → 全局 `plugins.umo_user_id` → `"default"`。
+    """
+    uid = await session_user_id(sessions, session_id)
+    return uid or fallback_user_id(config)
+
+
 def _messages_to_provider_request(messages: Any, req_cls: Any) -> tuple[Any, list]:
     """我们的 `list[Message]` → AstrBot `ProviderRequest`。
 
@@ -238,6 +351,12 @@ class PluginHostService:
         #: 🔴 人设仓库（**人格管理器**要它才能让插件读到人格）。
         #: ⚠️ 与 `sessions`/`settings` 同款：由装配层注入，缺席时如实降级。
         self.personas: Any = None
+        #: 🔴 存储后端（**对话历史端口**要它才能让插件存取自己的对话）。
+        #: ⚠️ 与上面几个同款：由装配层注入；缺席时对话端口**如实不接**
+        #:    （插件的主动消息存档会失败，但投递不受影响）。
+        self.store: Any = None
+        #: 对话历史端口实例（`StoreConversationManager`；诊断/测试可读）
+        self.conversation_manager: Any = None
         #: 投递端口实例（`SessionDelivery`；诊断/测试可读）
         self.delivery: Any = None
         #: 🔴 平台注册表（装配时建好；`None` = 还没启动）。
@@ -245,6 +364,11 @@ class PluginHostService:
         #:    静态事实，重建既浪费又会让"启动时的那个"与"派发时的那个"
         #:    有机会不一致（两个对象 != 同源）。
         self.platform_registry: Any = None
+        #: 🔴 **配置文件（`data/config_profile.json`）路径解析器** —— 由装配层注入。
+        #: 与 `_backend_getter` 同款：路由装配那一刻 `app.config` 可能还没被测试
+        #: 覆盖（`create_app` 之后才设 `EMOTION_CONFIG_PROFILE_PATH`），
+        #: 所以用**回调延迟取值**；真实部署下回落 `DEFAULT_PATH`。
+        self._config_profile_path: Any = None
 
     def _load_global_config(self) -> dict:
         """读 AstrBot 全局配置（`cmd_config.json`）—— 插件的 `get_config()` 就靠它。
@@ -283,7 +407,6 @@ class PluginHostService:
     async def start(self) -> Any:
         """加载插件（失败**不阻止主服务启动**，如实记日志）。"""
         _ensure_host_on_path()
-
         from astrbot_host.compat.core.star.context import HostPorts
         from astrbot_host.host_app import PluginHost
         from astrbot_host.compat.core.star.star_tools import set_data_root
@@ -318,6 +441,9 @@ class PluginHostService:
             mirror_root=mirror_root if self.config.plugins.mirror_sources else None,
             auto_initialize=self.config.plugins.auto_initialize,
             initialize_timeout=self.config.plugins.initialize_timeout,
+            # 🔴 **停用名单从配置读出来传进去**（宿主侧不反向依赖本模块）。
+            #    读不到 = 空名单（全部启用），那时行为与加这个能力**之前逐字一致**。
+            inactivated=self.saved_inactivated(),
         )
         try:
             # 🔴 **投递端口**：让插件的主动消息真的能落到用户看得见的地方。
@@ -390,6 +516,24 @@ class PluginHostService:
             #    （两个缓存写入口都在 `manager` 分支之后），所以只能靠补桥修好。
             persona_manager = await self._build_persona_manager()
 
+            # 🔴 **对话历史端口**（2026-09-27 第八轮续，情绪明确要求修）。
+            #
+            # 之前 `conversation_manager=` **从来没传过** →
+            # `context.conversation_manager` 抛 NotImplementedError →
+            # 插件每轮主动消息都报：
+            #   「主动消息主链生成失败: 宿主未接入会话历史能力」
+            #   「主动消息写入会话历史失败: 同上」
+            # 后果：消息**发得出去**（有兜底），但插件**存不下自己刚说过的话**
+            # → 下一轮读不到上文 → **可能重复话题**。
+            #
+            # ⚠️ 根因不是"忘了传"，是**契约写错了**：原来的
+            #    `ConversationManagerPort` 只有 `get_history`/`append`，
+            #    而插件真正调的是 `get_curr_conversation_id`/`get_conversation`/
+            #    `new_conversation`/`update_conversation`/`add_message_pair`
+            #    （15 个调用点，真源码 `core/conversation_mgr.py`）。
+            #    契约错 = 谁也没法实现它。已按真实现重写 + 本端口落地。
+            conversation_manager = self._build_conversation_manager()
+
             self.report = await self.host.start(
                 ports=HostPorts(
                     # 🔴🔴 **全局配置必须真读进来**（P-N5，2026-09-22 修）。
@@ -416,6 +560,7 @@ class PluginHostService:
                     platform_manager=platform_manager,
                     provider_manager=provider_manager,
                     persona_manager=persona_manager,
+                    conversation_manager=conversation_manager,
                 )
             )
         except Exception as exc:  # noqa: BLE001
@@ -425,7 +570,50 @@ class PluginHostService:
             self.report = None
             return None
         logger.info("插件宿主已接入\n%s", self.report.summary())
+        # 🔴 **能力自检（启动时打一次）** —— 2026-09-27 第八轮续补。
+        #
+        # 为什么必须有：`HostPorts.capabilities()` 早就能如实列出"哪项能力没接"
+        # （`context.py:207`），但**生产启动路径从来没调用过它** ⇒
+        # 这个"可观测"机制**形同虚设**，缺口只能靠翻插件日志才发现。
+        #
+        # 实证：`conversation_manager` 缺了**好几轮**才被情绪从截图里翻出来
+        # —— 插件自己在日志里刷的是「宿主未接入会话历史能力」，
+        # 那是**插件视角**的报错，我们的启动日志里一个字都没有。
+        #
+        # ⚠️ 缺能力**只警告不中断**（照作者判据：能力不对等要如实 degraded，
+        #    不该让整个宿主起不来）。
+        self._log_capability_selfcheck()
         return self.report
+
+    def _log_capability_selfcheck(self) -> None:
+        """把 `HostPorts.capabilities()` 的结果打进启动日志（缺什么一眼可见）。"""
+        host = self.host
+        ctx = getattr(host, "context", None) if host is not None else None
+        ports = getattr(ctx, "_ports", None)
+        if ports is None or not hasattr(ports, "capabilities"):
+            # 拿不到就如实说"没能自检"，**不假装检查过了**
+            logger.warning("能力自检跳过：拿不到 HostPorts（诊断信息缺失）")
+            return
+        try:
+            caps = ports.capabilities()
+        except Exception:  # noqa: BLE001
+            logger.error("能力自检失败", exc_info=True)
+            return
+
+        missing = sorted(k for k, v in caps.items() if not v)
+        present = sorted(k for k, v in caps.items() if v)
+        logger.info(
+            "宿主能力自检：可用 %d 项 %s%s",
+            len(present),
+            present,
+            f" · 缺失 {len(missing)} 项 {missing}" if missing else " · 无缺失",
+        )
+        if missing:
+            # ⚠️ 缺失项**逐条列出**（不是只给个数）—— 个数看不出是哪个能力
+            logger.warning(
+                "以下宿主能力未接入（插件相关功能会**如实降级**，不是静默失败）：%s",
+                "、".join(missing),
+            )
 
     async def stop(self) -> None:
         if self.host is not None:
@@ -686,9 +874,39 @@ class PluginHostService:
             logger.error("构造投递端口失败（按未接入处理）", exc_info=True)
             return None
 
+    def _build_conversation_manager(self) -> Any:
+        """造对话历史端口（让插件能存/取自己那份对话历史）。
+
+        🔴 为什么需要（2026-09-27 第八轮续，情绪要求）：见 `start()` 里的注释 —— 
+           插件每轮主动消息都因为缺这个端口而**存不下自己说过的话**，
+           下一轮读不到上文 ⇒ **可能重复话题**。
+
+        ⚠️ **如实降级**（照 `_build_delivery` 同款）：没有 store 时不造端口
+           （返回 None）—— `context.conversation_manager` 会**显式抛错**，
+           插件走它自己的降级路径。这比造一个只会打日志的桩诚实得多
+           （本项目最忌"看起来能用其实没用"）。
+        """
+        store = getattr(self, "store", None)
+        if store is None:
+            logger.warning(
+                "没有 store → 对话历史端口不接（插件的主动消息存档将如实失败；"
+                "它自己的降级路径本来就有）"
+            )
+            return None
+        try:
+            from emotion_app.domain.conversation_manager import (
+                StoreConversationManager,
+            )
+
+            self.conversation_manager = StoreConversationManager(store)
+            return self.conversation_manager
+        except Exception:  # noqa: BLE001
+            logger.error("构造对话历史端口失败（按未接入处理）", exc_info=True)
+            return None
+
     # ---- LLM 钩子（P0-4：让插件改"发给模型的提示词"） ----
 
-    async def apply_llm_hooks(self, messages: Any) -> Any:
+    async def apply_llm_hooks(self, messages: Any, *, session_id: str = "") -> Any:
         """把**已组装好的消息列表**交给插件钩子，返回可能被改过的列表。
 
         适配层职责（把宿主的两套表示对接起来）：
@@ -700,6 +918,16 @@ class PluginHostService:
         🔴 **关键：插件的注入必须真的回到 messages 里**。
            真实现是把同一个 `ProviderRequest` 传给所有钩子、之后直接拿它请求模型；
            我们这里等价地：跑完钩子后**把 `req` 的最终状态转回去**。
+
+        🔴 **`session_id` 决定钩子看到的是【哪个用户】**（2026-09-26 修的真 bug）：
+           钩子拿到的 `event.unified_msg_origin` 就是 umo，而 umo 第三段 =
+           插件 `data["users"]` 的键。原来这里恒取全局 `plugins.umo_user_id`
+           → **会话 A 聊天时，插件的记忆/关系/被动状态按 `default` 那个用户算**
+           （与派发路径用的会话 user_id **不是同一个**）→ 串台。
+           ⚠️ 判据在 `session_user_id()`（与派发路径**同一份**，不许各写一套）。
+
+        ⚠️ 传空 `session_id`（无状态单轮 / 旧调用方）→ 回落全局配置，
+           **行为与以前逐字一致**（向后兼容）。
 
         ⚠️ 失败一律**原样返回**（插件是可选增强），但要**记日志**（不许静默）。
         """
@@ -715,7 +943,8 @@ class PluginHostService:
 
         try:
             req, contexts = _messages_to_provider_request(messages, ProviderRequest)
-            uid = str(self.config.plugins.umo_user_id or "default")
+            # 🔴 与消息派发**同一个判据**：会话绑了就用会话的，没绑才回落全局
+            uid = await resolve_user_id(self.config, self.sessions, session_id)
             event = build_inbound_event(_last_user_text_from(contexts), uid)
             await run_llm_request_hooks(event, req)
             out = _provider_request_to_messages(req, contexts)
@@ -770,7 +999,15 @@ class PluginHostService:
             return None
 
         try:
-            uid = user_id or str(self.config.plugins.umo_user_id or "default")
+            # ⚠️ 空 = 回落全局配置（与 `resolve_user_id()` 里**同一个**回落函数，
+            #    不在这里另写一份 `or "default"`）。调用方通常已经用
+            #    `resolve_user_id()` 算好了（会话绑定的优先）。
+            #    🔴 参数名是 `user_id` —— 别写成 `uid = uid or …`
+            #       （那样 `uid` 未定义 → UnboundLocalError → 被下面的
+            #        `except` 吞成一条"派发失败"日志，**整条派发静默失效**。
+            #        这正是本项目铁律说的：宽 except 会把真因换掉。
+            #        抓它的是真机判据，不是假宿主判据。）
+            uid = user_id or fallback_user_id(self.config)
             spec = None
             if platform_id:
                 from astrbot_host.platforms import PlatformSpecError
@@ -811,6 +1048,135 @@ class PluginHostService:
             )
         return result
 
+    # ---- 插件启停（照真实现的 `inactivated_plugins`）----
+
+    def _config_profile_store(self) -> Any:
+        """造配置文件 store（路径可由装配层覆盖 —— 测试必须隔离到 tmp）。
+
+        🔴 与 `api_admin._cfg_profile()` **同一个约定**（`EMOTION_CONFIG_PROFILE_PATH`）：
+           单测绝不能写进项目的 `data/`，更不能碰 `/opt/astrbot`。
+        """
+        from emotion_app.domain.config_profile import DEFAULT_PATH, ConfigProfileStore
+
+        path = DEFAULT_PATH
+        getter = self._config_profile_path
+        if callable(getter):
+            path = getter() or DEFAULT_PATH
+        return ConfigProfileStore(path)
+
+    def saved_inactivated(self) -> list[str]:
+        """读**已保存**的停用名单（面板的勾选状态以它为准，不是运行态）。
+
+        ⚠️ 为什么勾选要看"已保存"而不是"当前运行态"：保存之后重启前，运行态
+           还是旧的 —— 若勾选跟着运行态走，用户刚取消勾选、一保存就看见它自己
+           跳回去了，会以为"没保存成功"。（"需重启生效"另用 `restart_required` 表达。）
+
+        ⚠️ 读失败**不静默当空**：空名单 = "全部启用"，那是个有力的断言。
+           `ConfigProfileStore` 对损坏/空文件会记 ERROR 并另存 `.corrupt`
+           （见它的 `_preserve_corrupt`），所以这里不需要再造一层。
+        """
+        from emotion_app.domain.config_profile import SECTION_PLUGINS
+
+        raw = self._config_profile_store().load()
+        section = raw.get(SECTION_PLUGINS) or {}
+        value = section.get("inactivated_plugins")
+        if not isinstance(value, list):
+            # 形状不对（store 已记 ERROR 并回落默认值）→ 这里再点名一次后果
+            logger.error(
+                "配置里的插件停用名单不是数组（%r）→ 本条按【全部启用】处理",
+                type(value).__name__,
+            )
+            return []
+        return [str(x) for x in value if str(x).strip()]
+
+    def save_inactivated(self, values: Any) -> dict[str, Any]:
+        """保存停用名单（**面板唯一的写入口**）。
+
+        Returns:
+            `plugin_activation_view()` —— 保存后的完整状态。
+
+        Raises:
+            ConfigProfileError: 形状不对 / 元素不是字符串（路由层转 400 并点名字段）。
+        """
+        from emotion_app.domain.config_profile import (
+            SECTION_PLUGINS,
+            ConfigProfileError,
+            validate_patch,
+        )
+
+        if not isinstance(values, list):
+            raise ConfigProfileError(
+                "inactivated_plugins 必须是字符串数组（插件模块路径）",
+                field_name="inactivated_plugins",
+            )
+        # 🔴 判据只用 store 的 `validate_patch`（与其它配置项**同一套校验**），
+        #    不在这里另写一套"什么算合法"。
+        validated = validate_patch(
+            SECTION_PLUGINS, {"inactivated_plugins": values}
+        )
+        self._config_profile_store().patch({SECTION_PLUGINS: validated})
+        return self.plugin_activation_view()
+
+    def plugin_activation_ids(self) -> list[str]:
+        """当前宿主认识的**全部**插件 id（目录名）。
+
+        用途：详情路由 404 时回一份"可用 id"清单 —— 只说「没有这个插件」
+        会让用户不知道自己拼错了哪个字（那是**误导性**的报错，
+        本项目对错误文案的要求是"能直接指向下一步动作"）。
+
+        ⚠️ 宿主没起来时返回**空列表**是诚实的：那时我们确实一个都不认识
+        （调用方在宿主为空时会先返回 503，走不到这里）。
+        """
+        if self.host is None:
+            return []
+        return [p["id"] for p in self.host.plugins_view()]
+
+    def plugin_activation_view(self) -> dict[str, Any]:
+        """面板「插件启停」需要的**全部**信息（一次给全，前端不再自己算）。
+
+        三种状态必须**分开**表达，否则用户会看到自相矛盾的界面：
+
+        * `state`（来自宿主）—— 插件**现在**跑没跑；
+        * `enabled_saved` —— 用户**保存的意图**（勾选框显示它）；
+        * `restart_required` —— 两者不一致 = 有改动还没生效（必须重启服务）。
+
+        🔴 `restart_required` 是**算出来的**，不是恒 `true` 的装饰：
+           它就是"保存集合 != 运行集合"。所以保存完、重启后再打开这一页，
+           它会自己变回 `false` —— 这句话是可证伪的，而不是一句场面话。
+        """
+        from astrbot_host.loader.plugin_loader import normalize_module_path
+
+        saved_raw = self.saved_inactivated()
+        saved = [p for p in (normalize_module_path(x) for x in saved_raw) if p]
+
+        running = self.host is not None
+        plugins: list[dict[str, Any]] = self.host.plugins_view() if running else []
+
+        known = {p["module_path"] for p in plugins}
+        saved_set = set(saved)
+        # 名单里对不上任何插件的项（拼错 / 插件已删）—— 必须回给面板，别静默丢
+        unmatched = sorted(x for x in saved_set if x not in known)
+
+        for p in plugins:
+            p["enabled_saved"] = p["module_path"] not in saved_set
+
+        active = {p["module_path"] for p in plugins if p["state"] == "inactivated"}
+        if running:
+            restart_required = saved_set != active
+        else:
+            # 宿主没起来 → 运行态未知，但"存了却肯定没生效"是确定的
+            # （空名单则无所谓，没什么要生效的）。
+            restart_required = bool(saved_set)
+
+        return {
+            "running": running,
+            "plugins": plugins,
+            "inactivated_saved": saved,
+            "inactivated_active": sorted(active),
+            "unmatched": unmatched,
+            "restart_required": restart_required,
+        }
+
     # ---- 诊断 ----
 
     def status(self) -> dict[str, Any]:
@@ -820,6 +1186,12 @@ class PluginHostService:
         return {
             "running": True,
             "loaded": self.report.loaded,
+            # 🔴 停用的插件**单独一列**（与 `failed` 是两条不同的路径）。
+            #    以前只有 loaded/failed 两项，"没跑"这件事分不清是停用还是坏了。
+            "inactivated": list(getattr(self.report, "inactivated", []) or []),
+            "unmatched_inactivated": list(
+                getattr(self.report, "unmatched_inactivated", []) or []
+            ),
             "failed": [{"plugin": n, "error": e} for n, e in self.report.failed],
             "mounted_apis": self.report.mounted_count,
             "initialized": len(self.report.initialized),

@@ -136,10 +136,20 @@ class JsonFormatter(logging.Formatter):
 
 
 class TextFormatter(logging.Formatter):
-    """人类可读；同样强制走 scrub。"""
+    """人类可读；同样强制走 scrub。
+
+    🔴 **必须带日期**（2026-10-08 修）：
+      起因是我上轮报了个错——说 `log_triage.py` 打出 `00:00:00`。那是我看错了；
+      真问题是**这里只打了 `%H:%M:%S`、没有日期**，而 `logs/serve.out` 是
+      `nohup >>` 追加的，**横跨多天、含 26 次重启**（实测首行 09-25 19:06 → 末行 10-08 15:15）。
+      后果：任何"这条是历史残留还是当前仍在发生"都判不了 ——
+      上轮我复盘"当前进程 0 个 5xx"就吃了这个亏。
+      ⚠️ Hypercorn 自己的行本来就带 `[YYYY-MM-DD HH:MM:SS +0800]`，
+         只有我们自己的日志缺日期 ⇒ 文件里两种格式并存，更容易误判。
+    """
 
     def format(self, record: logging.LogRecord) -> str:
-        base = f"{self.formatTime(record, '%H:%M:%S')} {record.levelname:<7} {record.name}: {record.getMessage()}"
+        base = f"{self.formatTime(record, '%Y-%m-%d %H:%M:%S')} {record.levelname:<7} {record.name}: {record.getMessage()}"
         data = getattr(record, "data", None)
         if data is not None:
             base += "  " + json.dumps(scrub(data), ensure_ascii=False)

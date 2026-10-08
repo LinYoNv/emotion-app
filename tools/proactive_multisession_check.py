@@ -29,8 +29,16 @@
 本脚本只创建/删除**它自己建的**三个会话；user_id 用
 `e2e_<随机>_<label>` 前缀（**不用 alice/bob 这种可能与你的数据重名的 id**），
 结束时三个会话全部删除。
-⚠️ 插件里的 `e2e_*` user 记录**会留下**（插件没有删 user 的安全 API），
-   但它们带的随机 tag 保证下次跑互不干扰、也不影响你真实在用的 user。
+⚠️ 插件里的 `e2e_*` user 记录**会留下**，**而且删不掉** ——
+   但原因**不是**"插件没有删 user 的 API"（**那句旧注释是错的**：插件有
+   `/page/user/delete`、`/page/user/identity/archive`、`/page/user/identity/delete`）。
+   真原因是：这些 user 一旦聊过天就被绑上 `unified_person_id`
+   （`main.py:5391` `_req036_attach_unified_profile_context`），
+   而插件的删除按钮对"已绑统一人物"的用户**按设计**拒绝直接删、要求走「身份与隔离→归档」；
+   归档又要求统一身份迁移**不在** `{degraded,paused,stopped}` 状态，
+   当前实测是 `scoped_projection_degraded`（详见 `docs/归档不可用_根因报告.md`）。
+   ⇒ **每跑一次本脚本，就会在陪伴的用户列表里多留 3 条永久残留。**
+   ⚠️ **跑之前先想清楚**；清单用 `tools/plugin_user_residue_report.py`（只读）看。
 
 用法：
     .venv/bin/python tools/proactive_multisession_check.py <base_url> <token>
