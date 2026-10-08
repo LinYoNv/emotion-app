@@ -324,7 +324,13 @@ def test_real_companion_components(real_host):
     #      * "有没有漏/多"交给下面那条**与注册表现场快照的集合比较**（同源，不漂）。
     assert by_type.get("command") == 3, f"指令数变了：{by_type}"
     assert by_type.get("llm_tool") == 22, f"LLM 工具数变了：{by_type}"
-    assert by_type.get("page") == 1, f"拓展页数变了：{by_type}"
+    # ⚠️ **2026-10-08 从 1 改成 2 —— 不是产品回归，是旧实现漏列**（已在报告里说明）：
+    #    本插件 `pages/` 下有**两个真实目录**（`companion-panel` 与 `陪伴面板`，
+    #    各含 `index.html`），而 `metadata.yaml` **只声明了 `companion-panel`**。
+    #    旧实现只读 metadata ⇒ 漏掉「陪伴面板」；改成扫目录后正确地列出 2 个。
+    #    真 AstrBot 的 `discover_plugin_pages()` 本来就是**扫目录**的。
+    #    ⇒ `2` 是**正确答案**（实测 `pages/` 目录清单 = ['companion-panel','陪伴面板']）。
+    assert by_type.get("page") == 2, f"拓展页数变了：{by_type}"
     assert by_type.get("listener") >= 11, f"监听器数退化了：{by_type}"
     assert by_type.get("hook") >= 76, f"钩子数退化了：{by_type}"
 

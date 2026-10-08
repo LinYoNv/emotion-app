@@ -51,6 +51,13 @@ METADATA_FILENAMES = ("metadata.yaml", "metadata.yml")
 #: 插件入口模块名（真实现是 `<插件目录>/main.py`，`discover()` 也按它判据）
 ENTRY_MODULE_NAME = "main"
 
+#: 插件页面根目录名（照真实现 `plugin_page_service.py:25`）
+PLUGIN_PAGE_DIR_NAME = "pages"
+
+#: 插件页面入口文件名（照真实现 `plugin_page_service.py:26`）——
+#: **必须有它才算一个页面**（真实现 `discover_plugin_pages` 就是这么判的）
+PLUGIN_PAGE_ENTRY_FILE = "index.html"
+
 #: 真 AstrBot 的插件模块路径前缀。真实现 `star_manager.py:1115`：:
 #:
 #:     path = "data.plugins." if not reserved else "astrbot.builtin_stars."
@@ -366,7 +373,8 @@ class PluginLoader:
             rec.version = str(meta.get("version") or "")
             rec.author = str(meta.get("author") or "")
             rec.desc = str(meta.get("desc") or "")
-            rec.pages = _normalize_pages(meta.get("pages"))
+            # 🔴 页面发现必须**扫 `pages/` 目录**，不能只看 metadata 声明（2026-10-08 修）
+            rec.pages = discover_plugin_pages(path, meta.get("pages"))
 
             # 🔴🔴 **停用名单命中 → 到此为止**（照真实现 `star_manager.py:1087/1218/1251`）。
             #
@@ -1029,17 +1037,94 @@ class PluginLoader:
         md.module = module
 
 
+def discover_plugin_pages(plugin_root: Path, declared: Any) -> list[dict[str, str]]:
+    """发现插件的页面 —— **扫 `pages/` 目录为准**，并与 metadata 声明**合并**。
+
+    ## 🔴 为什么必须扫目录（2026-10-08 修的真缺口）
+    情绪报：「记忆插件**存在吗**？我看插件面板里面没有呢，**应该是有扩展页的**」——
+    查实：`astrbot_plugin_memory_companion`（显示名「我会牢牢记住你」v2.1.4）
+    **已加载且运行中**，`pages/记忆面板/index.html`（3095 字节）**真实存在**，
+    但它的 `metadata.yaml` **根本没有 `pages:` 段**。
+
+    而**真 AstrBot 的页面发现根本不看 metadata** —— 读
+    `dashboard/services/plugin_page_service.py:508 discover_plugin_pages()`：
+    它直接 `pages_root = <插件根>/pages`，然后**遍历子目录**，
+    每个含 `index.html` 的目录就是一个页面，**`title` 取目录名**。
+    ⇒ 我们原来只读 `metadata.pages` 是**错的**，会漏掉所有"有页面但没声明"的插件。
+
+    实测本项目的缺口（扫出来的 vs 我们原来列的）：
+
+    | 插件 | metadata 声明 | `pages/` 实际 | 原来漏掉 |
+    |---|---|---|---|
+    | `memory_companion` | ❌ 无 | 记忆面板 | **记忆面板** |
+    | `nai_image` | ❌ 无 | test-panel | test-panel |
+    | `meme_manager` | ❌ 无 | app | app |
+    | `private_companion` | ✅ companion-panel | companion-panel · **陪伴面板** | **陪伴面板** |
+
+    ⚠️ 连"声明了"的 `private_companion` 也**漏了 1 个** —— 所以这不是"补几个特例"，
+       而是**发现方式本身错了**。（对照：真 AstrBot 的 `star_manager.py:1187` 确实也读
+       `metadata_yaml.pages`，但那是**另一条路**；**页面发现（discover）走的是目录扫描**。）
+
+    ## 合并规则
+    * **目录扫描是权威**（照真实现）—— 有 `index.html` 才算数；
+    * metadata 声明里**目录不存在**的条目**仍然保留**（它在真 AstrBot 里会被
+      `get_plugin_page` 判 404，但**保留能让用户看到"声明了却没页面"这个事实**，
+      比静默丢弃强 —— 本项目最忌静默）。
+    * 同名以**目录扫描**为准（title 用目录名，与真实现一致）。
+    """
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    # 1) 目录扫描（权威，照真实现 plugin_page_service.py:508-535）
+    pages_root = plugin_root / PLUGIN_PAGE_DIR_NAME
+    if pages_root.is_dir():
+        try:
+            dirs = sorted(
+                (d for d in pages_root.iterdir() if d.is_dir()),
+                key=lambda d: d.name.lower(),
+            )
+        except OSError as exc:
+            logger.warning("扫描插件页目录失败：%s: %s", pages_root, exc)
+            dirs = []
+        for page_dir in dirs:
+            name = page_dir.name.strip()
+            # 照真实现 `normalize_plugin_page_name`：只做安全校验（中文名照用），非法就跳过
+            if not name or name in {".", ".."} or name.startswith(".") or "/" in name or "\\" in name:
+                logger.warning("插件页目录名非法，已跳过：%r（位于 %s）", name, pages_root)
+                continue
+            # 照真实现：**必须有入口文件**才算一个页面
+            if not (page_dir / PLUGIN_PAGE_ENTRY_FILE).is_file():
+                logger.warning(
+                    "插件页目录缺少 %s，已跳过：%s", PLUGIN_PAGE_ENTRY_FILE, page_dir
+                )
+                continue
+            out.append({"name": name, "title": name})
+            seen.add(name)
+
+    # 2) 合并 metadata 声明（补上"声明了但目录不存在"的，便于诊断）
+    for item in _normalize_pages(declared):
+        if item["name"] in seen:
+            continue
+        out.append(item)
+        seen.add(item["name"])
+
+    return out
+
+
 def _normalize_pages(raw: Any) -> list[dict[str, str]]:
     """把 `metadata.yaml` 的 `pages:` 归一成 `[{"name","title"}]`。
 
-    照真实现的容错口径（`plugin_page_service.discover_plugin_pages`）：
+    照真实现的容错口径：
 
       * 支持**字符串**写法（`pages: [companion-panel]`）→ `title` 用 name 兜底；
       * 支持 **dict 列表**（最常用）→ 取 `name` 与 `title`；
       * ⚠️ **没有 `name` 的条目直接丢弃**（没名字就定位不到 `pages/<name>/`），
         但要留日志 —— 静默丢配置正是本项目最忌讳的 bug 类型。
 
-    🔴 为什么这个函数必须存在：插件**声明了页面** ≠ 页面**打得开**。
+    ⚠️ **本函数只是 metadata 那一半**；真正的页面发现是 `discover_plugin_pages()`。
+       单独调它**会漏掉没声明但目录存在的页面**（2026-10-08 修的真缺口）。
+
+    🔴 为什么这两个函数必须存在：插件**声明了页面** ≠ 页面**打得开**。
        页面 HTML 在 `<插件>/pages/<name>/index.html`，必须由**宿主提供页面路由**。
        我上一轮只挂了 Web API、没做页面路由，结果情绪看到的就是"插件没有配置入口"。
     """

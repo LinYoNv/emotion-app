@@ -213,3 +213,54 @@ def test_alias_does_not_change_canonical_module_name(loaded):
     rec = loaded.records[0]
     assert rec.module.__name__ == "astrbot_plugin_private_companion"
     assert rec.module.main.__name__ == "astrbot_plugin_private_companion.main"
+
+
+def test_alias_registers_intermediate_packages_from_scratch(tmp_path_factory):
+    """🔴 **别名必须自己逐级建中间包** —— 不复用"别人可能已经建好"的状态。
+
+    ## 为什么单独一条（注入验证抓不到的第三种成因）
+    注入「去掉逐级 `setdefault`」在**单跑本文件**时会被抓住，
+    但在**全批跑**时抓不住 —— 因为 `data.plugins` 中间包
+    **已被前面的测试建好了**，`setdefault` 的缺失就**不再产生可观察差异**。
+    ⇒ 判据依赖了**执行顺序**（本项目的老坑）。
+
+    修法：本判据**先把 `data` 相关的 `sys.modules` 条目清掉**，
+    从零开始加载 —— 这样"不建中间包"必然暴露。
+    ⚠️ 清完在 `finally` 里恢复，别污染同进程的其他测试。
+
+    ⚠️ 这条判据会真的失败：去掉 `_register_real_astrbot_alias` 里那段
+       逐级 `setdefault` 即红（**无论执行顺序**）。
+    """
+    import asyncio
+    import importlib
+
+    from astrbot_host.compat.core.star.context import HostPorts
+    from astrbot_host.loader import PluginLoader
+    from astrbot_host.shadow import install_shadow_package
+
+    install_shadow_package()
+    alias_pkg = "data.plugins.astrbot_plugin_private_companion"
+    alias_main = f"{alias_pkg}.main"
+    alias_root = "data.plugins"
+
+    # ① 先清掉**与别名有关**的中间层，模拟"从零开始"的真实安装场景
+    saved = {k: sys.modules[k] for k in (alias_main, alias_pkg, alias_root) if k in sys.modules}
+    for k in (alias_main, alias_pkg, alias_root):
+        sys.modules.pop(k, None)
+
+    try:
+        mirror = tmp_path_factory.mktemp("alias-scratch")
+        loader = PluginLoader(plugin_dirs=[PLUGIN_ROOT], mirror_root=mirror)
+        rec = asyncio.run(
+            loader.load_all(ports=HostPorts(config={}), only=[PLUGIN_NAME])
+        ).records[0]
+        # ② 中间包必须**由别名逻辑自己建出来**
+        assert alias_root in sys.modules, (
+            "`data.plugins` 中间包没被建 —— 去掉逐级 setdefault 就会这样"
+        )
+        mod = importlib.import_module(alias_main)
+        assert mod is rec.module.main, "别名没指向同一个模块对象"
+    finally:
+        # ③ 恢复现场（同进程其他测试还要用）
+        for k, v in saved.items():
+            sys.modules[k] = v

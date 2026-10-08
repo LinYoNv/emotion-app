@@ -770,6 +770,94 @@ def test_normalize_pages_accepts_real_world_shapes():
     assert _normalize_pages(None) == []
 
 
+# ---------------------------------------------------------------------------
+# 🔴 页面发现必须【扫目录】（2026-10-08 修的真缺口）
+# ---------------------------------------------------------------------------
+
+
+def _mk_page(plugin_root, name: str, *, with_entry: bool = True):
+    """造一个插件页目录 `<plugin_root>/pages/<name>/index.html`。"""
+    d = plugin_root / "pages" / name
+    d.mkdir(parents=True, exist_ok=True)
+    if with_entry:
+        (d / "index.html").write_text("<html>ok</html>", encoding="utf-8")
+    return d
+
+
+def test_discovers_page_without_metadata_declaration(tmp_path):
+    """🔴 **没在 `metadata.yaml` 里声明、但目录存在的页面，必须被发现。**
+
+    这正是情绪报的那个缺口：「记忆插件**存在吗**？我看插件面板里面没有呢，
+    **应该是有扩展页的**」—— 实测 `astrbot_plugin_memory_companion`
+    已加载且运行中、`pages/记忆面板/index.html` 真实存在，
+    但它的 metadata **根本没有 `pages:` 段** ⇒ 只读 metadata 的实现在这里漏掉它。
+
+    真 AstrBot 的 `discover_plugin_pages()` 是**扫目录**的（不看 metadata）。
+    ⚠️ 这条判据会真的失败：把实现改回只读 `_normalize_pages(declared)` 即红。
+    """
+    from astrbot_host.loader.plugin_loader import discover_plugin_pages
+
+    _mk_page(tmp_path, "记忆面板")
+    assert discover_plugin_pages(tmp_path, None) == [
+        {"name": "记忆面板", "title": "记忆面板"}
+    ]
+
+
+def test_page_dirs_win_over_metadata_declaration(tmp_path):
+    """目录扫描是**权威**：声明与目录**都**存在时，两边都要保留（去重）。
+
+    实测形态（`private_companion`）：metadata 只声明了 `companion-panel`，
+    但 `pages/` 下有 **两个**目录（`companion-panel` 和 `陪伴面板`）
+    ⇒ 漏的正是没声明的那个。连"声明过"的插件也漏，说明**发现方式本身错了**。
+    """
+    from astrbot_host.loader.plugin_loader import discover_plugin_pages
+
+    _mk_page(tmp_path, "companion-panel")
+    _mk_page(tmp_path, "陪伴面板")
+    discovered = discover_plugin_pages(
+        tmp_path, [{"name": "companion-panel", "title": "陪伴面板"}]
+    )
+    names = [p["name"] for p in discovered]
+    # 两个目录页都在，且**不重复**
+    assert sorted(names) == ["companion-panel", "陪伴面板"], names
+    assert len(names) == len(set(names)), f"去重失败：{names}"
+
+
+def test_directory_without_entry_file_is_not_a_page(tmp_path):
+    """**没有 `index.html` 的目录不算页面**（照真实现 `discover_plugin_pages`）。"""
+    from astrbot_host.loader.plugin_loader import discover_plugin_pages
+
+    _mk_page(tmp_path, "real-page")
+    _mk_page(tmp_path, "assets", with_entry=False)  # 是资源目录，不是页面
+    assert [p["name"] for p in discover_plugin_pages(tmp_path, None)] == ["real-page"]
+
+
+def test_declared_but_missing_dir_is_kept_for_diagnosis(tmp_path):
+    """声明了但目录不存在 → **保留**（让用户看见"声明了却没页面"这个事实）。
+
+    本项目铁律：**不许静默丢弃**。真 AstrBot 里这种条目会在取页面时 404，
+    但那比"面板上不显示、用户永远不知道"要好。
+    """
+    from astrbot_host.loader.plugin_loader import discover_plugin_pages
+
+    _mk_page(tmp_path, "exists")
+    got = discover_plugin_pages(tmp_path, [{"name": "ghost", "title": "幽灵页"}])
+    assert {p["name"] for p in got} == {"exists", "ghost"}
+
+
+def test_illegal_page_dir_name_is_skipped(tmp_path):
+    """非法的页面目录名要跳过（照真实现 `normalize_plugin_page_name` 的安全校验）。
+
+    ⚠️ 中文名是**合法**的（真实现只用它拒 `..`/斜杠/点开头）—— 别过度校验。
+    """
+    from astrbot_host.loader.plugin_loader import discover_plugin_pages
+
+    _mk_page(tmp_path, "ok-page")
+    _mk_page(tmp_path, ".hidden")
+    got = [p["name"] for p in discover_plugin_pages(tmp_path, None)]
+    assert got == ["ok-page"], got
+
+
 def test_page_asset_blocks_directory_traversal(tmp_path):
     """🔴 **安全判据**：插件页资源**绝不能**读到页面目录之外。
 
@@ -1538,3 +1626,93 @@ def test_real_cmd_config_is_reachable_by_default_config(tmp_path):
 
     got = load_global_config(resolved)
     assert got.get("timezone") == "Asia/Shanghai", f"真配置没读出来：{sorted(got)[:8]}"
+
+
+# ---------------------------------------------------------------------------
+# 🔴 装配判据：页面发现必须**接在加载链路上**（2026-10-08）
+#
+# ⚠️ 为什么单测 `discover_plugin_pages()` 不够（我第一版就栽在这）：
+#    那几条判据直接调函数 ⇒ **绕过了 `load_one`** ⇒ 注入"把 load_one 里那行改回
+#    只读 metadata"时**一条都不会红**（实测：45 passed 全绿）。
+#    这正是本项目的老坑「**模块能工作 ≠ 被接上了**」。
+#    ⇒ 必须走**真加载**，断言 `PluginRecord.pages` 真的含那个页面。
+# ---------------------------------------------------------------------------
+
+
+def _load_real_plugin_once(tmp_path_factory, dir_name):
+    """真加载一个插件（走 `PluginLoader.load_all`），返回 PluginRecord。"""
+    from astrbot_host.compat.core.star.context import HostPorts
+    from astrbot_host.loader import PluginLoader
+    from astrbot_host.shadow import install_shadow_package
+
+    install_shadow_package()
+    mirror = tmp_path_factory.mktemp(f"mirror-{dir_name}")
+    loader = PluginLoader(plugin_dirs=[PLUGIN_ROOT], mirror_root=mirror)
+    report = asyncio.run(loader.load_all(ports=HostPorts(config={}), only=[dir_name]))
+    assert report.records, f"加载器没发现插件 {dir_name}"
+    return report.records[0]
+
+
+def test_memory_companion_page_is_discovered_end_to_end(tmp_path_factory):
+    """🔴 **真机缺口**：记忆插件的「记忆面板」必须出现在 `rec.pages` 里。
+
+    情绪报：「记忆插件**存在吗**？我看插件面板里面没有呢，**应该是有扩展页的**」
+    —— 实查：插件已加载运行，`pages/记忆面板/index.html` 真实存在，
+    但 `metadata.yaml` **没有 `pages:` 段** ⇒ 旧实现（只读 metadata）**漏掉它**。
+
+    ⚠️ 这条判据走**真加载链路**（`load_all` → `load_one`），
+       所以它能抓住"函数对但没接上"的退化 —— 注入验证已证明它会红。
+    """
+    if not (PLUGIN_ROOT / "astrbot_plugin_memory_companion").is_dir():
+        pytest.fail("依赖的真插件不存在 —— 本判据不许跳过")
+    rec = _load_real_plugin_once(tmp_path_factory, "astrbot_plugin_memory_companion")
+    names = [p["name"] for p in (rec.pages or [])]
+    assert "记忆面板" in names, (
+        f"记忆面板没被发现（metadata 未声明、必须靠扫目录）：{names}"
+    )
+
+
+def test_companion_plugin_lists_both_page_dirs(tmp_path_factory):
+    """陪伴插件的两个页面目录**都要**在（metadata 只声明了其中 1 个）。
+
+    实测：`pages/` 下有 `companion-panel` 与 `陪伴面板` 两个目录（各有 index.html），
+    而 metadata **只声明了 `companion-panel`** ⇒ 旧实现漏掉「陪伴面板」。
+    ⚠️ 连"声明过"的插件也漏，说明**发现方式本身错了**，不是个别特例。
+    """
+    if not (PLUGIN_ROOT / "astrbot_plugin_private_companion").is_dir():
+        pytest.fail("依赖的真插件不存在 —— 本判据不许跳过")
+    rec = _load_real_plugin_once(tmp_path_factory, "astrbot_plugin_private_companion")
+    names = {p["name"] for p in (rec.pages or [])}
+    assert {"companion-panel", "陪伴面板"} <= names, (
+        f"陪伴插件的两个页面目录没都列出来：{sorted(names)}"
+    )
+
+
+def test_across_all_real_plugins_no_page_dir_is_missed(tmp_path_factory):
+    """🔴 **集合判据**：所有真插件 `pages/` 下**有 index.html 的目录**，
+    必须**一个不漏**地出现在各自的 `rec.pages` 里。
+
+    ⚠️ 用**集合比较**而不是数量比较 —— 本项目踩过「数量相等 ≠ 组成正确」。
+    两边同源（一边扫目录、一边读记录），所以不依赖执行顺序。
+    """
+    from astrbot_host.loader.plugin_loader import discover_plugin_pages
+
+    if not PLUGIN_ROOT.is_dir():
+        pytest.fail("真插件根目录不存在 —— 本判据不许跳过")
+
+    dirs = sorted(d for d in PLUGIN_ROOT.iterdir() if (d / "pages").is_dir())
+    assert dirs, "没找到任何带 pages/ 的插件 —— 判据失去意义"
+
+    missing: dict[str, list[str]] = {}
+    for plugin_dir in dirs:
+        # 期望 = 直接扫目录（权威口径），不看该插件的 metadata 声明
+        expected = {p["name"] for p in discover_plugin_pages(plugin_dir, None)}
+        if not expected:
+            continue
+        rec = _load_real_plugin_once(tmp_path_factory, plugin_dir.name)
+        got = {p["name"] for p in (rec.pages or [])}
+        absent = expected - got
+        if absent:
+            missing[plugin_dir.name] = sorted(absent)
+
+    assert not missing, f"这些页面目录被漏掉：{missing}"

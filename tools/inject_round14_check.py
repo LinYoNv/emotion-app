@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""注入验证：本轮（2026-10-08）三组修复的判据**真的会红**吗？
+"""注入验证：本轮（2026-10-08）四组修复的判据**真的会红**吗？
 
 ## 守哪三件事
   A. **日志必须带日期** —— 否则 `logs/serve.out`（追加、跨多天）判不出
@@ -9,6 +9,10 @@
      这两条高频错误**永远看不到上游到底回了什么**（诊断信息被吞）。
   C. **真 AstrBot 模块别名**（W5）—— 否则插件间 40 处
      `import_module("data.plugins.X.main")` 100% 失败。
+  D. **插件页发现必须扫 `pages/` 目录** —— 只读 `metadata.pages` 会漏掉
+     所有"有页面但没声明"的插件（实测漏了记忆面板 / 陪伴面板 / test-panel）。
+     ⚠️ D 只有**装配判据**能抓住：直接调 `discover_plugin_pages()` 的单元判据
+     抓不住它（我第一版就这么被骗过去，45 passed 全绿）。
 
 ## 四道防线（缺一条就会得到假结论，全是踩过的坑）
   ① 基线**落盘**在脚本之外（`.inject_round14_baseline.json`）——
@@ -46,6 +50,7 @@ BASELINE = Path(__file__).resolve().parent / ".inject_round14_baseline.json"
 TEST_NODES = [
     "tests/test_config_logging.py",
     "tests/test_upstream.py",
+    "tests/test_plugin_host_e2e.py",
     "host/tests/test_loader_real_plugin.py",
 ]
 
@@ -106,6 +111,17 @@ INJECTIONS: list[tuple[str, str, Path, str, str]] = [
         '            pkg.__name__ = ".".join(parts)  # 注入：改规范名\n'
         '            sys.modules[".".join(parts)] = pkg',
     ),
+    (
+        "D1 页面发现退回只读 metadata",
+        "把 `load_one` 里的 `discover_plugin_pages(...)` 改回 `_normalize_pages(meta['pages'])`"
+        " —— 这正是**情绪报的那个缺口**：metadata 没声明 `pages:` 的插件"
+        "（记忆插件的「记忆面板」）在面板上完全不出现。"
+        "⚠️ 这条注入**只有装配判据能抓住** —— 直接调函数的单元判据抓不住它"
+        "（我第一版就是这么被自己骗过去的，45 passed 全绿）。",
+        LOADER,
+        '            rec.pages = discover_plugin_pages(path, meta.get("pages"))',
+        '            rec.pages = _normalize_pages(meta.get("pages"))  # 注入：只读 metadata',
+    ),
 ]
 
 
@@ -139,6 +155,11 @@ def _run_tests() -> tuple[int, str]:
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     proc = subprocess.run(
         [str(ROOT / ".venv" / "bin" / "python"), "-m", "pytest", *TEST_NODES,
+         # ⚠️ 这条判据需要**真 AstrBot 的 dashboard 包**才能跑（`astrbot.dashboard`），
+         #    在本项目的常规环境里必然 `Failed`（它**故意不 skip**）⇒
+         #    全量测试的命令**一贯 deselect 它**，这里也要照做，否则"基线就不是绿的"。
+         "--deselect",
+         "tests/test_plugin_host_e2e.py::test_router_matches_real_implementation_live",
          "-q", "-p", "no:cacheprovider", "--tb=no"],
         cwd=str(ROOT), capture_output=True, text=True, timeout=900, env=env,
     )
