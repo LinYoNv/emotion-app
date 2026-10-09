@@ -1187,18 +1187,34 @@ async function loadChat() {
 
 function renderSessionList() {
   const ul = $("session-list");
+  if (!ul) return;
   ul.innerHTML = "";
   if (!state.sessions.length) {
-    ul.innerHTML = '<li style="cursor:default;color:var(--muted)">还没有会话</li>';
+    // ⚠️ 空态有专门的块（`#session-empty`），这里**不再**插一行占位 ——
+    //    两处都显示"还没有会话"就是同一句话说两遍。
     return;
   }
   for (const s of state.sessions) {
     const li = document.createElement("li");
-    li.textContent = s.title || "(未命名)";
+    const main = document.createElement("div");
+    main.className = "sess-main";
+    const title = document.createElement("span");
+    title.className = "sess-title";
+    title.textContent = s.title || "(未命名)";
+    main.appendChild(title);
+
     const meta = document.createElement("span");
     meta.className = "badge";
-    meta.textContent = `${s.message_count} 条 · ${s.policy.mode}`;
-    li.appendChild(meta);
+    // 🔴 把「这条会话用哪个模型」显示出来（情绪要的就是"每条会话各自的模型"）。
+    //    ⚠️ 没选时如实说「未选模型」 —— 不能显示成某个具体模型名，
+    //       那会让用户以为已经选好了（而聊天会明确拒绝）。
+    const modelLabel = (s.model || "").trim()
+      ? s.model
+      : "未选模型";
+    meta.textContent = `${s.message_count} 条 · ${s.policy.mode} · ${modelLabel}`;
+    if (!(s.model || "").trim()) meta.classList.add("no-model");
+    main.appendChild(meta);
+
     // 未读小标（与消息数那个 badge 并排；只在该会话有未读时出现）
     const unread = (state.unread || {})[s.id] || s.unread || 0;
     if (unread > 0) {
@@ -1206,16 +1222,84 @@ function renderSessionList() {
       u.className = "badge unread-badge";
       u.textContent = String(unread);
       u.title = `${unread} 条未读`;
-      li.appendChild(u);
+      main.appendChild(u);
     }
+    li.appendChild(main);
+
+    // 🔴 **点一下就进聊天**（情绪 2026-10-09：「单击所选会话跳转到聊天」）。
+    //    配置不再在这里改 —— 全搬到「设置 → 配置文件 → 会话」。
+    li.onclick = () => openSessionInChat(s.id);
+    li.title = "点一下进这条会话聊天";
+
+    // 删除：放在行**内部**（而不是全局一个"删除当前"按钮）——
+    //   因为这一页不再有"当前选中的会话"这个概念了，删除必须指名道姓。
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "danger sess-del";
+    del.textContent = "删除";
+    del.title = "删除这条会话（消息会一起删掉，不可恢复）";
+    del.onclick = (e) => {
+      // 🔴 必须挡住冒泡：否则会**先触发 li 的 onclick 跳进聊天**，
+      //    用户看到的是"点了删除却进了聊天"（静默做错事）。
+      e.stopPropagation();
+      deleteSessionById(s);
+    };
+    li.appendChild(del);
+
     if (s.id === state.currentSessionId) li.classList.add("active");
-    li.onclick = () => { state.currentSessionId = s.id; selectSession(s.id); switchToTab("chat"); };
     ul.appendChild(li);
   }
+  // 列表有内容时隐藏空态
+  if ($("session-empty")) $("session-empty").classList.toggle("hidden", !!state.sessions.length);
+}
+
+/** 点会话 → 进聊天（「会话」页唯一的主动作）。 */
+function openSessionInChat(id) {
+  state.currentSessionId = id;
+  selectSession(id);
+  switchToTab("chat");
+}
+
+/** 按 id 删会话（会话页行内按钮 + 设置页的删除按钮共用）。
+ *
+ * 🔴 抽成一个函数是刻意的（本项目「同一概念多条写入路径」已踩 6 次）：
+ *    两处入口必须做**同一件事** —— 同一句确认文案、同一个失败提示、
+ *    同一次列表刷新。复制一份必然漂移。
+ */
+async function deleteSessionById(s) {
+  const name = s.title || "(未命名)";
+  if (!confirm(`删除会话「${name}」？\n\n它里面的 ${s.message_count} 条消息会一起删掉，且不可恢复。`)) {
+    return;
+  }
+  try {
+    await api("DELETE", `/api/v1/sessions/${s.id}`);
+    // 删掉的正好是聊天页当前那条 → 清掉，否则聊天页会去读一个不存在的会话
+    if (state.currentSessionId === s.id) {
+      state.currentSessionId = "";
+      state.currentSession = null;
+    }
+    await loadSessions();
+    showHint($("session-page-hint"), `已删除「${name}」`);
+    showHint($("cfg-session-hint"), `已删除「${name}」`);
+  } catch (e) {
+    showHint($("session-page-hint"), "删除失败：" + e.message, true);
+    showHint($("cfg-session-hint"), "删除失败：" + e.message, true);
+  }
+}
+
+/** 往提示元素里写一句话（`bad=true` 用危险色）。
+ *  ⚠️ 与 `toast()` 的区别：这个**不依赖元素存在**（搬页面时最容易漏的就是某个
+ *     hint 元素已被移走）—— 找不到元素就静默跳过，绝不因此抛错。
+ */
+function showHint(el, msg, bad) {
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = bad ? "var(--danger)" : "";
 }
 
 function renderSessionSelect() {
   const sel = $("session-select");
+  if (!sel) return;
   sel.innerHTML = "";
   if (!state.sessions.length) {
     const o = document.createElement("option");
@@ -1232,47 +1316,115 @@ function renderSessionSelect() {
   }
 }
 
+/** 设置页那个「选择会话」下拉（情绪 2026-10-09：Q1 选 A「加个下拉框」）。
+ *
+ * 🔴 **与聊天页的 `#session-select` 是两个独立控件**，刻意不复用：
+ *    聊天页那个管"我现在跟谁聊"，这个管"我正在配谁"。共用一个的话，
+ *    去设置里配 B 会把聊天对象也换掉（用户会看到聊天页莫名其妙变了）。
+ */
+function renderSessionPicker() {
+  const sel = $("cfg-session-picker");
+  if (!sel) return;
+  const keep = sel.value;          // 保住用户当前选的那条（重绘不该把他弹走）
+  sel.innerHTML = "";
+  if (!state.sessions.length) {
+    const o = document.createElement("option");
+    o.value = ""; o.textContent = "（还没有会话 · 先用右边「+ 新建会话」开一条）";
+    sel.appendChild(o);
+    return;
+  }
+  for (const s of state.sessions) {
+    const o = document.createElement("option");
+    o.value = s.id;
+    const model = (s.model || "").trim();
+    o.textContent = `${s.title || "(未命名)"}（${s.message_count} 条${model ? " · " + model : " · 未选模型"}）`;
+    sel.appendChild(o);
+  }
+  // 优先保住用户刚选的；否则用当前会话；再否则第一条
+  const want = keep || state.currentSessionId || state.sessions[0].id;
+  if (state.sessions.some((s) => s.id === want)) sel.value = want;
+}
+
+/** 渲染「对话模型」下拉 —— **复用 `makeProviderSelect`**，不另写一套。
+ *
+ * 🔴 为什么必须复用（本项目铁律：同一概念不许两条会漂移的路径）：
+ *    那个函数已经处理了两个边界，而它们**各自都出过事**：
+ *      ① 模型被删了 → 显式补一个"（已不在已配置模型里）"的选项，
+ *         不让 select **静默跳到"不指定"**（那会让用户以为是他自己没选）；
+ *      ② 一个模型都没配 → 区分"读失败"和"真的没有"，
+ *         两者给用户的下一步动作完全不同。
+ *    复制一份必然漏掉其中一条。
+ */
+function renderSessionModelField(s) {
+  const host = $("cfg-session-model-fields");
+  if (!host) return;
+  host.innerHTML = "";
+  host.appendChild(
+    buildConfigField(
+      "session",
+      {
+        key: "model",
+        label: "这条会话用哪个模型",
+        type: "provider_select",
+        provider_type: "chat_completion",
+        hint: "留空 = 这条会话还没选模型，聊天会明确提示你去选（不会偷偷用别的）。",
+      },
+      s.model || "",
+    ),
+  );
+  // ⚠️ `buildConfigField` 生成的 id 是 `cfg-session-model` —— 但那是**每条会话各自**
+  //    的字段，用 id 取它会在切会话时读到上一条的旧值。所以这里**只靠 DOM 引用**，
+  //    每次重绘都新造一个，不存在"残留"。
+  const el = host.querySelector("select");
+  if (el) {
+    el.dataset.sessionModel = "1";
+    el.onchange = () => saveSessionModel(s.id, el.value);
+  }
+}
+
+/** 保存"这条会话用哪个模型"（选了就立刻存，不需要再点保存）。
+ *
+ * 🔴 为什么**立刻存**而不是跟"保存"按钮一起提交：
+ *    模型是这条会话的**关键属性**，用户选完就以为生效了。
+ *    要再点一次"保存"的话，他很可能直接去聊天 —— 然后被拒绝（因为没存）。
+ *    当时的观感会是"我明明选了模型，它说我没选"。
+ */
+async function saveSessionModel(sessionId, modelId) {
+  const hint = $("cfg-session-model-hint") || $("cfg-session-hint");
+  try {
+    await api("PATCH", `/api/v1/sessions/${sessionId}`, { model: modelId || "" });
+    state.currentSession = state.sessions.find((x) => x.id === sessionId) || state.currentSession;
+    if (state.currentSession && state.currentSession.id === sessionId) {
+      state.currentSession.model = modelId || "";
+    }
+    const s = state.sessions.find((x) => x.id === sessionId);
+    if (s) s.model = modelId || "";
+    showHint(hint, modelId ? `已保存：这条会话用 ${modelId}` : "已清空：这条会话没有选模型");
+    renderSessionPicker();
+    renderSessionList();
+  } catch (e) {
+    showHint(hint, "保存模型失败：" + e.message, true);
+  }
+}
+
 async function selectSession(id) {
   const s = state.sessions.find((x) => x.id === id);
   if (!s) return;
   state.currentSessionId = id;
   state.currentSession = s;
 
-  $("session-empty").classList.add("hidden");
-  $("session-form").classList.remove("hidden");
-
-  $("s-title").value = s.title || "";
-  // 🔴 插件用户 ID = **umo 第三段**（方案 B）：陪伴按它认人，
-  //    记忆/关系/主动消息开关都挂在这一个值下面。
-  //    ⚠️ 用 `??` 而不是 `||`：只有 null/undefined 才回落空串 ——
-  //       空串本身仍然是**有意义**的（存量会话还没绑标签，走全局默认）。
-  $("s-user-id").value = s.user_id ?? "";
-  // 把**完整 umo** 显示出来（后端算好的，前端绝不自己拼 ——
-  // 平台 id 属于宿主 `host/astrbot_host/umo.py` 的唯一定义）。
-  if ($("s-umo-hint")) {
-    toast(
-      $("s-umo-hint"),
-      s.umo ? `完整 umo：${s.umo}` : "这个会话还没有 umo（保存一个用户 ID 后就有了）",
-    );
-  }
-  $("s-mode").value = s.policy.mode;
-  $("s-tail").value = s.policy.protected_tail;
-  $("s-trigger").value = s.policy.summary_trigger;
-  $("s-summary").value = s.summary || "";
-  $("mode-hint").textContent = MODE_HINTS[s.policy.mode] || "";
-
-  // 人设下拉
-  const sel = $("s-persona");
-  sel.innerHTML = '<option value="">（当前人设）</option>';
-  for (const p of state.personas) {
-    const o = document.createElement("option");
-    o.value = p.id; o.textContent = p.name;
-    if (p.id === s.persona_id) o.selected = true;
-    sel.appendChild(o);
-  }
+  // ⚠️ 配置表单**已经搬到「设置」页**（情绪 2026-10-09），所以这里不再
+  //    "显示表单" —— 它常驻在设置页。这里只负责**把数据灌进去**
+  //    （用户切到设置页时要看到的是**当前这条会话**的配置）。
+  // 🔴 全部用 `showHint` / 存在性判断：搬页面最容易漏的就是某个元素，
+  //    而 `$("x").value = ...` 在元素不存在时会**当场抛错**，
+  //    把 `selectSession` 后面的 `loadHistory`（聊天记录）一起带走。
+  //    实测这正是"搬完页面聊天不显示历史"的成因。
+  fillSessionForm(s);
 
   renderSessionList();
   renderSessionSelect();
+  renderSessionPicker();
   // 🔴 切会话会改变"聊天实际用哪个人设"（会话绑定那层）→ 提示必须跟着重算。
   //    这是 `selectSession` 收敛全部切换入口的好处：只在这里接一次就够
   //    （下拉 / 列表点击 / 路由 / 新建后选中 都走这里）。
@@ -1280,6 +1432,56 @@ async function selectSession(id) {
   await loadHistory(id);
   refreshSessionInfo();
   await markSessionRead(id);
+}
+
+/** 把一条会话的数据灌进**设置页那个表单**。
+ *
+ * 🔴 抽出来是为了让"哪些元素可能不存在"只在一处处理 —— 搬页面时
+ *    `selectSession` 里二十行裸 `$("x").value` 是全项目最容易断的地方。
+ * ⚠️ 每个取值都先确认元素在，再赋值；缺一个**不抛错**（其余字段照样填）。
+ */
+function fillSessionForm(s) {
+  const set = (id, v) => {
+    const el = $(id);
+    if (el) el.value = v;
+  };
+  set("s-title", s.title || "");
+  // 🔴 插件用户 ID = **umo 第三段**（方案 B）：陪伴按它认人，
+  //    记忆/关系/主动消息开关都挂在这一个值下面。
+  //    ⚠️ 用 `??` 而不是 `||`：只有 null/undefined 才回落空串 ——
+  //       空串本身仍然是**有意义**的（存量会话还没绑标签，走全局默认）。
+  set("s-user-id", s.user_id ?? "");
+  // 把**完整 umo** 显示出来（后端算好的，前端绝不自己拼 ——
+  // 平台 id 属于宿主 `host/astrbot_umo` 的唯一定义）。
+  if ($("s-umo-hint")) {
+    toast(
+      $("s-umo-hint"),
+      s.umo ? `完整 umo：${s.umo}` : "这个会话还没有 umo（保存一个用户 ID 后就有了）",
+    );
+  }
+  const policy = s.policy || {};
+  set("s-mode", policy.mode || "recent_only");
+  set("s-tail", policy.protected_tail ?? 20);
+  set("s-trigger", policy.summary_trigger ?? 40);
+  set("s-summary", s.summary || "");
+  if ($("mode-hint")) {
+    $("mode-hint").textContent = MODE_HINTS[policy.mode] || "";
+  }
+
+  // 人设下拉
+  const sel = $("s-persona");
+  if (sel) {
+    sel.innerHTML = '<option value="">（当前人设）</option>';
+    for (const p of state.personas) {
+      const o = document.createElement("option");
+      o.value = p.id; o.textContent = p.name;
+      if (p.id === s.persona_id) o.selected = true;
+      sel.appendChild(o);
+    }
+  }
+
+  // 模型下拉（复用 provider_select 那套控件，见 renderSessionModelField）
+  renderSessionModelField(s);
 }
 
 /** 把某个会话标记为已读（清掉它的未读徽标）。
@@ -1391,9 +1593,21 @@ $("new-session").onclick = $("new-session-2").onclick = async () => {
     $("messages").innerHTML = "";
     renderSessionList();
     renderSessionSelect();
+    renderSessionPicker();
     refreshSessionInfo();
-    switchToTab("chat");
-  } catch (e) { toast($("session-hint"), "创建失败：" + e.message, true); }
+    // 🔴 「会话」页那个新建按钮 → 建完**直接进聊天**（用户在这一页的意图就是开聊）。
+    //    设置页那个 → 留在原地（他是去配的，弹走反而打断）。
+    if (document.activeElement && document.activeElement.id === "new-session-2") {
+      switchToTab("chat");
+    } else {
+      fillSessionForm(s);
+      showHint($("cfg-session-hint"), "已新建会话，去上面那条「对话模型」给它选个模型");
+    }
+  } catch (e) {
+    showHint($("session-hint"), "创建失败：" + e.message, true);
+    showHint($("cfg-session-hint"), "创建失败：" + e.message, true);
+    showHint($("session-page-hint"), "创建失败：" + e.message, true);
+  }
 };
 
 $("clear-session").onclick = async () => {
@@ -1408,13 +1622,24 @@ $("clear-session").onclick = async () => {
   } catch (e) { toast($("chat-hint"), "失败：" + e.message, true); }
 };
 
-$("s-mode").onchange = () => {
-  $("mode-hint").textContent = MODE_HINTS[$("s-mode").value] || "";
-};
+if ($("s-mode")) {
+  $("s-mode").onchange = () => {
+    const h = $("mode-hint");
+    if (h) h.textContent = MODE_HINTS[$("s-mode").value] || "";
+  };
+}
 
-$("session-form").onsubmit = async (e) => {
-  e.preventDefault();
-  if (!state.currentSession) return;
+/* 会话配置表单（现居「设置 → 配置文件 → 会话」）。
+ * ⚠️ 它**不再**是 <form> 的 submit 事件 —— 见下面 `cfgSessionSaveBtn`：
+ *    搬进设置页后它嵌在 `#cfg-session-form` 里，而那个 form 已经有自己的
+ *    submit 处理器（保存全局配置）。两个 submit 处理器套在同一个 form 上
+ *    会**互相干扰**（内层阻止冒泡与否都会有一边不执行）。
+ *    ⇒ 所以这里改成**按钮点击**触发，语义更明确，也不与全局保存冲突。 */
+async function saveSessionConfig() {
+  if (!state.currentSession) {
+    showHint($("cfg-session-hint"), "还没有选中会话（先在上面选一条）", true);
+    return;
+  }
   try {
     const s = await api("PATCH", `/api/v1/sessions/${state.currentSession.id}`, {
       title: $("s-title").value,
@@ -1435,28 +1660,85 @@ $("session-form").onsubmit = async (e) => {
     if (i >= 0) state.sessions[i] = s;
     renderSessionList();
     renderSessionSelect();
+    renderSessionPicker();
     // 刚改了"会话绑定的人设" → 聊天页那行提示要立刻跟着变
     // （否则用户绑完人设、切回聊天页，看到的还是旧提示）。
     renderChatPersonaHint();
-    toast($("session-hint"), "已保存");
+    showHint($("cfg-session-hint"), "已保存");
     refreshSessionInfo();
-  } catch (e2) { toast($("session-hint"), "保存失败：" + e2.message, true); }
-};
+  } catch (e2) {
+    showHint($("cfg-session-hint"), "保存失败：" + e2.message, true);
+  }
+}
 
-$("s-del").onclick = async () => {
-  if (!state.currentSession) return;
-  if (!confirm(`删除会话「${state.currentSession.title}」？消息一并删除。`)) return;
-  try {
-    await api("DELETE", `/api/v1/sessions/${state.currentSession.id}`);
-    state.currentSessionId = "";
-    state.currentSession = null;
-    $("messages").innerHTML = "";
-    $("session-form").classList.add("hidden");
-    $("session-empty").classList.remove("hidden");
-    await loadSessions();
-    refreshSessionInfo();
-  } catch (e) { toast($("session-hint"), "删除失败：" + e.message, true); }
-};
+/** 「保存这条会话的配置」按钮（在设置页里）。
+ *  ⚠️ 用 `type="button"` 语义：它只保存**这条会话**，不提交外层那个全局配置 form。
+ *     （外层 `#cfg-session-form` 的 submit 归 `saveConfigSection("session")`。） */
+const _cfgSessionSaveBtn = $("cfg-session-save");
+if (_cfgSessionSaveBtn) {
+  // 🔴 先摘掉外层 form 的 submit 行为：按钮在 form 里，默认 type=submit
+  //    会**同时**触发全局配置保存 —— 用户点"保存会话"却改了全局设置。
+  _cfgSessionSaveBtn.type = "button";
+  _cfgSessionSaveBtn.onclick = (e) => {
+    e.preventDefault();
+    saveSessionConfig();
+  };
+}
+
+/** 设置页的「删除这条会话」—— 与列表里那个行内删除**共用同一函数**
+ *  （同一概念只许一条写入路径：同一句确认、同一个失败提示、同一次刷新）。 */
+const _cfgSessionDel = $("cfg-session-del");
+if (_cfgSessionDel) {
+  _cfgSessionDel.onclick = () => {
+    const sid = $("cfg-session-picker") ? $("cfg-session-picker").value : "";
+    const s = state.sessions.find((x) => x.id === sid) || state.currentSession;
+    if (!s) {
+      showHint($("cfg-session-hint"), "没有可删除的会话", true);
+      return;
+    }
+    deleteSessionById(s);
+  };
+}
+
+/** 设置页的「选择会话」下拉 → 切到那条会话（**只影响"正在配谁"**，
+ *  与聊天页的 `#session-select` 互不干扰）。 */
+const _cfgSessionPicker = $("cfg-session-picker");
+if (_cfgSessionPicker) {
+  _cfgSessionPicker.onchange = () => {
+    const s = state.sessions.find((x) => x.id === _cfgSessionPicker.value);
+    if (!s) return;
+    // ⚠️ 这里**不调 `selectSession`** —— 那会把"聊天页当前会话"也换掉，
+    //    而用户此刻只是在**改配置**，没说要换聊天对象。
+    state.currentSession = s;
+    fillSessionForm(s);
+    showHint($("cfg-session-model-hint"), `正在配置：${s.title || "(未命名)"}`);
+  };
+}
+
+/** 设置页的「+ 新建会话」—— 复用聊天页那个按钮的处理（`$("new-session-2")`）。
+ *  ⚠️ 不复制一份逻辑：新建会话要同时更新 sessions 数组、当前会话、
+ *     三个渲染函数与状态栏，复制必然漂移。 */
+const _cfgSessionNew = $("cfg-session-new");
+if (_cfgSessionNew) {
+  _cfgSessionNew.onclick = () => {
+    const btn = $("new-session");
+    if (btn) btn.onclick ? btn.onclick() : btn.click();
+  };
+}
+
+/* ⚠️ `#s-del` 这个按钮**已随「会话」页那一版表单一起删除**（情绪 2026-10-09
+ *    「会话页只留跳转聊天/新建/删除」）—— 删除现在有两个入口，都在别处：
+ *      * 会话列表里每行的「删除」按钮（`renderSessionList`）
+ *      * 设置页的「删除这条会话」（`#cfg-session-del`）
+ *    三者**共用** `deleteSessionById()`（同一概念只许一条写入路径）。
+ *    这里保留一个存在性判断，而不是直接删掉这段：万一有旧书签/旧缓存页面
+ *    还带着这个 id 的 DOM，`$("s-del").onclick = ...` 会**当场抛错**，
+ *    把整个脚本后半段（含 umo 复制）一起带走。 */
+if ($("s-del")) {
+  $("s-del").onclick = () => {
+    if (state.currentSession) deleteSessionById(state.currentSession);
+  };
+}
 
 /* ---- umo（插件用户 ID）：复制 / 换一个 ----------------------------------
  *
@@ -1729,6 +2011,21 @@ async function loadConfigProfile() {
     renderConfigSections();
     // 顺带把"已配置的模型"拉回来（provider_select 的选项来源）
     await loadConfigModels();
+
+    // 🔴 **模型列表拉回来之后**，必须重渲染会话相关的两个控件：
+    //      * 设置页的「选择会话」下拉（它要显示每条会话用的模型名）
+    //      * 「这条会话用哪个模型」下拉（选项来自 `state.cfgModels`）
+    //    ⚠️ 我第一版漏了这一步，后果是**下拉里一个模型都没有** ——
+    //       因为 `renderSessionModelField` 在 `cfgModels` 还是空数组时就渲染了，
+    //       之后**再没人重绘**。真机判据 B2 实测"选项 1 个"（只有"不指定"），
+    //       而 `providers.json` 里其实配了 **3 个**。
+    //       用户的观感是"我明明配了模型，这里却选不了" —— 极易误判成模型没配上。
+    //    ⇒ 顺序：**先拿数据、再渲染**；反过来就是"渲染一个空列表然后不管了"。
+    renderSessionPicker();
+    if (state.currentSession) {
+      renderSessionModelField(state.currentSession);
+    }
+
     const n = Object.keys(state.cfgProfile).length;
     // ⚠️ 段名要跟着 `SECTIONS` 走：后端多一段而这里写死两段，就成了**假信息**
     //    （本页只渲染会话/上下文两段，插件段在「插件」页里管）。

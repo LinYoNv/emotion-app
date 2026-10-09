@@ -143,7 +143,71 @@ class ChatService:
         #: 钩子能不能收 `session_id=`（`bind_llm_hook` 时按签名定一次，见
         #: `_accepts_session_id`）。⚠️ 老的一参数钩子仍然是 False —— 兼容。
         self._llm_hook_takes_session: bool = False
+        #: 🔴 **模型解析端口**（情绪 2026-10-09「按会话选模型」）。
+        #:
+        #: 形状：`(model_id: str) -> dict | None`，返回
+        #: `{"base_url": ..., "api_key": ..., "model": ...}`，找不到返回 `None`。
+        #:
+        #: ⚠️ 为什么用**注入的函数**而不是在这里 import 存储：
+        #:    存储住在 `infra/providers_store.py`，而领域层只依赖 Protocol
+        #:    （与 `bind_llm_hook` 同款约定）。装配层（`web/app.py`）负责接线。
+        #:
+        #: ⚠️ 未注入 = 该能力**不存在** ⇒ 走老路径（环境变量/运行时设置），
+        #:    保证既有测试与"没配模型供应商"的部署行为不变。
+        self._model_resolver: Any = None
         self._bg_tasks: set[asyncio.Task] = set()   # 后台任务（防被 GC 回收）
+
+    def bind_model_resolver(self, resolver: Any) -> None:
+        """注入"按模型 id 查 base_url/key"的端口（见 `_model_resolver` 注释）。
+
+        Args:
+            resolver: `(model_id) -> {"base_url", "api_key", "model"} | None`；
+                传 `None` = 关闭该能力。
+        """
+        self._model_resolver = resolver
+        log.info(
+            "会话模型解析端口已接线" if resolver is not None else "会话模型解析端口已关闭",
+            extra={"data": {"wired": resolver is not None}},
+        )
+
+    def resolve_session_model(self, model_id: str) -> UpstreamTarget | None:
+        """把会话上那个**模型 id**（形如 `fast/deepseek-flash`）解析成上游目标。
+
+        Returns:
+            解析成功 → `UpstreamTarget`；未注入解析器 / 找不到该 id /
+            该模型所属源没有 `base_url` → **`None`**
+            （调用方据此**明确报错**，绝不静默回落到别的模型）。
+        """
+        mid = (model_id or "").strip()
+        if not mid or self._model_resolver is None:
+            return None
+        try:
+            found = self._model_resolver(mid)
+        except Exception as exc:  # noqa: BLE001
+            # 解析器是外部注入的 —— 它炸了不能把聊天带走，但**必须留痕**
+            log.error(
+                "解析会话模型失败",
+                extra={"data": {"model_id": mid, "error": f"{type(exc).__name__}: {exc}"}},
+            )
+            return None
+        if not isinstance(found, dict):
+            return None
+        base_url = str(found.get("base_url") or "").strip()
+        if not base_url:
+            # 模型配了、但它挂的源没有 api_base —— 这是**配置不完整**，
+            # 必须让调用方看到，不能在下面悄悄退回环境变量
+            log.warning(
+                "模型 %s 所属的源没有 api_base，无法使用",
+                mid,
+                extra={"data": {"model_id": mid}},
+            )
+            return None
+        return UpstreamTarget(
+            base_url=base_url,
+            api_key=str(found.get("api_key") or ""),
+            model=str(found.get("model") or mid.rsplit("/", 1)[-1]),
+            timeout=self._config.upstream.timeout_seconds,
+        )
 
     def bind_llm_hook(self, hook: Any) -> None:
         """注入 LLM 钩子端口（P0-4）。
@@ -310,12 +374,38 @@ class ChatService:
 
     # ---- 目标解析（人设可覆盖全局）----
 
-    def resolve_target(self, persona: Persona | None, model_override: str = "") -> UpstreamTarget:
+    def resolve_target(
+        self,
+        persona: Persona | None,
+        model_override: str = "",
+        session_model: str = "",
+    ) -> UpstreamTarget:
         """决定这次调用用哪个 base_url / key / model。
 
         优先级（从高到低）：
-          **人设覆盖 > 请求指定(model) > 运行时设置 > 环境变量**
-        ⚠️ 实测爱语支持 per-persona 覆盖（`persona_api_url`/`persona_api_key`/`persona_model`）。
+
+            ① **人设覆盖**（`persona.api_url`/`api_key`/`model`）
+            ② **请求指定**（`model_override`）
+            ③ **会话选择的模型**（`session_model` —— 情绪 2026-10-09 要的「按会话选模型」）
+            ④ 运行时设置（面板「上游连接」那块，正在下线）
+            ⑤ 环境变量（`.env`）
+
+        ⚠️ ③ 与 ④⑤ 的差别不只是"优先级高一点"：
+           ③ 是**用户在界面上明确选的**，所以它解析失败时**必须报错**，
+           不能悄悄退回 ④⑤ —— 那会让用户以为选的那个在用。
+           （本项目铁律：静默用了别的东西 = 最贵的那类 bug。）
+
+        ⚠️ 实测爱语支持 per-persona 覆盖（`persona_api_url`/`persona_api_key`/`persona_model`），
+           所以 ① 位置最高是有依据的，不是拍脑袋。
+
+        Args:
+            session_model: 会话上存的模型 id（形如 `fast/deepseek-flash`）。
+                **空串 = 这条会话没选**，此时照旧走 ④⑤（向后兼容）。
+
+        Raises:
+            不抛异常。③ 解析不出来时**回落**到 ④⑤，但调用方应先调
+            `model_unavailable_reason()` 拿到明确原因并报给用户 ——
+            见 `complete()` / `stream()` 里的用法。
         """
         env = self._config.upstream
         # 运行时设置优先于环境变量（情绪 A1 ②：业务配置要能在面板/App 改）
@@ -324,12 +414,59 @@ class ChatService:
         api_key = rt.get("api_key") or env.api_key
         model = rt.get("model") or env.model
 
+        # ③ 会话选的模型：它自带 base_url/key（来自模型供应商页的那个源），
+        #    所以解析成功后**地址与 key 就定了**。
+        #    ⚠️ 这与 `model_override`（请求级临时指定）**不是互斥关系**：
+        #       "用哪个端点"由会话决定，"这次叫什么模型名"才可以被 override。
+        #       我第一版写成 `if sess_target and not model_override` ——
+        #       结果带 override 时**整个端点都被丢掉、退回环境变量**，
+        #       请求会打到错的地址上（而模型名看着对，极难查）。
+        #       被 `test_request_level_model_override_still_wins` 抓住。
+        sess_target = self.resolve_session_model(session_model) if session_model else None
+        if sess_target is not None:
+            base_url, api_key = sess_target.base_url, sess_target.api_key
+            # 没被 override 时，模型名也用它
+            if not model_override:
+                model = sess_target.model
+
         return UpstreamTarget(
             base_url=(persona.api_url if persona and persona.api_url else base_url),
             api_key=(persona.api_key if persona and persona.api_key else api_key),
             model=model_override or (persona.model if persona and persona.model else "") or model,
             timeout=env.timeout_seconds,
         )
+
+    def model_unavailable_reason(self, session_model: str) -> str:
+        """会话选了模型、但它**用不了**时，返回一句**可行动**的原因；能用则返回 `""`。
+
+        🔴 为什么单独一个函数（而不是在 resolve_target 里顺手打个日志）：
+           这里要产出的是**给用户看的话**，必须包含"去哪修"。
+           只在日志里说，用户看到的就是"聊天没反应"（本项目最忌的静默）。
+
+        三种"用不了"要分得开（用户要做的事完全不同）：
+          ① 没选            → 去设置页给这条会话选一个
+          ② 选了但找不到    → 那个模型在模型供应商页已经没了
+          ③ 找到了但源没地址 → 源配了一半
+        """
+        mid = (session_model or "").strip()
+        if not mid:
+            return (
+                "这条会话还没有选择对话模型。"
+                "请到「设置 → 配置文件 → 会话」里为它选一个模型。"
+            )
+        if self._model_resolver is None:
+            # 没接线：不是用户的错，是我们的装配问题 —— 说清楚，别让用户去瞎配
+            return (
+                f"这条会话选了模型 {mid}，但本服务没有接入模型供应商"
+                "（服务端未装配模型解析器）—— 这是部署问题，请查看服务日志。"
+            )
+        if self.resolve_session_model(mid) is None:
+            return (
+                f"这条会话选的模型 {mid} 现在用不了："
+                "它可能已在「模型供应商」里被删除，或它所属的源还没有填 API 地址。"
+                "请到「模型供应商」检查，或回到「设置 → 配置文件 → 会话」换一个模型。"
+            )
+        return ""
 
     async def resolve_persona(
         self, persona_id: str = "", *, session_id: str = ""
@@ -541,10 +678,50 @@ class ChatService:
 
     # ---- 非流式 ----
 
-    async def complete(self, req: ChatRequest) -> ChatResult:
-        target = self.resolve_target(req.persona, req.model)
+    def _reject_if_model_unusable(self, req: ChatRequest, session: Session | None) -> None:
+        """会话选了模型但它用不了时 → **抛 `ChatError`**（带可行动的原因）。
 
+        🔴 为什么**必须抛**而不是静默回落（这是本功能的关键取舍）：
+           用户既然在界面上为这条会话选了模型，他就有理由相信
+           "这条会话用的是那个模型"。如果它坏了我们还照常回话，
+           那回复就是**另一个模型**生成的，而界面上写着这个 —— 用户无从察觉。
+           本项目最贵的 bug 类型正是"静默用了别的东西"（参考图被丢弃那次）。
+
+        ⚠️ 两种情况**不拦**：
+           ① 会话没选模型 → 走老路径（环境变量/运行时设置），这是向后兼容；
+           ② 请求里显式带了 `req.model` → 那是一次临时指定，用户意图明确。
+        """
+        if req.model:
+            return
+        # ⚠️ `session` 可能是 `None`（没有 session_id 的裸调用）——
+        #    先把模型取出来，别在日志行里直接碰 `session.model`
+        #    （短路能保住判断，但**日志那一行照样会执行**，会炸在 None 上）。
+        session_model = (session.model if session is not None else "").strip()
+        # ⚠️ 只拦"**选了**却用不了"那种；"没选"是合法状态（老会话，走环境变量）
+        if not session_model:
+            return
+        reason = self.model_unavailable_reason(session_model)
+        if not reason:
+            return
+        log.warning(
+            "会话模型不可用，已拒绝本次请求",
+            extra={"data": {"session": req.session_id, "model": session_model, "reason": reason}},
+        )
+        raise ChatError(reason)
+
+    async def complete(self, req: ChatRequest) -> ChatResult:
+        # 🔴 **顺序要紧**：先取会话，再解析目标 —— 因为"用哪个模型"是**会话**上的字段。
+        #    早期版本把 `resolve_target` 写在 `prepare_session` 之前，
+        #    那样读不到 `session.model`，会话级模型**永远不会生效**
+        #    （而且不报错：它会安静地用全局模型，用户以为选的生效了）。
         session, history, summary = await self.prepare_session(req)
+        # ⚠️ `session` **可能是 `None`**（没有 session_id 的裸调用 / 会话不存在）。
+        #    不去碰它的属性 —— 我第一版直接写 `session.model`，
+        #    当场把 32 个既有用例打成 `AttributeError: 'NoneType'`。
+        session_model = session.model if session is not None else ""
+        self._reject_if_model_unusable(req, session)
+        target = self.resolve_target(req.persona, req.model, session_model)
+
         messages = self.build_messages(req, history=history, summary=summary)
         # ⭐ P0-4：让插件在**发给模型之前**改提示词（记忆/人设注入靠这个）
         # 🔴 **必须传 `session_id`**：钩子要用它决定"这次是哪个插件用户"
@@ -748,10 +925,18 @@ class ChatService:
 
         ⚠️ 持久化**在流结束后**做（累积完整回复再写），
            且失败不影响已经流出去的 token。
+        🔴 **顺序要紧**（与 `complete()` 同款，理由见那里）：
+           面板**永远走流式**，所以漏了这里 = 会话级模型整个功能没生效
+           —— 而且不报错，只是安静地用别的模型。
         """
-        target = self.resolve_target(req.persona, req.model)
-
         session, history, summary = await self.prepare_session(req)
+        # ⚠️ `session` **可能是 `None`**（没有 session_id 的裸调用 / 会话不存在）。
+        #    不去碰它的属性 —— 我第一版直接写 `session.model`，
+        #    当场把 32 个既有用例打成 `AttributeError: 'NoneType'`。
+        session_model = session.model if session is not None else ""
+        self._reject_if_model_unusable(req, session)
+        target = self.resolve_target(req.persona, req.model, session_model)
+
         messages = self.build_messages(req, history=history, summary=summary)
         # ⭐ P0-4：与 `complete()` 同款（**流式也要注入**，否则"流式聊天没有记忆"）
         # 🔴 同样**必须传 `session_id`**（理由见 `complete()` 那处）

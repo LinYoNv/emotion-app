@@ -808,6 +808,75 @@ def create_app(
         _mount_plugin_routes(app, config, _require_auth_or_api_key)
 
     # ------------------------------------------------------------------
+    # 按会话选模型（情绪 2026-10-09）
+    # ------------------------------------------------------------------
+
+    # ⭐ 情绪 2026-10-09：**按会话选模型** —— 把"模型 id → base_url/key"的解析器
+    #    接进 ChatService。会话上存的是模型供应商页里的模型 id（`<源id>/<模型名>`），
+    #    所以这里读的是同一份 `data/providers.json`。
+    #
+    # ⚠️ **用回调而不是现在就取 store**（与上面 `_config_profile_path` 同款）：
+    #    `create_app(...)` 执行时，测试还没设 `EMOTION_PROVIDERS_PATH`；
+    #    直接取值会读到默认路径 ⇒ 测试会去碰项目真实的 `data/providers.json`。
+    #    回调在**真正要解析时**才求值，那时配置已经就位。
+    #
+    # ⚠️ 找不到模型时回 `None`，**绝不**假装成功（`resolve_session_model` 会据此报错）。
+    #
+    # ⚠️🔴 这段**必须住在 `create_app` 主流程**，不能放进 `_mount_plugin_routes()`：
+    #     「按会话选模型」跟插件**毫无关系**，而那个函数只在
+    #     `config.plugins.enabled and mount_web_apis` 时才被调用
+    #     ⇒ 不启插件的部署会**永远接不上**。我第一版就写在那儿，
+    #     被 `tests/test_session_model.py` 当场抓住（"未装配模型解析器"）。
+    _chat_svc = app.config.get("EMOTION_CHAT")
+    if _chat_svc is not None and hasattr(_chat_svc, "bind_model_resolver"):
+
+        def _resolve_model(model_id: str) -> dict[str, Any] | None:
+            """把模型 id（`<源id>/<模型名>`）解析成 `{base_url, api_key, model}`。
+
+            🔴 这个函数是「按会话选模型」唯一的解析处 —— 别在别处再写一套
+               （本项目「同一概念多条写入路径」已踩 6 次）。
+            """
+            from ..infra.providers_store import DEFAULT_PATH, ProviderStore
+
+            mid = (model_id or "").strip()
+            if not mid:
+                return None
+            path = app.config.get("EMOTION_PROVIDERS_PATH") or DEFAULT_PATH
+            try:
+                store = ProviderStore(path)
+                model = store.get_model(mid)
+                if model is None:
+                    log.warning(
+                        "会话选的模型在模型供应商里不存在",
+                        extra={"data": {"model_id": mid, "path": str(path)}},
+                    )
+                    return None
+                source = store.get_source(model.provider_source_id)
+                if source is None:
+                    log.warning(
+                        "模型所属的源不存在",
+                        extra={"data": {"model_id": mid, "source": model.provider_source_id}},
+                    )
+                    return None
+                # ⚠️ key 可能是多把（轮询/故障切换）—— 取第一把，与插件侧同口径
+                from .provider_bridge import _first_key
+
+                return {
+                    "base_url": str(getattr(source, "api_base", "") or ""),
+                    "api_key": _first_key(getattr(source, "key", None)),
+                    "model": str(getattr(model, "model", "") or mid.rsplit("/", 1)[-1]),
+                }
+            except Exception as exc:  # noqa: BLE001
+                # 读盘失败不能把聊天带走，但**必须留痕**（静默失败是最贵的 bug）
+                log.error(
+                    "读取模型供应商配置失败",
+                    extra={"data": {"model_id": mid, "error": f"{type(exc).__name__}: {exc}"}},
+                )
+                return None
+
+        _chat_svc.bind_model_resolver(_resolve_model)
+
+    # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
 
@@ -914,6 +983,7 @@ def _mount_plugin_routes(
     if _chat_svc is not None and hasattr(_chat_svc, "bind_llm_hook"):
         _chat_svc.bind_llm_hook(service.apply_llm_hooks)
         log.info("LLM 钩子已接入（插件可在调模型前注入提示词）")
+
 
     methods = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 

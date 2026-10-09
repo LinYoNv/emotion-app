@@ -1384,3 +1384,63 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 .log-critical { border-left-color: var(--danger); }
 .log-error   .log-level,
 .log-critical .log-level { color: var(--danger); }
+
+/* ==========================================================================
+   会话页（2026-10-09 改版）与设置页的会话选择器
+   --------------------------------------------------------------------------
+   「会话」页从"列表 + 编辑表单"缩成**只有列表**（点一下进聊天），
+   所以这里要补：单列布局、每行的删除按钮、未选模型时的提示色。
+   ========================================================================== */
+
+/* 会话页：单列（不再用 `.split` 分栏 —— 右边那个编辑区已经搬去设置页了） */
+.session-picker-page {
+  flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 12px;
+}
+.session-grid { flex: 1; min-height: 0; overflow-y: auto; }
+
+/* 列表行：标题 + 元信息在左，删除按钮在右 */
+.session-grid li {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px; cursor: pointer;
+}
+.session-grid .sess-main {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.session-grid .sess-title {
+  font-size: 14px; font-weight: 500; color: var(--fg);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* ⚠️ 删除按钮**默认低调**（透明、灰字），悬停才变红 ——
+   列表里一排红按钮会把"点进去开聊"这个主操作淹掉。 */
+.session-grid .sess-del {
+  flex: 0 0 auto; padding: 3px 9px; font-size: 12px; line-height: 1.4;
+  background: transparent; border-color: transparent; color: var(--muted);
+}
+.session-grid .sess-del:hover {
+  color: var(--danger); border-color: var(--danger); background: var(--danger-soft);
+}
+
+/* 「未选模型」要**看得出来**：它会导致聊天被明确拒绝（不是小问题），
+   所以用 warn 色而不是跟其它元信息一样的灰 —— 否则用户会忽略它。 */
+.session-grid .badge.no-model { color: var(--warn); }
+
+/* 设置页的「选择会话」工具条 */
+.sev-picker {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 10px 12px; margin-bottom: 4px;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--panel-2);
+}
+.sev-picker-label {
+  flex: 0 0 auto; font-size: 13px; color: var(--fg); font-weight: 500;
+  /* ⚠️ 全局 `label{display:flex;flex-direction:column}` 会命中它 ——
+     显式声明方向，否则这个"标签"会竖排（第八轮那个 126px/行 的同款成因）。 */
+  flex-direction: row; align-items: center;
+}
+.sev-picker select { flex: 1 1 240px; min-width: 0; }
+
+/* 段内小标题（「其他会话设置」）—— 与段标题区分开，别长得一样 */
+.cfg-head-sub {
+  margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border);
+}
+.cfg-head-sub h4 { font-size: 13px; color: var(--muted); font-weight: 600; }

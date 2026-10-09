@@ -67,6 +67,18 @@ class Session:
     #: 上下文策略（每个会话可独立设）
     policy: ContextPolicy = field(default_factory=ContextPolicy)
 
+    #: 🔴 **本会话用哪个模型**（情绪 2026-10-09 要的「按会话选模型」）。
+    #:
+    #: 取值形态 = **模型供应商页里的模型 id**，形如 `fast/deepseek-flash`
+    #: （`<源id>/<模型名>`，与 `providers.json` 的 `default_provider_id` 同一口径）。
+    #:
+    #: 优先级（见 `chat.py:resolve_target`）：人设覆盖 > **本字段** > 环境变量。
+    #:
+    #: ⚠️ 空串 = "没给这条会话单独选"。此时**不再回落**到任何全局模型，
+    #:    而是明确报错说清"这条会话还没选模型、去哪选"。
+    #:    理由：本项目最贵的 bug 类型是"静默用了别的东西，用户以为生效了"。
+    model: str = ""
+
     #: 摘要（rolling/semantic 模式用）
     summary: str = ""
 
@@ -96,6 +108,7 @@ class Session:
             "title": self.title,
             "persona_id": self.persona_id,
             "user_id": self.user_id,
+            "model": self.model,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "policy": self.policy.to_dict(),
@@ -113,6 +126,8 @@ class Session:
             persona_id=str(d.get("persona_id") or ""),
             # ⚠️ 旧数据没有这个字段 → 空串 = 回落全局（向后兼容，见字段注释）
             user_id=str(d.get("user_id") or ""),
+            # ⚠️ 旧数据没有这个字段 → 空串（不是"用了某个默认模型"，就是"没选"）
+            model=str(d.get("model") or ""),
             created_at=float(d.get("created_at", time.time())),
             updated_at=float(d.get("updated_at", time.time())),
             policy=ContextPolicy.from_dict(d.get("policy") or {}),
@@ -329,7 +344,11 @@ class SessionRepository:
             raise SessionNotFound(session_id)
 
         s = sessions[session_id]
-        allowed = {"title", "persona_id", "user_id", "summary", "summarized_upto"}
+        # 🔴 这是**白名单**：不在里面的键会被**静默忽略**（不报错、不落盘）。
+        #    所以加字段时**必须同时加到这里** —— 否则前端传了也没用，
+        #    而用户看到的是"保存成功"（本项目最忌的静默失败）。
+        #    `model` 于 2026-10-09 加入（按会话选模型）。
+        allowed = {"title", "persona_id", "user_id", "summary", "summarized_upto", "model"}
         for k, v in patch.items():
             if k == "policy":
                 if not isinstance(v, dict):
@@ -339,6 +358,8 @@ class SessionRepository:
             elif k in allowed:
                 if k == "user_id":
                     v = _normalize_user_id(v, session_id=session_id)
+                if k == "model":
+                    v = str(v or "").strip()
                 setattr(s, k, v if not isinstance(v, str) else str(v))
 
         s.updated_at = time.time()

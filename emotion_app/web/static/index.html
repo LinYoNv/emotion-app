@@ -125,78 +125,42 @@
 
   <!-- ============ 会话 ============ -->
   <section id="tab-session" class="panel hidden">
-    <div class="split">
-      <aside>
-        <div class="row"><button id="new-session-2" class="primary" type="button">+ 新建会话</button></div>
-        <ul id="session-list" class="list"></ul>
-      </aside>
-      <div class="editor">
-        <div id="session-empty" class="empty">
-          <span class="empty-ico" aria-hidden="true">🗂️</span>
-          <strong>还没选会话</strong>
-          <span>左边点一条会话来改它的设置；<br />或者用「+ 新建会话」开一条新的。</span>
-        </div>
-        <form id="session-form" class="hidden">
-          <label>标题 <input id="s-title" /></label>
-          <label>绑定人设（留空 = 用当前人设）
-            <select id="s-persona"><option value="">（当前人设）</option></select>
-          </label>
-          <label>插件用户 ID（= umo 第三段）
-            <input id="s-user-id" placeholder="例如 sess-a1b2c3d4e5f6" />
-          </label>
-          <p class="hint">
-            陪伴插件<strong>按这个 ID 认人</strong>：记忆 / 关系 / 主动消息开关都挂在它下面，
-            完整 umo 就是 <code>11:FriendMessage:&lt;它&gt;</code>。
-            新建会话时<strong>自动分配一个独有的</strong>，所以可以直接拿它到陪伴面板里
-            建档、开主动消息。<strong>同一个 ID 绑到多个会话时，主动消息只会落到最早建的那个。</strong>
-          </p>
-          <!-- 🔴 这段回答的是"主动消息是不是只能给 default"（情绪 2026-09-27 问）。
-               真相：`default` 只是**存量会话**的回落值，新会话本来就自动分配独有 umo；
-               但光有 umo 还不够 —— 插件那边得**认这个用户**，主动消息才会按它投递。
-               把三步写出来用户照着做就行；否则只能靠猜，而猜错的表现是
-               "主动消息一直落到那条『陪伴（主动消息）』会话"，
-               看起来**像产品不支持**（实际只是没在插件侧建用户）。 -->
-          <details class="umo-howto">
-            <summary>怎么让主动消息落到<strong>这个</strong>会话（而不是 default）</summary>
-            <ol>
-              <li>确认上面的「插件用户 ID」<strong>不是 <code>default</code></strong>
-                  —— 老会话会沿用旧的 <code>default</code>（新建会话才会自动分配），
-                  这时点「换一个专用 umo」即可。</li>
-              <li>点「复制 umo」，拿到 <code>11:FriendMessage:&lt;这个 ID&gt;</code>。</li>
-              <li>到<strong>陪伴插件面板</strong>（插件 → 陪伴 → 拓展页）的
-                  <strong>用户 / 身份</strong>里<strong>添加这个 umo</strong>，
-                  并给它<strong>打开主动消息</strong>。</li>
-            </ol>
-            <p class="hint">
-              ⚠️ 插件侧还没有这个用户时，主动消息会落到<strong>全局兜底 umo</strong>
-              （就是列表里那条「陪伴（主动消息）」会话，绑的是 <code>default</code>）——
-              那是<strong>回落</strong>，不是「只能给 default」。
-              插件侧建好用户后，之后的主动消息就按这个会话投递。
-            </p>
-          </details>
-          <div class="row">
-            <button type="button" id="s-umo-copy">复制 umo</button>
-            <button type="button" id="s-umo-new">换一个专用 umo</button>
-          </div>
-          <p class="hint" id="s-umo-hint"></p>
-          <label>上下文模式
-            <select id="s-mode">
-              <option value="recent_only">滚动上下文（只留最近 N 条）</option>
-              <option value="rolling_summary">动态上下文（摘要 + 最近原文）</option>
-              <option value="semantic">混合模式（前缀稳定，缓存友好）</option>
-            </select>
-          </label>
-          <p class="hint" id="mode-hint"></p>
-          <label>保护窗口（最近 N 条保留原文） <input id="s-tail" type="number" min="1" /></label>
-          <label>总结触发（超出窗口多少条后总结） <input id="s-trigger" type="number" min="1" /></label>
-          <label>摘要（手动编辑；动态/混合模式会注入） <textarea id="s-summary" rows="4"></textarea></label>
-          <div class="row">
-            <button type="submit" class="primary">保存</button>
-            <button type="button" id="s-del" class="danger">删除会话</button>
-          </div>
-          <p class="hint" id="session-hint"></p>
-        </form>
+    <!-- 🔴 **本页只管"开聊"**（情绪 2026-10-09 的要求）：
+         「不行你就把[会话]页的功能改成只有单击所选会话跳转到聊天和新建会话与删除，
+           其他的配置移动到设置-配置文件-会话里。」
+
+         ⇒ 所以这里**只剩三件事**：
+             ① 点一条会话 → **直接进聊天**（不再"点开进详情"）
+             ② 新建会话
+             ③ 删除会话
+         标题 / 绑定人设 / 插件用户 ID / 上下文模式 / 对话模型 / 摘要……
+         全部搬到「设置 → 配置文件 → 会话」。
+
+         ⚠️ 为什么"点一下直接开聊"比原来好：原来点一下只是选中，
+            还要再滚到下面找"保存"；而用户在这一页**真正想做的事**就是开聊。
+            编辑配置是低频动作，搬到设置页反而更清楚（那里本来就是"改设置"的地方）。 -->
+    <div class="session-picker-page">
+      <header class="cfg-head">
+        <h4>选一条会话开聊</h4>
+        <span class="hint">点一下就进聊天；改配置请到「设置 → 配置文件 → 会话」</span>
+      </header>
+
+      <div class="row">
+        <button id="new-session-2" class="primary" type="button">+ 新建会话</button>
       </div>
+
+      <ul id="session-list" class="list session-grid"></ul>
+
+      <div id="session-empty" class="empty">
+        <span class="empty-ico" aria-hidden="true">🗂️</span>
+        <strong>还没有会话</strong>
+        <span>用上面的「+ 新建会话」开一条，然后就能开聊了。</span>
+      </div>
+
+      <!-- 会话页那句"删除"的落点：删除只在**选中**时有意义，
+           所以做成列表里每条自己的按钮（见 JS 的 renderSessions）。
+           ⚠️ 删除是**不可逆**的（消息一起没），所以按钮带 danger 且要 confirm。 -->
+      <p class="hint" id="session-page-hint"></p>
     </div>
   </section>
 
@@ -567,10 +531,96 @@
     <section class="cfg-section" id="cfg-session-section">
       <header class="cfg-head">
         <h4>会话</h4>
-        <span class="hint">默认对话/TTS 模型、人格、重试与显示开关</span>
+        <span class="hint">先选一条会话，再配它自己的对话模型</span>
       </header>
+
+      <!-- 🔴 **按会话选模型**（情绪 2026-10-09 的要求）。
+           「会话」页只管开聊，配置全搬到这里 —— 所以这里必须先有个"配哪条"的选择器。
+           ⚠️ 与聊天页的 `#session-select` **是两个不同的控件、各自独立**：
+              聊天页那个是"我现在要跟谁聊"，这个是"我正在配谁"。
+              复用同一个会互相干扰（切去配 B 就换了聊天对象）—— 刻意不复用。 -->
+      <div class="sev-picker">
+        <label class="sev-picker-label" for="cfg-session-picker">选择会话</label>
+        <select id="cfg-session-picker"></select>
+        <button type="button" id="cfg-session-new">+ 新建会话</button>
+        <button type="button" id="cfg-session-del" class="danger">删除这条会话</button>
+      </div>
+      <p class="hint" id="cfg-session-model-hint"></p>
+
       <form id="cfg-session-form" class="cfg-form">
-        <!-- 字段由 renderConfigSections() 按 schema.session 注入 -->
+        <!-- 「对话模型」由 JS 注入到这里（复用 provider_select 控件，见 renderSessionModelField）。
+             ⚠️ 它**不在**后端 schema 里 —— 因为它是**每条会话各自**的字段
+                （存在会话记录上），不是全局配置，所以不走 renderConfigSections。 -->
+        <div class="cfg-fields" id="cfg-session-model-fields"></div>
+
+        <!-- ======================================================================
+             🔴 以下整块是从「会话」页**搬过来**的（情绪 2026-10-09「其他的配置移动到
+                设置-配置文件-会话里」）。**id 一律保留原样** —— JS 全靠这些 id 取数，
+               改名等于把那一整套逻辑（含 umo 说明、上下文模式提示）全部打断。
+             ⚠️ 搬运时**逐字保留**，包括那些长注释：它们记的都是真机踩出来的坑。
+             ====================================================================== -->
+        <div id="session-form">
+          <label>标题 <input id="s-title" /></label>
+          <label>绑定人设（留空 = 用当前人设）
+            <select id="s-persona"><option value="">（当前人设）</option></select>
+          </label>
+          <label>插件用户 ID（= umo 第三段）
+            <input id="s-user-id" placeholder="例如 sess-a1b2c3d4e5f6" />
+          </label>
+          <p class="hint">
+            陪伴插件<strong>按这个 ID 认人</strong>：记忆 / 关系 / 主动消息开关都挂在它下面，
+            完整 umo 就是 <code>11:FriendMessage:&lt;它&gt;</code>。
+            新建会话时<strong>自动分配一个独有的</strong>，所以可以直接拿它到陪伴面板里
+            建档、开主动消息。<strong>同一个 ID 绑到多个会话时，主动消息只会落到最早建的那个。</strong>
+          </p>
+          <!-- 🔴 这段回答的是"主动消息是不是只能给 default"（情绪 2026-09-27 问）。
+               真相：`default` 只是**存量会话**的回落值，新会话本来就自动分配独有 umo；
+               但光有 umo 还不够 —— 插件那边得**认这个用户**，主动消息才会按它投递。
+               把三步写出来用户照着做就行；否则只能靠猜，而猜错的表现是
+               "主动消息一直落到那条『陪伴（主动消息）』会话"，
+               看起来**像产品不支持**（实际只是没在插件侧建用户）。 -->
+          <details class="umo-howto">
+            <summary>怎么让主动消息落到<strong>这个</strong>会话（而不是 default）</summary>
+            <ol>
+              <li>确认上面的「插件用户 ID」<strong>不是 <code>default</code></strong>
+                  —— 老会话会沿用旧的 <code>default</code>（新建会话才会自动分配），
+                  这时点「换一个专用 umo」即可。</li>
+              <li>点「复制 umo」，拿到 <code>11:FriendMessage:&lt;这个 ID&gt;</code>。</li>
+              <li>到<strong>陪伴插件面板</strong>（插件 → 陪伴 → 拓展页）的
+                  <strong>用户 / 身份</strong>里<strong>添加这个 umo</strong>，
+                  并给它<strong>打开主动消息</strong>。</li>
+            </ol>
+            <p class="hint">
+              ⚠️ 插件侧还没有这个用户时，主动消息会落到<strong>全局兜底 umo</strong>
+              （就是列表里那条「陪伴（主动消息）」会话，绑的是 <code>default</code>）——
+              那是<strong>回落</strong>，不是「只能给 default」。
+              插件侧建好用户后，之后的主动消息就按这个会话投递。
+            </p>
+          </details>
+          <div class="row">
+            <button type="button" id="s-umo-copy">复制 umo</button>
+            <button type="button" id="s-umo-new">换一个专用 umo</button>
+          </div>
+          <p class="hint" id="s-umo-hint"></p>
+          <label>上下文模式
+            <select id="s-mode">
+              <option value="recent_only">滚动上下文（只留最近 N 条）</option>
+              <option value="rolling_summary">动态上下文（摘要 + 最近原文）</option>
+              <option value="semantic">混合模式（前缀稳定，缓存友好）</option>
+            </select>
+          </label>
+          <p class="hint" id="mode-hint"></p>
+          <label>保护窗口（最近 N 条保留原文） <input id="s-tail" type="number" min="1" /></label>
+          <label>总结触发（超出窗口多少条后总结） <input id="s-trigger" type="number" min="1" /></label>
+          <label>摘要（手动编辑；动态/混合模式会注入） <textarea id="s-summary" rows="4"></textarea></label>
+          <p class="hint" id="session-hint"></p>
+        </div>
+
+        <header class="cfg-head cfg-head-sub">
+          <h4>其他会话设置</h4>
+          <span class="hint">这一节是**所有会话共用**的默认值（后端 schema 提供）</span>
+        </header>
+        <!-- 其余字段由 renderConfigSections() 按 schema.session 注入 -->
         <div class="cfg-fields" id="cfg-session-fields"></div>
         <div class="row cfg-actions">
           <button type="submit" id="cfg-session-save" class="primary">保存</button>
