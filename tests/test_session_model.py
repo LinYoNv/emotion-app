@@ -330,3 +330,62 @@ async def test_request_level_model_override_still_wins(make):
     assert call["model"] == "临时模型", call["model"]
     # 端点仍来自会话选的那个模型所属的源
     assert call["url"] == "https://a.test/v1/chat/completions", call["url"]
+
+
+# ===========================================================================
+# ④ 总结该用哪个模型（情绪 2026-10-09：上下文策略改成会话级的副产品）
+# ===========================================================================
+
+
+async def test_summary_target_prefers_session_policy_model(make):
+    """🔴 `policy.summary_model` 优先于会话的对话模型。
+
+    为什么值得单独一条：总结是**低频但可能很贵**的调用（一次读整段旧对话），
+    用户常想让主对话用好模型、总结用便宜快的。如果这里被忽略，
+    他以为换了、实际没换 —— **而且没有任何界面会显示出来**。
+    """
+    c = await make(providers=[
+        ("srcA/model-a", "model-a", "srcA"),
+        ("srcB/model-b", "model-b", "srcB"),
+    ])
+    s = await c.sessions.create(title="总结模型测试")
+    # 对话用 A，总结用 B
+    await c.sessions.update(s.id, {"model": "srcA/model-a"})
+    await c.sessions.update(s.id, {
+        "policy": {"mode": "recent_only", "protected_tail": 6, "summary_trigger": 20,
+                   "summary_model": "srcB/model-b"},
+    })
+
+    sess = await c.sessions.get(s.id)
+    t = c.app.config["EMOTION_CHAT"].resolve_summary_target(sess)
+    assert t.model == "model-b", f"总结没走会话指定的模型，实际用了 {t.model!r}"
+    # ⚠️ 会话级解析出的是**基础地址**（同 `resolve_target` 的口径）
+    assert t.base_url == "https://b.test/v1", t.base_url
+
+
+async def test_summary_target_falls_back_to_session_model(make):
+    """没指定 `summary_model` → 用**这条会话自己的对话模型**。
+
+    ⚠️ 这里最容易写错的是"回落到**全局环境默认**" —— 会话级选模型之后，
+       全局默认已经不是这条会话在用的东西了，拿它做总结等于悄悄换了模型。
+    """
+    c = await make(providers=[("srcA/model-a", "model-a", "srcA")])
+    s = await c.sessions.create(title="只有对话模型")
+    await c.sessions.update(s.id, {"model": "srcA/model-a"})
+    sess = await c.sessions.get(s.id)
+    t = c.app.config["EMOTION_CHAT"].resolve_summary_target(sess)
+    assert t.model == "model-a", f"没有回落到会话自己的模型：{t.model!r}"
+    assert t.base_url == "https://a.test/v1", t.base_url
+
+
+async def test_summary_target_falls_back_to_env_when_nothing_set(make):
+    """两级都没有 → 才走环境默认（**最后一档**，不是第一档）。"""
+    c = await make(providers=[("srcA/model-a", "model-a", "srcA")])
+    s = await c.sessions.create(title="什么都没设")
+    sess = await c.sessions.get(s.id)
+    t = c.app.config["EMOTION_CHAT"].resolve_summary_target(sess)
+    assert t.model == "env-model", t.model
+    # ⚠️ `resolve_target` 给的是**基础地址**（不带 `/chat/completions`）——
+    #    路径是真正发请求时拼的。我第一版按"带路径"断言 ⇒ **假红**
+    #    （产品是对的，是我的期望值写错了；本项目已踩过两次同类）。
+    assert t.base_url == "https://env-fallback.test/v1", t.base_url

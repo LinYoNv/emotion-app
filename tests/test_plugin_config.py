@@ -22,7 +22,12 @@ from __future__ import annotations
 
 import json
 import sys
+import io
 from pathlib import Path
+
+# ⚠️ 用 `quart.datastructures` 那份（项目既有约定，见 `test_persona_ref_http.py`）——
+#    不是 werkzeug 那份：Quart 的测试客户端认的是它自己的 FileStorage。
+from quart.datastructures import FileStorage
 
 import pytest
 
@@ -350,3 +355,179 @@ async def test_display_name_is_not_the_directory_name(make):
     assert not same, (
         f"这些插件的 display_name 与目录名相同 ⇒ 多半是拿目录名冒充的：{same}"
     )
+
+
+# ===========================================================================
+# ④ 插件「配置文件」管理（2026-10-09 情绪「3 也可以做」）
+#     照真实现 `ConfigFileService`：`type: "file"` 的配置项，
+#     文件落在**插件目录**的 `files/<键路径>/` 下。
+# ===========================================================================
+
+
+def test_config_key_folder_matches_real_implementation():
+    """`_config_key_to_folder` 与真实现同语义（点分 → 目录、白名单清洗）。
+
+    ⚠️ 这条守的是**路径安全**：`../` 必须被洗掉，否则就是把用户的
+       上传写到插件目录外面去。
+    """
+    from astrbot_host.host_app import PluginHost
+
+    assert PluginHost._config_key_to_folder("openai_director_fallback_images") == (
+        "openai_director_fallback_images"
+    )
+    assert PluginHost._config_key_to_folder("a.b.c") == "a/b/c"
+    assert PluginHost._config_key_to_folder("") == "_"
+    # 🔴 穿越字符必须被洗掉
+    for evil in ("../evil", "..", "a/../../b", "a\\..\\b"):
+        got = PluginHost._config_key_to_folder(evil)
+        assert ".." not in got, f"{evil!r} 洗出了 {got!r}，含 .."
+
+
+def test_schema_item_finds_nested_file_fields():
+    """`_schema_item` 要能找到**嵌在 object 里**的 file 字段。
+
+    ⚠️ 我第一版只处理了"顶层键"那一种形状，`a.b`（`a` 是 object、
+       `b` 在它的 `items` 里）**找不到** —— 而那正是插件里最常见的嵌套形状。
+       ⇒ 这条判据专门守嵌套。
+    """
+    from astrbot_host.host_app import PluginHost
+
+    sch = {
+        "top": {"type": "file", "file_types": ["png"]},
+        "a": {"type": "object", "items": {"b": {"type": "file", "file_types": ["jpg"]}}},
+    }
+    assert PluginHost._schema_item(sch, "top")["type"] == "file"
+    nested = PluginHost._schema_item(sch, "a.b")
+    assert nested is not None, "嵌套的 file 字段没找到"
+    assert nested["type"] == "file"
+    assert nested["file_types"] == ["jpg"]
+    assert PluginHost._schema_item(sch, "nope") is None
+
+
+#: 真有 `type: "file"` 配置项的插件（本机实测只有一个）。
+#: ⚠️ 不复用 `PLUGIN_ID`（`astrbot_plugin_splitter` 没有 file 字段）——
+#:    拿它测 config-files 只能测到"不是 file 型"那条分支。
+FILE_PLUGIN_ID = "astrbot_plugin_nai_image"
+FILE_CONFIG_KEY = "openai_director_fallback_images"
+
+
+async def test_config_file_routes_require_auth(make):
+    """🔴 三条 config-files 路由**都必须鉴权**。
+
+    本项目真事故：我加的路由漏了 `require_auth()` → 未登录也能读/写，
+    而服务绑 `0.0.0.0` = 公网可访问。
+    ⚠️ 断言 **401**（不是"不是 200"）—— 后者在 500 时也会过。
+    """
+    c = await make(login=False)
+    q = f"?config_key={FILE_CONFIG_KEY}"
+    r = await c.get(f"/api/v1/plugins/{FILE_PLUGIN_ID}/config-files{q}")
+    assert r.status_code == 401, r.status_code
+    r = await c.post(f"/api/v1/plugins/{FILE_PLUGIN_ID}/config-files{q}")
+    assert r.status_code == 401, r.status_code
+    r = await c.delete(f"/api/v1/plugins/{FILE_PLUGIN_ID}/config-files")
+    assert r.status_code == 401, r.status_code
+
+
+async def test_config_files_rejects_non_file_config_item(make):
+    """⚠️ 拿一个**不是 file 型**的配置项去要文件清单 → 409（不是空列表）。
+
+    🔴 为什么必须是 409 而不是"空列表"：
+       "这个配置项不收文件" 与 "这个配置项还没有文件" 是**两件事**，
+       给用户的下一步动作完全不同（前者要改配置项，后者要上传）。
+       显示成空列表 = 用户一直传、一直失败、不知道为什么。
+    """
+    c = await make()
+    r = await c.get(
+        f"/api/v1/plugins/{PLUGIN_ID}/config-files?config_key=__definitely_not_a_key__"
+    )
+    assert r.status_code == 409, await r.get_data(as_text=True)
+    d = await r.get_json()
+    assert "file 类型" in d["error"]["message"] or "不存在" in d["error"]["message"]
+
+
+async def test_config_files_roundtrip_on_real_plugin(make):
+    """在有真 file 字段的插件上跑一遍**列表 → 上传 → 列表 → 删除**。
+
+    ⚠️ 用 `make()` 的 tmp_path 作数据目录（`_cfg` 已经这么配了）——
+       **绝不碰** `/opt/astrbot/data/`（那是别人 AstrBot 的生产数据）。
+    """
+    c = await make()
+    base = f"/api/v1/plugins/{FILE_PLUGIN_ID}/config-files"
+    q = f"?config_key={FILE_CONFIG_KEY}"
+
+    # ① 空清单：必须带 `file_types`（前端要用它生成 accept）
+    r = await c.get(base + q)
+    assert r.status_code == 200, await r.get_data(as_text=True)
+    d = await r.get_json()
+    assert d["files"] == []
+    assert d["file_types"] == ["png", "jpg", "jpeg", "webp"]
+
+    # ② 上传一张真 png
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
+    r = await c.post(
+        base + q,
+        files={"file": FileStorage(io.BytesIO(png), filename="unit_probe.png")},
+    )
+    assert r.status_code == 200, await r.get_data(as_text=True)
+    up = (await r.get_json())["uploaded"]
+    assert len(up) == 1 and up[0]["uploaded"].endswith("unit_probe.png")
+
+    # ③ 清单里真有了
+    r = await c.get(base + q)
+    files = (await r.get_json())["files"]
+    assert any(f.endswith("unit_probe.png") for f in files), files
+
+    # ④ 删掉
+    rel = next(f for f in files if f.endswith("unit_probe.png"))
+    r = await c.delete(base, json={"key": FILE_CONFIG_KEY, "path": rel})
+    assert r.status_code == 200, await r.get_data(as_text=True)
+    r = await c.get(base + q)
+    assert not any(f.endswith("unit_probe.png") for f in (await r.get_json())["files"])
+
+
+async def test_config_file_upload_rejects_bad_extension(make):
+    """⚠️ 扩展名不符要**拒绝**，且理由是人话。
+
+    🔴 为什么这条重要：不校验的话用户能把任意文件传进"只收图片"的配置项，
+       而插件读图失败时**大概率只打一行日志**（本项目最贵的 bug 类型）——
+       用户只会觉得"图没生效"，无从归因。
+    """
+    c = await make()
+    base = f"/api/v1/plugins/{FILE_PLUGIN_ID}/config-files"
+    q = f"?config_key={FILE_CONFIG_KEY}"
+    r = await c.post(
+        base + q,
+        files={"file": FileStorage(io.BytesIO(b"not an image"), filename="evil.txt")},
+    )
+    assert r.status_code == 400, await r.get_data(as_text=True)
+    msg = (await r.get_json())["error"]["message"]
+    # ⚠️ 断言消息里**真的说了**允许哪些类型（不是一句泛泛的"上传失败"）
+    assert ".png" in msg and ".txt" in msg, msg
+
+
+async def test_config_file_delete_rejects_path_escape(make):
+    """🔴 删除必须挡住路径穿越与"删别人文件"。
+
+    两道校验缺一不可（`delete_plugin_config_file`）：
+      ① 路径必须在**这个配置项自己的目录**里 —— 否则能删同插件别的项的文件；
+      ② 不能有 `..` —— 否则能删插件本体（`../../main.py`）。
+    """
+    c = await make()
+    base = f"/api/v1/plugins/{FILE_PLUGIN_ID}/config-files"
+    for bad in (
+        "files/../../main.py",                      # 穿越到插件本体
+        "files/some_other_key/x.png",               # 别的配置项的目录
+        FILE_CONFIG_KEY + "/../x.png",              # 相对穿越
+    ):
+        r = await c.delete(base, json={"key": FILE_CONFIG_KEY, "path": bad})
+        assert r.status_code == 400, f"{bad!r} 居然没被拒：{r.status_code}"
+
+    # 🔴 **必须断言拒绝的【理由】**，不能只看状态码。
+    #    ⚠️ 这条是我被注入验证逼出来的：我第一版只断言 `== 400`，
+    #       而把归属校验停用后，这些路径会走到"文件不存在"那个分支 ——
+    #       **照样是 400、测试照样绿**，于是注入"C3 抓不住"。
+    #       两者对用户的意义完全不同：一个是"你越界了（安全问题）"，
+    #       另一个是"这文件没有（正常的空操作）"。
+    r = await c.delete(base, json={"key": FILE_CONFIG_KEY, "path": "files/some_other_key/x.png"})
+    msg = (await r.get_json())["error"]["message"]
+    assert "不属于这个配置项" in msg, f"拒绝理由不对（可能是走到了「文件不存在」）：{msg}"

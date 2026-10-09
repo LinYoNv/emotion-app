@@ -59,6 +59,24 @@ class ContextPolicy:
     #: 送入上游的总字符预算（粗粒度保护；精确 token 计数留待后续）
     budget_chars: int = 24000
 
+    #: 🔴 **用哪个模型做总结**（情绪 2026-10-09：上下文策略改成会话级）。
+    #:
+    #: 取值形态 = 模型供应商页里的模型 id（`<源id>/<模型名>`）；
+    #: 空串 = **用会话当前的对话模型**（`Summarizer` 构造时那个 model）。
+    #:
+    #: ⚠️ 为什么值得有：总结是**低频但可能很贵**的调用（一次要把整段旧对话读进去）。
+    #:    用户常想让主对话用好模型、总结用便宜快的。
+    #: ⚠️ 它**真会被用**：`Summarizer.maybe_summarize` 收 `model` 并透传到上游
+    #:    （`summarizer.py` 的 `model=model or self._model`）。**不是空壳。**
+    summary_model: str = ""
+
+    #: 🔴 **总结用的提示词**（留空 = 用内置的 `SUMMARY_PROMPT`）。
+    #:
+    #: ⚠️ 它**真会被用**：`build_summary_messages(..., instruction=...)` 拿它当 system 消息。
+    #: ⚠️ 为什么值得暴露：不同人设想要的摘要粒度差别很大（有的要"关键事实"、
+    #:    有的要"情绪走向"），写死一种必然有一半不合用。
+    summary_instruction: str = ""
+
     def validate(self) -> None:
         if self.mode not in VALID_MODES:
             raise ContextError(f"未知 mode：{self.mode!r}，允许 {VALID_MODES}")
@@ -78,6 +96,8 @@ class ContextPolicy:
             "summary_trigger": self.summary_trigger,
             "summary_max_chars": self.summary_max_chars,
             "budget_chars": self.budget_chars,
+            "summary_model": self.summary_model,
+            "summary_instruction": self.summary_instruction,
         }
 
     @classmethod
@@ -88,6 +108,12 @@ class ContextPolicy:
             summary_trigger=int(d.get("summary_trigger", 40)),
             summary_max_chars=int(d.get("summary_max_chars", 2000)),
             budget_chars=int(d.get("budget_chars", 24000)),
+            # ⚠️ 旧会话没有这两个字段 → 空串（= 用内置提示词 / 会话当前模型），
+            #    这正是"没设过"的正确语义，**不是**回落成某个写死的模型名。
+            summary_model=str(d.get("summary_model") or ""),
+            # ⚠️ 提示词是**用户原文**，不能 strip 掉尾部换行再存
+            #    （本项目踩过：`.strip()` 静默改掉用户原文）。
+            summary_instruction=str(d.get("summary_instruction") or ""),
         )
 
 
@@ -239,8 +265,17 @@ SUMMARY_PROMPT = (
 )
 
 
-def build_summary_messages(chunk: list[Message], *, previous_summary: str = "") -> list[Message]:
-    """构造"生成摘要"的请求消息。"""
+def build_summary_messages(
+    chunk: list[Message], *, previous_summary: str = "", instruction: str = ""
+) -> list[Message]:
+    """构造"生成摘要"的请求消息。
+
+    Args:
+        instruction: 自定义总结提示词（情绪 2026-10-09 的会话级字段）。
+            **空串 = 用内置的 `SUMMARY_PROMPT`** —— 不能拿空串去当 system 消息
+            （那会让模型完全没有摘要格式的约束，输出会漂）。
+            ⚠️ 传进来的用户原文**不做 strip**（只判空），理由见 `ContextPolicy.summary_instruction`。
+    """
     lines: list[str] = []
     if previous_summary.strip():
         lines.append(f"【已有摘要】\n{previous_summary.strip()}\n")
@@ -252,6 +287,6 @@ def build_summary_messages(chunk: list[Message], *, previous_summary: str = "") 
             lines.append(f"{who}：{content}")
 
     return [
-        Message(role=ROLE_SYSTEM, content=SUMMARY_PROMPT),
+        Message(role=ROLE_SYSTEM, content=(instruction or "").strip() or SUMMARY_PROMPT),
         Message(role=ROLE_USER, content="\n".join(lines)),
     ]

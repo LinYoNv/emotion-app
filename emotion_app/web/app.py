@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import inspect
 import json as _json
 import time
 import uuid
@@ -1420,3 +1421,131 @@ def _mount_plugin_routes(
                 500,
             )
         return jsonify({"ok": True, "message": message}), 200
+
+    # ======================================================================
+    # 插件「配置文件」三条路由（照真实现，2026-10-09 补）
+    # ======================================================================
+    #
+    # 真实现路径（`dashboard/api/plugins.py:762-814`）：
+    #   GET    /api/v1/plugins/config-files?plugin_id=&config_key=
+    #   POST   /api/v1/plugins/config-files?plugin_id=&config_key=   （multipart）
+    #   DELETE /api/v1/plugins/config-files?plugin_id=               （body: {key, path}）
+    #
+    # 🔴 **每条都先走 `_plugin_guard()`** —— 它含 `require_auth()`。
+    #    本项目真事故：我加的路由漏了鉴权 ⇒ 未登录也能读，而服务绑 0.0.0.0。
+    #    （真实现用的是 `require_plugin_scope`，我们统一用面板令牌。）
+
+    @app.get("/api/v1/plugins/<plugin_id>/config-files")
+    async def plugin_config_files_list(plugin_id: str):  # type: ignore[no-untyped-def]
+        """列出某个 `file` 型配置项已有的文件。"""
+        guard = _plugin_guard(plugin_id)
+        if guard is not None:
+            return guard
+        config_key = (request.args.get("config_key") or "").strip()
+        if not config_key:
+            return jsonify({"error": {"message": "缺少 config_key", "type": "invalid_request"}}), 400
+        # ⚠️ 先确认它**是** file 型：否则"这个配置项不收文件"会被显示成
+        #    "这个配置项还没有文件"（两件事，用户下一步动作完全不同）
+        meta = service.host.plugin_config_file_meta(plugin_id, config_key)
+        if meta is None:
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": f"配置项 {config_key} 不存在，或者它不是 file 类型",
+                            "type": "unsupported",
+                        }
+                    }
+                ),
+                409,
+            )
+        data = service.host.list_plugin_config_files(plugin_id, config_key)
+        if data is None:
+            return jsonify({"error": {"message": f"没有这个插件：{plugin_id}", "type": "not_found"}}), 404
+        data["file_types"] = meta["file_types"]
+        return jsonify(data), 200
+
+    @app.post("/api/v1/plugins/<plugin_id>/config-files")
+    async def plugin_config_files_upload(plugin_id: str):  # type: ignore[no-untyped-def]
+        """上传一个文件到某个 `file` 型配置项。"""
+        guard = _plugin_guard(plugin_id)
+        if guard is not None:
+            return guard
+        config_key = (request.args.get("config_key") or "").strip()
+        if not config_key:
+            return jsonify({"error": {"message": "缺少 config_key", "type": "invalid_request"}}), 400
+
+        files = await request.files
+        uploaded: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for f in files.values():
+            # ⚠️ **`read()` 到底是同步还是要 await，取决于实现** ——
+            #    实测本机（Quart + werkzeug 的 `FileStorage`）是**同步**返回 bytes，
+            #    我第一版按"Quart 一切都 async"写成 `await f.read()` ⇒
+            #    `TypeError: object bytes can't be used in 'await' expression`，
+            #    **每一次上传都失败**（而错误文案还看不出来是"我 await 错了"）。
+            #    ⇒ 两种都容忍：是协程就 await，不是就直接用。
+            #    （参考本项目铁律：别按"看起来该怎样"猜 API，按实测写。）
+            try:
+                data = f.read()
+                if inspect.isawaitable(data):
+                    data = await data
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{getattr(f, 'filename', '?')}：读取失败 {exc}")
+                continue
+            try:
+                uploaded.append(
+                    await service.host.save_plugin_config_file(
+                        plugin_id, config_key, getattr(f, "filename", "") or "", data
+                    )
+                )
+            except ValueError as exc:
+                # ⚠️ 逐条收集**而不是**第一个就返回：用户一次拖 5 张图、
+                #    其中 1 张不是 png，应该告诉他"4 张成功、这张不行"，
+                #    而不是让他反复试。（真实现也是这么收集的）
+                errors.append(f"{getattr(f, 'filename', '?')}：{exc}")
+            except Exception as exc:  # noqa: BLE001
+                log.exception("上传插件配置文件失败", extra={"data": {"plugin": plugin_id}})
+                errors.append(f"{getattr(f, 'filename', '?')}：{type(exc).__name__}: {exc}")
+
+        if not uploaded:
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": "上传失败：" + ("；".join(errors) if errors else "没有文件"),
+                            "type": "invalid_request",
+                        },
+                        "errors": errors,
+                    }
+                ),
+                400,
+            )
+        return jsonify({"ok": True, "uploaded": uploaded, "errors": errors}), 200
+
+    @app.delete("/api/v1/plugins/<plugin_id>/config-files")
+    async def plugin_config_files_delete(plugin_id: str):  # type: ignore[no-untyped-def]
+        """删掉一个已上传的文件（body: `{"key": ..., "path": ...}`）。"""
+        guard = _plugin_guard(plugin_id)
+        if guard is not None:
+            return guard
+        body = await request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request"}}), 400
+        config_key = str(body.get("key") or "").strip()
+        rel_path = str(body.get("path") or "").strip()
+        if not config_key or not rel_path:
+            return jsonify({"error": {"message": "缺少 key / path", "type": "invalid_request"}}), 400
+        try:
+            out = service.host.delete_plugin_config_file(plugin_id, config_key, rel_path)
+        except ValueError as exc:
+            # ⚠️ 文件不存在/路径越界都走这里 —— **必须报错**，
+            #    不能静默返回 200（"删了但没删掉"是最难查的一类）
+            return jsonify({"error": {"message": str(exc), "type": "invalid_request"}}), 400
+        except Exception as exc:  # noqa: BLE001
+            log.exception("删除插件配置文件失败", extra={"data": {"plugin": plugin_id}})
+            return (
+                jsonify({"error": {"message": f"删除失败：{type(exc).__name__}: {exc}", "type": "internal_error"}}),
+                500,
+            )
+        return jsonify({"ok": True, "message": f"已删除 {out['deleted']}"}), 200

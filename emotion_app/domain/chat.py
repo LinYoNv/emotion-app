@@ -338,7 +338,15 @@ class ChatService:
         try:
             session = await self._sessions.get(session_id)
             msgs = await self._sessions.messages(session_id)
-            target = self.resolve_target(None)
+            # 🔴 **总结该用哪个模型**（情绪 2026-10-09 的会话级字段）：
+            #    ① 会话 policy 里显式指了 `summary_model` → 用它（**那是模型 id**，
+            #       要经 `resolve_session_model` 解析成 base_url/key）；
+            #    ② 没指 → 用"这条会话自己的对话模型"（不是全局默认！）——
+            #       因为会话级选模型之后，"全局默认"已经不是它实际在用的东西了。
+            #    ⚠️ 原来这里写的是 `resolve_target(None)` = **完全忽略会话**
+            #       ⇒ 总结会偷偷用另一个模型，而用户以为用的是他选的那个
+            #       （本项目最忌的"静默用了别的东西"）。
+            target = self.resolve_summary_target(session)
 
             outcome = await self._summarizer.maybe_summarize(
                 session_id=session_id,
@@ -349,6 +357,9 @@ class ChatService:
                 base_url=target.base_url,
                 api_key=target.api_key,
                 timeout=target.timeout,
+                # ⚠️ 传**上游真正的模型名**（`target.model` 已经是解析后的名字）；
+                #    不传的话 Summarizer 会用构造时那个默认模型名。
+                model=target.model,
             )
 
             if outcome.ran and outcome.ok:
@@ -435,6 +446,44 @@ class ChatService:
             model=model_override or (persona.model if persona and persona.model else "") or model,
             timeout=env.timeout_seconds,
         )
+
+    def resolve_summary_target(self, session: Any) -> UpstreamTarget:
+        """总结该打到哪个上游目标（会话级 `summary_model` 优先）。
+
+        🔴 三级回落，**每一级都是"这条会话"自己的东西**：
+            ① `policy.summary_model`（用户为总结单独指定的模型 id）
+            ② 会话自己选的对话模型（`session.model`）
+            ③ 环境变量/运行时设置（`resolve_target` 的默认行为）
+
+        ⚠️ 为什么不做成"直接用 ①，解析失败就报错"：
+           总结是**后台任务**，它失败只影响摘要新旧，不该把用户的聊天打断
+           （`schedule_summarize` 的注释就是这个约束）。所以这里逐级回落，
+           并在**每次回落时记日志** —— 不静默，但不阻塞。
+
+        ⚠️ ①② 解析出来的是 `UpstreamTarget`，③ 是 `resolve_target` 的产物 ——
+           两者形状相同，所以下面统一成一个返回值。
+        """
+        policy_model = str(getattr(session.policy, "summary_model", "") or "").strip()
+        if policy_model:
+            t = self.resolve_session_model(policy_model)
+            if t is not None:
+                return t
+            log.warning(
+                "会话指定的总结模型不可用，回落到会话对话模型",
+                extra={"data": {"summary_model": policy_model}},
+            )
+        # ② 会话自己的对话模型
+        session_model = str(getattr(session, "model", "") or "").strip()
+        if session_model:
+            t = self.resolve_session_model(session_model)
+            if t is not None:
+                return t
+            log.warning(
+                "会话对话模型不可用，总结回落到环境默认",
+                extra={"data": {"session_model": session_model}},
+            )
+        # ③ 兜底
+        return self.resolve_target(None)
 
     def model_unavailable_reason(self, session_model: str) -> str:
         """会话选了模型、但它**用不了**时，返回一句**可行动**的原因；能用则返回 `""`。

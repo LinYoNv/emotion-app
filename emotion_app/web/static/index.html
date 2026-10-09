@@ -634,6 +634,19 @@
           <p class="hint" id="mode-hint"></p>
           <label>保护窗口（最近 N 条保留原文） <input id="s-tail" type="number" min="1" /></label>
           <label>总结触发（超出窗口多少条后总结） <input id="s-trigger" type="number" min="1" /></label>
+          <!-- 🔴 **总结用哪个模型**（情绪 2026-10-09：上下文策略改成会话级）。
+               选项由 `renderSessionSummaryModelField()` 从模型供应商里填。
+               ⚠️ 与「对话模型」是**两个独立的下拉**：主对话与总结可以各用一个模型
+                  （总结是低频但可能很贵的调用，让总结走便宜快的模型是常见诉求）。 -->
+          <label>总结用的模型
+            <select id="s-summary-model"></select>
+          </label>
+          <p class="hint" id="s-summary-model-hint"></p>
+          <label>总结提示词（留空 = 用内置）
+            <textarea id="s-summary-instruction" rows="3"
+                      placeholder="留空则用内置提示词"></textarea>
+          </label>
+          <p class="hint">留空 = 用内置提示词（要求模型输出一段简洁摘要）。填了就整段替换它 —— 想保留格式要求请自己写上。</p>
           <label>摘要（手动编辑；动态/混合模式会注入） <textarea id="s-summary" rows="4"></textarea></label>
           <p class="hint" id="session-hint"></p>
         </div>
@@ -651,20 +664,15 @@
       </form>
     </section>
 
-    <section class="cfg-section" id="cfg-context-section">
-      <header class="cfg-head">
-        <h4>上下文管理策略</h4>
-        <span class="hint">三种上下文模式 + 触发压缩/总结的细项</span>
-      </header>
-      <form id="cfg-context-form" class="cfg-form">
-        <!-- 字段由 renderConfigSections() 按 schema.context 注入 -->
-        <div class="cfg-fields" id="cfg-context-fields"></div>
-        <div class="row cfg-actions">
-          <button type="submit" id="cfg-context-save" class="primary">保存</button>
-          <p class="hint" id="cfg-context-hint"></p>
-        </div>
-      </form>
-    </section>
+    <!-- 🔴 **「上下文管理策略」整段已删除**（情绪 2026-10-09：「上下文策略一样做成会话级的，
+         不做全局」）。
+         ⚠️ 原来这里有 10 个全局字段，其中 7 个是**零消费**的空壳
+            （`context_limit_reached_strategy` / `llm_compress_*` 三个 /
+            `fallback_max_context_tokens` 全库 0 处读取），
+            另 3 个与会话级重复 —— 而真正生效的一直是**会话级**（`Session.policy`）。
+         ⇒ 能力没丢，是**收敛到会话级一处**：
+            「会话」页选会话 → 「对话模型」+ 「上下文策略」都在那里。
+         ⚠️ 真能生效的两项（总结模型 / 总结提示词）已加进会话级。 -->
 
     <!-- 恢复默认：后端 `DELETE /api/v1/config-profile` 是**整份配置文件**级的
          （没有分段参数）→ 所以这里只有一个按钮，确认文案里也如实说"两段一起清"。 -->

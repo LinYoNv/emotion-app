@@ -1583,7 +1583,12 @@ def build_blueprint(require_auth: Any) -> Blueprint:
             return _err(f"会话不存在：{session_id}", "not_found", 404)
 
         msgs = await repo.messages(session_id)
-        target = chat.resolve_target(None)
+        # 🔴 **与后台总结走同一个解析器**（`_resolve_summary_target`）——
+        #    这里原来写的是 `chat.resolve_target(None)`（**忽略会话**），
+        #    那样手动总结与自动总结会**用不同的模型**，
+        #    而用户看到的结果差异无从解释（"同一段对话，手动总结和自动总结不一样"）。
+        #    ⚠️ 本项目「同一概念两条写入路径」的又一次预防：两处**必须同源**。
+        target = chat.resolve_summary_target(session)
         body = await request.get_json(silent=True) or {}
 
         outcome = await chat._summarizer.maybe_summarize(
@@ -1595,6 +1600,8 @@ def build_blueprint(require_auth: Any) -> Blueprint:
             base_url=target.base_url,
             api_key=target.api_key,
             timeout=target.timeout,
+            # ⚠️ 同上：传上游真正的模型名，否则会用 Summarizer 的默认模型名
+            model=target.model,
             force=bool(body.get("force", True)),
         )
 

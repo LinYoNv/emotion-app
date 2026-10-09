@@ -1475,6 +1475,8 @@ function fillSessionForm(s) {
   set("s-mode", policy.mode || "recent_only");
   set("s-tail", policy.protected_tail ?? 20);
   set("s-trigger", policy.summary_trigger ?? 40);
+  // 🔴 总结模型 / 总结提示词（情绪 2026-10-09 的会话级两项）
+  set("s-summary-instruction", policy.summary_instruction || "");
   set("s-summary", s.summary || "");
   if ($("mode-hint")) {
     $("mode-hint").textContent = MODE_HINTS[policy.mode] || "";
@@ -1494,6 +1496,58 @@ function fillSessionForm(s) {
 
   // 模型下拉（复用 provider_select 那套控件，见 renderSessionModelField）
   renderSessionModelField(s);
+  // 总结模型下拉（同一套控件，独立的一个 select）
+  renderSessionSummaryModelField(s);
+}
+
+/** 渲染「总结用哪个模型」下拉。
+ *
+ * 🔴 复用自己的 `makeProviderSelect` —— **不写第二套**（本项目「同一概念不要多条路径」）。
+ * ⚠️ 与「对话模型」是**两个独立控件**：都叫 provider_select，但存进 policy 的不同键。
+ */
+function renderSessionSummaryModelField(s) {
+  const host = $("s-summary-model");
+  if (!host) return;
+  const policy = s.policy || {};
+  // ⚠️ `makeProviderSelect(f, value)` 收的是**字段对象**（不是类型字符串），
+  //    返回的是**包着 select 的 span**，不是 select 本身
+  //    —— 我第一版按 `makeProviderSelect("chat_completion", ...)` 写，是**编造签名**
+  //    （本项目铁律：别编造 API）。这里照 `renderSessionModelField` 的真实用法。
+  const box = makeProviderSelect(
+    { key: "summary_model", provider_type: "chat_completion" },
+    policy.summary_model || "",
+  );
+  host.innerHTML = "";
+  host.appendChild(box);
+  const sel = box.querySelector("select");
+  if (sel) {
+    // ⚠️ 去 id（会与「对话模型」那个撞），只靠 DOM 引用 —— 每次重绘都新造，无残留
+    sel.removeAttribute("id");
+    sel.dataset.sessionSummaryModel = "1";
+    sel.onchange = () => saveSessionSummaryModel(s.id, sel.value);
+  }
+  if ($("s-summary-model-hint")) {
+    $("s-summary-model-hint").textContent = "留空 = 用这条会话的对话模型。";
+  }
+}
+
+/** 立刻保存"总结用哪个模型"（与「对话模型」同样的即时语义）。 */
+async function saveSessionSummaryModel(sessionId, modelId) {
+  const hint = $("s-summary-model-hint");
+  try {
+    // ⚠️ 必须**带上 policy 的其它键**：后端 PATCH policy 是整块替换，
+    //    只发 summary_model 会把 mode/protected_tail 等冲成默认值。
+    const cur = (state.currentSession || {}).policy || {};
+    const s = await api("PATCH", `/api/v1/sessions/${encodeURIComponent(sessionId)}`, {
+      policy: { ...cur, summary_model: modelId },
+    });
+    state.currentSession = s;
+    const i = state.sessions.findIndex((x) => x.id === s.id);
+    if (i >= 0) state.sessions[i] = s;
+    showHint(hint, modelId ? `总结将使用：${modelId}` : "总结将使用这条会话的对话模型");
+  } catch (e) {
+    showHint(hint, "保存失败：" + e.message, true);
+  }
 }
 
 /** 把某个会话标记为已读（清掉它的未读徽标）。
@@ -1665,6 +1719,12 @@ async function saveSessionConfig() {
         mode: $("s-mode").value,
         protected_tail: parseInt($("s-tail").value, 10) || 20,
         summary_trigger: parseInt($("s-trigger").value, 10) || 40,
+        // 🔴 这两项必须**一起提交** —— policy 是整块替换，
+        //    漏了它们会把用户刚设的总结模型/提示词静默清空
+        //    （而"保存"看起来是成功的）。
+        summary_model: (state.currentSession || {}).policy?.summary_model || "",
+        // ⚠️ 提示词是**用户原文**：不 trim（只判空），否则会静默改掉他写的尾部换行
+        summary_instruction: $("s-summary-instruction").value,
       },
     });
     state.currentSession = s;
@@ -2052,13 +2112,16 @@ async function loadConfigProfile() {
     renderSessionPicker();
     if (state.currentSession) {
       renderSessionModelField(state.currentSession);
+      // ⚠️ 同一个坑：总结模型下拉也在 `cfgModels` 到位**之前**渲染过
+      //    ⇒ 拉回来之后必须**也**重绘它，否则它永远是空的（用户以为没配模型）。
+      renderSessionSummaryModelField(state.currentSession);
     }
 
     const n = Object.keys(state.cfgProfile).length;
     // ⚠️ 段名要跟着 `SECTIONS` 走：后端多一段而这里写死两段，就成了**假信息**
     //    （本页只渲染会话/上下文两段，插件段在「插件」页里管）。
     let msg = `已读取配置（${n} 段：${Object.keys(state.cfgProfile).join(" / ")}；`
-      + `本页渲染「会话」「上下文」，插件启停在「插件」页）。字段由后端 schema 提供。`;
+      + `本页渲染「会话」，插件启停在「插件」页）。字段由后端 schema 提供。`;
     if (state.cfgModelsError) msg += ` ⚠️ ${state.cfgModelsError}`;
     toast(hint, msg, !!state.cfgModelsError);
   } catch (e) {
@@ -2066,7 +2129,7 @@ async function loadConfigProfile() {
     state.cfgSchema = null;
     // 🔴 失败**不隐藏表单**，但要**说清原因**（隐藏了用户就以为"这页没功能"）
     toast(hint, `读取配置失败：${e.message}`, true);
-    for (const id of ["cfg-session-fields", "cfg-context-fields"]) {
+    for (const id of ["cfg-session-fields"]) {
       const el = $(id);
       if (el) el.innerHTML = "";
     }
@@ -2097,11 +2160,17 @@ async function loadConfigModels() {
   }
 }
 
-/** 按 schema 渲染两段表单（**每次重渲染，避免残留旧值**）。 */
+/** 按 schema 渲染表单（**每次重渲染，避免残留旧值**）。
+ *
+ * 🔴 2026-10-09：原来渲染**两段**（session + context）。
+ *    全局 `context` 段已删除（情绪：「上下文策略一样做成会话级的，不做全局」）
+ *    ⇒ 这里只剩一段。
+ *    ⚠️ **上下文策略的能力没丢** —— 它搬到了「设置 → 配置文件 → 会话」里的
+ *       `会话策略` 一组（那是 `Session.policy`，**真在生效**的那份）。
+ */
 function renderConfigSections() {
   const sch = state.cfgSchema || {};
   renderConfigSection("session", sch.session, $("cfg-session-fields"));
-  renderConfigSection("context", sch.context, $("cfg-context-fields"));
 }
 
 function renderConfigSection(section, fields, host) {
@@ -2356,7 +2425,11 @@ async function resetConfigProfile() {
 //    ⇒ 是 `tools/upstream_removed_check.py` 的 B2 判据抓住的
 //      （它专门断言"点了之后**真发出请求**"，而不是"按钮存在"）。
 $("cfg-session-form").onsubmit = (e) => { e.preventDefault(); saveConfigSection("session"); };
-$("cfg-context-form").onsubmit = (e) => { e.preventDefault(); saveConfigSection("context"); };
+// 🔴 原来这里还有一行 `$("cfg-context-form").onsubmit = ...` —— 那个表单已随
+//    全局 context 段一起删除。**不能留**：元素不存在时 `$()` 返回 null，
+//    读 `.onsubmit` 会**当场抛 TypeError**，而它在脚本顶层 ⇒
+//    后面所有接线（重置按钮、日志页 5 条）全部不执行 —— **零报错、全静默**。
+//    （第十八轮那次真实事故就是这个形状，见 `tools/upstream_removed_check.py`）
 $("cfg-reset").onclick = () => resetConfigProfile();
 
 // ---- 日志：刷新 / 复制 / 自动刷新开关 ----
@@ -4347,6 +4420,8 @@ function showPluginsView(which) {
     //    不丢的话，下次打开另一个插件的配置页会先闪出上一个插件的值
     //    （而用户很可能就在那一瞬间点了保存 → **把 A 的配置存进 B**）。
     state.pluginConfig = null;
+    // 🔴 同理清掉 file 值缓存（键路径跨插件重名，见 `openPluginConfig` 里的注释）
+    state.pluginFileValues = {};
   }
   if (which === "list") state.pluginCurrentId = "";
 }
@@ -4393,8 +4468,246 @@ function pluginFieldType(spec) {
   return null;
 }
 
+/* ================================================================================
+ * 插件的 `file` 型配置项（2026-10-09，照真 AstrBot 的 config-files）
+ *
+ * 情绪：「3 也可以做」—— 插件配置文件的列出/上传/删除。
+ *
+ * ## 真实现语义（`dashboard/api/plugins.py:762-814`）
+ *   一个 `type: "file"` 的配置项，值是一个**路径数组**；文件真实落在
+ *   **插件目录的 `files/<配置键路径>/`** 下。上传**只落盘、不写配置值** ——
+ *   用户再在配置页把路径填进那个数组，两个动作是分开的。
+ *   ⇒ 这个控件要同时呈现**两件事**：① 盘上有哪些文件 ② 配置值里引用了哪些。
+ *      它们**可能不一致**（传了但没填 / 填了但文件被删），
+ *      而"不一致"恰恰是用户最需要看见的 —— 所以下面显式标出来。
+ *
+ * ## 为什么值要自己维护在 state 里
+ *   普通控件的值能从 DOM 直接读（`input.value`）。这个控件是"按钮 + 清单"，
+ *   没有单一控件承载值 ⇒ 把**当前路径数组**存在
+ *   `state.pluginFileValues[<键路径>]`，收集器从那里取。
+ *   ⚠️ 不用 DOM 属性存：属性只能存字符串，来回 JSON 编解码容易出错且难查。
+ * ================================================================================ */
+
+/** 当前各 file 型配置项的值（键路径 → 路径数组）。收集器从这里读。 */
+if (!state.pluginFileValues) state.pluginFileValues = {};
+
+/** 画一个 `file` 型配置项。返回容纳它的元素（调用方会打 data 属性）。 */
+function buildPluginFileField(pluginId, key, spec, value, pathPrefix) {
+  const path = pathPrefix ? `${pathPrefix}.${key}` : key;
+  const box = document.createElement("div");
+  box.className = "cfg-field plugin-cfg-file";
+
+  const title = document.createElement("span");
+  title.className = "cfg-label";
+  title.textContent = spec.description || key;
+  box.appendChild(title);
+
+  if (spec.hint) {
+    const h = document.createElement("small");
+    h.className = "hint";
+    h.textContent = spec.hint;
+    box.appendChild(h);
+  }
+
+  // 值规整成字符串数组（插件声明 default 可能是 []、也可能缺失）
+  const initial = Array.isArray(value) ? value.map((x) => String(x)) : [];
+  state.pluginFileValues[path] = initial.slice();
+
+  const list = document.createElement("div");
+  list.className = "plugin-file-list";
+  box.appendChild(list);
+
+  const actions = document.createElement("div");
+  actions.className = "row plugin-file-actions";
+  const pick = document.createElement("input");
+  pick.type = "file";
+  pick.multiple = true;
+  // ⚠️ `accept` 用插件声明的 `file_types` 生成 —— 让系统文件框**先**过滤一道，
+  //    但**不能**只靠它（那只是提示，用户仍可选"所有文件"）⇒ 服务端照样校验。
+  const types = Array.isArray(spec.file_types) ? spec.file_types : [];
+  if (types.length) pick.accept = types.map((t) => "." + String(t).replace(/^\./, "")).join(",");
+  pick.className = "plugin-file-pick";
+  const upBtn = document.createElement("button");
+  upBtn.type = "button";
+  upBtn.textContent = "上传";
+  upBtn.className = "plugin-file-upload";
+  const hint = document.createElement("small");
+  hint.className = "hint plugin-file-hint";
+
+  actions.appendChild(pick);
+  actions.appendChild(upBtn);
+  box.appendChild(actions);
+
+  upBtn.onclick = async () => {
+    const files = Array.from(pick.files || []);
+    if (!files.length) {
+      showHint(hint, "先选文件再点上传", true);
+      return;
+    }
+    showHint(hint, "正在上传…");
+    const fd = new FormData();
+    for (const f of files) fd.append("file", f, f.name);
+    try {
+      const r = await fetch(
+        `/api/v1/plugins/${encodeURIComponent(pluginId)}/config-files`
+          + `?config_key=${encodeURIComponent(key)}`,
+        { method: "POST", body: fd },
+      );
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        // ⚠️ 后端逐条收集了错误（"5 张里这张不行"）→ **原样透出**，
+        //    不简化成一句"上传失败"（那样用户得反复试）
+        throw new Error((d.error && d.error.message) || `HTTP ${r.status}`);
+      }
+      const okN = (d.uploaded || []).length;
+      const errs = d.errors || [];
+      showHint(
+        hint,
+        `已上传 ${okN} 个${errs.length ? "；" + errs.join("；") : ""}`
+          + "。⚠️ 上传只是把文件放进插件目录，**还要把它填进下面的列表并保存**才会生效。",
+        errs.length > 0,
+      );
+      pick.value = "";
+      await refreshPluginFileList(pluginId, key, path, list, hint, spec);
+    } catch (e) {
+      showHint(hint, "上传失败：" + e.message, true);
+    }
+  };
+
+  box.appendChild(hint);
+  // 首次渲染就去拉一次清单（异步；失败会在 hint 里说明）
+  refreshPluginFileList(pluginId, key, path, list, hint, spec);
+  return box;
+}
+
+/** 拉取"盘上有哪些文件"并重画清单。 */
+async function refreshPluginFileList(pluginId, key, path, list, hint, spec) {
+  try {
+    const d = await api(
+      "GET",
+      `/api/v1/plugins/${encodeURIComponent(pluginId)}/config-files`
+        + `?config_key=${encodeURIComponent(key)}`,
+    );
+    renderPluginFileList(pluginId, key, path, list, hint, d.files || [], spec);
+  } catch (e) {
+    // 🔴 读不到**不能**显示成"没有文件" —— 那会让用户重复上传
+    list.innerHTML = "";
+    const p = document.createElement("small");
+    p.className = "hint";
+    p.textContent = `读取已上传文件失败：${e.message}`;
+    list.appendChild(p);
+  }
+}
+
+/** 重画清单：**盘上的文件** + **配置值引用了哪些**，并标出不一致。 */
+function renderPluginFileList(pluginId, key, path, list, hint, files, spec) {
+  list.innerHTML = "";
+  const referenced = state.pluginFileValues[path] || [];
+
+  if (!files.length) {
+    const p = document.createElement("small");
+    p.className = "hint";
+    p.textContent = "（还没有上传任何文件）";
+    list.appendChild(p);
+  }
+
+  for (const rel of files) {
+    const row = document.createElement("div");
+    row.className = "plugin-file-row";
+
+    const name = document.createElement("span");
+    name.className = "plugin-file-name";
+    // ⚠️ 显示**文件名**而不是整条相对路径：路径里那段目录名（= 配置键）
+    //    对用户没有信息量，还长到把按钮挤出去。
+    name.textContent = rel.split("/").pop();
+    name.title = rel;               // 完整路径放 title（悬停可见）
+    row.appendChild(name);
+
+    // 配置值里引用了它吗？—— 这是"传了但没填"最直观的提示
+    const used = referenced.includes(rel);
+    const badge = document.createElement("span");
+    badge.className = "badge " + (used ? "ok" : "no-model");
+    badge.textContent = used ? "已启用" : "未启用";
+    badge.title = used
+      ? "配置里引用了这个文件"
+      : "文件已上传，但配置的列表里还没有它 —— 需要点下面的「加入列表」再保存";
+    row.appendChild(badge);
+
+    if (!used) {
+      const add = document.createElement("button");
+      add.type = "button";
+      add.className = "plugin-file-add";
+      add.textContent = "加入列表";
+      add.onclick = () => {
+        // ⚠️ 改的是**我们维护的那份值**，然后把控件重画一遍让徽标跟上。
+        //    不直接改 DOM 文本 —— 那样两处状态会漂。
+        state.pluginFileValues[path] = (state.pluginFileValues[path] || []).concat([rel]);
+        renderPluginFileList(pluginId, key, path, list, hint, files, spec);
+        showHint(hint, "已加入列表。⚠️ 还要点页面上的「保存」才会写进插件配置。");
+      };
+      row.appendChild(add);
+    } else {
+      const rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "plugin-file-remove";
+      rm.textContent = "移出列表";
+      rm.onclick = () => {
+        state.pluginFileValues[path] = (state.pluginFileValues[path] || []).filter((x) => x !== rel);
+        renderPluginFileList(pluginId, key, path, list, hint, files, spec);
+        showHint(hint, "已移出列表。⚠️ 还要点「保存」才会写进插件配置。");
+      };
+      row.appendChild(rm);
+    }
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "plugin-file-del";
+    del.textContent = "删除文件";
+    del.onclick = async () => {
+      if (!confirm(`确定删除 ${rel}？此操作不可恢复。`)) return;
+      try {
+        await api("DELETE", `/api/v1/plugins/${encodeURIComponent(pluginId)}/config-files`, {
+          key,
+          path: rel,
+        });
+        // ⚠️ 列表里还引用着它 → 一并移掉，否则保存后插件读一个不存在的文件
+        //    （那种失败在插件那边多半是一行日志 = 静默）
+        state.pluginFileValues[path] = (state.pluginFileValues[path] || []).filter((x) => x !== rel);
+        showHint(hint, `已删除 ${rel}（并已从列表移除）。⚠️ 还要点「保存」才会写进插件配置。`);
+      } catch (e) {
+        showHint(hint, "删除失败：" + e.message, true);
+      }
+      await refreshPluginFileList(pluginId, key, path, list, hint, spec);
+    };
+    row.appendChild(del);
+    list.appendChild(row);
+  }
+}
+
 /** 把一个插件 schema 项渲染成一个字段控件（复用 `buildConfigField`）。 */
 function buildPluginField(pluginId, key, spec, value, pathPrefix) {
+  // 🔴 **`file` 型单独走一条路**（2026-10-09 补，照真 AstrBot 的 config-files）。
+  //    它跟别的类型**根本不是同一类控件**：值是一个**路径数组**
+  //    （`["files/<key>/x.png", ...]`），而界面要给的是
+  //    **上传/删除按钮 + 已上传文件的清单**。
+  //    ⇒ 早于 `pluginFieldType()` 判断 —— 那个函数对 `file` 返回 null，
+  //      会在下面被当成"不支持"而画成一句"请直接改配置文件"
+  //      （那正是本轮之前的行为）。
+  if (spec && spec.type === "file") {
+    const box = buildPluginFileField(pluginId, key, spec, value, pathPrefix);
+    // ⚠️ 这两个 data 属性是**收集器认领控件的凭据**（`collectPluginConfigChanges`
+    //    靠 `[data-plugin-key]` 找）。
+    //    ⚠️ 但 file 型**不能**让收集器按普通控件去读 —— 它的值由
+    //       `buildPluginFileField` 自己维护在 `state` 里（见那里的注释），
+    //       所以这里打的是**另一个**标记 `data-plugin-file`，
+    //       收集器会跳过它、改用专门的分支。
+    if (box) {
+      box.dataset.pluginKey = key;
+      box.dataset.pluginPath = pathPrefix ? `${pathPrefix}.${key}` : key;
+      box.dataset.pluginFile = "1";
+    }
+    return box;
+  }
   const ourType = pluginFieldType(spec);
   if (ourType === null) {
     // 🔴 如实说"不支持"，**不画假控件**
@@ -4503,6 +4816,12 @@ async function openPluginConfig(pluginId, opts) {
     // 迟到的响应不要覆盖用户已经切走的视图（与本文件别处同款守卫）
     if (state.pluginCurrentId !== pluginId) return;
     state.pluginConfig = d;
+    // 🔴 **每个插件开一次都要清空 file 值缓存** ——
+    //    键路径（`path`）在不同插件之间是**重名**的（`openai_director_fallback_images`
+    //    这类名字，两个插件都可能叫同一个）。
+    //    不清的话，切插件后收集器会把**上一个插件**的路径数组当成这个插件的值提交，
+    //    而界面上看着一切正常（本项目最忌的"静默用了别的东西"）。
+    state.pluginFileValues = {};
     renderPluginConfig(d);
     if (!keepHint) toast(hint, "");
   } catch (e) {
@@ -4565,6 +4884,38 @@ function collectPluginConfigChanges() {
   for (const wrap of body.querySelectorAll("[data-plugin-key]")) {
     const key = wrap.dataset.pluginKey;
     const path = wrap.dataset.pluginPath || key;
+
+    // 🔴 **`file` 型没有单一控件承载值** —— 它是"按钮 + 清单"，
+    //    值由 `buildPluginFileField` 维护在 `state.pluginFileValues` 里。
+    //    ⚠️ 这里必须**先于** `querySelector("input")` 判断：
+    //       那个 file 选择框（`type=file`）也在里面，会被误当成值控件
+    //       ⇒ 读出来是 `C:\fakepath\x.png` 这种垃圾，保存进配置后
+    //         插件永远找不到文件，而**界面上看起来"保存成功"**。
+    if (wrap.dataset.pluginFile === "1") {
+      const v = state.pluginFileValues[path] || [];
+      const parts0 = path.split(".");
+      let before0 = loaded;
+      for (const seg of parts0) {
+        if (before0 && typeof before0 === "object") before0 = before0[seg];
+        else { before0 = undefined; break; }
+      }
+      if (JSON.stringify(v) === JSON.stringify(before0)) continue;
+      if (parts0.length === 1) {
+        changes[key] = v;
+      } else {
+        const top = parts0[0];
+        const base = JSON.parse(JSON.stringify(loaded[top] ?? {}));
+        let cur = base;
+        for (let i = 1; i < parts0.length - 1; i += 1) {
+          if (typeof cur[parts0[i]] !== "object" || cur[parts0[i]] === null) cur[parts0[i]] = {};
+          cur = cur[parts0[i]];
+        }
+        cur[parts0[parts0.length - 1]] = v;
+        changes[top] = base;
+      }
+      continue;
+    }
+
     const ctrl = wrap.querySelector("input, select, textarea");
     if (!ctrl) continue;
 

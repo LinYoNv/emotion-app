@@ -26,7 +26,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from emotion_app.domain.config_profile import (  # noqa: E402
     CONTEXT_MODES,
     DEFAULT_PATH,
-    SECTION_CONTEXT,
     SECTION_SESSION,
     SECTIONS,
     SPECS,
@@ -102,10 +101,77 @@ def test_context_modes_are_our_three_modes():
 
     情绪选的方案："三模式当策略下拉，AstrBot 参数作细项"。
     若这里被改成 AstrBot 的那套（如 `llm_compress`），说明有人误解了需求。
+
+    ⚠️ 2026-10-09 改：全局 `context` 段**已删除**（情绪：「上下文策略一样做成会话级的，
+       不做全局」）⇒ 这里不再从 `SPECS[SECTION_CONTEXT]` 取，而是守**会话级那份真定义**
+       （`ContextPolicy` 的 `VALID_MODES`）—— 它才是真正生效的那个。
     """
+    from emotion_app.domain.context import VALID_MODES
+
     assert CONTEXT_MODES == ("recent_only", "rolling_summary", "semantic")
-    mode = next(s for s in SPECS[SECTION_CONTEXT] if s.key == "mode")
-    assert [v for v, _ in mode.options] == list(CONTEXT_MODES)
+    # ⚠️ 比**集合**不比顺序 —— 两处的顺序本来就不同（`VALID_MODES` 是
+    #    semantic/rolling_summary/recent_only，`CONTEXT_MODES` 是反过来的）。
+    #    我第一版写成元组相等 ⇒ **假红**（产品是对的，是判据要求过严）。
+    #    这里真正要不变量的是"两边是同一批模式"。
+    assert set(CONTEXT_MODES) == set(VALID_MODES), (
+        f"配置文件里的模式清单与会话级 ContextPolicy 不一致："
+        f"{CONTEXT_MODES} vs {VALID_MODES}"
+    )
+
+
+def test_global_context_section_is_gone():
+    """🔴 **全局 `context` 段必须不存在**（情绪 2026-10-09：「不做全局」）。
+
+    ⚠️ 这条是**防回归**：我删了 58 行，若哪天有人手滑加回来（或误把会话级字段
+       又抄一份到全局），这里立刻红。
+    ⚠️ 断言"不在 SECTIONS 里"而**不只是断言常量没定义** —— 后者改个名就绕过了。
+    """
+    assert "context" not in SECTIONS, f"全局 context 段又回来了：{SECTIONS}"
+    assert set(SECTIONS) == {"session", "plugins"}, sorted(SECTIONS)
+    assert "context" not in SPECS, "SPECS 里还留着 context 段"
+
+
+def test_session_policy_has_summary_model_and_instruction():
+    """🔴 会话级新增的两项必须**真存在且能往返**（不是只写在 dataclass 里）。
+
+    两项分别接到：`Summarizer` 的 `model=`（总结用哪个模型）
+    与 `build_summary_messages(instruction=...)`（总结提示词）。
+    """
+    from emotion_app.domain.context import ContextPolicy
+
+    p = ContextPolicy(mode="semantic", summary_model="fast/deepseek-flash",
+                      summary_instruction="只记关键事实")
+    d = p.to_dict()
+    assert d["summary_model"] == "fast/deepseek-flash"
+    assert d["summary_instruction"] == "只记关键事实"
+
+    back = ContextPolicy.from_dict(d)
+    assert back.summary_model == "fast/deepseek-flash"
+    assert back.summary_instruction == "只记关键事实"
+
+    # ⚠️ 旧会话（dump 里没这两个键）→ 空串（= 用内置），**不能**报错也不能填默认值
+    old = ContextPolicy.from_dict({"mode": "semantic"})
+    assert old.summary_model == ""
+    assert old.summary_instruction == ""
+
+
+def test_summary_instruction_empty_falls_back_to_builtin():
+    """🔴 空提示词 = 用内置 `SUMMARY_PROMPT`（不能真的发一条空 system 消息）。
+
+    ⚠️ 空 system 消息会让模型**没有任何摘要格式约束** ⇒ 输出漂移，
+       而症状是"摘要质量变差"—— 极难归因。所以这条必须守住。
+    """
+    from emotion_app.domain.context import SUMMARY_PROMPT, build_summary_messages
+    from emotion_app.domain.message import ROLE_SYSTEM, Message
+
+    chunk = [Message(role="user", content="你好")]
+    for empty in ("", "   ", "\n"):
+        msgs = build_summary_messages(chunk, instruction=empty)
+        assert msgs[0].role == ROLE_SYSTEM
+        assert msgs[0].content == SUMMARY_PROMPT, f"空提示词 {empty!r} 没有回落到内置"
+
+    msgs = build_summary_messages(chunk, instruction="只记关键事实")
+    assert msgs[0].content == "只记关键事实", "自定义提示词没被用上"
 
 
 def test_no_agent_or_group_fields_leaked_in():
@@ -141,9 +207,11 @@ def test_unknown_key_is_rejected_and_named():
         (SECTION_SESSION, "request_max_retries", 11),        # 高于上限
         (SECTION_SESSION, "tts_trigger_probability", 1.5),   # 超出 0..1
         (SECTION_SESSION, "tts_trigger_probability", -0.1),
-        (SECTION_CONTEXT, "llm_compress_keep_recent_ratio", 1.0),
-        (SECTION_CONTEXT, "protected_tail", -1),
-        (SECTION_CONTEXT, "fallback_max_context_tokens", 10),
+        # ⚠️ 原先是全局 context 段的字段（已删）⇒ 换成 session 段里**同样有边界**的项，
+        #    覆盖面不变（int 上下限 / float 0..1 两种都有）。
+        (SECTION_SESSION, "request_max_retries", -1),
+        (SECTION_SESSION, "request_max_retries", 11),
+        (SECTION_SESSION, "tts_trigger_probability", 1.0 + 0.5),
     ],
 )
 def test_out_of_range_is_rejected(section, key, value):
@@ -159,8 +227,10 @@ def test_out_of_range_is_rejected(section, key, value):
         (SECTION_SESSION, "streaming_response", "yes"),      # bool 位置给了字符串
         (SECTION_SESSION, "request_max_retries", "3"),       # int 位置给了字符串
         (SECTION_SESSION, "request_max_retries", True),      # ⚠️ bool 是 int 子类，必须拒绝
-        (SECTION_CONTEXT, "mode", "nope"),                   # enum 非法值
-        (SECTION_CONTEXT, "mode", 3),                        # enum 给了数字
+        # ⚠️ 同上：enum 非法值的覆盖改到 session 段的 provider_select 上
+        #    （它也是"值必须在一组合法取值里"的同一类校验）。
+        (SECTION_SESSION, "default_chat_provider_id", 5),    # 该是字符串
+        (SECTION_SESSION, "tts_trigger_probability", "yes"),  # 该是数字
         (SECTION_SESSION, "fallback_chat_provider_ids", "a/b"),  # 该是数组
         (SECTION_SESSION, "fallback_chat_provider_ids", [1, 2]),  # 元素不是字符串
         (SECTION_SESSION, "default_chat_provider_id", 5),    # 该是字符串
@@ -222,13 +292,14 @@ def test_patch_is_partial_and_does_not_reset_siblings(store):
 
 
 def test_patch_both_sections(store):
+    """两段一起 PATCH，互不干扰。⚠️ 全局 context 段已删 ⇒ 改用 plugins 段配对。"""
     store.patch({
         SECTION_SESSION: {"streaming_response": False},
-        SECTION_CONTEXT: {"mode": "semantic"},
+        "plugins": {"inactivated_plugins": ["some_plugin"]},
     })
     got = store.load()
     assert got[SECTION_SESSION]["streaming_response"] is False
-    assert got[SECTION_CONTEXT]["mode"] == "semantic"
+    assert got["plugins"]["inactivated_plugins"] == ["some_plugin"]
 
 
 def test_reset_restores_defaults(store):
@@ -373,7 +444,8 @@ async def test_get_returns_profile_and_schema(mk):
     body = await r.get_json()
     assert set(body) == {"profile", "schema"}, sorted(body)
     assert set(body["profile"]) == set(SECTIONS)
-    assert body["schema"][SECTION_CONTEXT], "schema 里没有上下文字段"
+    assert set(body["schema"]) == set(SECTIONS), sorted(body["schema"])
+    assert "context" not in body["schema"], "全局 context 段又回来了"
 
 
 async def test_patch_updates_and_returns_profile(mk):
@@ -415,7 +487,7 @@ async def test_patch_empty_body_is_rejected(mk):
 
 async def test_delete_resets(mk):
     c = await mk()
-    await c.patch("/api/v1/config-profile", json={SECTION_CONTEXT: {"mode": "semantic"}})
+    await c.patch("/api/v1/config-profile", json={SECTION_SESSION: {"streaming_response": False}})
     r = await c.delete("/api/v1/config-profile")
     assert r.status_code == 200
     assert (await r.get_json())["profile"] == default_profile()

@@ -45,7 +45,17 @@ DEFAULT_PATH = "data/config_profile.json"
 SCHEMA_VERSION = 1
 
 SECTION_SESSION = "session"
-SECTION_CONTEXT = "context"
+#: 🔴 **原来的全局 `context` 段已删除**（情绪 2026-10-09：「上下文策略一样做成会话级的，
+#: 不做全局」）。那段共 10 个字段，其中 7 个**零消费**（`context_limit_reached_strategy`/
+#: `llm_compress_*` 三个/`fallback_max_context_tokens` 全库 0 处读取；
+#: `max_context_length`/`dequeue_context_length` 那"2 处"引用是**兼容层里同名的另一个东西**，
+#: 不是消费），另外 3 个（`mode`/`protected_tail`/`summary_trigger`）与**会话级**那套重复
+#: —— 而真正生效的一直是会话级（`Session.policy`）。
+#:
+#: ⇒ 删掉整段，改为把**真能生效的两项**加进会话级 `ContextPolicy`：
+#:    `summary_model`（用哪个模型总结）与 `summary_instruction`（总结提示词）。
+#: ⚠️ 旧配置文件里若还留着 `"context": {...}`，`parse()` 会当**未知段忽略**
+#:    （store 的"未知键保留"行为）—— 不会报错，也不会被读。
 #: 🆕 **插件段**（2026-09-27）：插件宿主的**启停名单**。
 #:
 #: 🔴 为什么放这里（而不是 `.env` 或 `data/cmd_config.json`）：
@@ -56,7 +66,7 @@ SECTION_CONTEXT = "context"
 #:   权限的密钥文件），放 `cmd_config.json` 则是**发明一个真实现没有的落点**、
 #:   还会污染插件可见的 `get_config()`。
 SECTION_PLUGINS = "plugins"
-SECTIONS: tuple[str, ...] = (SECTION_SESSION, SECTION_CONTEXT, SECTION_PLUGINS)
+SECTIONS: tuple[str, ...] = (SECTION_SESSION, SECTION_PLUGINS)
 
 #: 上下文模式的合法取值（**我们已有的三种**，不是 AstrBot 的那套）。
 #: ⚠️ 这三条是 `domain/chat` 里既有的组装逻辑，**本配置文件只是它们的"默认值来源"**，
@@ -177,64 +187,6 @@ SPECS: dict[str, tuple[FieldSpec, ...]] = {
         FieldSpec(
             "streaming_response", "流式输出", "bool", True,
             hint="⚠️ 我们默认**开**（本来就有流式）—— 与 AstrBot 默认值不同，是有意的。",
-        ),
-    ),
-    SECTION_CONTEXT: (
-        FieldSpec(
-            "mode", "上下文模式", "enum", "recent_only",
-            hint="我们既有的三种组装方式；下面的参数是它们的细项。",
-            options=(
-                ("recent_only", "只保留最近原文"),
-                ("rolling_summary", "滚动摘要 + 最近原文"),
-                ("semantic", "语义摘要 + 最近原文（前缀更稳，上游缓存命中更好）"),
-            ),
-        ),
-        FieldSpec(
-            "protected_tail", "保留最近原文条数", "int", 6,
-            hint="无论怎么压缩，最近这么多条**原文**始终保留。",
-            minimum=0, maximum=200,
-        ),
-        FieldSpec(
-            "max_context_length", "压缩前最多保留对话轮数", "int", -1,
-            hint="超过该轮数后才按下方策略压缩；**-1 = 不按轮数限制**（照 AstrBot 语义）。",
-            minimum=-1, maximum=10000,
-        ),
-        FieldSpec(
-            "dequeue_context_length", "轮次超限时一次丢弃轮数", "int", 1,
-            hint="超过上一项且无法 LLM 压缩时，一次丢弃多少轮旧对话。",
-            minimum=1, maximum=1000,
-        ),
-        FieldSpec(
-            "context_limit_reached_strategy", "历史超限时的处理方式", "enum", "llm_compress",
-            hint="照 AstrBot 的两个取值。",
-            options=(
-                ("truncate", "按对话轮数截断"),
-                ("llm_compress", "由 LLM 压缩上下文"),
-            ),
-        ),
-        FieldSpec(
-            "llm_compress_instruction", "上下文压缩提示词", "text",
-            DEFAULT_COMPRESS_INSTRUCTION,
-            hint="留空则用默认提示词。",
-        ),
-        FieldSpec(
-            "llm_compress_keep_recent_ratio", "压缩时保留最近上下文比例", "float", 0.15,
-            hint="0–0.9（AstrBot 上限 0.3，我们放宽到 0.9）。",
-            minimum=0.0, maximum=0.9,
-        ),
-        FieldSpec(
-            "llm_compress_provider_id", "用于压缩的模型", "provider_select", "",
-            hint="留空 = 用当前对话模型。", provider_type="chat_completion",
-        ),
-        FieldSpec(
-            "fallback_max_context_tokens", "上下文窗口兜底值", "int", 128000,
-            hint="模型元数据里没有上下文窗口时用这个值。",
-            minimum=1000, maximum=10_000_000,
-        ),
-        FieldSpec(
-            "summary_trigger", "累积多少条触发总结", "int", 20,
-            hint="我们既有字段（滚动摘要用）：累积超过这么多条就触发一次总结。",
-            minimum=2, maximum=1000,
         ),
     ),
     SECTION_PLUGINS: (
@@ -532,7 +484,6 @@ __all__ = [
     "DEFAULT_PATH",
     "FieldSpec",
     "SCHEMA_VERSION",
-    "SECTION_CONTEXT",
     "SECTION_PLUGINS",
     "SECTION_SESSION",
     "SECTIONS",

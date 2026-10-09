@@ -30,6 +30,10 @@ from typing import Any
 
 logger = logging.getLogger("astrbot")
 
+#: 插件「配置文件」上传的单文件上限（真实现用 `MAX_FILE_BYTES`；这里 12 MiB，
+#: 够放参考图这类用途，又不至于让面板卡住）。
+_MAX_CONFIG_FILE_BYTES = 12 * 1024 * 1024
+
 #: 🔴 **挂载前缀照真实现**（`dashboard/api/plugins.py:388`）：
 #:    真 AstrBot 的插件扩展路由是 `/api/plugins/extensions/{plugin_path:path}`，
 #:    其中 `plugin_path` 是插件自己登记的路由（如 `astrbot_plugin_x/page/overview`）。
@@ -822,6 +826,250 @@ class PluginHost:
             "⚠️ 本服务**尚未实现插件热重载**，需要**重启服务**后生效。"
         )
 
+    # ======================================================================
+    # 插件「配置文件」管理（照真实现 `ConfigFileService`，2026-10-09 补）
+    # ======================================================================
+    #
+    # 真实现（`dashboard/api/plugins.py:762-814` + `services/config_service.py:1145-1215`）：
+    #
+    #   GET    /api/v1/plugins/config-files?plugin_id=&config_key=   列出
+    #   POST   /api/v1/plugins/config-files?plugin_id=&config_key=   上传
+    #   DELETE /api/v1/plugins/config-files?plugin_id=               删除
+    #
+    # 🔴 **它管理的不是随便什么文件，而是 `_conf_schema.json` 里 `type: "file"`
+    #    那些配置项对应的文件** —— 这是最容易误解的一点。
+    #    接口里那个 `config_key` 就是**配置项的键路径**（`openai_director_fallback_images`），
+    #    文件落在 **插件目录** 的 `files/<键路径>/` 下。
+    #
+    # ⚠️ 实测本机真有这种配置项（不是空壳能力）：
+    #    `astrbot_plugin_nai_image` 的 `openai_director_fallback_images`
+    #    （`file_types: [png, jpg, jpeg, webp]`，语义是"精准参考兜底参考图"）。
+    #
+    # ⚠️ 真实现上传后**只落盘、不写配置值** —— 用户在配置页把
+    #    `files/<key>/<name>` 填进那个数组才算真正用上。两个动作是分开的，
+    #    这里**保持同一语义**（不替用户做决定）。
+
+    @staticmethod
+    def _config_key_to_folder(key_path: str) -> str:
+        """把配置键路径转成目录名（照真实现 `_config_key_to_folder`）。
+
+        ⚠️ 与真实现逐字对齐：按 `.` 切分、每段过一遍白名单清洗、用 `/` 连接。
+           空则回落 `_`。
+        """
+        parts = [
+            "".join(c for c in seg if c.isalnum() or c in "_-")
+            for seg in str(key_path or "").split(".")
+            if seg
+        ]
+        parts = [p for p in parts if p]
+        return "/".join(parts) if parts else "_"
+
+    @staticmethod
+    def _schema_item(schema: Any, key_path: str) -> dict[str, Any] | None:
+        """按 `key_path` 在 schema 里找配置项（照真实现 `_get_schema_item`）。
+
+        ⚠️ 支持点分路径（`a.b.c`）逐层下钻 —— 真实现也是这么找的，
+           因为 `file` 类型的字段**可能嵌在 `object` 里**。
+        """
+        if not isinstance(schema, dict) or not key_path:
+            return None
+        # 快路径：顶层直接命中
+        if key_path in schema and isinstance(schema[key_path], dict):
+            return schema[key_path]
+        # 点分下钻：每一段要么是**普通键**（`object` 的 `items` 里），
+        # 要么本身就是 schema 的一层。两种形状都得走通 ——
+        # ⚠️ 我第一版只处理了"键"那一种，`a.b`（`a` 是 object 字段、
+        #    `b` 在它的 `items` 里）**找不到**，而那正是插件里最常见的嵌套形状。
+        cur: Any = schema
+        for seg in str(key_path).split("."):
+            if not isinstance(cur, dict):
+                return None
+            if seg in cur and isinstance(cur[seg], dict):
+                cur = cur[seg]
+            elif isinstance(cur.get("items"), dict) and seg in cur["items"]:
+                nxt = cur["items"][seg]
+                cur = nxt
+            else:
+                return None
+        return cur if isinstance(cur, dict) else None
+
+    def _plugin_file_dir(self, plugin_id: str, config_key: str) -> Path | None:
+        """插件里某个配置项的文件目录：`<插件目录>/files/<key路径>/`。
+
+        ⚠️ 返回 `None` = 插件不存在（由调用方转 404）。
+        ⚠️ **不做目录穿越防护以外的路径拼接** —— `_config_key_to_folder` 已把
+           每段洗成白名单字符，所以拼出来的路径不可能逃出插件目录。
+        """
+        if self.loader is None:
+            return None
+        rec = self.loader.records.get(plugin_id)
+        if rec is None:
+            return None
+        return Path(rec.path) / "files" / self._config_key_to_folder(config_key)
+
+    def list_plugin_config_files(self, plugin_id: str, config_key: str) -> dict[str, Any] | None:
+        """列出一个 `file` 型配置项已经有哪些文件。
+
+        Returns:
+            `{"files": ["files/<key>/<name>", ...]}`；插件不存在返回 `None`。
+            ⚠️ 目录不存在时返回**空列表**（不是 `None`）—— "这个插件还没有文件"
+               与"没有这个插件"是两件事。
+
+        ⚠️ 路径形态与真实现一致：**相对插件目录**且以 `files/` 开头
+           （真实现 `config_service.py:1176-1180` 就是这么给的，
+            因为配置值里存的就是这个相对路径）。
+        """
+        root = self._plugin_file_dir(plugin_id, config_key)
+        if root is None:
+            return None
+        if not root.is_dir():
+            return {"files": []}
+        out: list[str] = []
+        for p in sorted(root.rglob("*")):
+            if p.is_file():
+                out.append(p.relative_to(root.parent.parent).as_posix())
+        return {"files": out}
+
+    def plugin_config_file_meta(
+        self, plugin_id: str, config_key: str
+    ) -> dict[str, Any] | None:
+        """该配置项**是不是** `file` 型，以及允许的扩展名。
+
+        🔴 为什么单独有这个：真实现把校验写成
+           `if not meta or meta.get("type") != "file": raise ValueError(...)`
+           —— 上传/删除都得先过这一关，否则就是"给一个不能存文件的地方存文件"。
+           收成一处，三条路由共用（本项目「同一概念不要多条路径」）。
+
+        Returns:
+            `{"file_types": [...], "description": str}`；插件不存在或该项
+            不是 file 型时返回 `None`。
+        """
+        if self.loader is None:
+            return None
+        rec = self.loader.records.get(plugin_id)
+        if rec is None:
+            return None
+        schema = getattr(rec.config, "schema", None)
+        meta = self._schema_item(schema, config_key)
+        if not isinstance(meta, dict) or meta.get("type") != "file":
+            return None
+        raw_types = meta.get("file_types") or []
+        types = [str(t).lstrip(".").lower() for t in raw_types if str(t).strip()]
+        return {
+            "file_types": types,
+            "description": str(meta.get("description") or ""),
+        }
+
+    async def save_plugin_config_file(
+        self, plugin_id: str, config_key: str, filename: str, data: bytes
+    ) -> dict[str, Any]:
+        """保存一个上传的文件到 `<插件目录>/files/<key>/<filename>`。
+
+        🔴 **扩展名必须校验**（照真实现 `config_service.py:1039-1060`）：
+           不在 `file_types` 里就拒绝。否则用户能把 `.exe` 传进一个"只收图片"
+           的配置项，而插件那边读图失败时大概率是**一行日志**（静默）。
+
+        ⚠️ 文件名清洗：只保留基名 + 白名单字符。**必须**——
+           真实现有 `_sanitize_filename`，而路径穿越（`../../`）正是
+           这类接口最经典的洞。
+        ⚠️ 大小上限与真实现同量级（真实现 `MAX_FILE_BYTES`）。
+
+        Returns:
+            `{"uploaded": "<相对路径>", "size": int}`。
+        Raises:
+            `ValueError` —— 扩展名不符/文件名为空/过大（**消息要能直接给用户看**）。
+        """
+        meta = self.plugin_config_file_meta(plugin_id, config_key)
+        if meta is None:
+            raise ValueError("该配置项不存在，或者它不是 file 类型（不能存文件）")
+        root = self._plugin_file_dir(plugin_id, config_key)
+        assert root is not None  # meta 非 None ⇒ 插件一定存在
+
+        safe = Path(str(filename or "").replace("\\", "/")).name
+        safe = "".join(c for c in safe if c.isalnum() or c in "._- ")
+        safe = safe.strip().strip(".")
+        if not safe:
+            raise ValueError("文件名非法（清洗后为空）")
+
+        exts = meta["file_types"]
+        ext = safe.rsplit(".", 1)[-1].lower() if "." in safe else ""
+        if exts and ext not in exts:
+            raise ValueError(
+                f"不支持的文件类型：.{ext}（这个配置项只收 {', '.join('.' + e for e in exts)}）"
+            )
+        if len(data) > _MAX_CONFIG_FILE_BYTES:
+            raise ValueError(
+                f"文件过大：{len(data)} 字节，上限 {_MAX_CONFIG_FILE_BYTES} 字节"
+            )
+        if not data:
+            raise ValueError("文件是空的")
+
+        root.mkdir(parents=True, exist_ok=True)
+        target = root / safe
+        target.write_bytes(data)
+        rel = target.relative_to(root.parent.parent).as_posix()
+        logger.info(
+            "插件配置文件已上传",
+            extra={"data": {"plugin": plugin_id, "key": config_key,
+                            "path": rel, "size": len(data)}},
+        )
+        return {"uploaded": rel, "size": len(data)}
+
+    def delete_plugin_config_file(
+        self, plugin_id: str, config_key: str, rel_path: str
+    ) -> dict[str, Any]:
+        """删掉一个已上传的文件。
+
+        🔴 **两道校验，缺一不可**：
+           ① 路径必须落在**这个配置项自己的目录**里（`files/<key>/`）——
+              否则传 `files/其它key/x.png` 就能删别人的文件；
+              传 `../../main.py` 就能删插件本体。
+              （真实现 `config_service.py:1105` 写死 `startswith("files/")`，
+               我们更严：必须匹配**该项的**目录。）
+           ② 文件必须存在 —— 不存在要**报错**，不能静默成功
+              （"删了但没删掉"是最难查的一类）。
+        """
+        root = self._plugin_file_dir(plugin_id, config_key)
+        if root is None:
+            raise ValueError(f"没有这个插件：{plugin_id}")
+
+        norm = str(rel_path or "").replace("\\", "/").lstrip("/")
+        if not norm:
+            raise ValueError("缺少 path 参数")
+        parts = [p for p in norm.split("/") if p]
+        if any(p in (".", "..") for p in parts):
+            raise ValueError(f"非法路径：{rel_path}")
+        target = root.parent.parent / norm
+        # 🔴 **这一道校验同时挡住两类越界，所以它是唯一的那个**：
+        #    ① 删**同插件别的配置项**的文件（`files/other_key/x.png`）；
+        #    ② 删**插件本体**（`files/../../main.py`，不过上面已先挡一道）。
+        #
+        # ⚠️ 我最初还写了一版"字符串前缀必须等于 `files/<key>/`"的检查 ——
+        #    它和这一道**在语义上完全重叠**（凡是前缀不对的，`relative_to` 也必拒），
+        #    注入验证时"C3 抓不住"就暴露了这点：把前缀检查改成 `if False`，
+        #    判据**照样全绿**，因为 `relative_to` 独立地挡住了同一个输入。
+        #    **两条同一职责的校验 = 谁也证明不了谁有用**（本项目「同一概念不要
+        #    多条路径」的另一面）。⇒ 删掉重叠的那条，只留这一道，
+        #    于是判据能真正证明**这一道**在工作。
+        #
+        # ⚠️ 用 `resolve()` 而不是字符串比较：能顺带挡住软链之类的绕过。
+        #    用 `root` 而不是 `root.parent.parent` 做基准 —— 后者会让
+        #    `files/other/x.png` 的 **字符串** 前缀恰好"看起来对"。
+        try:
+            target.resolve().relative_to(root.resolve())
+        except ValueError:
+            raise ValueError(
+                f"路径不属于这个配置项（应在 {root.name}/ 下）：{rel_path}"
+            ) from None
+
+        if not target.is_file():
+            raise ValueError(f"文件不存在：{rel_path}")
+        target.unlink()
+        logger.info(
+            "插件配置文件已删除",
+            extra={"data": {"plugin": plugin_id, "key": config_key, "path": norm}},
+        )
+        return {"deleted": norm}
     def plugin_readme(self, plugin_id: str, *, limit: int = 200_000) -> tuple[str, bool] | None:
         """读插件的 `README.md`（照真实现 `plugin_service.py:1924-1981` 只找它）。
 

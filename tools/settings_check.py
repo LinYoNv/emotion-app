@@ -133,21 +133,28 @@ def main() -> int:
         rendered = cdp.eval(
             "(function(){"
             " var s=document.querySelectorAll('#cfg-session-fields .cfg-field').length;"
-            " var c=document.querySelectorAll('#cfg-context-fields .cfg-field').length;"
+            " var ctx=document.querySelectorAll('#cfg-context-fields .cfg-field').length;"
+            " var ctxSec=!!document.getElementById('cfg-context-section');"
             " var heads=[].map.call(document.querySelectorAll('#tab-settings h4'),"
             "   function(h){return h.innerText.trim();});"
             " var hint=(document.getElementById('cfg-hint')||{}).innerText||'';"
-            " return {session:s, context:c, heads:heads, hint:hint};})()"
+            " return {session:s, context:ctx, ctxSection:ctxSec, heads:heads, hint:hint};})()"
         ) or {}
         check("① 「会话」段真的渲染出字段（不是 0 个、也不是没抛异常就算过）",
               (rendered.get("session") or 0) >= 5,
               f"实际 {rendered.get('session')} 个")
-        check("① 「上下文管理策略」段真的渲染出字段",
-              (rendered.get("context") or 0) >= 5,
-              f"实际 {rendered.get('context')} 个")
-        check("① 两个小节标题都在（会话 / 上下文管理策略）",
+        # 🔴 2026-10-09 改：全局「上下文管理策略」段**已删除**
+        #    （情绪：「上下文策略一样做成会话级的，不做全局」）——
+        #    它原有 10 个字段，7 个**零消费**、3 个与会话级重复。
+        #    ⇒ 判据从"它渲染出来了"**反过来**：**它必须不存在**。
+        #    ⚠️ 断言"元素不存在"而**不只是**"字段数为 0"：后者在
+        #       元素还在、只是没渲染字段时也会过（那正是删除没删干净的样子）。
+        check("① 全局「上下文管理策略」段**确实没了**（能力已收敛到会话级）",
+              rendered.get("ctxSection") is False and (rendered.get("context") or 0) == 0,
+              f"段还在={rendered.get('ctxSection')} 字段数={rendered.get('context')}")
+        check("① 小节标题只剩「会话」（上下文那个必须消失）",
               "会话" in (rendered.get("heads") or [])
-              and "上下文管理策略" in (rendered.get("heads") or []),
+              and "上下文管理策略" not in (rendered.get("heads") or []),
               f"heads={rendered.get('heads')}")
         check("① 提示里说的是「已读取配置」（不是「读取失败」）",
               "已读取配置" in (rendered.get("hint") or ""),
@@ -182,12 +189,20 @@ def main() -> int:
         print("\n========== 第二部分：保存行为 ==========")
 
         # ---- ③ 只发改动项 ----
-        cdp.eval(
+        # ⚠️ 2026-10-09：原来这里改的是 `cfg-context-mode`（全局 context 段），
+        #    那段已删除 ⇒ 改用**会话段**里一个 enum 字段，覆盖完全一样
+        #    （"只发改动过的键、不整段回传"）。
+        # ⚠️ 用 **bool** 而不是 provider_select：后者在"没配模型"时可能
+        #    一个选项都没有（实测本机 `default_chat_provider_id` 就是空串），
+        #    那样"改了值"其实没改 ⇒ 判据假红。bool 永远可翻转。
+        #    （又一次印证：判据的输入要挑**一定取得到**的那个。）
+        changed_key = cdp.eval(
             "(function(){window.__rec=[];"
-            " var el=document.getElementById('cfg-context-mode');"
-            " el.value='semantic';"
-            " document.getElementById('cfg-context-form').dispatchEvent("
-            "  new Event('submit',{cancelable:true})); return 'ok';})()"
+            " var el=document.getElementById('cfg-session-display_reasoning_text');"
+            " if(!el) return '';"
+            " el.checked = !el.checked;"
+            " document.getElementById('cfg-session-form').dispatchEvent("
+            "  new Event('submit',{cancelable:true})); return 'display_reasoning_text';})()"
         )
         time.sleep(1.8)
         patched = cdp.eval(
@@ -195,21 +210,20 @@ def main() -> int:
             " return x.m==='PATCH' && x.u==='/api/v1/config-profile';});"
             " return r.length?r[r.length-1]:null;})()"
         )
-        check("③ 保存上下文段 → 真的发了 `PATCH /api/v1/config-profile`",
+        check("③ 保存会话段 → 真的发了 `PATCH /api/v1/config-profile`",
               bool(patched), f"got {patched}")
         if patched:
             body = patched.get("b") or {}
-            ctx = body.get("context") or {}
+            sess = body.get("session") or {}
             check("③ 🔴 只发**改动过的**字段（不是整段回传）",
-                  list(ctx) == ["mode"], f"context 里的键={list(ctx)}")
-            check("③ → 改动值正确带上了", ctx.get("mode") == "semantic", f"{ctx}")
-            check("③ → **没有**顺手把 session 段也发上去",
-                  "session" not in body, f"body 里的段={list(body)}")
+                  list(sess) == [changed_key], f"session 里的键={list(sess)}（期望 {changed_key}）")
+            check("③ → **没有**顺手把已删除的 context 段也发上去",
+                  "context" not in body, f"body 里的段={list(body)}")
 
         # 没改动时不该发请求
         cdp.eval(
             "(function(){window.__rec=[];"
-            " document.getElementById('cfg-context-form').dispatchEvent("
+            " document.getElementById('cfg-session-form').dispatchEvent("
             "  new Event('submit',{cancelable:true})); return 'ok';})()"
         )
         time.sleep(1.2)
@@ -219,6 +233,26 @@ def main() -> int:
         )
         check("③ 没有改动时**不发** PATCH（别拿空请求刷后端）", (noop or 0) == 0,
               f"发了 {noop} 次")
+
+        # 🔴 **收尾**：上面翻了一个 bool 并保存了 —— 判据改了**真实配置**，
+        #    必须把它翻回去。否则每跑一次就改用户一次配置
+        #    （本体项目踩过：某判据每跑一次就把插件配置翻一次，
+        #      跑偶数遍巧合抵消、跑奇数遍留下脏配置）。
+        cdp.eval(
+            "(function(){"
+            " var el=document.getElementById('cfg-session-display_reasoning_text');"
+            " if(!el) return 'no-el';"
+            " el.checked = !el.checked;"
+            " document.getElementById('cfg-session-form').dispatchEvent("
+            "  new Event('submit',{cancelable:true})); return 'ok';})()"
+        )
+        time.sleep(1.5)
+        reverted = cdp.eval(
+            "(function(){var el=document.getElementById('cfg-session-display_reasoning_text');"
+            " return el ? el.checked : null;})()"
+        )
+        check("③ 收尾：把翻过的 bool 改回原值（判据不许留下副作用）",
+              reverted is False, f"display_reasoning_text 现在={reverted}")
 
         print("\n========== 第三部分：错误如实显示 ==========")
 

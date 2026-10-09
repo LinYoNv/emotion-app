@@ -121,7 +121,11 @@ class Summarizer:
                     base_url=base_url,
                     api_key=api_key,
                     timeout=timeout,
+                    # 🔴 模型优先取**调用方传的**（会话级 `policy.summary_model`），
+                    #    否则用 Summarizer 自己的默认（= 服务启动时的上游模型）。
                     model=model or self._model,
+                    # 🔴 会话级自定义提示词（空 = 用内置）
+                    instruction=policy.summary_instruction,
                 )
             except Exception as exc:  # noqa: BLE001
                 # ⚠️ 失败**不推进游标** —— 下次重试同一段（幂等：结果一样）
@@ -163,10 +167,11 @@ class Summarizer:
         api_key: str,
         timeout: float,
         model: str,
+        instruction: str = "",
     ) -> str:
         """真正调一次上游做总结。"""
         prompt_msgs = context_mod.build_summary_messages(
-            chunk, previous_summary=previous_summary
+            chunk, previous_summary=previous_summary, instruction=instruction
         )
         result = await self._client.chat(
             prompt_msgs,

@@ -1558,3 +1558,50 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
    ⚠️ 这与 `.app.collapsed .nav-label{display:none}` 同一套逻辑：
       看不出内容的东西，不如不显示。 */
 .app.collapsed .nav-group { display: none; }
+
+/* ==========================================================================
+   插件 `file` 型配置项（2026-10-09，照真 AstrBot 的 config-files）
+   --------------------------------------------------------------------------
+   结构：标题 + hint + 文件清单（每行：文件名 + 启用徽标 + 操作按钮）+ 上传行 + 提示
+   ⚠️ 与普通配置项的区别是**它有两个状态**：盘上有文件 / 配置值引用了它，
+      两者可以不一致（传了没填、填了被删）—— 所以每行带「已启用/未启用」徽标。
+   ========================================================================== */
+
+.plugin-cfg-file {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 10px 12px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--sunken);
+}
+
+.plugin-file-list { display: flex; flex-direction: column; gap: 4px; }
+
+/* 一行文件。⚠️ 用 flex + row 显式声明方向：
+   本项目的 `label` 有全局 `flex-direction: column` 规则，
+   而这里外层是 div 不受影响，但保持与别处一致的显式声明习惯。 */
+.plugin-file-row {
+  display: flex; flex-direction: row; align-items: center; gap: 8px;
+  padding: 4px 6px; border-radius: 4px; /* ⚠️ 用已定义的 `--panel`（不是 `--surface` —— 那个令牌**不存在**，
+     `var()` 引用未定义者**不报错**、静默解析成空 ⇒ 背景色悄悄没了。
+     这正是 `tests/test_ui_tokens.py` 守的东西，本轮真被抓到过一次。 */
+  background: var(--panel);
+}
+.plugin-file-name {
+  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 12.5px; color: var(--fg);
+}
+.plugin-file-row .badge { flex: 0 0 auto; }
+
+.plugin-file-actions {
+  display: flex; flex-direction: row; align-items: center; gap: 8px;
+  flex-wrap: wrap;
+}
+/* ⚠️ 文件选择框默认很窄（浏览器按字符宽算），给个下限免得文件名被截成"…" */
+.plugin-file-pick { flex: 0 1 auto; min-width: 0; max-width: 100%; font-size: 12px; }
+
+.plugin-file-add, .plugin-file-remove, .plugin-file-del, .plugin-file-upload {
+  flex: 0 0 auto; font-size: 12px; padding: 3px 9px;
+}
+/* 危险操作（删文件）与"移出列表"在视觉上要能分开：
+   前者不可恢复。⚠️ 只改颜色、**不隐藏** —— 隐藏按钮会让用户以为没这功能。 */
+.plugin-file-del { color: var(--danger); }
+.plugin-file-hint { display: block; }
