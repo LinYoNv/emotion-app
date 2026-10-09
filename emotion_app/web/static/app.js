@@ -2132,15 +2132,50 @@ $("clear-overrides").onclick = async () => {
   } catch (e) { toast($("settings-hint"), "失败：" + e.message, true); }
 };
 
+/* 🔴 「测试连接」**真的打上游**（2026-10-09 修）。
+ *
+ * 改之前这里写的是 `fetch("/v1/models")` —— 那打的是**我们自己的** OpenAI 兼容端点，
+ * 它只回显内存里的模型名、**一个上游请求都不发**（实测 1.6ms 返回）。
+ * ⇒ 按钮测的是"我们的进程还活着"，**key 全废、上游全断也照样秒回"正常"**。
+ *   情绪当场看出不对：「点击测试连接竟然是秒返回正常」。
+ *
+ * 现在打 `POST /api/v1/settings/ping`（服务端代打上游，key 不下发浏览器，
+ * 且能带上表单里**还没保存**的 base_url/key —— 用户常是"改地址→测→再保存"）。
+ *
+ * ⚠️ 表单值要一起发（`s-base-url` / `s-api-key`），否则用户刚改完地址点测试，
+ *    测的还是**旧的**那个地址 —— 那又变成"测错了对象"。
+ *    这与「获取模型」按钮（`#fetch-models`）的口径**保持一致**。 */
 $("ping").onclick = async () => {
   const el = $("settings-hint");
-  toast(el, "测试中…");
+  toast(el, "正在连接上游…");
   try {
-    const r = await fetch("/v1/models");
-    if (r.status === 401) { toast(el, "接口正常（需登录/带令牌才能列模型）"); return; }
-    const d = await r.json();
-    toast(el, "连接正常，模型：" + (d.data || []).map((m) => m.id).join(", "));
-  } catch (e) { toast(el, "失败：" + e.message, true); }
+    const formKey = ($("s-api-key")?.value || "").trim();
+    const body = {
+      base_url: ($("s-base-url")?.value || "").trim(),
+      // ⚠️ 与「获取模型」按钮**逐字一致**的口径：只在用户**这次填了** key 时传，
+      //    留空则让服务端去用已保存的那把（key 框是只写的，页面上显示的是占位符）。
+      ...(formKey ? { api_key: formKey } : {}),
+    };
+    const r = await fetch("/api/v1/settings/ping", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    let d = {};
+    try { d = await r.json(); } catch (_) { /* 非 JSON 也要能报出来 */ }
+
+    if (r.ok && d.ok) {
+      // 成功时**如实说清**"通到什么程度" —— 尤其是"上游可达但不含你配的模型名"
+      // 与"...但该站不支持 /models"这两种**半通**状态，它们最容易被说成"正常"。
+      toast(el, d.detail || "上游可达");
+      return;
+    }
+    const msg = (d.error && d.error.message) || d.detail || `HTTP ${r.status}`;
+    toast(el, "连接失败：" + msg, true);
+  } catch (e) {
+    // 连**我们自己的**服务都打不通（服务挂了/网络问题）—— 与"上游不通"是两回事，说清楚
+    toast(el, "连不上本机服务：" + e.message, true);
+  }
 };
 
 /* ================= 模型供应商（两层结构） =================

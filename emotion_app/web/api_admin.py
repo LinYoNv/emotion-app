@@ -34,7 +34,7 @@ from ..domain.persona_repo import PersonaNotFound
 from ..domain import persona_ref as persona_ref_mod
 from ..domain.session_repo import SessionNotFound
 from ..domain.settings import WRITABLE_FIELDS
-from ..infra.logging_setup import get_logger
+from ..infra.logging_setup import get_logger, scrub_text
 from ..storage.base import StorageError
 
 log = get_logger(__name__)
@@ -525,6 +525,190 @@ def build_blueprint(require_auth: Any) -> Blueprint:
             return denied
         store = _cfg_profile()
         return jsonify({"profile": store.reset()}), 200
+
+    @bp.post("/settings/ping")
+    async def ping_upstream():  # type: ignore[no-untyped-def]
+        """★「**测试连接**」—— **真的打一次上游**，不是自检。
+
+        ## 🔴 修的是什么（情绪 2026-10-09 报障）
+
+        情绪：「点击『测试连接』竟然是**秒返回正常**，检查一下。」
+
+        查实：前端那个按钮打的是 `fetch("/v1/models")` —— 而 `/v1/models`
+        是**我们自己的** OpenAI 兼容端点（`app.py:465`，给爱语那种外部客户端用的），
+        它**只回显当前配置的模型名、一个上游请求都不发**：
+
+            model = _effective_model()          # 只读自己内存里的配置
+            return jsonify({... "id": model ...})
+
+        实测 `HTTP 200，耗时 0.0016 秒`（1.6 毫秒）。
+
+        ⇒ 那个按钮测的是「**我们的进程还活着**」，与上游毫无关系：
+          **key 全废、上游全断、域名解析不了，它照样秒回"连接正常"。**
+          这类"判据测错了对象"比没有判据更糟 —— 它给出的是**假的安全感**。
+
+        ## 为什么由服务端代打
+
+        与 `/settings/models` 同款理由（**不重复实现，直接复用同一套解析与分类**）：
+          1. **key 不能下发浏览器**（面板里 key 框是只写的）；
+          2. 能带上**表单里还没保存**的 `base_url` / `api_key`
+             （用户常是"改地址 → 测一下 → 再保存"，只读已保存值的话第一次填地址时按钮就是废的）。
+
+        ## 与 `/settings/models` 的区别（刻意分开，别合并）
+
+        * `models` 是**功能**：要拿到完整模型列表（前端拿去渲染勾选）。
+        * `ping` 是**诊断**：只关心"通不通、哪一类不通"，成功时**少干活**
+          （只回报条数与是否含当前配置的那个模型），失败时给出上游原话。
+
+        ⚠️ 内置模型列表为空**不算失败**（与 `models` 的判据**故意不同**）：
+           有些中转站确实不给 `/models`，但聊天端点照样能用。
+           `models` 那里空列表要报错（用户明确要列表，给空就是没拿到东西）；
+           而 `ping` 这里空列表只标注一句，**不据此判定不通**。
+
+        Returns:
+            200 `{ok: true, base_url, model, model_count, model_present, detail}`
+            502 `{ok: false, error_type, detail}` —— 逐类说清是哪一种不通
+        """
+        denied = require_auth()
+        if denied is not None:
+            return denied
+        _, settings, _ = _svc()
+        if settings is None:
+            return _err("设置服务未就绪", "server_error", 503)
+
+        body = await request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            body = {}
+
+        eff = settings.effective_upstream()
+        base_url = str(body.get("base_url") or eff.get("base_url") or "").strip()
+        api_key = str(body.get("api_key") or "").strip() or str(eff.get("api_key") or "")
+        model = str(eff.get("model") or "").strip()
+        # ⚠️ 地址为空的检查**必须排在 `_fail` 定义之后** —— 早期版本我把它写在
+        #    上面，于是 `_fail` 还没绑定就调用 → `UnboundLocalError`。
+        #    这是被 `tests/test_settings_ping.py::test_ping_empty_base_url_is_rejected`
+        #    当场抓住的（判据先于产品发现问题，而不是反过来）。
+
+        url = base_url.rstrip("/") + "/models"
+        headers = {"Accept": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        import httpx
+
+        from quart import current_app
+
+        # 🔴 用**独立**的 config key 注入 transport，不与 `/settings/models` 共用：
+        #    两者是不同能力，共用一个 key 会让"只想打桩其中一个"变成不可能。
+        transport = current_app.config.get("EMOTION_PING_TRANSPORT")
+        timeout = 15.0
+
+        def _fail(message: str, error_type: str) -> tuple[Any, int]:
+            """失败统一出口 —— **每条失败都必须能被用户看到**（不许静默）。"""
+            log.warning(
+                "测试上游连接失败：%s",
+                message,
+                extra={"data": {"url": url, "error_type": error_type}},
+            )
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": {"message": message, "type": error_type},
+                        "error_type": error_type,
+                        "detail": message,
+                        "base_url": base_url,
+                    }
+                ),
+                502,
+            )
+
+        if not base_url:
+            # ⚠️ 走 `_fail` 而不是 `_err`：本端点的**成功与失败共用同一个信封**
+            #    （都带 `ok` 字段），前端一条判断分支就能处理完。
+            #    混两种信封会让"地址为空"这条少一个 `ok`，前端得为它写特例。
+            return _fail("上游 API 地址为空，无法测试连接", "invalid_api_base")
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
+                resp = await client.get(url, headers=headers)
+        except httpx.TimeoutException:
+            return _fail(
+                f"连接上游超时（{timeout:.0f}s）：{url} —— 检查地址是否可达/是否需要代理",
+                "upstream_timeout",
+            )
+        except httpx.HTTPError as exc:
+            return _fail(
+                f"连不上上游：{type(exc).__name__}: {exc}", "upstream_unreachable"
+            )
+
+        if resp.status_code in (401, 403):
+            return _fail(
+                f"上游拒绝鉴权（HTTP {resp.status_code}）—— 检查 API Key 是否正确",
+                "upstream_auth",
+            )
+        if resp.status_code >= 400:
+            # 🔴 先过 scrub_text：中转站常把收到的 Authorization 头原样回显在错误体里
+            detail = scrub_text((resp.text or "")[:200]).replace("\n", " ")
+            return _fail(f"上游返回 HTTP {resp.status_code}：{detail}", "upstream_error")
+
+        try:
+            payload = resp.json()
+        except Exception:  # noqa: BLE001
+            return _fail(
+                "上游返回的不是 JSON —— 确认地址填的是 OpenAI 兼容端点（通常以 /v1 结尾）",
+                "upstream_bad_payload",
+            )
+
+        names: list[str] = []
+        raw = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict) and item.get("id"):
+                    names.append(str(item["id"]))
+                elif isinstance(item, str):
+                    names.append(item)
+        elif isinstance(payload, dict) and isinstance(payload.get("models"), list):
+            for item in payload["models"]:
+                if isinstance(item, dict) and item.get("id"):
+                    names.append(str(item["id"]))
+                elif isinstance(item, str):
+                    names.append(item)
+
+        present = (model in names) if model else None
+        if names:
+            if present:
+                detail = f"上游可达，返回 {len(names)} 个模型，含当前配置的 {model}"
+            elif model:
+                detail = (
+                    f"上游可达，返回 {len(names)} 个模型，但**不含当前配置的 {model}**"
+                    " —— 地址/key 是通的，模型名可能不对"
+                )
+            else:
+                detail = f"上游可达，返回 {len(names)} 个模型"
+        else:
+            detail = (
+                "上游可达（HTTP 200），但它没有返回模型列表"
+                " —— 地址/key 通，只是该站不支持 /models；这不影响聊天"
+            )
+
+        log.info(
+            "测试上游连接成功",
+            extra={"data": {"url": url, "count": len(names), "model_present": present}},
+        )
+        return (
+            jsonify(
+                {
+                    "ok": True,
+                    "base_url": base_url,
+                    "model": model,
+                    "model_count": len(names),
+                    "model_present": present,
+                    "detail": detail,
+                }
+            ),
+            200,
+        )
 
     @bp.post("/settings/models")
     async def list_upstream_models():  # type: ignore[no-untyped-def]
