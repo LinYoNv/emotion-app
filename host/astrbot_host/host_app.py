@@ -335,9 +335,17 @@ class PluginHost:
         每项形状（`id`/`module_path` 是同一件东西的两种写法：
         前者给人看，后者是停用名单里的元素）：
 
-            {"id": 目录名, "module_path": "<目录名>.main", "name": 显示名,
+            {"id": 目录名, "module_path": "<目录名>.main", "name": 名字,
+             "display_name": 中文显示名（可空）, "pages": [拓展页...],
              "version": ..., "state": "loaded|failed|inactivated|not_loaded",
              "error": "..."}
+
+        🔴 `display_name` 与 `pages` 是 2026-10-09 为**侧边栏插件分组**补的：
+           侧边栏要按"有拓展页的插件"列出子项，需要①中文名②哪些插件有页面。
+           ⚠️ 以前没有这两项，前端只能拿 `name`（可能是目录名）去猜 ——
+              而 `pages` 更是**完全拿不到**（只有单独一条 `/plugins/pages` 接口）。
+           ⚠️ 不做成"只列有页面的插件"：侧边栏也许将来要列全部插件，
+              过滤是**显示方**的事（数据层给全，语义单一）。
         """
         if self.loader is None:
             return []
@@ -348,8 +356,14 @@ class PluginHost:
                     "id": rec.dir_name,
                     "module_path": rec.module_path,
                     "name": rec.name,
+                    # ⚠️ **可能为空**（不是每个插件都声明 display_name）。
+                    #    显示方用 `display_name || name` 退化 —— 数据层不硬填。
+                    "display_name": rec.display_name,
                     "version": rec.version,
                     "state": rec.state,
+                    # 拓展页（`pages/` 目录扫出来的，照真实现）。侧边栏分组要用。
+                    # ⚠️ 形状已由 `discover_plugin_pages` 定好：`{name, title}`。
+                    "pages": [dict(pg) for pg in rec.pages],
                     "error": (rec.error or "").strip().splitlines()[-1]
                     if rec.error
                     else "",

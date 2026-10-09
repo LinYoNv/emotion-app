@@ -287,3 +287,66 @@ async def test_config_save_bad_body_is_400(make):
     assert r.status_code == 400
     d = await r.get_json()
     assert "config" in d["error"]["message"], d["error"]["message"]
+
+
+# ===========================================================================
+# ③ 侧边栏插件分组要的两个字段（`display_name` / `pages`）
+#     情绪 2026-10-09：「要按我们平台实际有的插件添加，就算以后我自己添加了
+#     插件也能自己显示」⇒ 数据必须来自接口，不能写死。
+# ===========================================================================
+
+
+async def test_plugins_view_exposes_display_name_and_pages(make):
+    """🔴 `GET /api/v1/plugins` 必须给出 `display_name` 与 `pages`。
+
+    守的是**侧边栏插件分组能不能动态生成**：
+      * 没有 `display_name` → 侧边栏只能显示目录名（`meme_manager`），
+        而真 AstrBot 显示「表情包管理器」；
+      * 没有 `pages` → 前端得另开一条请求、或**写死插件名**
+        （情绪明确禁止写死："以后我自己添加了插件也能自己显示"）。
+    """
+    c = await make()
+    r = await c.get("/api/v1/plugins")
+    assert r.status_code == 200, await r.get_data(as_text=True)
+    d = await r.get_json()
+    ps = d["plugins"]
+    assert ps, "插件清单是空的"
+
+    # 每个插件都要有这两个键（值可以为空 —— 不是每个插件都声明）
+    for p in ps:
+        assert "display_name" in p, f"{p['id']} 缺 display_name"
+        assert "pages" in p, f"{p['id']} 缺 pages"
+        assert isinstance(p["pages"], list), f"{p['id']} 的 pages 不是 list"
+
+    # 🔴 至少有一个插件**真的有** display_name（否则等于没读）
+    with_dn = [p for p in ps if (p.get("display_name") or "").strip()]
+    assert with_dn, "没有任何插件读到 display_name —— 说明根本没读 metadata 的那个字段"
+
+    # 🔴 至少有一个插件**真的有** pages（否则侧边栏分组是空的）
+    with_pages = [p for p in ps if p["pages"]]
+    assert with_pages, "没有任何插件有拓展页（本机实测有 6 个，全空说明 pages 没接出来）"
+    for p in with_pages:
+        for pg in p["pages"]:
+            assert pg.get("name"), f"{p['id']} 的页面项缺 name：{pg}"
+
+
+async def test_display_name_is_not_the_directory_name(make):
+    """🔴 `display_name` 必须是 `metadata.yaml` 里的那个，**不是目录名**。
+
+    ⚠️ 这条守的是一次真实差点漏掉的事：`host_app.py` 原来把
+    `rec.name`（= 目录名）赋给 `display_name` ⇒ 字段**存在但值没意义**。
+    只断言"字段存在"抓不住它（值照样有），必须**断言两者不同**。
+
+    ⚠️ 用集合比较而不是写死某个插件名（情绪要求不能写死）。
+    """
+    c = await make()
+    r = await c.get("/api/v1/plugins")
+    ps = (await r.get_json())["plugins"]
+    pairs = [
+        (p["id"], p["display_name"]) for p in ps
+        if (p.get("display_name") or "").strip()
+    ]
+    same = [pid for pid, dn in pairs if dn == pid]
+    assert not same, (
+        f"这些插件的 display_name 与目录名相同 ⇒ 多半是拿目录名冒充的：{same}"
+    )

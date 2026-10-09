@@ -193,6 +193,12 @@ function showPanel(name) {
     else a.removeAttribute("aria-current");
   });
 
+  // 🔴 侧边栏插件子项的选中态（情绪 2026-10-09）。
+  //    ⚠️ 由**路由**决定，不在这里自己算：`showPanel("plugins")` 同时被
+  //       「插件列表」与「某个插件页面」用到，只有 `location.hash` 分得清。
+  //    ⚠️ 不在这里 `return` 或改动 `name` 的逻辑 —— 那只负责"哪个 panel 可见"。
+  syncNavPluginActive();
+
   // 🔴 手机端顶栏标题跟随当前页（2026-09-27 加）。
   //    手机上抽屉是浮层、关着时看不见导航，若顶栏只写死"情绪app"，
   //    用户**没法知道自己现在在哪一页** —— 顶栏存在的意义就只剩个汉堡。
@@ -3710,14 +3716,134 @@ async function loadPluginSwitch() {
     const d = await api("GET", "/api/v1/plugins");
     state.pluginSwitch = d;
     renderPluginSwitch();
+    // 🔴 侧边栏的插件分组**跟这一份数据同源**（同一次请求的结果）——
+    //    它是"哪个插件有拓展页"的唯一数据来源，另开一条请求就会漂。
+    renderNavPluginPages(d);
     hint.style.color = "";
   } catch (e) {
     // 🔴 读失败 → 说清原因 + 清空（不把"没读到"显示成"没有插件"）
     state.pluginSwitch = null;
     host.innerHTML = "";
+    // ⚠️ 侧边栏也要清掉：留着上一次的分组会显示**已经不存在的插件**，
+    //    点进去 404（比"没有"更糟 —— 用户会以为插件还在）。
+    renderNavPluginPages(null);
     hint.textContent = `读取插件清单失败：${e.message}`;
     hint.style.color = "var(--danger)";
   }
+}
+
+/* ================================================================================
+ * 侧边栏的「插件页面」分组（情绪 2026-10-09）
+ *
+ * 「在插件页点击就有了，不过做成 astrbot 那样也行，就是在侧边栏添加这个。」
+ * ⇒ 照真 AstrBot：侧边栏「插件」下面按插件列出**有拓展页的那些**。
+ *
+ * 🔴 **完全不写死插件名**（情绪明确要求：「以后我自己添加了插件也能自己显示」）：
+ *    数据来自 `GET /api/v1/plugins` 的 `plugins[].pages[]` + `display_name`，
+ *    装了新插件且它带 `pages/`，刷新面板就自己出现。
+ *
+ * ## 真 AstrBot 的做法（对照，`InstalledPluginsTab-DSnl1LUd.js:1`）
+ *    侧边栏那一项点的是 `pages[0]`（**只取第一个**）。
+ *    ⚠️ 我们**列全部**：配套插件有 2 个页面（`companion-panel` + `陪伴面板`），
+ *       只给一个会把另一个变成"只能从插件页进"的半残（真 AstrBot 就是这样）。
+ *       我们的插件页本来就能列出全部，侧边栏对齐它更一致。
+ * ================================================================================ */
+
+const NAV_PLUGIN_OPEN_KEY = "emotion.navPluginGroupOpen";
+
+/** 画侧边栏的插件分组。`d` 为 `null` = 读失败/没数据 ⇒ 整块隐藏。 */
+function renderNavPluginPages(d) {
+  const group = $("nav-plugin-group");
+  const box = $("nav-plugin-items");
+  if (!group || !box) return;
+
+  const plugins = ((d && d.plugins) || []).filter(
+    // ⚠️ 只列**真的有拓展页**的插件：没页面的插件在侧边栏里没有可点的东西。
+    (p) => Array.isArray(p.pages) && p.pages.length > 0,
+  );
+
+  box.innerHTML = "";
+  if (!plugins.length) {
+    // 一个都没有 ⇒ 整块不显示（空分组是纯噪音）
+    group.classList.add("hidden");
+    return;
+  }
+  group.classList.remove("hidden");
+
+  for (const p of plugins) {
+    // ⚠️ 显示名：`display_name` 可能为空（不是每个插件都声明）→ 退化成 name。
+    //    **必须在显示时退化**：数据层保持"有没有声明"这个区别。
+    const title = (p.display_name || "").trim() || p.name || p.id;
+    // 一个插件可能有多个页面 → 生成多条子项（带页面名区分）
+    const multi = p.pages.length > 1;
+    for (const pg of p.pages) {
+      const a = document.createElement("a");
+      a.className = "nav-subitem";
+      a.href = `#/plugins/${encodeURIComponent(p.id)}/${encodeURIComponent(pg.name)}`;
+      a.dataset.navPage = `${p.id}/${pg.name}`;
+      a.title = multi ? `${title} · ${pg.title || pg.name}` : title;
+      const ico = document.createElement("span");
+      ico.className = "nav-subico";
+      ico.setAttribute("aria-hidden", "true");
+      ico.textContent = "🧩";
+      a.appendChild(ico);
+      const lb = document.createElement("span");
+      lb.className = "nav-sublabel";
+      // 多页面时把页面名带上，否则两条同名分不出来
+      lb.textContent = multi ? `${title} · ${pg.title || pg.name}` : title;
+      a.appendChild(lb);
+      box.appendChild(a);
+    }
+  }
+  syncNavPluginGroupOpen();
+}
+
+/** 侧边栏插件子项的**选中态**：按当前 hash 高亮对应的那一条。
+ *
+ * 🔴 为什么按 hash 判而不是按 `name`：`showPanel("plugins")` 这个 `name`
+ *    同时服务「插件列表」和「某个插件页面」两种状态 ——
+ *    光有 `name` 分不出用户在哪一条子项上。
+ * ⚠️ 高亮子项时**同时点亮「插件」那一项**：用户视角是"我在插件这个大区里"，
+ *    两个都暗着会让人以为导航没跟上。
+ */
+function syncNavPluginActive() {
+  const raw = (location.hash || "").replace(/^#\/?/, "");
+  const parts = raw.split("/").filter(Boolean).map(decodeURIComponent);
+  // `#/plugins/<id>/<page>` → 有 page 才是"在看某个插件页面"
+  const want = (parts[0] === "plugins" && parts[1] && parts[2])
+    ? `${parts[1]}/${parts[2]}` : "";
+  document.querySelectorAll(".nav-subitem").forEach((a) => {
+    const on = !!want && a.dataset.navPage === want;
+    a.classList.toggle("active", on);
+    if (on) a.setAttribute("aria-current", "page");
+    else a.removeAttribute("aria-current");
+  });
+  if (want) {
+    const parent = document.querySelector('.nav-item[data-nav="plugins"]');
+    if (parent) parent.classList.add("active");
+  }
+}
+
+/** 展开/收起态：**记在 localStorage**，切页与刷新都不该自己弹开。 */
+function syncNavPluginGroupOpen() {
+  const group = $("nav-plugin-group");
+  const btn = $("nav-plugin-toggle");
+  const box = $("nav-plugin-items");
+  if (!group || !btn || !box) return;
+  const open = localStorage.getItem(NAV_PLUGIN_OPEN_KEY) === "1";
+  group.classList.toggle("open", open);
+  box.classList.toggle("hidden", !open);
+  btn.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
+const _navPluginToggle = $("nav-plugin-toggle");
+if (_navPluginToggle) {
+  _navPluginToggle.onclick = (ev) => {
+    ev.preventDefault();
+    const open = localStorage.getItem(NAV_PLUGIN_OPEN_KEY) === "1";
+    localStorage.setItem(NAV_PLUGIN_OPEN_KEY, open ? "0" : "1");
+    syncNavPluginGroupOpen();
+  };
 }
 
 /** 按 `state.pluginSwitch` 重画勾选列表 + 提示。 */
@@ -3911,6 +4037,14 @@ function openPluginPage(pluginId, pageName, opts) {
   $("plugin-frame").src = url;
   state.pluginCurrentId = pluginId;
   showPluginsView("frame");
+  // 🔴 **必须补这两句**：点侧边栏子项是**直接调**这个函数的（不经过 `applyRoute`），
+  //    而侧边栏的「哪个子项被选中」是 `showPanel` 里算的 ⇒ 不补的话
+  //    点侧边栏进来**选中态不会跟上**（真机判据 B2 抓到的：
+  //    "选中子项 0 条，而父项点亮了" —— 父项是另一条路径恰好点亮的）。
+  //    ⚠️ 顺序：先 `showPanel` 再 `go` —— `go` 会写 hash 触发 `applyRoute`，
+  //       那条路径也会 `showPanel`，两边结果一致（幂等，不会闪）。
+  showPanel("plugins");
+  syncNavPluginActive();
 
   if (!(opts && opts.updateHash === false)) {
     go(`plugins/${encodeURIComponent(pluginId)}/${encodeURIComponent(pageName)}`);

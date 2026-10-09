@@ -116,6 +116,16 @@ class PluginRecord:
     name: str
     dir_name: str
     path: Path
+    #: 🔴 **`metadata.yaml` 的 `display_name`**（用户认得出的中文名，如「表情包管理器」）。
+    #: ⚠️ 与 `name` 是两件事：`name` 可能是**目录名**（`meme_manager`），
+    #:    面板要显示的是这个。**可以为空**（不是每个插件都声明）。
+    #: 2026-10-09 补 —— 在此之前这个字段**全项目零消费**。
+    #:
+    #: ⚠️ **必须放在 `path` 之后**：dataclass 的「有默认值的字段不能排在没有默认值的
+    #:    字段前面」。我第一次插在 `path` 前面 ⇒ 启动直接
+    #:    `TypeError: non-default argument 'path' follows default argument`
+    #:    （插件宿主整个起不来，接口报"宿主未启动"）。
+    display_name: str = ""
     module: Any = None
     star_cls: type | None = None
     instance: Any = None
@@ -381,6 +391,17 @@ class PluginLoader:
             #    否则面板只能显示目录名（用户认不出是哪个插件）。
             meta = self._read_metadata(path)
             rec.name = meta.get("name") or path.name
+            # 🔴 **`display_name` 才是用户认得出的名字**（情绪 2026-10-09 对照截图发现）。
+            #
+            # 实测 `metadata.yaml`：`name: meme_manager` + `display_name: 表情包管理器`
+            # ⇒ 上一行读到的是**目录名**，面板上就显示 `meme_manager`，
+            #   而真 AstrBot 面板显示「表情包管理器」。
+            # ⚠️ 这个字段**以前全项目零消费**（只在 `host_app.py:655` 出现过一次，
+            #   而那里赋的还是 `rec.name`）—— 又一个"有字段、没人读"。
+            # ⚠️ **不是每个插件都有** `display_name`（如 `astrbot_gemini_400_fix` 没有）
+            #   ⇒ 回落空串，由**显示方**决定退化用 `name`
+            #   （**不在这里硬填成目录名**：那会让"有没有声明显示名"在数据层就看不出来）。
+            rec.display_name = str(meta.get("display_name") or "")
             rec.version = str(meta.get("version") or "")
             rec.author = str(meta.get("author") or "")
             rec.desc = str(meta.get("desc") or "")

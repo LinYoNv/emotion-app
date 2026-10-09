@@ -60,6 +60,28 @@
         <span class="nav-ico" aria-hidden="true">🧩</span><span class="nav-label">插件</span>
         <span class="nav-badge hidden" id="plugins-badge">0</span>
       </a>
+      <!-- 🔴 **插件拓展页的侧边栏分组**（情绪 2026-10-09，照真 AstrBot 的样子）：
+           「插件」下面按插件列出**有拓展页的那些**，点一下直接打开那个页面。
+
+           ## 数据来源（**不写死任何插件名**，情绪明确要求"以后自己加插件也能显示"）
+           由 `renderNavPluginPages()` 从 `GET /api/v1/plugins` 的
+           `plugins[].pages[]` + `display_name` **动态生成** ——
+           装了新插件、它带 `pages/`，刷新面板就自己出现（无需改代码）。
+
+           ⚠️ **默认不展开**（`hidden`）：真 AstrBot 也是折叠的，而展开态会占掉
+              侧边栏一大截（当前 6 个页面）。展开状态记在 localStorage ——
+              用户收起后切页/刷新不该又弹开。
+           ⚠️ 这一块**必须放在 `#sidebar-nav` 内**：收起态（只显示图标）下
+              它整块隐藏（见 CSS），否则图标条里会多出一串没有图标文字的项。
+           ⚠️ 空的时候**整块不显示** —— 一个没有子项的"插件"分组是纯噪音。 -->
+      <div id="nav-plugin-group" class="nav-group hidden">
+        <button type="button" id="nav-plugin-toggle" class="nav-group-head"
+                aria-expanded="false" aria-controls="nav-plugin-items">
+          <span class="nav-group-arrow" aria-hidden="true">▸</span>
+          <span class="nav-label">插件页面</span>
+        </button>
+        <div id="nav-plugin-items" class="nav-group-items"></div>
+      </div>
       <!-- ⚠️ 与契约 §4 的唯一差异：**图标用 🔌 而不是 🧩**。
            原因：上面「插件」已经用了 🧩，而侧边栏**收起态只剩图标**
            （`.app.collapsed .nav-label { display: none }`）→ 两个 🧩 在图标条里

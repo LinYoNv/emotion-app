@@ -284,10 +284,42 @@ def main() -> int:
               const r2 = await fetch('/api/v1/plugins/PLUGIN_ID/config', { cache: 'no-store' });
               const d2 = await r2.json();
               const got = (d2.config || {})[key];
+              const ok = got === want;
+
+              // 🔴 **判据改的是真实状态，必须自己收尾**（把值改回原样）。
+              //    ⚠️ 我第一版没收尾 ⇒ 每次跑判据都把 `config_mode` 翻一次，
+              //       跑两遍正好互相抵消（看着"人畜无害"），但**跑奇数遍**就留下
+              //       一个被改过的插件配置 —— 那种"测试污染生产数据"的账最难查。
+              //    ⚠️ 收尾走**接口**（不是直接改盘）：直接改盘会让内存里那份
+              //       与磁盘不一致，而插件读的是内存那份。
+              // ⚠️🔴 **必须重新取控件**：保存成功会调 `openPluginConfig(id)` 把
+              //     `#plugin-config-body` **整块重绘** ⇒ 上面那个 `wrap` 已经成了
+              //     游离节点，改它不会触发任何 change（我第一版就是这样，
+              //     收尾"静默失败"—— 判据看了半天才发现是 DOM 被换了）。
+              const wrap2 = [...document.getElementById('plugin-config-body')
+                               .querySelectorAll('[data-plugin-key]')]
+                              .find(el => el.dataset.pluginKey === key);
+              const ctrl2 = wrap2 && wrap2.querySelector('input, select');
+              if (ctrl2) {
+                ctrl2.value = cfg[key];
+                ctrl2.dispatchEvent(new Event('change', { bubbles: true }));
+                document.getElementById('plugin-config-save').click();
+                for (let i = 0; i < 60; i++) {
+                  await new Promise(r => setTimeout(r, 120));
+                  const h = document.getElementById('plugin-config-hint');
+                  if (h && /保存|失败|重启|已/.test(h.textContent || '')) break;
+                }
+                const r3 = await fetch('/api/v1/plugins/PLUGIN_ID/config', { cache: 'no-store' });
+                const d3 = await r3.json();
+                if ((d3.config || {})[key] !== cfg[key]) {
+                  return { ok: false, detail: '收尾失败：' + key + ' 没改回 ' + JSON.stringify(cfg[key]) };
+                }
+              }
+
               return {
-                ok: got === want,
+                ok: ok,
                 detail: key + ': ' + JSON.stringify(cfg[key]) + ' → 保存 ' + JSON.stringify(want)
-                        + ' → 服务端读回 ' + JSON.stringify(got)
+                        + ' → 服务端读回 ' + JSON.stringify(got) + '（已改回原值）'
               };
             })()""".replace("PLUGIN_ID", PLUGIN_ID), aw=True)
 
