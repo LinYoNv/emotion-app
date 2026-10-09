@@ -495,32 +495,32 @@
           是两个概念；删掉就没有配 key 的入口了。只是移到最上面并改了标题。
   -->
   <section id="tab-settings" class="panel hidden">
-    <h3>上游连接（本机直连上游） <small>（本服务自己用；与下面"选哪个模型"是两回事）</small></h3>
-    <form id="settings-form">
-      <label>API 地址 <input id="s-base-url" placeholder="https://api.syuan.org/v1" /></label>
-      <label>模型
-        <span class="field-row">
-          <input id="s-model" />
-          <button type="button" id="fetch-models" title="从上面那个 API 地址拉取可用模型">获取模型</button>
-        </span>
-      </label>
-      <label id="model-picker-wrap" class="hidden">可选模型
-        <!-- ⚠️ `<select>` **没有** `type` 属性 —— 别给它加 `type="button"`。
-             那个属性在 select 上不合法（HTML 规范里 select 没有 type），
-             浏览器会忽略它，但校验器会报错、后来人看到还会以为这里有什么玄机。
-             🔴 顺带澄清一个**常见误解**：`<select>` 在表单里**不会**触发隐式提交
-             （隐式提交只由 `<button>` / `<input type=submit>` 发起），
-             所以这里本来就不需要任何"防提交"处理。 -->
-        <select id="model-picker"></select>
-      </label>
-      <label>API Key <input id="s-api-key" type="password" placeholder="留空 = 不修改" /></label>
-      <div class="row">
-        <button type="submit" class="primary">保存</button>
-        <button type="button" id="clear-overrides">恢复环境变量默认</button>
-        <button type="button" id="ping">测试连接</button>
-      </div>
-      <p class="hint" id="settings-hint"></p>
-    </form>
+    <!-- ======================================================================
+         🔴 「上游连接」整块**已移除**（情绪 2026-10-09 明确要求）。
+
+         原来它提供：API 地址 / 模型 / API Key / 保存 / 恢复环境变量默认 / 测试连接。
+         情绪的理由（原话）：「[上游连接]这个版块随着全局默认对话模型一起移除吧，
+         还是和刚才说的一样按[会话]用户自己选择的模型来进行对话。」
+         ⇒ 现在"用哪个模型"**只由每条会话自己选的模型决定**（设置在
+            「设置 → 配置文件 → 会话」里），不再有一个"全局兜底模型"。
+
+         ⚠️ 删掉后这三件事分别去哪儿了（都**没有**丢能力）：
+           ① 配 key / 地址   → 「模型供应商」页（源上填 `api_base` + `key`）
+           ② 拉可用模型       → 「模型供应商」页的「获取模型列表」
+                                （`POST /api/v1/provider-sources/<源id>/models`，
+                                  真打上游 `GET /models` —— 见 api_providers.py:716）
+           ③ 测连通性         → 同② ：能列出模型就说明地址与 key 都对
+                                （这条比原来那个"秒回正常"的假测试**更可信**）
+
+         ⚠️ **`.env` 里的 `EMOTION_UPSTREAM_*` 仍然生效**，但它现在只是
+            "没有任何会话选模型时的最后兜底" —— 而那种情况会**明确报错**
+            引导用户去选，不会静默用起来（见 `ChatService.model_unavailable_reason`）。
+         ====================================================================== -->
+    <h3>设置</h3>
+    <p class="hint">
+      「用哪个模型」现在按<strong>每条会话</strong>各自设置 —— 见下面的
+      「配置文件 → 会话」。模型与 key 在「模型供应商」页配置。
+    </p>
 
     <!-- ~~~~~~~~~~ 配置文件（会话 + 上下文管理策略） ~~~~~~~~~~ -->
     <h3>配置文件 <small>（字段来自后端 schema，不是前端写死的）</small></h3>

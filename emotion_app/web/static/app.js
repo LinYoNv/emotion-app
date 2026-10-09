@@ -1796,28 +1796,44 @@ $("s-umo-new") && ($("s-umo-new").onclick = async () => {
 });
 
 /* ================= 设置 ================= */
+/** 设置页 loader。
+ *
+ * 🔴 「上游连接」那块表单**已删除**（情绪 2026-10-09）——
+ *    所以这里不再取 `s-base-url` / `s-model` / `s-api-key`
+ *    （那几个元素已不存在，取它们会**当场抛错**，把 `/health` 那步也带走）。
+ *
+ * ⚠️ 但**仍然要拉 `/api/v1/settings`**：那个端点还管着
+ *    「当前激活人格」（`active_persona_id`），人格页依赖它。
+ *    把整个请求删掉会让"当前人设"静默显示不出来。
+ *
+ * ⚠️ 保留 `#deploy-config`（部署配置只读视图，来自 `/health`）——
+ *    它与"上游连接"是两件事，不受本次删除影响。
+ */
 async function loadSettings() {
   try {
+    // 仍然要这个请求：`active_persona_id`（当前人设）从这里来。
     const d = await api("GET", "/api/v1/settings");
-    const u = d.settings.upstream;
-    $("s-base-url").value = u.base_url || "";
-    $("s-model").value = u.model || "";
-    $("s-api-key").value = "";
-    $("s-api-key").placeholder = u.api_key_configured
-      ? `已设置（来源：${u.api_key_source}，留空 = 不变）`
-      : "未设置";
-    $("settings-hint").textContent =
-      `key 来源：${u.api_key_source} · 覆盖字段：${JSON.stringify(d.settings.overrides)}`;
+    state.settings = d.settings || null;
+  } catch (e) {
+    // ⚠️ 不吞：读到失败要留痕，但**不往已删元素里写**
+    state.settings = null;
+    state.settingsError = e.message;
+  }
 
-    // 重新加载设置时把上次的模型下拉收起来（避免显示过期的列表）
-    $("model-picker-wrap").classList.add("hidden");
-
+  try {
     const h = await api("GET", "/health");
-    $("deploy-config").textContent = JSON.stringify(
-      { server: h.config.server, storage: h.config.storage, auth: h.config.auth, logging: h.config.logging },
-      null, 2
-    );
-  } catch (e) { toast($("settings-hint"), "加载失败：" + e.message, true); }
+    const el = $("deploy-config");
+    if (el) {
+      el.textContent = JSON.stringify(
+        { server: h.config.server, storage: h.config.storage, auth: h.config.auth, logging: h.config.logging },
+        null, 2
+      );
+    }
+  } catch (e) {
+    // 🔴 失败要说出来：否则用户看到一片空白会以为"这页没内容"
+    const el = $("deploy-config");
+    if (el) el.textContent = `读取失败：${e.message}`;
+  }
 }
 
 /* ================================================================================
@@ -2320,92 +2336,13 @@ async function resetConfigProfile() {
   }
 }
 
-/* ---------------- 获取模型 ----------------
- *
- * 🔴 为什么是**服务端代拉**（`POST /api/v1/settings/models`）而不是前端直连上游：
- *    1. API Key 只在服务端。面板上那个 key 输入框是**只写**的
- *       （接口只回"是否已设置"），让前端直连就得把 key 下发到浏览器 = 泄露凭据。
- *    2. 用户常常「先改 API 地址 → 想拉模型 → 再选 → 最后保存」，
- *       所以要把**表单里还没保存的** base_url / api_key 一起传过去；
- *       只读已保存配置的话，第一次填地址时按钮就是废的。
- *
- * 拿到列表后：**自动选中当前模型**（若在列表里），用户也可直接点选；
- * 选中即写回输入框（**仍需点「保存」才生效** —— 不做隐式保存）。
- */
-$("fetch-models").onclick = async () => {
-  const el = $("settings-hint");
-  const btn = $("fetch-models");
-  const formKey = $("s-api-key").value.trim();
-
-  btn.disabled = true;
-  const oldLabel = btn.textContent;
-  btn.textContent = "获取中…";
-  toast(el, "正在从上游拉取模型列表…");
-
-  try {
-    const r = await fetch("/api/v1/settings/models", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        base_url: $("s-base-url").value.trim(),
-        // 只在用户**这次填了** key 时传；留空则让服务端用已保存的
-        ...(formKey ? { api_key: formKey } : {}),
-      }),
-    });
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok) {
-      // 后端已把"哪一类失败"说清了（超时/鉴权/非 JSON/空列表），原样展示
-      toast(el, "获取失败：" + (d?.error?.message || `HTTP ${r.status}`), true);
-      return;
-    }
-
-    const models = d.models || [];
-    const sel = $("model-picker");
-    sel.innerHTML = "";
-    for (const m of models) {
-      const o = document.createElement("option");
-      o.value = m;
-      o.textContent = m;
-      sel.appendChild(o);
-    }
-    // 自动选中当前模型（在列表里的话）
-    const cur = $("s-model").value.trim();
-    if (cur && models.includes(cur)) sel.value = cur;
-    $("model-picker-wrap").classList.remove("hidden");
-
-    // 点选即填（不自动保存 —— 让用户决定何时落盘）
-    sel.onchange = () => { $("s-model").value = sel.value; };
-
-    const src = d.source || {};
-    toast(
-      el,
-      `拉到 ${models.length} 个模型（来自 ${src.base_url}`
-        + `${src.used_form_api_key ? "，用本次填的 key" : "，用已保存的 key"}）`
-        + " —— 选一个后点「保存」生效"
-    );
-  } catch (e) {
-    toast(el, "获取失败：" + e.message, true);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = oldLabel;
-  }
-};
-
-$("settings-form").onsubmit = async (e) => {
-  e.preventDefault();
-  const patch = { upstream_base_url: $("s-base-url").value, upstream_model: $("s-model").value };
-  const k = $("s-api-key").value;
-  if (k) patch.upstream_api_key = k;
-  try {
-    const d = await api("PATCH", "/api/v1/settings", patch);
-    $("s-api-key").value = "";
-    toast($("settings-hint"), "已保存");
-    if (d.ignored_fields) toast($("settings-hint"), "已保存；忽略：" + d.ignored_fields.join(","), true);
-    loadSettings();
-  } catch (e2) { toast($("settings-hint"), "保存失败：" + e2.message, true); }
-};
-
 // ---- 配置文件（会话 / 上下文管理策略）：两段各存各的，只发改动项 ----
+// ⚠️ 这三条与「上游连接」**毫无关系** —— 我第一版删除时范围切宽了，
+//    把这一整段连同日志页那 5 条一起切掉，重做时又漏补。
+//    后果**完全静默**：配置页的「保存」按钮点了没反应、日志页刷新/复制全废，
+//    而控制台一行错都不报（因为处理器压根没绑，不是绑错了）。
+//    ⇒ 是 `tools/upstream_removed_check.py` 的 B2 判据抓住的
+//      （它专门断言"点了之后**真发出请求**"，而不是"按钮存在"）。
 $("cfg-session-form").onsubmit = (e) => { e.preventDefault(); saveConfigSection("session"); };
 $("cfg-context-form").onsubmit = (e) => { e.preventDefault(); saveConfigSection("context"); };
 $("cfg-reset").onclick = () => resetConfigProfile();
@@ -2422,58 +2359,29 @@ $("logs-auto").onchange = () => {
   else stopLogsAutoRefresh();
 };
 
-$("clear-overrides").onclick = async () => {
-  if (!confirm("清空运行时覆盖，恢复环境变量默认？")) return;  try {
-    await api("DELETE", "/api/v1/settings/overrides", {});
-    await loadSettings();
-  } catch (e) { toast($("settings-hint"), "失败：" + e.message, true); }
-};
-
-/* 🔴 「测试连接」**真的打上游**（2026-10-09 修）。
+/* ================================================================================
+ * 🔴 「上游连接」那一整块 JS **已删除**（情绪 2026-10-09）。
+ *    连同删掉的四个处理器，它们只服务于那块已被移除的表单：
+ *      * `$("fetch-models").onclick`    —— 「获取模型」（打 /api/v1/settings/models）
+ *      * `$("settings-form").onsubmit`  —— 保存 API 地址/模型/key
+ *      * `$("clear-overrides").onclick` —— 恢复环境变量默认
+ *      * `$("ping").onclick`            —— 「测试连接」（打 /api/v1/settings/ping）
  *
- * 改之前这里写的是 `fetch("/v1/models")` —— 那打的是**我们自己的** OpenAI 兼容端点，
- * 它只回显内存里的模型名、**一个上游请求都不发**（实测 1.6ms 返回）。
- * ⇒ 按钮测的是"我们的进程还活着"，**key 全废、上游全断也照样秒回"正常"**。
- *   情绪当场看出不对：「点击测试连接竟然是秒返回正常」。
+ *    ⚠️ 为什么**必须一起删**（不能只删 HTML）：
+ *       这些用的是 `$("x").onclick = ...` —— 元素不存在时 `$` 返回 null，
+ *       直接取 `.onclick` 会**当场抛 TypeError**，把整个脚本后半段
+ *       （模型供应商页、插件页、日志页的全部接线）一起带走。
+ *       症状是"设置页之后的页面全都点不动"，控制台只有一行错，很难往这里想。
  *
- * 现在打 `POST /api/v1/settings/ping`（服务端代打上游，key 不下发浏览器，
- * 且能带上表单里**还没保存**的 base_url/key —— 用户常是"改地址→测→再保存"）。
- *
- * ⚠️ 表单值要一起发（`s-base-url` / `s-api-key`），否则用户刚改完地址点测试，
- *    测的还是**旧的**那个地址 —— 那又变成"测错了对象"。
- *    这与「获取模型」按钮（`#fetch-models`）的口径**保持一致**。 */
-$("ping").onclick = async () => {
-  const el = $("settings-hint");
-  toast(el, "正在连接上游…");
-  try {
-    const formKey = ($("s-api-key")?.value || "").trim();
-    const body = {
-      base_url: ($("s-base-url")?.value || "").trim(),
-      // ⚠️ 与「获取模型」按钮**逐字一致**的口径：只在用户**这次填了** key 时传，
-      //    留空则让服务端去用已保存的那把（key 框是只写的，页面上显示的是占位符）。
-      ...(formKey ? { api_key: formKey } : {}),
-    };
-    const r = await fetch("/api/v1/settings/ping", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    let d = {};
-    try { d = await r.json(); } catch (_) { /* 非 JSON 也要能报出来 */ }
-
-    if (r.ok && d.ok) {
-      // 成功时**如实说清**"通到什么程度" —— 尤其是"上游可达但不含你配的模型名"
-      // 与"...但该站不支持 /models"这两种**半通**状态，它们最容易被说成"正常"。
-      toast(el, d.detail || "上游可达");
-      return;
-    }
-    const msg = (d.error && d.error.message) || d.detail || `HTTP ${r.status}`;
-    toast(el, "连接失败：" + msg, true);
-  } catch (e) {
-    // 连**我们自己的**服务都打不通（服务挂了/网络问题）—— 与"上游不通"是两回事，说清楚
-    toast(el, "连不上本机服务：" + e.message, true);
-  }
-};
+ *   🔴 但**后端端点全部保留** —— 前端不调用 ≠ 要删掉后端能力：
+ *      * `/api/v1/settings` 仍要读：它管着**当前激活人格**（`active_persona_id`）
+ *      * `/settings/models` + `/settings/ping` 有完整回归测试
+ *        （`tests/test_settings_ping.py` 18 条 + 注入验证 6/6），
+ *        是"服务端代拉上游、key 不下发浏览器"的既有实现。
+ *        将来「模型供应商」页要"测试这个源通不通"可直接复用，不必重写一套。
+ *      * 配 key/地址/拉模型 → 归「模型供应商」页
+ *        （`POST /api/v1/provider-sources/<源id>/models`，真打上游，见 api_providers.py:716）
+ * ================================================================================ */
 
 /* ================= 模型供应商（两层结构） =================
  *
