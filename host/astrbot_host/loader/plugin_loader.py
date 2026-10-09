@@ -140,6 +140,17 @@ class PluginRecord:
     #: ⚠️ 光有元数据还不够 —— 页面 HTML 在 `<插件>/pages/<name>/index.html`，
     #:    要宿主**提供页面路由**才打得开（这正是"插件没有配置入口"的根因）。
     pages: list[dict[str, str]] = field(default_factory=list)
+    #: 🔴 **该插件的配置对象**（真 `AstrBotConfig`：带 `schema` 与 `save_config()`）。
+    #:
+    #: 为什么必须**留住它**（情绪 2026-10-09 要做「插件配置页」）：
+    #:   原来 `_build_plugin_config()` 的返回值**只传给了插件构造器就丢了** ——
+    #:   想给面板读配置，只能重新构造或重新读盘。
+    #:   真实现把这件事放在 `StarMetadata.config`（`core/star/star.py:54`），
+    #:   而我们的 `StarMetadata` 之前**没有这个字段** —— 同一缺口的两半。
+    #:
+    #: ⚠️ 它同时也是 `save_config()` 的**唯一入口**：面板保存时必须写回**这个**
+    #:    对象（而不是另起一份 JSON 写盘），否则又成了"同一概念两条写入路径"。
+    config: Any = None
     #: 🔴 是否因**停用名单**被跳过（真实现 `inactivated_plugins`）。
     #: 停用与"加载失败"是**两条不同的路径**：停用的插件不 import、不实例化、
     #: 不 `initialize()`，并且**不计入失败**（真实现 `star_manager.py:1240`
@@ -437,6 +448,16 @@ class PluginLoader:
             #    实测踩到：传 None 会让插件 `__init__` 里 `config.get(...)` 直接
             #    AttributeError —— 而且是在 4600 行构造逻辑深处才炸。
             plugin_config = self._build_plugin_config(path, meta)
+
+            # 🔴 **留住配置对象**（情绪 2026-10-09「插件配置页」的前提）。
+            #    以前这一行的返回值只往下传一层就没人引用了 ——
+            #    面板要读/写插件配置时**无从下手**（只能重新构造或重新读盘，
+            #    那必然与插件手里那份漂移）。
+            #    真实现是 `StarMetadata.config`（`core/star/star.py:54`）。
+            #    ⚠️ 两处都要存：`rec.config` 给宿主读，`StarMetadata.config`
+            #       是为了与真实现同形（插件/第三方按那个字段找配置）。
+            rec.config = plugin_config
+            self._stash_star_config(star_cls, plugin_config)
 
             try:
                 rec.instance = star_cls(context=self._context, config=plugin_config)
@@ -958,6 +979,28 @@ class PluginLoader:
                 exc_info=True,
             )
             return {}
+
+    @staticmethod
+    def _stash_star_config(star_cls: type, config: Any) -> None:
+        """把配置对象挂到 `StarMetadata.config`（真实现 `core/star/star.py:54`）。
+
+        🔴 **为什么不能只存 `rec.config`**：
+           真实现把配置放在**元数据**上（`star_map[module].config`），
+           而第三方/插件是按那个字段找配置的。
+           只存我们自己的 `PluginRecord` = 形状与真实现不一致，
+           "看起来能用"但任何按真实现写的代码都取不到。
+
+        ⚠️ 与 `_fill_star_metadata` 分开：那个负责"名字/作者/版本"这类**静态**
+           信息（在实例化**前**就要填好），配置是加载链路后段才有的。
+           合成一个函数会让调用时机含糊（早调了 `config` 还是 None）。
+        """
+        from astrbot_host.compat.core.star.base import StarMetadata, star_map
+
+        md = star_map.get(star_cls.__module__)
+        if md is None:
+            md = StarMetadata(star_cls_type=star_cls, module_path=star_cls.__module__)
+            star_map[star_cls.__module__] = md
+        md.config = config
 
     @staticmethod
     def _fill_star_metadata(

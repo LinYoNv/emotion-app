@@ -671,6 +671,143 @@ class PluginHost:
             "components": components,
         }
 
+    def plugin_config(self, plugin_id: str) -> dict[str, Any] | None:
+        """读一个插件的配置（照真实现 `GET /api/v1/plugins/config`）。
+
+        ## 真实现形状（`config_service.py:844-863` + `api/plugins.py:726-732`）
+
+        ::
+
+            {
+              "plugin_name": "<插件目录名>",
+              "metadata": {                      # ⚠️ 无 schema 时是 None
+                 "<插件目录名>": {
+                    "description": "<插件名> 配置",
+                    "type": "object",
+                    "items": <插件 _conf_schema.json 的原文>,
+                 }
+              },
+              "config": <当前实际值>,
+              "i18n": {},
+            }
+
+        🔴 **`metadata.items` 就是插件自带的 `_conf_schema.json` 原文** ——
+           配置项的标签/类型/默认值/hint/可选项**全部由插件自己声明**，
+           宿主不猜、不补。这一条决定了前端能画出通用表单。
+
+        Returns:
+            上述 dict；**插件不存在时返回 `None`**（由调用方转 404 ——
+            不许在这里编个空壳，那会让"插件不存在"看起来像"插件没配置"）。
+        """
+        if self.loader is None:
+            return None
+        rec = self.loader.records.get(plugin_id)
+        if rec is None:
+            return None
+
+        cfg = rec.config
+        # ⚠️ `_build_plugin_config()` 失败时会退回**裸 dict**（并已记 ERROR）——
+        #    那种情况下没有 `schema` 可用，如实报 `metadata=None`，
+        #    而不是假装"这个插件没有配置项"（两者给用户的下一步动作完全不同）。
+        schema = getattr(cfg, "schema", None)
+        metadata: dict[str, Any] | None = None
+        if isinstance(schema, dict):
+            metadata = {
+                plugin_id: {
+                    "description": f"{plugin_id} 配置",
+                    "type": "object",
+                    "items": schema,
+                }
+            }
+
+        # 当前值：`AstrBotConfig` 是 `dict` 子类，转成纯 dict 交出去。
+        current: dict[str, Any] = {}
+        if isinstance(cfg, dict):
+            current = {k: v for k, v in cfg.items()}
+        elif cfg is not None:
+            logger.warning(
+                "插件 %s 的配置对象不是 dict（%s）—— 面板将显示为空",
+                plugin_id,
+                type(cfg).__name__,
+            )
+
+        return {
+            "plugin_name": plugin_id,
+            "metadata": metadata,
+            "config": current,
+            "i18n": {},
+        }
+
+    async def save_plugin_config(self, plugin_id: str, config: dict[str, Any]) -> str:
+        """保存插件的配置，**并热重载该插件**（照真实现）。
+
+        真实现（`config_service.py:989-1018`）：`validate_config` →
+        `config.save_config(...)` → **`await plugin_manager.reload(plugin_name)`**，
+        然后回一句「保存插件 X 成功~ 机器人正在热重载插件。」
+
+        🔴 **为什么必须重载插件**（不是顺手多做的事）：
+            插件在 `__init__` 里就把配置读进自己的一堆属性了；只改文件不重载，
+            用户在面板上改的**不会生效**，而他看到的是"保存成功"
+            —— 正是本项目最忌的"静默不生效"。
+
+        ⚠️ 我们**没有** `validate_config`（真实现那个是给全局配置做校验的）。
+           所以这里不做额外校验 —— **不假装校验过**。
+
+        Returns:
+            给用户看的一句话（中文，照真实现口吻）。
+
+        Raises:
+            KeyError: 插件不存在。
+            RuntimeError: 该插件没有可写配置对象（存不了，**不静默**）。
+        """
+        if self.loader is None:
+            raise KeyError(plugin_id)
+        rec = self.loader.records.get(plugin_id)
+        if rec is None:
+            raise KeyError(plugin_id)
+
+        cfg = rec.config
+        save = getattr(cfg, "save_config", None)
+        if not callable(save):
+            # 🔴 **不静默**：这说明 `_build_plugin_config` 退回了裸 dict，
+            #    保存必然无效 —— 必须让用户看到"这个插件存不了"，
+            #    而不是回一句"已保存"然后什么都没发生。
+            raise RuntimeError(
+                f"插件 {plugin_id} 的配置对象不可写（没有 save_config）—— "
+                "它可能没有 _conf_schema.json，或加载时构造失败，请查看服务日志。"
+            )
+
+        # ⚠️ 浅合并（照真实现 `AstrBotConfig.save_config` → `self.update(...)`）：
+        #    只覆盖前端传来的键，其余保留。**不是**先清空再写。
+        save(config)
+
+        # ==================================================================
+        # 🔴 关于"热重载"：**我们目前没有这个能力，如实说，不假装**。
+        #
+        # 真实现会 `await plugin_manager.reload(plugin_name)`，文案是
+        # 「保存插件 X 成功~ 机器人正在热重载插件。」。
+        #
+        # ⚠️ 我第一版写成了 `getattr(self.loader, "reload", None)` +
+        #    `inspect.isawaitable(...)` —— 那是**我假设的 API**：
+        #    全库 grep 确认 `PluginLoader` **没有 `reload`/`unload`**
+        #    （只有 `load_all`/`load_one`/`initialize_all`）。
+        #    它永远不会抛错、也永远不会生效 ⇒ 静默地走"没有热重载能力"那个分支，
+        #    而日志里连一行都不打 —— 这正是本项目最忌的"编造 API + 静默"。
+        #
+        # ✅ 现在的做法：**如实告知需要重启**，并给出与插件启停一致的措辞
+        #    （`config_profile.py` 里"改完需要重启服务才生效"是同一个约定）。
+        #    将来真做了重载，改这一处即可。
+        # ==================================================================
+        logger.info(
+            "插件 %s 的配置已保存（需要重启服务才能生效）",
+            plugin_id,
+            extra={"data": {"plugin": plugin_id, "keys": sorted(config.keys())[:20]}},
+        )
+        return (
+            f"插件 {plugin_id} 的配置已保存。"
+            "⚠️ 本服务**尚未实现插件热重载**，需要**重启服务**后生效。"
+        )
+
     def plugin_readme(self, plugin_id: str, *, limit: int = 200_000) -> tuple[str, bool] | None:
         """读插件的 `README.md`（照真实现 `plugin_service.py:1924-1981` 只找它）。
 

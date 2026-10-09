@@ -737,6 +737,35 @@
       </div>
       <iframe id="plugin-frame" class="plugin-frame" title="插件拓展页"></iframe>
     </div>
+
+    <!-- ==================================================================
+         🔴 **插件配置**（情绪 2026-10-09）：「有些插件没有内置的独立 webui
+            就可以打开插件的配置，如图。」
+
+         形状照真 AstrBot 的「插件配置」弹窗：
+            标题「插件配置」+ 配置项列表（由**插件自己声明的 schema** 驱动）
+            + 底部「保存并关闭 / 关闭」。
+
+         ⚠️ **没有「日志级别」那一项** —— 真实现有（落 `plugin_log_levels.json`），
+            而我们**没有 LogManager**（全库零命中）。
+            画一个没有后端的控件 = 假能力（本项目铁律：写了不调用 = 没有）。
+            将来真做了，再加。
+
+         视图互斥由 `showPluginsView()` 一处管（第四种取值 `"config"`），
+         这里不自己写显隐。
+         ================================================================== -->
+    <div id="plugin-config-wrap" class="hidden">
+      <div class="row frame-bar">
+        <button type="button" id="plugin-config-back">← 返回插件列表</button>
+        <strong id="plugin-config-title">插件配置</strong>
+        <span class="hint" id="plugin-config-hint"></span>
+      </div>
+      <div id="plugin-config-body" class="detail-body"></div>
+      <div class="row cfg-actions plugin-config-actions">
+        <button type="button" id="plugin-config-save" class="primary">保存并关闭</button>
+        <button type="button" id="plugin-config-close">关闭</button>
+      </div>
+    </div>
   </section>
   </div><!-- /.content-body -->
 </main>

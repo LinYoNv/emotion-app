@@ -1265,3 +1265,158 @@ def _mount_plugin_routes(
             detail["readme"], detail["readme_truncated"] = readme
 
         return jsonify(detail), 200
+
+    # ==================================================================
+    # 插件配置（情绪 2026-10-09：「有些插件没有内置的独立 webui
+    # 就可以打开插件的配置」）
+    #
+    # 契约照真实现：
+    #   GET  /api/v1/plugins/config?plugin_id=  → api/plugins.py:720-732
+    #   PUT  /api/v1/plugins/config             → api/plugins.py:735-750
+    # 形状由 host_app.plugin_config() 产出（见那里的 docstring）。
+    #
+    # 🔴 三个"同一概念多条写入路径"的防线（本项目已踩 6 次）：
+    #   `_plugin_guard()` 把「鉴权 → 宿主判空 → 插件不存在」三段收敛到**一处** ——
+    #   两条路由共用；否则改一处忘一处（第八轮补 `/api/plug` legacy 路由
+    #   时就是这么收敛的）。
+    # ==================================================================
+
+    def _plugin_guard(plugin_id: str) -> tuple[Any, int] | None:
+        """两条插件配置路由的**共用前置**。
+
+        Returns:
+            `None` = 放行（`service.host` 一定可用）；
+            `(response, status)` = 直接返回给客户端。
+
+        ⚠️ 与 `plugin_detail` 里那三段是**同一套语义**（401/503/404），
+           之所以没回头去改 `plugin_detail` 用这个：那处已经过真机判据
+           （`tools/plugin_detail_check.py` 19/19），不在本轮改动范围内动它
+           风险大于收益。**新路由一律走这里。**
+        """
+        # 🔴 第一行必须鉴权（本项目真事故：漏了它 → 未登录也能读，
+        #    而服务绑 0.0.0.0）
+        denied = require_auth()
+        if denied is not None:
+            return denied
+        if service.host is None:
+            # ⚠️ **不返回空配置**：那会把"宿主没起来"显示成"这插件没配置"
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": "插件宿主未启动（请看服务日志里的原因）",
+                            "type": "unavailable",
+                        }
+                    }
+                ),
+                503,
+            )
+        # ⚠️ 这行我第一版写成了
+        #    `if plugin_id not in service.host.loader.records if service.host.loader else True:`
+        #    —— 两个三元条件叠在一起，语义是错的（loader 为 None 时反而**报 404**）。
+        #    而"宿主在、loader 没建"应该是 503（服务还没就绪），不是"插件不存在"。
+        loader = getattr(service.host, "loader", None)
+        if loader is None:
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": "插件宿主尚未完成加载（请看服务日志）",
+                            "type": "unavailable",
+                        }
+                    }
+                ),
+                503,
+            )
+        if plugin_id not in loader.records:
+            available = sorted(service.plugin_activation_ids())
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": f"没有这个插件：{plugin_id}",
+                            "type": "not_found",
+                            "available": available,
+                        }
+                    }
+                ),
+                404,
+            )
+        return None
+
+    @app.get("/api/v1/plugins/<plugin_id>/config")
+    async def plugin_config_get(plugin_id: str):  # type: ignore[no-untyped-def]
+        """读一个插件的配置（schema + 当前值）。"""
+        guard = _plugin_guard(plugin_id)
+        if guard is not None:
+            return guard
+
+        data = service.host.plugin_config(plugin_id)
+        if data is None:
+            # 走到这里说明 guard 放行了但宿主说没有 —— 如实报 404，
+            # **不编一个空配置**（那会显示成"这个插件没有配置项"）
+            return (
+                jsonify({"error": {"message": f"没有这个插件：{plugin_id}", "type": "not_found"}}),
+                404,
+            )
+        return jsonify(data), 200
+
+    @app.put("/api/v1/plugins/<plugin_id>/config")
+    async def plugin_config_put(plugin_id: str):  # type: ignore[no-untyped-def]
+        """保存一个插件的配置。
+
+        Body: `{"config": {...}}`（照真实现；**整体浅合并**，不是 diff）。
+        """
+        guard = _plugin_guard(plugin_id)
+        if guard is not None:
+            return guard
+
+        body = await request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return (
+                jsonify({"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}}),
+                400,
+            )
+        config = body.get("config")
+        if not isinstance(config, dict):
+            # 🔴 不说"缺少 config"就完事 —— 要说清**要什么形状**
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": "请求体需要 `{\"config\": {...}}` 形状",
+                            "type": "invalid_request_error",
+                        }
+                    }
+                ),
+                400,
+            )
+
+        try:
+            message = await service.host.save_plugin_config(plugin_id, config)
+        except KeyError:
+            return (
+                jsonify({"error": {"message": f"没有这个插件：{plugin_id}", "type": "not_found"}}),
+                404,
+            )
+        except RuntimeError as exc:
+            # 插件没有可写配置对象 —— 这是**能力缺失**，必须让用户看到，
+            # 而不是回一句"已保存"然后什么都没发生
+            return (
+                jsonify({"error": {"message": str(exc), "type": "unsupported"}}),
+                409,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("保存插件配置失败", extra={"data": {"plugin": plugin_id}})
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": f"保存失败：{type(exc).__name__}: {exc}",
+                            "type": "internal_error",
+                        }
+                    }
+                ),
+                500,
+            )
+        return jsonify({"ok": True, "message": message}), 200

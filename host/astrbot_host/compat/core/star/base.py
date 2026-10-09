@@ -59,6 +59,14 @@ class StarMetadata:
     display_name: str = ""
     activated: bool = True
     reserved: dict[str, Any] = field(default_factory=dict)
+    #: 🔴 **该插件的配置对象**（真 `AstrBotConfig`：带 `schema` + `save_config()`）。
+    #: 照真实现 `core/star/star.py:54`（`metadata.config = config`）。
+    #:
+    #: ⚠️ **别与 `Star.config` 搞混**：`Star.__init__` 的 `config` 形参是
+    #:    **刻意丢弃**的（见 `Star.__init__` 的注释，那是照真实现的等义行为），
+    #:    配置的权威存放处是**这里**（元数据）—— 面板读配置也走这里。
+    #:    真实现把同一个字段名挂在**元数据**上，不是实例上。
+    config: Any | None = None
 
 
 class CommandParserMixin:

@@ -1444,3 +1444,56 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border);
 }
 .cfg-head-sub h4 { font-size: 13px; color: var(--muted); font-weight: 600; }
+
+/* ==========================================================================
+   插件配置页（2026-10-09）
+   --------------------------------------------------------------------------
+   形状照真 AstrBot 的配置弹窗：一堆配置项 + 底部「保存并关闭 / 关闭」。
+   ⚠️ 我们**没有**「日志级别」那一项（没有 LogManager，画了就是假能力）。
+   ========================================================================== */
+
+#plugin-config-body {
+  flex: 1; min-height: 0; overflow-y: auto;
+  padding: 12px 14px;
+}
+
+/* 配置项之间的间隔：插件的 schema 动辄几十项，挤在一起根本扫不动 */
+#plugin-config-body .cfg-fields { gap: 12px; }
+
+/* 分组（schema 里 type=object 的项）：给个框，让层次看得出来 */
+.plugin-cfg-group {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  background: var(--panel-2);
+  display: flex; flex-direction: column; gap: 8px;
+}
+.plugin-cfg-group > h5 {
+  margin: 0; font-size: 13px; font-weight: 600; color: var(--fg);
+}
+/* 嵌套组再深一层时弱化描边，避免"框套框"看不出层级 */
+.plugin-cfg-group .plugin-cfg-group {
+  border-color: transparent; background: transparent; padding: 6px 0 0 10px;
+  border-left: 2px solid var(--border);
+}
+
+/* 🔴 我们渲染不了的项（list/dict/file/template_list/_special）——
+   如实说明，**不画假控件**。用虚线框 + 警示色，让用户一眼看出"这项要另想办法" */
+.plugin-cfg-unsupported {
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  background: var(--sunken);
+}
+.plugin-cfg-unsupported .hint { color: var(--warn); }
+
+/* 底部动作条：跟着 body 走（不随内容滚动），否则几十项配置时要滚到底才能点保存 */
+.plugin-config-actions {
+  flex: 0 0 auto;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--panel-2);
+}
+
+/* 「配置」按钮：与「详情」并排，样式沿用 link-btn 但给它一点自己的间距 */
+.switch-row .switch-config { margin-left: 4px; }

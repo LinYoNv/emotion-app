@@ -268,11 +268,17 @@ async function applyRoute() {
 
   if (name === "plugins") {
     const [pid, page] = args;
-    // 🔴 三态路由：`#/plugins` = 列表；`#/plugins/<id>` = 详情；
+    // 🔴 四态路由：`#/plugins` = 列表；`#/plugins/<id>` = 详情；
+    //    `#/plugins/<id>/config` = **插件配置**（情绪 2026-10-09）；
     //    `#/plugins/<id>/<page>` = 插件拓展页 iframe。
     //    ⚠️ 详情那条必须**放在前面**判断（`page` 为空就是详情），
     //       否则 `#/plugins/<id>` 会落进 `else` 被当成"回列表"。
-    if (pid && page) openPluginPage(pid, page, { updateHash: false });
+    //    ⚠️🔴 `config` 必须在**拓展页之前**判：否则会被当成一个叫 "config"
+    //       的拓展页去打开（而那种页面不存在 → 用户看到"打不开"）。
+    //       目前**没有**插件把页面起名叫 `config`（实测 7 个页面名都对不上），
+    //       但**不能靠这个巧合** —— 插件是第三方代码，明天就可能有人这么起名。
+    if (pid && page === "config") openPluginConfig(pid);
+    else if (pid && page) openPluginPage(pid, page, { updateHash: false });
     else if (pid) openPluginDetail(pid, { updateHash: false });
     else closePluginPage();
   }
@@ -3780,6 +3786,25 @@ function renderPluginSwitch() {
     };
     row.appendChild(detail);
 
+    // 🔴 「配置」按钮（情绪 2026-10-09：「有些插件没有内置的独立 webui
+    //    就可以打开插件的配置」）。
+    //    ⚠️ 与「详情」按钮**同款三条防护**，一条都不能少：
+    //       `type="button"` + `preventDefault()` + `stopPropagation()` ——
+    //       整行是 `<label>`，不挡的话"打开配置"会**顺手把插件停用/启用**
+    //       （静默改配置，本项目最忌的那类 bug）。
+    const cfgBtn = document.createElement("button");
+    cfgBtn.type = "button";
+    cfgBtn.className = "link-btn switch-config";
+    cfgBtn.textContent = "配置";
+    cfgBtn.title = "打开这个插件的配置";
+    cfgBtn.onclick = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      // ⚠️ 也走 hash 路由（与"详情"一致）：这样能后退、能分享、刷新还在
+      go(`plugins/${encodeURIComponent(p.id)}/config`);
+    };
+    row.appendChild(cfgBtn);
+
     if (bad && p.error) {
       const err = document.createElement("small");
       err.className = "switch-err";
@@ -4162,15 +4187,17 @@ function setPluginSwitchVisible(visible) {
  * 现在改成：**任何**切换都只调这一个函数，三种视图在一个地方被同时决定。
  * 新增视图时只改这里 —— 这比"记得在 N 个地方都补一行"可靠。
  *
- * @param {"list"|"frame"|"detail"} which
+ * @param {"list"|"frame"|"detail"|"config"} which
  */
 function showPluginsView(which) {
-  // 三块主体：互斥
+  // 🔴 四块主体：**互斥**。新增了 "config"（插件配置，情绪 2026-10-09）——
+  //    正如这里的注释所说，新增视图**只改这一处**就够。
   $("plugin-frame-wrap").classList.toggle("hidden", which !== "frame");
   $("plugin-detail-wrap").classList.toggle("hidden", which !== "detail");
+  $("plugin-config-wrap").classList.toggle("hidden", which !== "config");
   $("plugin-page-list").classList.toggle("hidden", which !== "list");
   $("plugins-hint").classList.toggle("hidden", which !== "list");
-  // 启停那块只在**列表态**显示（其余两态整个面板让给主体）
+  // 启停那块只在**列表态**显示（其余状态整个面板让给主体）
   setPluginSwitchVisible(which === "list");
 
   if (which !== "frame") {
@@ -4180,6 +4207,12 @@ function showPluginsView(which) {
   if (which !== "detail") {
     // 离开详情就丢掉缓存，并清 id —— 迟到的详情响应靠它判断"用户已经走了"
     state.pluginDetail = null;
+  }
+  if (which !== "config") {
+    // 🔴 同理：离开配置页要把**已加载的配置**丢掉。
+    //    不丢的话，下次打开另一个插件的配置页会先闪出上一个插件的值
+    //    （而用户很可能就在那一瞬间点了保存 → **把 A 的配置存进 B**）。
+    state.pluginConfig = null;
   }
   if (which === "list") state.pluginCurrentId = "";
 }
@@ -4191,6 +4224,284 @@ function closePluginPage() {
 
 $("plugin-frame-back").onclick = () => go("plugins");
 $("plugin-detail-back").onclick = () => go("plugins");
+
+/* ================================================================================
+ * 插件配置（情绪 2026-10-09：「有些插件没有内置的独立 webui 就可以打开插件的配置」）
+ *
+ * ## 数据形状（照真 AstrBot，见 `host/astrbot_host/host_app.py:plugin_config`）
+ *
+ *     { plugin_name, metadata: {<id>: {description, type:"object", items: <_conf_schema.json>}},
+ *       config: {<当前值>}, i18n: {} }
+ *
+ * 🔴 **渲染器复用设置页那一套**（`buildConfigField` / `makeConfigInput`），
+ *    不另写第二套 —— 本项目「同一概念两条写入路径」已踩 6 次。
+ *    做法是加一个**适配器**把插件 schema 的项翻译成我们的字段格式，
+ *    而不是复制渲染代码。
+ *
+ * 🔴 **我们只渲染能真正保存的控件**。插件 schema 里有几种类型我们**没有**对应控件
+ *    （`list`/`dict`/`file`/`template_list`、以及各种 `_special`），
+ *    对它们如实显示一句"这个插件项本面板暂不支持编辑，请直接改配置文件"，
+ *    **不画一个存不进去的控件**（那会让用户以为改了会生效 —— 假能力）。
+ * ================================================================================ */
+
+/** 插件 schema 的 `type` → 我们 `makeConfigInput` 认识的类型。
+ *
+ * ⚠️ 认不出来时返回 `null`（调用方据此画"不支持"提示），**不硬塞成 string** ——
+ *    把 `list` 当 string 画会显示成 "[object Object]" 或丢内容，
+ *    而用户点保存就把**列表写成了字符串**（数据被改坏且不报错）。
+ */
+function pluginFieldType(spec) {
+  const t = spec && spec.type;
+  if (t === "bool") return "bool";
+  if (t === "int" || t === "float") return "string";   // 数字用文本输入（见下）
+  if (t === "string" || t === "text") return "string";
+  if (t === "object") return null;                     // 分组，单独递归
+  return null;
+}
+
+/** 把一个插件 schema 项渲染成一个字段控件（复用 `buildConfigField`）。 */
+function buildPluginField(pluginId, key, spec, value, pathPrefix) {
+  const ourType = pluginFieldType(spec);
+  if (ourType === null) {
+    // 🔴 如实说"不支持"，**不画假控件**
+    const wrap = document.createElement("label");
+    wrap.className = "cfg-field plugin-cfg-unsupported";
+    const title = document.createElement("span");
+    title.className = "cfg-label";
+    title.textContent = spec.description || key;
+    wrap.appendChild(title);
+    const h = document.createElement("small");
+    h.className = "hint";
+    const kind = spec.type === "object" ? "（分组，见下面各项）" : `（类型 ${spec.type || "未知"}）`;
+    h.textContent = `本面板暂不支持编辑 ${kind}，请直接改插件的配置文件。`;
+    wrap.appendChild(h);
+    return wrap;
+  }
+
+  const field = {
+    key,
+    label: spec.description || key,
+    type: ourType,
+    hint: spec.hint || "",
+    default: spec.default,
+  };
+  // 枚举：我们已有 `enum` 分支，但插件 schema 用的是 `options` + `labels`
+  // （labels 下标与 options 配对，照真实现 `ConfigItemRenderer`）
+  if (Array.isArray(spec.options) && spec.options.length) {
+    field.type = "enum";
+    const labels = Array.isArray(spec.labels) ? spec.labels : [];
+    field.options = spec.options.map((o, i) => ({ value: o, label: labels[i] || String(o) }));
+  }
+
+  const wrap = buildConfigField("plugin", field, value);
+  wrap.dataset.pluginKey = key;
+  wrap.dataset.pluginPath = pathPrefix ? `${pathPrefix}.${key}` : key;
+  return wrap;
+}
+
+/** 递归渲染一份插件 schema 段。
+ *
+ * ⚠️ 递归深度设上限：插件的 `_conf_schema.json` 是**外部数据**，
+ *    有环或超深嵌套会让页面卡死（浏览器栈溢出）。
+ */
+function renderPluginSchemaItems(host, pluginId, schema, values, pathPrefix, depth) {
+  if (depth > 6) {
+    const h = document.createElement("small");
+    h.className = "hint";
+    h.textContent = "（嵌套过深，本面板不再展开）";
+    host.appendChild(h);
+    return;
+  }
+  for (const [key, spec] of Object.entries(schema || {})) {
+    if (!spec || typeof spec !== "object") continue;
+    // 🔴 `invisible: true` 的项**不画**（插件自己标了"别在界面上显示"）
+    if (spec.invisible) continue;
+
+    if (spec.type === "object" && spec.items) {
+      // 分组：画个小标题 + 递归
+      const group = document.createElement("div");
+      group.className = "plugin-cfg-group";
+      const gt = document.createElement("h5");
+      gt.textContent = spec.description || key;
+      group.appendChild(gt);
+      if (spec.hint) {
+        const gh = document.createElement("small");
+        gh.className = "hint";
+        gh.textContent = spec.hint;
+        group.appendChild(gh);
+      }
+      const inner = document.createElement("div");
+      inner.className = "cfg-fields";
+      // ⚠️ 嵌套值要**逐层下钻**：`values[key]` 可能不是对象（旧配置/类型不符），
+      //    那就按空对象渲染（让用户看到可编辑的默认项），而不是整段不显示。
+      const sub = values && typeof values[key] === "object" && values[key] !== null
+        ? values[key] : {};
+      renderPluginSchemaItems(inner, pluginId, spec.items, sub,
+                              pathPrefix ? `${pathPrefix}.${key}` : key, depth + 1);
+      group.appendChild(inner);
+      host.appendChild(group);
+    } else {
+      host.appendChild(buildPluginField(pluginId, key, spec, values ? values[key] : undefined, pathPrefix));
+    }
+  }
+}
+
+/** 打开某个插件的配置页。 */
+async function openPluginConfig(pluginId, opts) {
+  const keepHint = !!(opts && opts.keepHint);
+  state.pluginCurrentId = pluginId;
+  showPluginsView("config");
+  const title = $("plugin-config-title");
+  if (title) title.textContent = `插件配置 · ${pluginId}`;
+  const hint = $("plugin-config-hint");
+  const body = $("plugin-config-body");
+  if (body) body.innerHTML = "";
+  // 🔴 `keepHint`：保存成功后要把后端的提示**留住**。
+  //    我第一版没这个参数，保存时 `toast(hint, message)` 之后紧接着调
+  //    `openPluginConfig(id)` 重新拉数据 —— 而那个函数**第一件事就是**
+  //    `toast(hint, "正在读取配置…")` 再 `toast(hint, "")`，
+  //    于是那句"已保存，需要重启服务后生效"**存在不到一帧**、用户根本看不到。
+  //    真机判据 C2 抓到了它（hint 读出来是空串）。
+  if (!keepHint) toast(hint, "正在读取配置…");
+
+  try {
+    const d = await api("GET", `/api/v1/plugins/${encodeURIComponent(pluginId)}/config`);
+    // 迟到的响应不要覆盖用户已经切走的视图（与本文件别处同款守卫）
+    if (state.pluginCurrentId !== pluginId) return;
+    state.pluginConfig = d;
+    renderPluginConfig(d);
+    if (!keepHint) toast(hint, "");
+  } catch (e) {
+    if (state.pluginCurrentId !== pluginId) return;
+    // 🔴 失败要说清是"读不到"还是"没配置"，别留一片空白
+    if (body) {
+      body.innerHTML = "";
+      const p = document.createElement("p");
+      p.className = "hint";
+      p.textContent = `读取插件配置失败：${e.message}`;
+      body.appendChild(p);
+    }
+    toast(hint, `读取失败：${e.message}`, true);
+  }
+}
+
+/** 把读到的配置画出来。 */
+function renderPluginConfig(d) {
+  const body = $("plugin-config-body");
+  if (!body) return;
+  body.innerHTML = "";
+  const pluginId = d.plugin_name;
+  const md = d.metadata && d.metadata[pluginId];
+  const save = $("plugin-config-save");
+
+  if (!md || !md.items || !Object.keys(md.items).length) {
+    // 🔴 三种"没有配置"要分清（用户的下一步动作完全不同）：
+    //    ① 插件根本没有 schema（没写 _conf_schema.json）
+    //    ② 有 schema 但内容为空
+    //    ③ 宿主构造配置失败（那种情况后端会说 metadata=null 且日志里有 ERROR）
+    const p = document.createElement("p");
+    p.className = "hint";
+    p.textContent = "这个插件没有声明任何配置项（它没有 _conf_schema.json，或内容为空）。";
+    body.appendChild(p);
+    // 没有配置项时**把保存按钮禁用**（点了也没东西可存）
+    if (save) save.disabled = true;
+    return;
+  }
+  if (save) save.disabled = false;
+
+  const root = document.createElement("div");
+  root.className = "cfg-fields";
+  renderPluginSchemaItems(root, pluginId, md.items, d.config || {}, "", 0);
+  body.appendChild(root);
+}
+
+/** 收集插件配置的**改动项**（只发改动 —— 与设置页同款口径）。
+ *
+ * ⚠️ 返回**扁平键**（`a.b.c` 路径），保存时后端按浅合并处理。
+ *    我们的存储是 JSON，嵌套分组在键上就是嵌套 dict；
+ *    但后端的 `save_config` 是**浅合并**（顶层键整体替换），
+ *    所以嵌套分组的改动要**整组提交**（下面按顶层归并）。
+ */
+function collectPluginConfigChanges() {
+  const body = $("plugin-config-body");
+  const loaded = (state.pluginConfig || {}).config || {};
+  if (!body) return {};
+
+  const changes = {};
+  for (const wrap of body.querySelectorAll("[data-plugin-key]")) {
+    const key = wrap.dataset.pluginKey;
+    const path = wrap.dataset.pluginPath || key;
+    const ctrl = wrap.querySelector("input, select, textarea");
+    if (!ctrl) continue;
+
+    let v;
+    if (ctrl.type === "checkbox") v = ctrl.checked;
+    else if (ctrl.tagName === "SELECT") v = ctrl.value;
+    else v = ctrl.value;
+
+    // 与加载时的值比：**只有真改了才提交**
+    const parts = path.split(".");
+    let before = loaded;
+    for (const seg of parts) {
+      if (before && typeof before === "object") before = before[seg];
+      else { before = undefined; break; }
+    }
+    if (JSON.stringify(v) === JSON.stringify(before)) continue;
+
+    // ⚠️ 归并到**顶层键**（后端是浅合并：嵌套 dict 得整份给）
+    if (parts.length === 1) {
+      changes[key] = v;
+    } else {
+      // 深路径 → 从已加载的顶层那份**拷贝后**逐层写入，
+      // 这样同组其它键不会丢（丢键是静默数据损失）
+      const top = parts[0];
+      if (!changes[top]) {
+        const base = loaded[top];
+        changes[top] = (base && typeof base === "object")
+          ? JSON.parse(JSON.stringify(base)) : {};
+      }
+      let cur = changes[top];
+      for (let i = 1; i < parts.length - 1; i++) {
+        const seg = parts[i];
+        if (!cur[seg] || typeof cur[seg] !== "object") cur[seg] = {};
+        cur = cur[seg];
+      }
+      cur[parts[parts.length - 1]] = v;
+    }
+  }
+  return changes;
+}
+
+$("plugin-config-back").onclick = () => go("plugins");
+$("plugin-config-close").onclick = () => go("plugins");
+$("plugin-config-save").onclick = async () => {
+  const id = state.pluginCurrentId;
+  const hint = $("plugin-config-hint");
+  const btn = $("plugin-config-save");
+  if (!id) return;
+  const changes = collectPluginConfigChanges();
+  if (!Object.keys(changes).length) {
+    toast(hint, "没有改动，无需保存。");
+    return;
+  }
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = "保存中…";
+  try {
+    const r = await api("PUT", `/api/v1/plugins/${encodeURIComponent(id)}/config`, { config: changes });
+    // ⚠️ 后端的文案里有"需要重启服务才生效"——**原样透出**，
+    //    不在这里简化成"已保存"（那会掩盖生效时机）
+    // ⚠️ 顺序要紧：**先重新拉数据**（界面上的值要等于服务端的真实值），
+    //    再写提示 —— 反过来的话那句提示会被重拉过程清掉（见 openPluginConfig）。
+    await openPluginConfig(id, { keepHint: true });
+    toast(hint, (r && r.message) || "已保存");
+  } catch (e) {
+    toast(hint, `保存失败：${e.message}`, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+};
 
 /* ================= 启动 ================= */
 
