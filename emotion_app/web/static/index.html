@@ -4,6 +4,21 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>情绪app</title>
+<meta name="color-scheme" content="dark" />
+<meta name="description" content="情绪app 面板 —— 自托管的虚拟聊天伙伴后端" />
+<!-- 🔴 favicon **之前是 404**（实测 `curl /favicon.ico` → 404）。
+     浏览器每次打开面板都会去要它，拿不到就在标签页上显示一个默认的空白页图标，
+     而且每个页面都会往服务端打一条 404 日志（噪音）。
+     用 SVG：单文件、可缩放、不需要多套尺寸。`theme-color` 让移动端
+     地址栏跟着面板底色走（原来没写，安卓 Chrome 上地址栏是白的）。 -->
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+<meta name="theme-color" content="#101217" />
+<!-- 🔴 字体**预加载**（不是必须，但差别很大）：
+     面板首屏就是文字，`font-display:swap` 下不预载会先渲染系统字体、
+     再换成 Geist —— 肉眼是一次整页文字跳动（CLS 也会被记一笔）。
+     只预载 latin 那一条：中文字形本来就走系统字体，预载它没意义。
+     ⚠️ `crossorigin` 不能省 —— 字体请求是 CORS 模式，少了它会**重复下载**。 -->
+<link rel="preload" href="/static/fonts/geist-latin.woff2" as="font" type="font/woff2" crossorigin />
 <link rel="stylesheet" href="/static/app.css" />
 </head>
 <body>
@@ -30,18 +45,18 @@
     </div>
 
     <nav id="sidebar-nav" class="sidebar-nav" aria-label="主导航">
-      <a class="nav-item" href="#/chat" data-nav="chat">
+      <a class="nav-item" href="#/chat" data-nav="chat" data-nav-title="聊天">
         <span class="nav-ico" aria-hidden="true">💬</span><span class="nav-label">聊天</span>
         <!-- 未读徽标（主动消息进来时点亮）—— 结构与「插件」那个 badge 逐字一致 -->
         <span class="nav-badge hidden" id="chat-badge" title="有未读消息">0</span>
       </a>
-      <a class="nav-item" href="#/session" data-nav="session">
+      <a class="nav-item" href="#/session" data-nav="session" data-nav-title="会话">
         <span class="nav-ico" aria-hidden="true">🗂️</span><span class="nav-label">会话</span>
       </a>
-      <a class="nav-item" href="#/persona" data-nav="persona">
+      <a class="nav-item" href="#/persona" data-nav="persona" data-nav-title="人设">
         <span class="nav-ico" aria-hidden="true">🎭</span><span class="nav-label">人设</span>
       </a>
-      <a class="nav-item" href="#/plugins" data-nav="plugins">
+      <a class="nav-item" href="#/plugins" data-nav="plugins" data-nav-title="插件">
         <span class="nav-ico" aria-hidden="true">🧩</span><span class="nav-label">插件</span>
         <span class="nav-badge hidden" id="plugins-badge">0</span>
       </a>
@@ -49,15 +64,15 @@
            原因：上面「插件」已经用了 🧩，而侧边栏**收起态只剩图标**
            （`.app.collapsed .nav-label { display: none }`）→ 两个 🧩 在图标条里
            完全分不出来。结构（class/层级/nav-ico/nav-label）与其它 nav-item 逐字一致。 -->
-      <a class="nav-item" href="#/providers" data-nav="providers">
+      <a class="nav-item" href="#/providers" data-nav="providers" data-nav-title="模型供应商">
         <span class="nav-ico" aria-hidden="true">🔌</span><span class="nav-label">模型供应商</span>
       </a>
       <!-- ⚠️ 图标用 📜（不是 ⚙️/🔌）—— 侧边栏收起态只剩图标，重复就分不出来。
            结构（class/层级/nav-ico/nav-label）与其它 nav-item 逐字一致。 -->
-      <a class="nav-item" href="#/logs" data-nav="logs">
+      <a class="nav-item" href="#/logs" data-nav="logs" data-nav-title="日志">
         <span class="nav-ico" aria-hidden="true">📜</span><span class="nav-label">日志</span>
       </a>
-      <a class="nav-item" href="#/settings" data-nav="settings">
+      <a class="nav-item" href="#/settings" data-nav="settings" data-nav-title="设置">
         <span class="nav-ico" aria-hidden="true">⚙️</span><span class="nav-label">设置</span>
       </a>
     </nav>
@@ -96,14 +111,14 @@
   <section id="tab-chat" class="panel">
     <div class="chatbar">
       <select id="session-select" title="切换会话"></select>
-      <button id="new-session">+ 新会话</button>
-      <button id="clear-session" title="只清消息，保留会话设置">清空消息</button>
+      <button id="new-session" class="primary" type="button">+ 新会话</button>
+      <button id="clear-session" type="button" title="只清消息，保留会话设置">清空消息</button>
       <span class="hint" id="session-info"></span>
     </div>
     <div id="messages" class="messages"></div>
     <div class="composer">
       <textarea id="input" rows="2" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
-      <button id="send">发送</button>
+      <button id="send" class="primary" type="button">发送</button>
     </div>
     <p class="hint" id="chat-hint"></p>
   </section>
@@ -112,11 +127,15 @@
   <section id="tab-session" class="panel hidden">
     <div class="split">
       <aside>
-        <div class="row"><button id="new-session-2">+ 新建会话</button></div>
+        <div class="row"><button id="new-session-2" class="primary" type="button">+ 新建会话</button></div>
         <ul id="session-list" class="list"></ul>
       </aside>
       <div class="editor">
-        <div id="session-empty" class="empty">左边选一个会话。</div>
+        <div id="session-empty" class="empty">
+          <span class="empty-ico" aria-hidden="true">🗂️</span>
+          <strong>还没选会话</strong>
+          <span>左边点一条会话来改它的设置；<br />或者用「+ 新建会话」开一条新的。</span>
+        </div>
         <form id="session-form" class="hidden">
           <label>标题 <input id="s-title" /></label>
           <label>绑定人设（留空 = 用当前人设）
@@ -172,7 +191,7 @@
           <label>总结触发（超出窗口多少条后总结） <input id="s-trigger" type="number" min="1" /></label>
           <label>摘要（手动编辑；动态/混合模式会注入） <textarea id="s-summary" rows="4"></textarea></label>
           <div class="row">
-            <button type="submit">保存</button>
+            <button type="submit" class="primary">保存</button>
             <button type="button" id="s-del" class="danger">删除会话</button>
           </div>
           <p class="hint" id="session-hint"></p>
@@ -186,8 +205,8 @@
     <div class="split">
       <aside>
         <div class="row">
-          <button id="new-persona">+ 新建</button>
-          <button id="import-persona">导入</button>
+          <button id="new-persona" type="button">+ 新建</button>
+          <button id="import-persona" type="button">导入</button>
         </div>
         <ul id="persona-list" class="list"></ul>
       </aside>
@@ -197,7 +216,11 @@
              显隐**只由 `.is-detail` 决定**（CSS 单一事实来源），
              所以这里**不加** class="hidden"（那会和 !important 打架）。 -->
         <button type="button" id="persona-back" class="back-btn">← 返回列表</button>
-        <div id="persona-empty" class="empty">左边选一个人设，或新建一个。</div>
+        <div id="persona-empty" class="empty">
+          <span class="empty-ico" aria-hidden="true">🎭</span>
+          <strong>还没选人设</strong>
+          <span>左边点一个人设来编辑片段与参考图；<br />或者「+ 新建」「导入」一个。</span>
+        </div>
         <form id="persona-form" class="hidden">
           <div class="row">
             <input id="p-name" placeholder="名字（必填）" required />
@@ -219,7 +242,7 @@
           </details>
 
           <div class="row">
-            <button type="submit">保存</button>
+            <button type="submit" class="primary">保存</button>
             <button type="button" id="preview">预览提示词</button>
           </div>
           <p class="hint">
@@ -270,8 +293,8 @@
         <thead><tr><th>启用</th><th>标题</th><th>order</th><th>来源</th><th>内容</th><th></th></tr></thead>
         <tbody id="sections-body"></tbody>
       </table>
-      <button id="add-section">+ 添加片段</button>
-      <button id="save-sections">保存片段</button>
+      <button id="add-section" type="button">+ 添加片段</button>
+      <button id="save-sections" type="button">保存片段</button>
     </div>
   </section>
 
@@ -518,11 +541,17 @@
         </span>
       </label>
       <label id="model-picker-wrap" class="hidden">可选模型
+        <!-- ⚠️ `<select>` **没有** `type` 属性 —— 别给它加 `type="button"`。
+             那个属性在 select 上不合法（HTML 规范里 select 没有 type），
+             浏览器会忽略它，但校验器会报错、后来人看到还会以为这里有什么玄机。
+             🔴 顺带澄清一个**常见误解**：`<select>` 在表单里**不会**触发隐式提交
+             （隐式提交只由 `<button>` / `<input type=submit>` 发起），
+             所以这里本来就不需要任何"防提交"处理。 -->
         <select id="model-picker"></select>
       </label>
       <label>API Key <input id="s-api-key" type="password" placeholder="留空 = 不修改" /></label>
       <div class="row">
-        <button type="submit">保存</button>
+        <button type="submit" class="primary">保存</button>
         <button type="button" id="clear-overrides">恢复环境变量默认</button>
         <button type="button" id="ping">测试连接</button>
       </div>
@@ -544,7 +573,7 @@
         <!-- 字段由 renderConfigSections() 按 schema.session 注入 -->
         <div class="cfg-fields" id="cfg-session-fields"></div>
         <div class="row cfg-actions">
-          <button type="submit" id="cfg-session-save">保存</button>
+          <button type="submit" id="cfg-session-save" class="primary">保存</button>
           <p class="hint" id="cfg-session-hint"></p>
         </div>
       </form>
@@ -559,7 +588,7 @@
         <!-- 字段由 renderConfigSections() 按 schema.context 注入 -->
         <div class="cfg-fields" id="cfg-context-fields"></div>
         <div class="row cfg-actions">
-          <button type="submit" id="cfg-context-save">保存</button>
+          <button type="submit" id="cfg-context-save" class="primary">保存</button>
           <p class="hint" id="cfg-context-hint"></p>
         </div>
       </form>
@@ -674,7 +703,7 @@
                placeholder="至少 16 字符" required />
       </label>
       <div class="row">
-        <button type="submit">进入</button>
+        <button type="submit" class="primary">进入</button>
       </div>
       <p class="hint">登录后由服务端下发 <b>HttpOnly</b> 会话 cookie（默认 24 小时），
         JS 读不到令牌，刷新页面不用重输。</p>
@@ -685,7 +714,7 @@
 <!-- 导入人设 -->
 <div id="import-modal" class="modal hidden">
   <div class="modal-box import-box">
-    <div class="row"><h3>导入人设</h3><button id="import-close">关闭</button></div>
+    <div class="row"><h3>导入人设</h3><button id="import-close" type="button">关闭</button></div>
 
     <p class="hint">
       支持 <b>爱语备份</b>（<code>{"data":{"prompts":{…}}}</code>，一个文件可含多个人设）、
@@ -726,7 +755,7 @@
         那些字段**没有消费方**（契约 §7.5 明确不做，不做假能力）。 -->
 <div id="preset-modal" class="modal hidden">
   <div class="modal-box preset-box">
-    <div class="row"><h3>选择厂商预设</h3><button id="preset-close">关闭</button></div>
+    <div class="row"><h3>选择厂商预设</h3><button id="preset-close" type="button">关闭</button></div>
     <p class="hint" id="preset-hint">正在读取厂商预设…</p>
     <!-- 按 provider_type 分组（对话 / 语音 / 嵌入 / …）；计数由 JS 按真实数据算 -->
     <div class="preset-groups" id="preset-groups" role="group" aria-label="预设分组"></div>
@@ -744,7 +773,7 @@
 <!-- 预览弹层 -->
 <div id="modal" class="modal hidden">
   <div class="modal-box">
-    <div class="row"><h3 id="modal-title">预览</h3><button id="modal-close">关闭</button></div>
+    <div class="row"><h3 id="modal-title">预览</h3><button id="modal-close" type="button">关闭</button></div>
     <pre id="modal-body" class="preview"></pre>
   </div>
 </div>

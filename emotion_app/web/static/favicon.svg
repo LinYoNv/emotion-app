@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="情绪app">
+  <!--
+    情绪app 的图标：一个**对话气泡**（本体的核心是"聊天"），
+    气泡里是两条一长一短的线 —— 读作"你说一句、我说一句"。
+
+    ⚠️ 刻意**不做**渐变、不做圆角方块底、不堆装饰：
+       这是 16×16 到 32×32 的浏览器标签页图标，
+       那个尺寸下任何细节都会糊成一团，只有轮廓与对比度有意义。
+    ⚠️ 颜色用**十六进制字面量**而不是 CSS 变量 ——
+       favicon 是独立文档，拿不到 app.css 的 `:root`。
+       这两个值取自令牌表：`--accent #7f9cec`、`--sunken #0c0e13`。
+  -->
+  <rect width="64" height="64" rx="14" fill="#0c0e13"/>
+  <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="13.25"
+        fill="none" stroke="#7f9cec" stroke-opacity=".35" stroke-width="1.5"/>
+  <!-- 气泡主体 + 左下角的小尾巴 -->
+  <path d="M16 17h32a6 6 0 0 1 6 6v16a6 6 0 0 1-6 6H30l-9.5 8v-8H16a6 6 0 0 1-6-6V23a6 6 0 0 1 6-6z"
+        fill="#7f9cec"/>
+  <rect x="17" y="26" width="19" height="3.6" rx="1.8" fill="#0c0e13"/>
+  <rect x="17" y="34.5" width="12" height="3.6" rx="1.8" fill="#0c0e13" fill-opacity=".62"/>
+</svg>

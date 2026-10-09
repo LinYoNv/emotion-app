@@ -97,7 +97,12 @@ async function api(method, path, body) {
 
 function toast(el, msg, bad) {
   el.textContent = msg;
-  el.style.color = bad ? "var(--danger)" : "var(--muted)";
+  // 🔴 成功/进度**不写颜色**（`""` = 交还给样式表那一流的颜色），
+  //    只有失败才落到语义令牌 `--danger`。
+  //    原来这里写的是 `var(--muted)` —— 那是**把主题色抄进了 JS**：
+  //    样式表改主题时这一处不会跟着变，且它给"已保存"这类**成功**消息
+  //    上了一个次级文字色，语义也不对。清空才是让 CSS 保持单一来源。
+  el.style.color = bad ? "var(--danger)" : "";
 }
 
 /* ---------------- 健康状态 ---------------- */
@@ -894,7 +899,7 @@ $("save-sections").onclick = async () => {
     Object.assign(state.current, p);
     toast($("chat-hint"), "片段已保存");
     loadPersonas();
-  } catch (e) { alert("保存失败：" + e.message); }
+  } catch (e) { toast($("chat-hint"), "保存失败：" + e.message, true); }
 };
 
 $("new-persona").onclick = async () => {
@@ -905,7 +910,7 @@ $("new-persona").onclick = async () => {
     state.personas.unshift(p);
     selectPersona(p.id);   // 新建后直接进详情（会写 hash）
     renderPersonaList();
-  } catch (e) { alert("创建失败：" + e.message); }
+  } catch (e) { toast($("chat-hint"), "创建失败：" + e.message, true); }
 };
 
 /* 「← 返回列表」：手机端从详情退回列表 */
@@ -940,7 +945,7 @@ $("persona-form").onsubmit = async (e) => {
     $("p-api-key").value = "";
     $("p-api-key").placeholder = p.api_key_configured ? "已设置（留空 = 不变）" : "留空 = 不变";
     toast($("chat-hint"), "已保存");
-  } catch (e2) { alert("保存失败：" + e2.message); }
+  } catch (e2) { toast($("chat-hint"), "保存失败：" + e2.message, true); }
 };
 
 $("activate").onclick = async () => {
@@ -948,7 +953,7 @@ $("activate").onclick = async () => {
   try {
     await api("POST", `/api/v1/personas/${state.current.id}/activate`);
     await loadPersonas();
-  } catch (e) { alert("设置失败：" + e.message); }
+  } catch (e) { toast($("chat-hint"), "设置失败：" + e.message, true); }
 };
 
 $("dup").onclick = async () => {
@@ -956,7 +961,7 @@ $("dup").onclick = async () => {
   try {
     await api("POST", `/api/v1/personas/${state.current.id}/duplicate`, {});
     await loadPersonas();
-  } catch (e) { alert("复制失败：" + e.message); }
+  } catch (e) { toast($("chat-hint"), "复制失败：" + e.message, true); }
 };
 
 /* ================= 导入 / 导出 =================
@@ -1072,7 +1077,7 @@ $("export-persona").onclick = async () => {
       `${state.current.name}.json`
     );
     toast($("chat-hint"), "已导出");
-  } catch (e) { alert("导出失败：" + e.message); }
+  } catch (e) { toast($("chat-hint"), "导出失败：" + e.message, true); }
 };
 
 $("del").onclick = async () => {
@@ -1085,7 +1090,7 @@ $("del").onclick = async () => {
     $("sections-block").classList.add("hidden");
     $("persona-empty").classList.remove("hidden");
     await loadPersonas();
-  } catch (e) { alert("删除失败：" + e.message); }
+  } catch (e) { toast($("chat-hint"), "删除失败：" + e.message, true); }
 };
 
 $("preview").onclick = async () => {
@@ -1093,7 +1098,7 @@ $("preview").onclick = async () => {
   try {
     const d = await api("GET", `/api/v1/personas/${state.current.id}/preview`);
     showModal(`提示词预览 · ${state.current.name}（${d.describe.total_chars} 字符 / ${d.describe.section_count} 段）`, d.text);
-  } catch (e) { alert("预览失败：" + e.message); }
+  } catch (e) { toast($("chat-hint"), "预览失败：" + e.message, true); }
 };
 
 /* ================= 会话 ================= */
@@ -1388,17 +1393,19 @@ $("new-session").onclick = $("new-session-2").onclick = async () => {
     renderSessionSelect();
     refreshSessionInfo();
     switchToTab("chat");
-  } catch (e) { alert("创建失败：" + e.message); }
+  } catch (e) { toast($("session-hint"), "创建失败：" + e.message, true); }
 };
 
 $("clear-session").onclick = async () => {
-  if (!state.currentSessionId) return alert("当前没有会话");
+  // 清空消息在**聊天页**上（`#clear-session` 就在 `#session-select` 旁边），
+  // 所以反馈落在同一条工具栏上的 `#chat-hint`，而不是会话页的 `#session-hint`。
+  if (!state.currentSessionId) return toast($("chat-hint"), "当前没有会话", true);
   if (!confirm("清空这个会话的消息？（会话设置会保留）")) return;
   try {
     await api("POST", `/api/v1/sessions/${state.currentSessionId}/clear`);
     $("messages").innerHTML = "";
     await loadSessions();
-  } catch (e) { alert("失败：" + e.message); }
+  } catch (e) { toast($("chat-hint"), "失败：" + e.message, true); }
 };
 
 $("s-mode").onchange = () => {
@@ -1448,7 +1455,7 @@ $("s-del").onclick = async () => {
     $("session-empty").classList.remove("hidden");
     await loadSessions();
     refreshSessionInfo();
-  } catch (e) { alert("删除失败：" + e.message); }
+  } catch (e) { toast($("session-hint"), "删除失败：" + e.message, true); }
 };
 
 /* ---- umo（插件用户 ID）：复制 / 换一个 ----------------------------------
@@ -2122,7 +2129,7 @@ $("clear-overrides").onclick = async () => {
   if (!confirm("清空运行时覆盖，恢复环境变量默认？")) return;  try {
     await api("DELETE", "/api/v1/settings/overrides", {});
     await loadSettings();
-  } catch (e) { alert("失败：" + e.message); }
+  } catch (e) { toast($("settings-hint"), "失败：" + e.message, true); }
 };
 
 $("ping").onclick = async () => {
@@ -3553,7 +3560,8 @@ function renderPluginSwitch() {
     parts.push(`⚠️ 名单里有对不上任何插件的项（拼写错误？）：${d.unmatched.join(", ")}`);
   }
   hint.textContent = parts.join(" ");
-  hint.style.color = d.restart_required || (d.unmatched || []).length ? "var(--danger)" : "";
+  // 有"待重启 / 名单对不上"⇒ 警告色；否则交还样式表（不写主题色）
+  hint.style.color = d.restart_required || (d.unmatched || []).length ? "var(--warn)" : "";
 }
 
 /** 保存启停设置（整体替换停用名单）。 */

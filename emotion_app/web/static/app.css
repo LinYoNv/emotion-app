@@ -1,26 +1,183 @@
+/* ==========================================================================
+   字族
+   --------------------------------------------------------------------------
+   🔴 **自托管，不引任何外部源**（本面板是零构建 + 可能无外网的部署）。
+     字体文件与许可见 `static/fonts/`（Geist / Geist Mono，SIL OFL 1.1）。
+
+   ⚠️ **为什么 Geist 后面必须跟一串中文族**：
+      自托管的是 **latin + latin-ext** 子集，**不含任何中文字形**。
+      中文全靠系统字体回落 —— 这正是我们想要的（中文字体动辄 5 MB，
+      而且每个平台自带的那套本来就更贴平台观感）。
+      顺序：macOS/iOS → 已装 MiSans → 鸿蒙 → Android/Linux → 思源 → Windows。
+      ⚠️ 本机实测 `fc-match "sans-serif:lang=zh-cn"` 命中的是
+         **Noto Sans CJK SC**，所以这一串里必须留着它，否则 Linux 上中文要退回文泉驿。
+
+   ⚠️ **不要**把插件里那几个 5 MB 的 `MiSans-*.woff2` 复制进来
+      （那是 `astrbot_plugin_memory_companion` 的资产，复制 = 仓库膨胀 + 一份会漂移的副本）。
+   ========================================================================== */
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 400 700;              /* 可变字体：一条 @font-face 覆盖 400..700 */
+  font-display: swap;
+  src: url("/static/fonts/geist-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+                 U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122,
+                 U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("/static/fonts/geist-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+                 U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF,
+                 U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "Geist Mono";
+  font-style: normal;
+  font-weight: 400 500;
+  font-display: swap;
+  src: url("/static/fonts/geist-mono-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+                 U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122,
+                 U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Geist Mono";
+  font-style: normal;
+  font-weight: 400 500;
+  font-display: swap;
+  src: url("/static/fonts/geist-mono-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+                 U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF,
+                 U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+/* ==========================================================================
+   设计令牌
+   --------------------------------------------------------------------------
+   🔴 **本文件是全站唯一的颜色/尺寸来源**。硬编码色值一律走变量 ——
+      改版前实测有 **30 处**散落的裸十六进制（`var(--hover)` 出现 4 次、
+      `var(--sunken)` 出现 9 次…），同族色还被手抄了 3 个近似值（`var(--panel-2)` /
+      `var(--panel-2)` / `var(--sunken)`），肉眼几乎分不出却让"选中的那块"看起来发脏。
+
+   ⚠️ **本轮刻意只动色/字/形，不动布局尺寸**（`--radius:8px` / `--sidebar-w:216px`
+      等保持原值）。原因是 `docs` 与第八轮的实测记录里，
+      矮窗（900×470）与手机（390×700）下的 flex 压缩行为已经量过一次，
+      这一轮不再引入新的布局变量，避免把"看得见的观感问题"换成"看不见的塌陷问题"。
+
+   色相：**冷灰蓝**（`hue ≈ 225`）单一家族，一个强调色。
+   ⚠️ 饱和度全部压在 50% 以下 —— 强调色 `#7f9cec` 实测 HSL `S≈74%`，
+      但它在 2200:1 的暗背景上**只做描边与文字**，不铺大面积填充，
+      所以观感是"被压住的"，不是"喊出来的"。
+   ========================================================================== */
 :root {
-  --bg: #14161a; --panel: #1c1f26; --border: #2b3140;
-  --fg: #e6e8ee; --muted: #99a1b3; --accent: #8ba7e8;
-  --user: #2a3142; --bot: #232733; --danger: #f7768e;
-  /* 侧边栏 + 层级（用变量而不是散落的 9999） */
+  /* ---------- 表面（从低到高） ---------- */
+  --bg:        #101217;   /* 页面底 */
+  --panel:     #171a21;   /* 侧边栏 / 卡片 */
+  --panel-2:   #1d212a;   /* 卡片里的次级块（列表行、详情项） */
+  --sunken:    #0c0e13;   /* 输入框 / 代码块等"凹进去"的表面 */
+  --hover:     #222734;   /* 中性 hover（不是强调色的那种） */
+
+  /* ---------- 描边 ---------- */
+  --border:        #262b36;
+  --border-strong: #333a49;   /* 需要分得比 --border 更开时（如聚焦前的输入框） */
+
+  /* ---------- 文字（三级：主 / 次 / 弱） ---------- */
+  --fg:    #e8eaf0;
+  --muted: #98a1b4;
+  --faint: #6d7688;           /* 比 --muted 更弱：纯元信息、占位符 */
+
+  /* ---------- 强调（全站唯一） ---------- */
+  --accent:      #7f9cec;
+  --accent-soft: rgba(127, 156, 236, .14);
+  --accent-line: rgba(127, 156, 236, .40);
+  --on-accent:   #0d1017;     /* 强调底上的前景（对比度 ≥ 9:1） */
+
+  /* ---------- 语义 ---------- */
+  --ok:     #79c99e;
+  --warn:   #e0b877;
+  --danger: #ec7a8b;
+  --ok-soft:     rgba(121, 201, 158, .12);
+  --warn-soft:   rgba(224, 184, 119, .12);
+  --danger-soft: rgba(236, 122, 139, .12);
+
+  /* ---------- 气泡 ---------- */
+  --user: #2a3346;
+  --bot:  #1e222c;
+
+  /* ---------- 侧边栏 + 层级 ---------- */
   --sidebar-w: 216px;
   --sidebar-w-collapsed: 60px;
   --z-scrim: 40; --z-sidebar: 50; --z-modal: 60;
-  --radius: 8px; --radius-sm: 6px;
-  --ease: 180ms cubic-bezier(.4, 0, .2, 1);
+  /* ⚠️ 只声明不消费的变量等于没有 —— 弹层实际用 var(--z-modal)，
+       别处不许再写裸 20/9999（改版前 `.modal` 就是裸 20，
+       低于侧边栏的 50，弹层在抽屉开着时会被压住）。 */
+
+  /* ---------- 圆角 ---------- */
+  --radius:    10px;   /* 外层容器：卡片 / 弹层 / 面板块 */
+  --radius-sm: 7px;    /* 内层控件：按钮 / 输入框 / 列表行 */
+
+  /* ---------- 字体 ---------- */
+  --font-sans: "Geist", ui-sans-serif, system-ui, -apple-system,
+               "PingFang SC", "MiSans", "HarmonyOS Sans SC",
+               "Noto Sans CJK SC", "Source Han Sans SC",
+               "Microsoft YaHei", "WenQuanYi Micro Hei", sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas,
+               "Noto Sans Mono CJK SC", "Microsoft YaHei Mono", monospace;
+
+  /* ---------- 动效 ---------- */
+  --ease:      180ms cubic-bezier(.4, 0, .2, 1);
+  --ease-out:  140ms cubic-bezier(.16, 1, .3, 1);
+
+  /* ---------- 阴影（**带色相**：冷灰蓝，不是纯黑） ---------- */
+  --shadow-sm: 0 1px 2px rgba(6, 9, 15, .5);
+  --shadow:    0 8px 24px -6px rgba(6, 9, 15, .7), 0 2px 6px rgba(6, 9, 15, .4);
+  --shadow-lg: 0 24px 60px -12px rgba(4, 6, 10, .8), 0 4px 12px rgba(6, 9, 15, .5);
+}
+
+/* 🔴 **兼容别名** —— 配置文件页（`renderConfigSection`）的样式读的是
+   `--line` / `--text` / `--input-bg` 这组名字，而它们**从来没被定义过**
+   （改版前实测：`var(--line)` 解析成空 → `border:1px solid` 无颜色 →
+   浏览器画成 `currentColor`，而该处文字是主前景色 ⇒ 那圈描边是**亮灰的**，
+   明显比周围边框抢眼）。这里把旧名指到新令牌上，
+   顺带把"两条会漂移的命名"收敛成一条（本项目「同一概念多条写入路径」踩过 4 次）。 */
+:root {
+  --line: var(--border);
+  --text: var(--fg);
+  --input-bg: var(--sunken);
 }
 * { box-sizing: border-box; }
+
 body {
   margin: 0; background: var(--bg); color: var(--fg);
-  font: 14px/1.6 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  font: 14px/1.6 var(--font-sans);
+  /* 🔴 数字用等宽字形 —— 面板里"窗口 N 条 / 113 个 handler / 已加载 9"
+     这类数字成列出现（尤其是详情页的计数块与日志页），
+     比例字体下每行宽度都不一样，成列看会左右抖。 */
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   /* 100dvh：iOS Safari 的地址栏会变，100vh 会导致底部被裁 */
   height: 100dvh; overflow: hidden;
 }
 
+/* 长文案不要出孤字（`pretty` 在支持的浏览器上会避免最后一行只剩一个词） */
+p, li { text-wrap: pretty; }
+h1, h2, h3, h4 { text-wrap: balance; }
+
+/* 滚动条：默认的在暗色下是一条亮白，很跳。
+   ⚠️ 只声明颜色，不改宽度/圆角 —— 免得动到第八轮量过的 flex 布局。 */
+* { scrollbar-color: var(--border-strong) transparent; }
+
+
 /* 键盘用户：跳转到主内容（平时不可见） */
 .skip-link {
   position: absolute; left: -9999px; top: 0; z-index: 100;
-  background: var(--accent); color: #10131a; padding: 8px 14px;
+  background: var(--accent); color: var(--on-accent); padding: 8px 14px;
   border-radius: 0 0 var(--radius-sm) 0; font-weight: 600;
 }
 .skip-link:focus { left: 0; }
@@ -42,17 +199,23 @@ body {
 }
 .brand {
   font-weight: 600; font-size: 14px; white-space: nowrap;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.015em;
 }
 
-/* 汉堡按钮：纯 CSS 画三条线（不引图标库） */
+/* 汉堡按钮：纯 CSS 画三条线（不引图标库）
+   🔴 `:hover` 必须与 `button` 的**默认**底色**不同**，否则悬停没有任何反馈。
+      改版前这里写死 `background: #262b36`，而 `button` 的默认底色就是同一个值
+      ⇒ 悬停只多了一圈 1px 描边，在 216px 的侧边栏里基本看不出来。
+      现在 `button` 默认是 `--hover`，所以这里的悬停要往**上一档**走。 */
 .icon-btn {
   flex-shrink: 0; width: 32px; height: 32px; padding: 0;
   display: grid; place-items: center;
   background: transparent; border: 1px solid transparent; border-radius: var(--radius-sm);
-  cursor: pointer; transition: background var(--ease), border-color var(--ease);
+  cursor: pointer;
+  transition: background var(--ease), border-color var(--ease), transform var(--ease-out);
 }
-.icon-btn:hover { background: #262b36; border-color: var(--border); }
+.icon-btn:hover { background: var(--panel-2); border-color: var(--border-strong); }
+.icon-btn:active { transform: scale(.94); background: var(--sunken); }
 .icon-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .burger, .burger::before, .burger::after {
   display: block; width: 15px; height: 2px; border-radius: 1px;
@@ -67,20 +230,43 @@ body {
 .nav-item {
   display: flex; align-items: center; gap: 10px;
   padding: 9px 10px; border-radius: var(--radius-sm);
-  color: var(--fg); text-decoration: none; font-size: 13.5px;
+  color: var(--muted); text-decoration: none; font-size: 13.5px; font-weight: 500;
   white-space: nowrap; position: relative;
   transition: background var(--ease), color var(--ease);
 }
-.nav-item:hover { background: #262b36; }
+.nav-item:hover { background: var(--hover); color: var(--fg); }
 .nav-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.nav-item.active { background: var(--accent); color: #10131a; font-weight: 600; }
-.nav-ico { width: 20px; text-align: center; flex-shrink: 0; font-size: 15px; }
+/* 🔴 当前页：**描边 + 柔底 + 左侧标记**，而不是整块实心强调色。
+   改版前是 `background: var(--accent)` 一大块实心蓝 —— 侧边栏 6 项里
+   有一项是"发光的实心块"，抢走了整个界面里最强的对比度（那是给主操作的）。
+   现在用 `--accent-soft` 底 + `::before` 的 3px 标记条：
+   在图标条（收起态）里也仍然看得出当前位置。 */
+.nav-item.active {
+  background: var(--accent-soft); color: var(--fg); font-weight: 600;
+}
+.nav-item.active::before {
+  content: ""; position: absolute; left: 0; top: 50%;
+  width: 3px; height: 18px; margin-top: -9px;
+  border-radius: 0 3px 3px 0; background: var(--accent);
+}
+/* ⚠️ 图标是 **emoji**（这是本项目既有的设计，12 处，不是本轮引入的）。
+   它们靠系统 emoji 字体渲染：macOS/iOS/Android/Windows 都有，
+   **但本机（Ubuntu 无桌面）没有装任何 emoji 字体** ⇒ 真浏览器截图里全是豆腐块。
+   ⚠️ 任何"看截图判断图标对不对"的核对都会被这一点骗到（我自己就差点把
+      "截图里是方块"当成改版改坏了）。这属于**测试环境的渲染假象**，不是产品缺陷。
+   这里显式把 emoji 字体族列出来 —— 装了就能用，没装也只是照旧回落，
+   不会因为少了 `sans-serif` 而把中文也带坏。 */
+.nav-ico {
+  width: 20px; text-align: center; flex-shrink: 0; font-size: 15px;
+  font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji",
+               "Segoe UI Symbol", var(--font-sans);
+}
 .nav-label { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .nav-badge {
-  background: var(--danger); color: #10131a; font-size: 11px; font-weight: 700;
+  background: var(--danger); color: #fff; font-size: 11px; font-weight: 700;
   border-radius: 9px; padding: 0 6px; line-height: 18px; min-width: 18px; text-align: center;
 }
-.nav-item.active .nav-badge { background: #10131a; color: var(--accent); }
+.nav-item.active .nav-badge { background: var(--danger); color: #fff; }
 
 .sidebar-foot {
   padding: 10px 12px; border-top: 1px solid var(--border);
@@ -92,8 +278,8 @@ body {
  * 为什么需要色差：这条信息与"窗口 N 条"那种中性状态混在一起时，
  * 用户**看不见**它（情绪的实际困惑正是被这行埋掉的：他以为主动消息只能给 default）。
  * ⚠️ 用暖黄而不是红：这不是错误，是"你该知道的事实 + 一个可选动作"。 */
-#session-info.warn { color: #e8c07d; }
-.status.ok::before { content: "● "; color: #9ece6a; }
+#session-info.warn { color: var(--warn); }
+.status.ok::before { content: "● "; color: var(--ok); }
 .status.bad::before { content: "● "; color: var(--danger); }
 
 /* 收起态（桌面）：只剩图标条 */
@@ -104,6 +290,32 @@ body {
 .app.collapsed .sidebar-foot { display: none; }
 .app.collapsed .sidebar-head { justify-content: center; padding: 12px 0; }
 .app.collapsed .nav-item { justify-content: center; padding: 10px 0; }
+/* 🔴 收起后**只剩图标**，而图标是 emoji —— 光看 🔌 / 📜 / 🧩 分不出是哪个页面。
+   这里用 CSS 造一个悬停标签（`data-nav-title` 写在 HTML 上）：
+   不引 JS、不引库，纯 `::after`，展开态下不显示。
+   ⚠️ 收起态的 nav-item 是 `justify-content:center`，标签必须绝对定位到**右侧外面**，
+      否则会把图标挤歪（实测：不用绝对定位时图标会横向位移 3~5px）。 */
+.app.collapsed .nav-item { position: relative; }
+.app.collapsed .nav-item::after {
+  content: attr(data-nav-title);
+  position: absolute; left: calc(100% + 8px); top: 50%;
+  transform: translateY(-50%) scale(.96);
+  transform-origin: left center;
+  padding: 4px 9px; border-radius: var(--radius-sm);
+  background: var(--panel-2); color: var(--fg);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow);
+  font-size: 12px; font-weight: 500; white-space: nowrap;
+  opacity: 0; pointer-events: none;
+  transition: opacity var(--ease-out), transform var(--ease-out);
+  z-index: var(--z-modal);
+}
+.app.collapsed .nav-item:hover::after,
+.app.collapsed .nav-item:focus-visible::after {
+  opacity: 1; transform: translateY(-50%) scale(1);
+}
+/* 收起态下激活标记条要贴到最左边，不能被 `justify-content:center` 带跑 */
+.app.collapsed .nav-item.active::before { left: 0; }
 
 /* 手机端抽屉遮罩 */
 .scrim {
@@ -111,20 +323,51 @@ body {
   z-index: var(--z-scrim); backdrop-filter: blur(1px);
 }
 
+/* ==========================================================================
+   按钮
+   --------------------------------------------------------------------------
+   改版前的问题（真机量过）：
+     * `.icon-btn:hover` 写死 `background:#262b36`，与 `button` 的底色**同值**
+       ⇒ 悬停只有 1px 描边变化，在 216px 宽的侧边栏里几乎看不出；
+     * 没有任何 `:disabled` 样式 ⇒ 禁用态和可点态长得一样；
+     * `.icon-btn:active` 无反馈（`button:active` 只对非 `.icon-btn` 生效，
+       因为它自己写了 `background:transparent` 且没写 active —— 实际是继承到的，
+       但 `.icon-btn:hover` 的写死底色把它盖住了）。
+   现在统一走令牌：hover 用 `--hover`、active 用更暗的一档 + 位移、disabled 压亮度。
+   ========================================================================== */
 button {
-  background: #262b36; color: var(--fg); border: 1px solid var(--border);
+  background: var(--hover); color: var(--fg); border: 1px solid var(--border);
   border-radius: var(--radius-sm); padding: 6px 12px; cursor: pointer; font-size: 13px;
-  transition: background var(--ease), border-color var(--ease), transform var(--ease);
+  font-family: inherit;
+  transition: background var(--ease), border-color var(--ease), color var(--ease),
+              transform var(--ease-out), box-shadow var(--ease);
 }
-button:hover { border-color: var(--accent); }
-button:active { transform: translateY(1px); }
+button:hover { background: var(--panel-2); border-color: var(--border-strong); }
+button:active { transform: translateY(1px); background: var(--sunken); }
 button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-button.danger:hover { border-color: var(--danger); color: var(--danger); }
+button:disabled,
+button[aria-disabled="true"] {
+  /* 🔴 禁用**必须看得出来**（改版前没有这条：点不动却和能点一样） */
+  opacity: .45; cursor: not-allowed; transform: none;
+}
+button:disabled:hover,
+button[aria-disabled="true"]:hover { background: var(--hover); border-color: var(--border); }
+
+/* 主按钮：一屏最多一个（保存 / 发送 / 进入） */
+button.primary {
+  background: var(--accent); border-color: var(--accent); color: var(--on-accent);
+  font-weight: 600;
+}
+button.primary:hover { background: #93abee; border-color: #93abee; }
+button.primary:active { background: #6d8ce4; }
+
+button.danger:hover { border-color: var(--danger); color: var(--danger); background: var(--danger-soft); }
 .link-btn {
   color: var(--accent); text-decoration: none; font-size: 12.5px;
   border-bottom: 1px dashed transparent;
 }
 .link-btn:hover { border-bottom-color: var(--accent); }
+
 
 .content { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 
@@ -143,21 +386,48 @@ button.danger:hover { border-color: var(--danger); color: var(--danger); }
 .panel { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 16px; gap: 12px; overflow: auto; }
 .hidden { display: none !important; }
 
-/* 聊天 */
+/* 聊天
+   --------------------------------------------------------------------------
+   🔴 气泡的**圆角与朝向**：改版前 .msg 一律 `border-radius:10px`，
+      自己发的那条（右侧）右上角也带圆角，读起来像"两块并排的砖"。
+      现在按朝向收一个角（右侧消息收右上、左侧消息收左上）——
+      这是聊天气泡的通用语汇，用户不用学就知道哪个是自己说的。
+   ⚠️ 对方气泡**加了一层描边**：`--bot` 与页面底色 `--bg` 在暗色下只差 6 级亮度，
+      实测对比度很低，气泡边界基本看不出来（尤其长回复的时候像一段裸文字）。 */
 .chatbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .chatbar select { min-width: 200px; }
 .chatbar .hint { margin-left: auto; }
 
 .messages { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding-right: 6px; }
-.msg { padding: 9px 13px; border-radius: 10px; max-width: 76%; white-space: pre-wrap; word-break: break-word; }
-.msg.user { align-self: flex-end; background: var(--user); }
-.msg.assistant { align-self: flex-start; background: var(--bot); }
-.msg.error { align-self: center; background: #3a2028; color: #ffc9d2; font-size: 13px; }
-.msg .meta { display: block; color: var(--muted); font-size: 11px; margin-top: 4px; }
-.composer { display: flex; gap: 8px; }
+.msg {
+  padding: 9px 13px; border-radius: var(--radius);
+  max-width: 76%; white-space: pre-wrap; word-break: break-word;
+  line-height: 1.65;
+}
+.msg.user {
+  align-self: flex-end; background: var(--user);
+  border: 1px solid var(--border-strong); border-top-right-radius: 4px;
+}
+.msg.assistant {
+  align-self: flex-start; background: var(--bot);
+  border: 1px solid var(--border); border-top-left-radius: 4px;
+}
+.msg.error {
+  align-self: center; background: var(--danger-soft); color: var(--danger);
+  border: 1px solid rgba(236, 122, 139, .3);
+  font-size: 13px; border-radius: var(--radius-sm);
+}
+.msg .meta { display: block; color: var(--faint); font-size: 11px; margin-top: 5px; }
+.composer { display: flex; gap: 8px; align-items: flex-end; }
 .composer textarea {
-  flex: 1; background: var(--panel); color: var(--fg); border: 1px solid var(--border);
-  border-radius: 8px; padding: 10px; resize: none; font: inherit;
+  flex: 1; background: var(--sunken); color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius); padding: 10px; resize: none; font: inherit;
+  transition: border-color var(--ease), box-shadow var(--ease);
+}
+.composer textarea:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 .hint { color: var(--muted); font-size: 12px; margin: 0; }
 
@@ -166,14 +436,14 @@ button.danger:hover { border-color: var(--danger); color: var(--danger); }
  *    会把这个**次要但关键**的步骤淹掉（情绪的实际困惑正是这个）。 */
 .umo-howto {
   border: 1px solid var(--border); border-radius: var(--radius-sm);
-  background: #0f1116; padding: 8px 10px; font-size: 12.5px;
+  background: var(--sunken); padding: 8px 10px; font-size: 12.5px;
 }
 .umo-howto > summary { cursor: pointer; color: var(--fg); font-weight: 500; }
 .umo-howto > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .umo-howto[open] > summary { margin-bottom: 6px; }
 .umo-howto ol { margin: 0; padding-left: 20px; color: var(--muted); }
 .umo-howto li { margin: 3px 0; }
-.umo-howto code { background: #1a1f28; padding: 1px 4px; border-radius: 4px; font-size: 12px; }
+.umo-howto code { background: var(--sunken); padding: 1px 4px; border-radius: var(--radius-sm); font-size: 12px; }
 .umo-howto strong { color: var(--fg); }
 .umo-howto .hint { margin-top: 6px; }
 
@@ -187,36 +457,76 @@ button.danger:hover { border-color: var(--danger); color: var(--danger); }
   height: auto;
   object-fit: contain;
   margin-top: 8px;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   cursor: zoom-in;
-  background: #0f1116;
+  background: var(--sunken);
 }
 /* 消息气泡里有图时放宽宽度限制 */
 .msg:has(.gen-image) { max-width: 92%; }
 
-/* 人设 */
+/* 人设 / 会话 / 供应商的左栏列表
+   --------------------------------------------------------------------------
+   🔴 选中的那一项**不能只靠描边变色**：改版前 `.list li.active` 与 `:hover`
+      都是"描边变成强调色"，两者肉眼分不出 ⇒ 用户不知道自己选中的到底是哪条
+      （而这个列表是"点开进详情"的入口，选错 = 看错人的数据）。
+      现在 `:hover` 只加中性底，`.active` 加**柔强调底 + 左侧标记条**，两级分明。 */
 .split { display: flex; gap: 16px; flex: 1; min-height: 0; }
 .split aside { width: 240px; flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
 .editor { flex: 1; overflow-y: auto; }
 .list { list-style: none; margin: 0; padding: 0; overflow-y: auto; }
 .list li {
-  padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
+  position: relative;
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm);
   margin-bottom: 6px; cursor: pointer; font-size: 13px;
+  transition: background var(--ease), border-color var(--ease);
 }
-.list li:hover { border-color: var(--accent); }
-.list li.active { border-color: var(--accent); background: #202737; }
+.list li:hover { background: var(--hover); border-color: var(--border-strong); }
+.list li.active {
+  background: var(--accent-soft); border-color: var(--accent-line);
+}
+.list li.active::before {
+  content: ""; position: absolute; left: -1px; top: 8px; bottom: 8px;
+  width: 2px; border-radius: 2px; background: var(--accent);
+}
 .list li .badge { color: var(--accent); font-size: 11px; margin-left: 6px; }
 /* 未读小标：与会话列表里那个"N 条 · mode"并排，用 danger 色区分开。
    ⚠️ 做成**实心圆角胶囊**而不是只改文字色 —— 会话列表是唯一能看出
       "哪条会话有未读"的地方，必须一眼可辨（侧边栏收起态只剩图标，
       那边只能靠 nav-badge 那个总数）。 */
 .list li .badge.unread-badge {
-  background: var(--danger); color: #10131a; font-weight: 700;
+  background: var(--danger); color: #fff; font-weight: 700;
   border-radius: 9px; padding: 0 6px; line-height: 18px; min-width: 18px;
   text-align: center; margin-left: 6px;
 }
-.empty { color: var(--muted); padding: 24px; text-align: center; }
+/* 🔴 **空态只有这一处定义**（原先文件下面还有一条 `.empty` 把它覆盖掉，
+   那是本项目「同一概念多条写入路径」的第 5 例 —— 结果就是空态文字贴在左上角，
+   右侧一大片空白，看着像页面坏了。删掉那条之后这里成了唯一来源。）
+
+   一条好的空态要说三件事，而不是丢一句灰字：
+     ① **为什么这里是空的**（现状）② **怎么让它有东西**（下一步）。
+   所以它被做成一块**居中的、有呼吸的**区块，并且允许调用方塞
+   `.empty-ico`（图标）与 `<strong>`（一句话标题）。 */
+.empty {
+  color: var(--muted);
+  padding: 40px 24px;
+  text-align: center;
+  font-size: 13px;
+  line-height: 1.75;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 6px;
+  min-height: 34vh;
+  /* `margin:auto 0` 让它在 `.editor` 这类纵向 flex 容器的**剩余空间**里居中，
+     而不是顶在最上面（顶在上面的那版观感像"内容没加载出来"）。 */
+  margin: auto 0;
+}
+.empty strong { color: var(--fg); font-weight: 600; font-size: 14px; }
+.empty .empty-ico {
+  font-size: 26px; opacity: .5; line-height: 1;
+  font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji",
+               "Segoe UI Symbol", var(--font-sans);
+}
 
 form { display: flex; flex-direction: column; gap: 10px; }
 label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
@@ -225,13 +535,31 @@ label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color:
 .field-row { display: flex; gap: 8px; align-items: stretch; }
 .field-row input { flex: 1 1 auto; min-width: 0; }
 .field-row button { flex: 0 0 auto; white-space: nowrap; }
+/* 输入类控件：底色用 `--sunken`（凹进去）而不是与卡片同色 ——
+   改版前 `input` 和它所在的卡片**同底色同描边**，输入框的边界是靠
+   描边单独撑出来的，一屏里 20 个字段看着像 20 个框贴着 20 个框。
+   `--sunken` 让"可输入"这件事有明确的视觉层级。 */
 input, textarea, select {
-  background: var(--panel); color: var(--fg); border: 1px solid var(--border);
-  border-radius: 6px; padding: 8px; font: inherit;
+  background: var(--sunken); color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); padding: 8px; font: inherit;
+  transition: border-color var(--ease), box-shadow var(--ease);
 }
-input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+input::placeholder, textarea::placeholder { color: var(--faint); }
+input:hover, textarea:hover, select:hover { border-color: var(--muted); }
+/* 聚焦：描边 + 一圈柔光（只变描边在暗色里不够醒目，键盘用户尤其需要） */
+input:focus, textarea:focus, select:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+/* 🔴 键盘可达：`:focus-visible` 对原生控件也会触发，别只给鼠标态 */
+input:focus-visible, textarea:focus-visible, select:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px;
+}
+input:disabled, textarea:disabled, select:disabled { opacity: .5; cursor: not-allowed; }
+
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-details { border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+details { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; }
 summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 
 /* 片段表 */
@@ -244,14 +572,29 @@ table.sections td.narrow { width: 70px; }
 table.sections tr.empty-row td { color: var(--muted); text-align: center; font-size: 12px; }
 
 .preview {
-  background: #0f1116; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--sunken); border: 1px solid var(--border); border-radius: var(--radius-sm);
   padding: 12px; overflow: auto; max-height: 55vh; white-space: pre-wrap;
-  font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace; color: #c8d0e0;
+  font: 12px/1.6 var(--font-mono); color: var(--fg);
 }
 
 /* 弹层 */
-.modal { position: fixed; inset: 0; background: #000a; display: flex; align-items: center; justify-content: center; z-index: 20; }
-.modal-box { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; width: min(860px, 92vw); }
+/* 🔴 **z-index 必须走令牌**（改版前这里写死 `20`）。
+   令牌表里 `--z-modal:60 > --z-sidebar:50 > --z-scrim:40`，而裸 `20`
+   **比侧边栏的 50 还低** ⇒ 手机端抽屉开着时打开的弹层会被抽屉盖住一半，
+   而"弹层看不见"的表现和"按钮点了没反应"一模一样（用户会以为坏了）。
+   ⚠️ 这类"变量声明了却没人用、真正的值在别处硬编码"是本项目的典型形态
+   （契约/能力写好了没人调 -> 第九轮踩过），所以这里显式消费它。 */
+.modal {
+  position: fixed; inset: 0; background: #000a;
+  display: flex; align-items: center; justify-content: center;
+  z-index: var(--z-modal);
+  backdrop-filter: blur(2px);
+}
+.modal-box {
+  background: var(--panel); border: 1px solid var(--border-strong);
+  border-radius: var(--radius); padding: 16px; width: min(860px, 92vw);
+  box-shadow: var(--shadow-lg);
+}
 .modal-box h3 { margin: 0; }
 .modal-box .row { justify-content: space-between; margin-bottom: 10px; }
 /* 登录框：独立的紧凑尺寸（宽度跟 modal-box 走会太宽） */
@@ -259,16 +602,16 @@ table.sections tr.empty-row td { color: var(--muted); text-align: center; font-s
 .login-box h3 { margin-bottom: 6px; }
 .login-box .row { justify-content: flex-start; margin: 4px 0 0; }
 .login-box .hint { margin: 0 0 4px; }
-.login-box code { background: #0f1116; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+.login-box code { background: var(--sunken); padding: 1px 5px; border-radius: var(--radius-sm); font-size: 12px; }
 
 /* 导入人设弹层 */
 .import-box { width: min(560px, 94vw); }
 .import-box .row { justify-content: space-between; }
 .import-box form { gap: 8px; }
-.import-box code { background: #0f1116; padding: 1px 4px; border-radius: 4px; font-size: 12px; }
+.import-box code { background: var(--sunken); padding: 1px 4px; border-radius: var(--radius-sm); font-size: 12px; }
 .import-box input[type=file] {
   /* 文件选择器在深色主题下默认很丑，统一一下 */
-  padding: 8px; background: #0f1116; border: 1px dashed var(--border);
+  padding: 8px; background: var(--sunken); border: 1px dashed var(--border);
 }
 #import-result { margin-top: 10px; max-height: 40vh; }
 
@@ -279,7 +622,7 @@ table.sections tr.empty-row td { color: var(--muted); text-align: center; font-s
       不固定的话这段高度会随图变，人设表单在手机上会上下跳。 */
 .ref-block {
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   padding: 8px 10px;
   display: flex;
   flex-direction: column;
@@ -290,8 +633,8 @@ table.sections tr.empty-row td { color: var(--muted); text-align: center; font-s
 .ref-row { display: flex; gap: 10px; align-items: flex-start; }
 .ref-thumb {
   width: 72px; height: 72px; flex: 0 0 72px;
-  object-fit: cover; border-radius: 6px;
-  border: 1px solid var(--border); background: #0f1116;
+  object-fit: cover; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--sunken);
 }
 .ref-side { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 1; }
 .ref-side .hint { word-break: break-all; }
@@ -434,10 +777,10 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   table.sections thead { display: none; }         /* 表头靠 data-label 替代 */
   table.sections tr {
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius-sm);
     padding: 8px;
     margin-bottom: 10px;
-    background: #191c23;
+    background: var(--panel-2);
   }
   table.sections td {
     border: none;
@@ -487,11 +830,24 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 .frame-bar { align-items: center; gap: 10px; flex-wrap: wrap; }
 .frame-bar strong { font-size: 13.5px; }
 .frame-bar .link-btn { margin-left: auto; }
+/* 🔴 插件页是**第三方内容**（每个插件自带一套浅色主题，实测：
+   陪伴面板 `#f4f6f8`、QQ空间 `#f5f7fb`、记忆面板 `#e8e5e1`），
+   而我们的外壳是暗色。直接嵌进来是"暗色壳里开了一扇刺眼的白窗"。
+   `background:#fff` 只是防首帧闪白，真正要处理的是**接缝**：
+   给 iframe 一圈描边 + 圆角 + 阴影，把它明确成"一个被框住的独立应用"，
+   而不是"我们的页面里有一块白色的地方"。 */
 .plugin-frame {
   flex: 1; min-height: 420px; width: 100%;
-  border: 1px solid var(--border); border-radius: var(--radius);
+  border: 1px solid var(--border-strong); border-radius: var(--radius);
   background: #fff;   /* 插件面板多为浅色主题，白底不会闪 */
+  box-shadow: var(--shadow);
+  /* ⚠️ 不加 `filter: invert()` 之类的"暗色化" hack：插件页各有各的主题，
+     反色会毁掉它们自己的图标与截图，而且这些插件**本来就支持 data-theme**，
+     正解是让它们自己切（见 plugin_pages.py 的 color-scheme 注入）。 */
 }
+/* 插件页标题栏里的那个"在新标签打开"——它是次要出口，
+   尺寸不该和「返回」按钮一样抢眼；用 .link-btn 的观感而不是按钮。 */
+#plugin-frame-open { font-size: 12.5px; }
 #plugin-page-list {
   /* 🔴 **永不收缩**：插件页入口是这一页的主功能，绝不能因为上面那块
      （启停列表）变高就被压成 0 高。2026-09-27 实测：只给启停列表
@@ -530,16 +886,17 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 }
 .switch-row {
   display: flex; flex-direction: row; align-items: center; gap: 10px; flex-wrap: wrap;
-  padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm);
   font-size: 13px; cursor: pointer;
+  transition: background var(--ease), border-color var(--ease);
 }
-.switch-row:hover { border-color: var(--accent); }
+.switch-row:hover { background: var(--hover); border-color: var(--border-strong); }
 .switch-cb { width: 16px; height: 16px; flex: 0 0 auto; cursor: pointer; }
 .switch-name { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 模块路径 = 停用名单里**元素的原文** —— 用户要看得见我们到底按什么匹配 */
 .switch-id {
   color: var(--muted); font-size: 11.5px;
-  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .switch-state {
@@ -566,19 +923,21 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   border: 1px solid var(--border); border-radius: var(--radius);
   padding: 10px 12px; background: var(--panel);
 }
+/* 详情里的次级块：比外层卡片再低一档，形成两层而不是"框里套同色的框" */
+.detail-group .detail-item { background: var(--panel-2); }
 .detail-group h4 { margin: 0 0 8px; font-size: 13.5px; }
 .detail-section-title { margin: 4px 0 0; font-size: 14px; }
 .detail-row { display: flex; gap: 10px; align-items: baseline; padding: 2px 0; font-size: 13px; }
 .detail-k { flex: 0 0 auto; width: 132px; color: var(--muted); font-size: 12.5px; }
 .detail-v { flex: 1 1 auto; min-width: 0; word-break: break-word; }
 .detail-v.mono, .detail-pre {
-  font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px;
+  font-family: var(--font-mono); font-size: 12px;
 }
 .detail-v.muted { color: var(--muted); }
 .detail-items { display: flex; flex-direction: column; gap: 8px; }
 .detail-item {
   border: 1px solid var(--border); border-radius: var(--radius-sm);
-  padding: 7px 9px; background: #20242e;
+  padding: 7px 9px; background: var(--panel-2);
 }
 .detail-item-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 3px; }
 .detail-badge {
@@ -587,10 +946,10 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 }
 .detail-badge.admin { color: var(--danger); border-color: var(--danger); }
 .detail-sub { margin-top: 5px; padding-left: 10px; border-left: 2px solid var(--border); }
-.detail-sub-line { font-size: 12.5px; color: var(--muted); font-family: ui-monospace, Menlo, Consolas, monospace; }
+.detail-sub-line { font-size: 12.5px; color: var(--muted); font-family: var(--font-mono); }
 .detail-pre {
   margin: 0; padding: 9px 10px; max-height: 40vh; overflow: auto;
-  background: #161922; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--sunken); border: 1px solid var(--border); border-radius: var(--radius-sm);
   white-space: pre-wrap; word-break: break-word; color: var(--fg);
 }
 .detail-pre.readme { max-height: 50vh; }
@@ -601,10 +960,12 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 
 /* 细节控件 */
 .list li:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.empty { color: var(--muted); padding: 20px 4px; }
 
-/* 「← 返回列表」：**默认隐藏**（桌面端两栏并列，不需要返回）。
-   手机端由 `#tab-persona.is-detail .back-btn` 打开（见上面的媒体查询）。 */
+/* 🔴 这里原本有**第二条** `.empty` 规则（`padding:20px 4px`），它把上面那条的
+   `text-align:center` 覆盖掉了 —— 于是"左边选一个会话。"这种空态文字
+   **贴在左上角**，而右侧是一大片空白（真机截图 `03-persona.png` 确认）。
+   两处同名规则还各自维护 padding，是"同一概念多条写入路径"的又一例（已踩 4 次）。
+   ⇒ 删掉这一条，只保留上面那条**唯一**的 `.empty` 定义。 */
 .back-btn { display: none; }
 
 /* ==================== 模型供应商页（两层结构） ====================
@@ -657,7 +1018,11 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 6px; min-height: 45vh; padding: 24px;
 }
-#provider-source-placeholder .empty-ico { font-size: 28px; opacity: .75; }
+#provider-source-placeholder .empty-ico {
+  font-size: 28px; opacity: .75;
+  font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji",
+               "Segoe UI Symbol", var(--font-sans);
+}
 #provider-source-placeholder p { margin: 0; }
 
 /* 卡片：与 `.modal-box`/侧边栏同族（同一个 --panel/--border/--radius） */
@@ -678,7 +1043,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 .providers-block h4 { margin: 0 0 4px; font-size: 13.5px; color: var(--fg); }
 .providers-block h4 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 .providers-block h4 code, .fl-text code, .providers-block small code {
-  background: #0f1116; padding: 1px 5px; border-radius: 4px; font-size: 11.5px; color: var(--muted);
+  background: var(--sunken); padding: 1px 5px; border-radius: var(--radius-sm); font-size: 11.5px; color: var(--muted);
 }
 .providers-block h5 { margin: 14px 0 0; font-size: 12.5px; color: var(--muted); font-weight: 500; }
 
@@ -703,12 +1068,12 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 /* 模型区 */
 .providers-model-bar { gap: 8px; }
 .ps-search { flex: 1 1 200px; min-width: 0; }
-#ps-model-count { background: #262b36; color: var(--muted); white-space: nowrap; }
+#ps-model-count { background: var(--hover); color: var(--muted); white-space: nowrap; }
 .ps-models { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .ps-models li {
   display: flex; align-items: center; gap: 10px;
   padding: 7px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm);
-  background: #191c23; font-size: 13px;
+  background: var(--panel-2); font-size: 13px;
 }
 .ps-models li .mid {
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -743,30 +1108,30 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 /* 当前筛选：实心高亮（`aria-pressed=true` 是**同一条事实**，两者必须一起切） */
 .providers-filter .filter-btn.active {
   background: var(--accent); border-color: var(--accent);
-  color: #10131a; font-weight: 600;
+  color: var(--on-accent); font-weight: 600;
 }
 
 /* 源列表项的类型徽标（语音 / 嵌入）。
    ⚠️ 对话类**不挂**徽标：默认视图里每条都是对话，挂上去纯属噪音；
       切到「全部」时非对话项才靠它一眼分出来。 */
 #provider-source-list li .src-type {
-  margin-left: 6px; padding: 0 5px; border-radius: 4px;
+  margin-left: 6px; padding: 0 5px; border-radius: var(--radius-sm);
   font-size: 10.5px; font-weight: 500; vertical-align: 1px;
-  background: #2b3140; color: var(--muted); border: 1px solid var(--border);
+  background: var(--border-strong); color: var(--muted); border: 1px solid var(--border);
 }
 #provider-source-list li.active .src-type { color: var(--fg); }
 
 /* 不可执行提示：**必须显眼**（它说的是"这个配置跑不了"），但不用红色警报 ——
    "能存不能跑"是**已知边界**，不是出错。 */
 #ps-not-executable {
-  color: #e8c07d; background: #2b2718; border: 1px solid #4a4028;
+  color: var(--warn); background: var(--warn-soft); border: 1px solid rgba(224, 184, 119, .28);
   border-radius: var(--radius-sm); padding: 7px 9px; line-height: 1.6;
 }
 
 /* 只读适配器展示（预设带来的非 OpenAI 类型） */
 #ps-type-adapter { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
 #ps-type-adapter code {
-  background: #0f1116; padding: 2px 6px; border-radius: 4px;
+  background: var(--sunken); padding: 2px 6px; border-radius: var(--radius-sm);
   font-size: 12px; color: var(--fg);
 }
 #ps-type-adapter .hint { line-height: 1.5; }
@@ -780,7 +1145,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   background: transparent; color: var(--muted);
 }
 .preset-groups .preset-group-btn.active {
-  background: var(--accent); border-color: var(--accent); color: #10131a; font-weight: 600;
+  background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600;
 }
 .preset-list {
   list-style: none; margin: 0; padding: 0; overflow-y: auto;
@@ -790,7 +1155,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   display: grid; grid-template-columns: 1fr auto; gap: 2px 10px;
   align-items: center; cursor: pointer;
   padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm);
-  background: #191c23;
+  background: var(--panel-2);
 }
 .preset-list li:hover { border-color: var(--accent); }
 .preset-list li:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
@@ -812,8 +1177,8 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   justify-self: end; padding: 1px 7px; border-radius: 999px;
   font-size: 11px; white-space: nowrap; border: 1px solid transparent;
 }
-.preset-list li .preset-tag.ok { background: #1e3324; color: #8fd39a; border-color: #2c4a34; }
-.preset-list li .preset-tag.warn { background: #2b2718; color: #e8c07d; border-color: #4a4028; }
+.preset-list li .preset-tag.ok { background: var(--ok-soft); color: var(--ok); border-color: rgba(121, 201, 158, .28); }
+.preset-list li .preset-tag.warn { background: var(--warn-soft); color: var(--warn); border-color: rgba(224, 184, 119, .28); }
 .preset-list li.preset-none {
   grid-template-columns: 1fr; cursor: default; color: var(--muted);
   text-align: center; border-style: dashed;
@@ -880,7 +1245,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   margin: 14px 0 18px;
   padding: 12px 14px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--radius);
   background: var(--panel, transparent);
 }
 .cfg-head { display: flex; flex-direction: column; gap: 2px; margin-bottom: 10px; }
@@ -904,7 +1269,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   box-sizing: border-box;
   padding: 7px 9px;
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   background: var(--input-bg, transparent);
   color: inherit;
   font: inherit;
@@ -922,7 +1287,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 .cfg-field input.cfg-invalid,
 .cfg-field select.cfg-invalid,
 .cfg-field textarea.cfg-invalid {
-  border-color: var(--danger, #d33);
+  border-color: var(--danger, var(--danger));
   box-shadow: 0 0 0 2px rgba(221, 51, 51, 0.15);
 }
 .cfg-actions { align-items: center; gap: 10px; }
@@ -959,8 +1324,8 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 .logs-list {
   max-height: 60vh;
   overflow-y: auto;
-  border: 1px solid var(--border, #333);
-  border-radius: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
   padding: 0.25rem;
   /* 手机上日志很长，横向也不许撑破布局 */
   overflow-x: auto;
@@ -970,7 +1335,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   border-left: 3px solid transparent;   /* 色条；具体颜色按级别覆盖 */
   padding: 0.4rem 0.6rem;
   border-bottom: 1px solid rgba(128, 128, 128, 0.15);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 0.82rem;
 }
 .log-row:last-child { border-bottom: none; }
@@ -997,7 +1362,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   margin: 0.3rem 0 0;
   padding: 0.35rem 0.5rem;
   background: rgba(128, 128, 128, 0.12);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   white-space: pre-wrap;
   word-break: break-word;
   font-size: 0.78rem;
@@ -1006,13 +1371,16 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 }
 
 /* 级别配色（色条 + 级别文字颜色） */
-.log-debug   { border-left-color: #6b7280; }
-.log-debug   .log-level { color: #6b7280; }
-.log-info    { border-left-color: #3b82f6; }
-.log-info    .log-level { color: #3b82f6; }
-.log-warning { border-left-color: #f59e0b; }
-.log-warning .log-level { color: #f59e0b; }
+/* ⚠️ 级别只许用本文件已有的语义令牌 —— 改版前这里的 info 用 #3b82f6（纯蓝）、
+   warning 用 #f59e0b（橙黄），与本文件其它地方的 --accent / --warn **不是同一个色**，
+   于是"日志页的蓝"和"全站的蓝"并排放着会看出是两种蓝。 */
+.log-debug   { border-left-color: var(--faint); }
+.log-debug   .log-level { color: var(--faint); }
+.log-info    { border-left-color: var(--accent); }
+.log-info    .log-level { color: var(--accent); }
+.log-warning { border-left-color: var(--warn); }
+.log-warning .log-level { color: var(--warn); }
 .log-error,
-.log-critical { border-left-color: #ef4444; }
+.log-critical { border-left-color: var(--danger); }
 .log-error   .log-level,
-.log-critical .log-level { color: #ef4444; }
+.log-critical .log-level { color: var(--danger); }
