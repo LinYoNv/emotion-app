@@ -37,6 +37,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _inject_guard import check_baseline  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 #: 被注入的文件
 CTX = ROOT / "host" / "astrbot_host" / "compat" / "core" / "star" / "context.py"
@@ -221,17 +224,14 @@ def main() -> int:
             base = {}
 
     # ---- ① 启动自检：上次是不是被杀在注入态 ----
-    for path, text in snap.items():
-        want = (base.get(path) or {}).get("sha256")
-        if want and want != _sha(text):
-            print("❌ 源码与落盘基线不一致 —— 上次注入验证可能被中断、源码停在注入态。")
-            print(f"   {path}")
-            print(f"   基线 {want[:16]}… 当前 {_sha(text)[:16]}…")
-            print(f"   基线文件：{BASELINE}")
-            return 2
-
-    if not base:
-        base = {p: {"sha256": _sha(t)} for p, t in snap.items()}
+    # 🔴 2026-10-10：逻辑抽到 `tools/_inject_guard.py`（原来 11 份副本会漂移）。
+    #    它把**基线过期**（正常提交造成）与**停在注入态**分开：工作区干净 ⇒
+    #    自动前进；有未提交改动 ⇒ 拒绝运行。
+    _verdict, base = check_baseline(root=ROOT, snap=snap, base=base, sha=_sha)
+    if _verdict == "stale":
+        print(f"   基线文件：{BASELINE}")
+        return 2
+    if _verdict == "exist":
         BASELINE.write_text(json.dumps(base, ensure_ascii=False, indent=1), encoding="utf-8")
         print(f"✅ 已记录基线（{len(base)} 个文件）→ {BASELINE}")
     else:

@@ -26,6 +26,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _inject_guard import check_baseline  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 BASELINE = ROOT / "tools" / ".inject_ui_tokens_baseline.json"
 PYTEST = ROOT / ".venv" / "bin" / "python"
@@ -143,14 +146,15 @@ def main() -> int:
 
     # ---- 启动自检：上次是否被中途杀掉、源码停在注入态 ----
     if BASELINE.exists():
-        snap = json.loads(BASELINE.read_text(encoding="utf-8"))
-        for rel, want in snap.items():
-            cur = (ROOT / rel).read_text(encoding="utf-8")
-            if cur != want:
-                print(f"❌ 源码 {rel} 与基线快照不一致 —— 上次运行可能被中断在注入态。")
-                print("   请先手动还原（或从 /root/backup 取备份），再运行本工具。")
-                return 2
-        print("✅ 启动自检：源码与基线快照一致")
+        _raw = json.loads(BASELINE.read_text(encoding="utf-8"))
+        cur = {rel: (ROOT / rel).read_text(encoding="utf-8") for rel in files}
+        # 🔴 2026-10-10：抽到 `tools/_inject_guard.py`（原 11 份副本会漂移）。
+        _v, _new = check_baseline(root=ROOT, snap=cur, base=_raw, sha=lambda t: t)
+        if _v == "stale":
+            print("   请先还原（`git diff` 看一眼），再运行本工具。")
+            return 2
+        snap = _new
+        BASELINE.write_text(json.dumps(snap, ensure_ascii=False, indent=1), encoding="utf-8")
     else:
         snap = {rel: (ROOT / rel).read_text(encoding="utf-8") for rel in files}
         BASELINE.write_text(json.dumps(snap, ensure_ascii=False, indent=1), encoding="utf-8")

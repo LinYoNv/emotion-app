@@ -40,6 +40,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _inject_guard import check_baseline  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 HTML = ROOT / "emotion_app" / "web" / "static" / "index.html"
 CSS = ROOT / "emotion_app" / "web" / "static" / "app.css"
@@ -188,14 +191,11 @@ def main() -> int:
 
     # ---- ① 启动自检：上次是不是被杀在注入态 ----
     if base:
-        for path, text in snap.items():
-            want = (base.get(path) or {}).get("sha256")
-            if want and want != _sha(text):
-                print("❌ 源码与落盘基线不一致 —— 上次注入验证可能被中断、源码停在注入态。")
-                print(f"   {path}")
-                print(f"   基线 {want[:16]}… 当前 {_sha(text)[:16]}…")
-                print(f"   基线文件：{BASELINE}（确认源码没问题后删掉它可重建）")
-                return 2
+        # 🔴 2026-10-10：抽到 `tools/_inject_guard.py`（原 11 份副本会漂移）。
+        _v, base = check_baseline(root=ROOT, snap=snap, base=base, sha=_sha)
+        if _v == "stale":
+            print(f"   基线文件：{BASELINE}")
+            return 2
         print("✅ 基线自检通过")
     else:
         base = {p: {"sha256": _sha(t)} for p, t in snap.items()}

@@ -38,6 +38,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _inject_guard import check_baseline  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 
 LOGGING = ROOT / "emotion_app" / "infra" / "logging_setup.py"
@@ -176,18 +179,12 @@ def main() -> int:
             base = {}
 
     # ---- ① 启动自检：上次是不是被杀在注入态 ----
-    for path, text in snap.items():
-        want = (base.get(path) or {}).get("sha256")
-        if want and want != _sha(text):
-            print("❌ 源码与落盘基线不一致 —— 上次注入验证可能被中断、源码停在注入态。")
-            print(f"   {path}")
-            print(f"   基线 {want[:16]}… 当前 {_sha(text)[:16]}…")
-            print(f"   基线文件：{BASELINE}")
-            print("   👉 若确认当前源码是**正确的**，删掉基线文件重跑即可重建。")
-            return 2
-
-    if not base:
-        base = {p: {"sha256": _sha(t)} for p, t in snap.items()}
+    # 🔴 2026-10-10：逻辑抽到 `tools/_inject_guard.py`（原来 11 份副本会漂移）。
+    _verdict, base = check_baseline(root=ROOT, snap=snap, base=base, sha=_sha)
+    if _verdict == "stale":
+        print(f"   基线文件：{BASELINE}")
+        return 2
+    if _verdict == "exist":
         BASELINE.write_text(json.dumps(base, ensure_ascii=False, indent=1), encoding="utf-8")
         print(f"✅ 已记录基线（{len(base)} 个文件）→ {BASELINE}")
     else:

@@ -19,6 +19,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _inject_guard import check_baseline  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 BASELINE = ROOT / "tools" / ".inject_settings_ping_baseline.json"
 PYTEST = ROOT / ".venv" / "bin" / "python"
@@ -153,11 +156,13 @@ def _sum(out: str) -> tuple[int, int]:
 def main() -> int:
     if BASELINE.exists():
         snap = json.loads(BASELINE.read_text(encoding="utf-8"))
-        for rel, want in snap.items():
-            if (ROOT / rel).read_text(encoding="utf-8") != want:
-                print(f"❌ {rel} 与基线不一致 —— 上次可能被中断在注入态，请先还原")
-                return 2
-        print("✅ 启动自检：与基线一致")
+        # 🔴 2026-10-10：抽到 `tools/_inject_guard.py`（原 11 份副本会漂移）——
+        #    工作区干净 ⇒ 基线过期、自动前进；有未提交改动 ⇒ 拒绝运行。
+        _v, snap = check_baseline(root=ROOT, snap=snap, base=snap, sha=lambda t: t)
+        if _v == "stale":
+            return 2
+        BASELINE.write_text(json.dumps(snap, ensure_ascii=False, indent=1), encoding="utf-8")
+        print("✅ 基线自检通过")
     else:
         snap = {SRC: (ROOT / SRC).read_text(encoding="utf-8")}
         BASELINE.write_text(json.dumps(snap, ensure_ascii=False, indent=1), encoding="utf-8")

@@ -370,6 +370,26 @@ def check_dirty(files: list[pathlib.Path], baseline: dict[pathlib.Path, str]) ->
     """
     dirty = [f for f in files if sha(f) != baseline.get(f)]
     if dirty:
+        # 🔴 2026-10-10：用 git 区分**基线过期**与**真的停在注入态**。
+        #    基线文件不在 git 里 ⇒ 源码每正常提交一次，"当前 ≠ 基线"就成立。
+        #    实测一次批量跑，13 套工具全是这个假报警，而产品完全正常。
+        #    ⚠️ 不能直接删掉这个保护（它是 2026-09-25 真事故的产物：
+        #       脚本被杀在注入态、下次那句"还原校验"比对的是自己的注入产物）。
+        #    判据：工作区**干净** ⇒ 内容是提交过的正常内容 ⇒ 基线过期、继续跑；
+        #          工作区**有未提交差异** ⇒ 真可能停在注入态 ⇒ 停下来。
+        import sys as _sys
+        _sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+        from _inject_guard import git_is_clean as _git_clean  # noqa: E402
+
+        if _git_clean(ROOT):
+            print(f"ℹ️ {len(dirty)} 个文件与基线不一致，但工作区干净 ⇒ "
+                  f"是正常提交造成基线过期，按当前源码刷新基线")
+            base = {f: sha(f) for f in files}
+            BASELINE.write_text(
+                json.dumps({str(k): v for k, v in base.items()}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            return []
         print("\n🔴 检测到上次运行留下的注入残留（源码与基线不一致）：")
         for f in dirty:
             print(f"   · {f.relative_to(ROOT)}")

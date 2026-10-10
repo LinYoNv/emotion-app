@@ -56,8 +56,7 @@ INJECTIONS = [
         "前端把插件名写死（新增插件不会自己出现）",
         JS,
         """  const plugins = ((d && d.plugins) || []).filter(
-    // ⚠️ 只列**真的有拓展页**的插件：没页面的插件在侧边栏里没有可点的东西。
-    (p) => Array.isArray(p.pages) && p.pages.length > 0,
+    (p) => Array.isArray(p.pages) && p.pages.length > 0 && p.state === "loaded",
   );""",
         """  const plugins = ((d && d.plugins) || []).filter(
     (p) => ["astrbot_plugin_memory_companion"].includes(p.id),  // 注入：写死
@@ -69,6 +68,20 @@ INJECTIONS = [
         CSS,
         ".app.collapsed .nav-group { display: none; }",
         "/* 注入：去掉这行 */",
+    ),
+    (
+        "N6",
+        "去掉 loaded 过滤（跑不起来的插件也会出现在导航里，点进去一片空白）",
+        JS,
+        '(p) => Array.isArray(p.pages) && p.pages.length > 0 && p.state === "loaded",',
+        '(p) => Array.isArray(p.pages) && p.pages.length > 0,  // 注入：不判状态',
+    ),
+    (
+        "N7",
+        "分组归属判错（外部插件被说成「本平台自带」）",
+        JS,
+        "    return /^astrbot_plugin_[A-Za-z0-9_]+\\.main$/.test(mp);",
+        "    return true;  // 注入：全都算自带的",
     ),
 ]
 
