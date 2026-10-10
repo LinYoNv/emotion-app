@@ -380,13 +380,21 @@ def check_dirty(files: list[pathlib.Path], baseline: dict[pathlib.Path, str]) ->
         import sys as _sys
         _sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
         from _inject_guard import git_is_clean as _git_clean  # noqa: E402
+        import json as _json   # ⚠️ `json` 在本文件是**函数内局部导入**（见 load_baseline），
+                               #    模块级没有 —— 这里必须自己来一份，否则 NameError
 
         if _git_clean(ROOT):
             print(f"ℹ️ {len(dirty)} 个文件与基线不一致，但工作区干净 ⇒ "
                   f"是正常提交造成基线过期，按当前源码刷新基线")
-            base = {f: sha(f) for f in files}
+            new_base = {f: sha(f) for f in files}
+            # 🔴 **必须原地更新调用方那个 dict**（2026-10-10 踩到）：
+            #    `main` 里 `before = baseline` 拿的是**同一个对象**，
+            #    只写文件不更新它 ⇒ 后面"还原校验"拿旧 sha 比对 ⇒ **假红**。
+            baseline.clear()
+            baseline.update(new_base)
             BASELINE.write_text(
-                json.dumps({str(k): v for k, v in base.items()}, ensure_ascii=False, indent=2),
+                _json.dumps({str(k): v for k, v in new_base.items()},
+                            ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
             return []

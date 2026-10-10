@@ -259,9 +259,15 @@ def check_dirty(files: list[pathlib.Path], baseline: dict[pathlib.Path, str]) ->
         if _git_clean(ROOT):
             print(f"ℹ️ {len(dirty)} 个文件与基线不一致，但工作区干净 ⇒ "
                   f"是正常提交造成基线过期，按当前源码刷新基线")
-            base = {f: sha(f) for f in files}
+            new_base = {f: sha(f) for f in files}
+            # 🔴 **必须原地更新调用方那个 dict**（2026-10-10 踩到）：
+            #    调用方拿的是同一个对象，只写文件不更新它 ⇒ 后面"还原校验"
+            #    拿旧 sha 比对 ⇒ **假红**。
+            baseline.clear()
+            baseline.update(new_base)
             BASELINE.write_text(
-                json.dumps({str(k): v for k, v in base.items()}, ensure_ascii=False, indent=2),
+                json.dumps({str(k): v for k, v in new_base.items()},
+                           ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
             return []

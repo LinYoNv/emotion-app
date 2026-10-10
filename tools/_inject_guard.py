@@ -28,8 +28,14 @@ from pathlib import Path
 from typing import Callable
 
 
-def git_is_clean(root: Path, paths: tuple[str, ...] = ("host", "emotion_app", "tools")) -> bool:
+def git_is_clean(root: Path, paths: tuple[str, ...] = ("host", "emotion_app")) -> bool:
     """这些路径在 git 里是否干净（无未提交改动）。
+
+    ⚠️ **默认只看被测源码（`host`/`emotion_app`），不看 `tools`**
+       （2026-10-10 实测踩到）：注入的**目标**是源码，工具自身被编辑
+       （比如正在改这个 guard）**不代表**源码停在注入态。
+       我第一版把 `tools` 也写进来，结果"给工具加个注释"就让所有工具
+       报"工作区有未提交改动" —— 又一个假报警。
 
     ⚠️ `git` 不存在/不是仓库时返回 `False`（**保守**：宁可让工具拒绝运行，
        也不要放行一个可能停在注入态的源码 —— 那是本项目最贵的一类假绿）。
