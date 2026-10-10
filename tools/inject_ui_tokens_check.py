@@ -115,8 +115,14 @@ INJECTIONS: list[tuple[str, str, str, str, str]] = [
     (
         "E2", "JS 里把主题令牌写进内联样式（回到改版前那种做法）",
         "emotion_app/web/static/app.js",
-        'el.style.color = bad ? "var(--danger)" : "";',
-        'el.style.color = bad ? "var(--danger)" : "var(--muted)";',
+        # ⚠️ 锚点必须**唯一**（2026-10-10 修）：这一行在 `app.js` 里有**两处**
+        #    （105 行的 `showBanner` 与 1309 行的 `showHint`），旧锚点命中 2 次
+        #    ⇒ 工具打 `⚠️ 锚点不唯一（2 次），跳过` ⇒ 这组注入**永远"抓不住"**
+        #      （看着像判据弱，实际是锚点没选对）。
+        #    带上下一行的 `}` 与上方那行 `el.textContent = msg;` 才能唯一——选 1309 那处，
+        #    因为它就是"给提示上色"这个风险的正主。
+        'el.textContent = msg;\n  el.style.color = bad ? "var(--danger)" : "";',
+        'el.textContent = msg;\n  el.style.color = bad ? "var(--danger)" : "var(--muted)";',
     ),
 ]
 
