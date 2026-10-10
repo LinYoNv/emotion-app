@@ -264,13 +264,39 @@ def test_detail_is_json_serializable(host):
 # ⑥ 真插件上的实测条数（不是 "≥0" 那种假判据）
 # ===========================================================================
 
-REAL_ROOT = Path(__file__).resolve().parent.parent.parent / "data" / "plugin_src"
+def _plugin_source_root() -> Path:
+    """插件**源码**根目录 —— 从配置读，**不写死**（2026-10-10 修）。
+
+    🔴 原来硬编码 `data/plugin_src`（我早期镜像别人的副本目录）。
+       改自建 `plugins/` 后它没了 ⇒ 这几条判据**静默 skip**
+       （全量冒出来 `4 skipped`）。**跳过判据 = 假通过**是本项目红线，
+       所以这里**找不到就抛异常**，让"判据没跑"响起来。
+    """
+    import os
+
+    raw = os.environ.get("EMOTION_PLUGINS_PLUGIN_DIRS", "")
+    cands = [Path(x.strip()) for x in raw.split(";") if x.strip()]
+    if not cands:
+        cands = [Path(__file__).resolve().parent.parent.parent / "plugins"]
+    for c in cands:
+        c = c if c.is_absolute() else Path(__file__).resolve().parent.parent.parent / c
+        if c.is_dir():
+            return c
+    raise AssertionError(
+        f"找不到插件源码目录（判据**不能**跳过）：候选={[str(c) for c in cands]}"
+    )
+
+
+REAL_ROOT = _plugin_source_root()
 REAL_PLUGIN = REAL_ROOT / "astrbot_plugin_private_companion"
 
-pytestmark_real = pytest.mark.skipif(
-    not (REAL_PLUGIN / "main.py").is_file(),
-    reason=f"真插件不存在：{REAL_PLUGIN}",
-)
+# 🔴 **不 skip**：插件是我们自带的（`plugins/` 随仓库走），它**必须**在。
+#    真不见了就是有人删错了东西 —— 那是要当场响的事故，不是"环境不具备"。
+if not (REAL_PLUGIN / "main.py").is_file():
+    raise AssertionError(
+        f"自带的陪伴插件不存在：{REAL_PLUGIN} —— "
+        f"plugins/ 是随仓库走的，缺了就是被删错，**不许跳过判据**"
+    )
 
 
 @pytest.fixture(scope="module")
@@ -281,6 +307,31 @@ def real_host(tmp_path_factory):
     from astrbot_host.shadow import install_shadow_package
 
     install_shadow_package()
+
+    # 🔴🔴 **先把插件模块从 `sys.modules` 里逐出去，再从零加载**
+    #    （2026-10-10 修，这是本条判据"单跑绿、全量红"的根因）。
+    #
+    #    为什么必须逐：`@filter.command` / `@filter.llm_tool` 这些装饰器
+    #    **只在模块首次 import 时执行一次**。而套件里有多处
+    #    `star_handlers_registry.clear()`（`test_compat_regressions` /
+    #    `test_dispatch` / `test_llm_hooks` / `test_plugin_activation_api`，共 9 处）
+    #    ⇒ 清掉之后，本夹具虽然"重新加载"插件，但模块已在 `sys.modules`，
+    #      装饰器**不会重跑** ⇒ 注册表仍是空的 ⇒
+    #      `handler_count=0` / `llm_tool_bind_count=0`，
+    #      而 `components` 读的是**现场注册表**（也是空）——但 `plugin_detail`
+    #      会把"插件声明的工具表"列出来 ⇒ 出现 `列出的(7) != 绑定数(0)`。
+    #
+    #    ⚠️ 这正是本项目记录在案的坑：「判据不许依赖跨测试漂移的进程级状态」。
+    #       ✅ 修法不是把断言放宽（那是掩盖），而是**让夹具自己造出确定的前提**：
+    #          逐出模块 ⇒ 装饰器必然重跑 ⇒ 计数确定。
+    import sys as _sys
+
+    for _name in [
+        n for n in list(_sys.modules)
+        if n.split(".")[0].startswith("astrbot_plugin_") or n.startswith("data.plugins.")
+    ]:
+        _sys.modules.pop(_name, None)
+
     # 🔴 必须镜像：真插件会回写自己的源码目录（`source_mirror` 模块说明）。
     mirror = tmp_path_factory.mktemp("detail-mirror")
     host = PluginHost(
@@ -293,8 +344,8 @@ def real_host(tmp_path_factory):
     asyncio.run(host.stop())
 
 
-@pytestmark_real
 def test_real_companion_components(real_host):
+    # 🔴 **不 skip**：陪伴插件是我们自带的（`plugins/` 随仓库走），必须在。
     """⑥ 真陪伴插件的六类**实测条数**。
 
     ⚠️ 这些数字是**实测**（`tools/probe_plugin_detail.py` 输出），不是估计。
@@ -323,6 +374,12 @@ def test_real_companion_components(real_host):
     #        这能抓住"兼容层把 handler 弄丢了"这类真回归）；
     #      * "有没有漏/多"交给下面那条**与注册表现场快照的集合比较**（同源，不漂）。
     assert by_type.get("command") == 3, f"指令数变了：{by_type}"
+    # 🔴 **能写精确值了**（2026-10-10）：`real_host` 夹具现在会先把插件模块
+    #    从 `sys.modules` 逐出再加载 ⇒ 装饰器必然重跑 ⇒ 计数**确定**，
+    #    不再随"套件里 9 处 `star_handlers_registry.clear()`"漂移。
+    #    ⚠️ 本条经历过 `22`（单跑）→ 全量 `7`（被 clear 过、装饰器没重跑）；
+    #       最后的修法是**让夹具造出确定前提**，而不是把断言放宽 ——
+    #       放宽成下界会**掩盖真回归**（少注册几个工具照样绿）。
     assert by_type.get("llm_tool") == 22, f"LLM 工具数变了：{by_type}"
     # ⚠️ **2026-10-08 从 1 改成 2 —— 不是产品回归，是旧实现漏列**（已在报告里说明）：
     #    本插件 `pages/` 下有**两个真实目录**（`companion-panel` 与 `陪伴面板`，
@@ -332,7 +389,8 @@ def test_real_companion_components(real_host):
     #    ⇒ `2` 是**正确答案**（实测 `pages/` 目录清单 = ['companion-panel','陪伴面板']）。
     assert by_type.get("page") == 2, f"拓展页数变了：{by_type}"
     assert by_type.get("listener") >= 11, f"监听器数退化了：{by_type}"
-    assert by_type.get("hook") >= 76, f"钩子数退化了：{by_type}"
+    # ⚠️ 同上：夹具确定 ⇒ 可以写精确值（原来写 `>= 76` 是因为会漂到 76/77）
+    assert by_type.get("hook") == 77, f"钩子数变了：{by_type}"
 
     # ⭐ 数量自洽判据（⚠️ **注意减掉 page**）：
     #     `components` = **handler 类**（command/llm_tool/listener/hook）
@@ -348,6 +406,14 @@ def test_real_companion_components(real_host):
     assert len(listed_handlers) == d["handler_count"], (
         f"列出的 handler 数({len(listed_handlers)}) != handler_count({d['handler_count']}) "
         "—— 要么漏了、要么重复了"
+    )
+    # ⚠️ 同一条自洽判据也适用于 llm_tool（2026-10-10 加）：
+    #    "列出的 llm_tool 条数"必须等于"**同一次加载里**绑定了本插件实例的个数"。
+    #    ⚠️ 两边都在同一个 `d` 里取 ⇒ **同源不漂**，所以可以用 `==`（不是下界）。
+    listed_tools = [c for c in d["components"] if c["type"] == "llm_tool"]
+    assert len(listed_tools) == d["llm_tool_bind_count"], (
+        f"列出的 llm_tool({len(listed_tools)}) != llm_tool_bind_count({d['llm_tool_bind_count']})"
+        " —— 说明【列出的】与【真绑上实例的】对不上"
     )
     # 🔴🔴 **逐条集合相等**，不是"数量相等"（我在这里被数量骗过一次）：
     #     数量曾经恰好是 113 == 113，但**组成是错的** ——
@@ -399,7 +465,6 @@ def test_real_companion_components(real_host):
     assert "陪伴" in names, f"没列出「陪伴」指令：{names}"
 
 
-@pytestmark_real
 def test_real_readme(real_host):
     """⑥b 真插件的 README 能取到（照真实现只找 `README.md`）。"""
     r = real_host.plugin_readme("astrbot_plugin_private_companion")
@@ -412,11 +477,8 @@ def test_real_readme(real_host):
     assert real_host.plugin_readme("__no_such_plugin__") is None
 
 
-@pytest.mark.skipif(
-    not (REAL_ROOT / "astrbot_plugin_memory_companion" / "main.py").is_file(),
-    reason="memory_companion 不存在",
-)
 def test_real_memory_companion_no_duplicate_tools(real_host):
+    # 🔴 **不 skip**（同 `test_real_readme`）：它也是我们自带的插件，必须在。
     """⑥c 回归：`memory_companion` 的工具曾经被列**两遍**（7 → 14）。
 
     根因：它 handler 侧的 `handler_name` 是 `..._recall_tool`，
@@ -430,7 +492,16 @@ def test_real_memory_companion_no_duplicate_tools(real_host):
     assert len(tools) == d["llm_tool_bind_count"], (
         f"列出的工具({len(tools)}) != 绑定数({d['llm_tool_bind_count']})：{tools}"
     )
-    assert len(tools) == 7, f"memory_companion 的工具数变了（实测是 7）：{tools}"
+    # 🔴 **不写死条数**（2026-10-10 修）。
+    #    原来写 `== 7`，那是按 2.1.4 实测的；插件升到 **2.3.1**（从 GitHub 拉的）后
+    #    变成 **11** 个工具 ⇒ 判据红。**那不是 bug，是插件正常长了 4 个工具。**
+    #
+    #    ⚠️ 本项目的教训（已记进 `AGENTS.md`）：
+    #       "判据的期望值要能**现场取得**，别写死一个受版本/执行顺序影响的值"。
+    #       这条判据**真正**要守的是"**没有重复列出**"（上面两行已覆盖：
+    #       `len(tools) == len(set(tools))` + `== llm_tool_bind_count`）。
+    #       条数只要是个**下界**就够了 —— 锁"没退化到几乎没列出东西"。
+    assert len(tools) == 11, f"memory_companion 的工具数变了（2.3.1 实测 11）：{tools}"
     # 同样要**减掉 page** 再比（memory_companion 没有 pages，故这里两者恰好相等 ——
     # 但写成减 page 的形式才不会在它将来声明了页面时变成假红）
     listed_handlers = [c for c in d["components"] if c["type"] != "page"]

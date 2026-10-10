@@ -112,15 +112,45 @@ def _sum_pytest(out: str) -> tuple[int, int]:
     return (int(f.group(1)) if f else 0, int(p.group(1)) if p else 0)
 
 
+def _git_is_clean() -> bool:
+    """这些文件在 git 里**是否干净**（等于最后一次提交内容）。
+
+    ⚠️ 为什么用它来区分两种"与基线不一致"（2026-10-10 加）：
+       基线文件本身**不在 git 里**（`tools/.inject_*` 是隐藏产物、且会被
+       `.gitignore` 排除），所以它会**过期** —— 源码正常提交一次，
+       "当前 ≠ 基线"就成立了。
+       而这条自检的**本意**是抓"上次跑一半被杀、源码正停在注入态"。
+       两者的区别很清楚：
+         * 文件**与 git 干净** ⇒ 内容是"被人提交过的正常内容" ⇒ 基线过期，可以正常往下跑；
+         * 文件**与 git 有未提交差异** ⇒ 真的可能停在注入态 ⇒ 必须停下来让人看。
+       ✅ 于是把"拒绝运行"改成上面的两分：只有后者才拒绝。
+       ⚠️ 另一个**更彻底**的修法是让基线跟着源码自动前进（快照存 git blob 哈希），
+          但那是"悄悄前进"，会把真的注入残留一起吞掉 —— 不取。
+    """
+    r = subprocess.run(
+        ["git", "status", "--porcelain", "--", "host", "emotion_app"],
+        cwd=ROOT, capture_output=True, text=True, timeout=30,
+    )
+    return r.returncode == 0 and not r.stdout.strip()
+
+
 def main() -> int:
     files = [HOST, LOADER, JS, CSS]
     if BASELINE.exists():
         snap = json.loads(BASELINE.read_text(encoding="utf-8"))
-        for rel, want in snap.items():
-            if (ROOT / rel).read_text(encoding="utf-8") != want:
-                print(f"❌ {rel} 与基线不一致 —— 上次可能停在注入态，请先还原")
-                return 2
-        print("✅ 启动自检：与基线一致")
+        stale = [rel for rel, want in snap.items() if (ROOT / rel).read_text(encoding="utf-8") != want]
+        if stale and not _git_is_clean():
+            print(f"❌ {stale} 与基线不一致，且工作区**有未提交改动** —— "
+                  f"上次可能停在注入态，请先还原（`git diff` 看一眼）")
+            return 2
+        if stale:
+            # 工作区干净 ⇒ 只是有人在两次跑之间正常提交了东西，基线该前进了。
+            print(f"ℹ️ {len(stale)} 个文件与基线不一致，但工作区干净 ⇒ "
+                  f"是正常提交造成基线过期，按当前源码刷新基线")
+            snap = {f: (ROOT / f).read_text(encoding="utf-8") for f in files}
+            BASELINE.write_text(json.dumps(snap, ensure_ascii=False), encoding="utf-8")
+        else:
+            print("✅ 启动自检：与基线一致")
     else:
         snap = {f: (ROOT / f).read_text(encoding="utf-8") for f in files}
         BASELINE.write_text(json.dumps(snap, ensure_ascii=False), encoding="utf-8")

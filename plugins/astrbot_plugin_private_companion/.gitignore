@@ -1,0 +1,28 @@
+# Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest_astrbot312/
+
+# Local tooling artifacts
+*.orig
+*.rej
+*.patch
+*.tmp
+*.bak
+/.zcode/
+
+# AstrBot host runtime data must never be packaged with this plugin.
+/data/
+
+# Local release verification snapshots are not plugin source.
+/verification/
+/dist/
+
+# The Android companion terminal is maintained and distributed separately.
+/android/
+
+# Legacy standalone checkouts are kept locally for compatibility/testing only.
+# Boundary feedback and temporary emotion runtime are implemented in this core.
+/astrbot_plugin_nene_boundary/
+/astrbot_plugin_temp_emotion/

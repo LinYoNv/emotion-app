@@ -780,6 +780,36 @@ def test_tolerant_keyword_only_construction_unchanged():
     assert getattr(ev, "platform_meta", None) is None, "没给平台就**不设**这个属性（保持 hasattr 语义）"
 
 
+def _plugin_source_root() -> Path:
+    """插件**源码**根目录 —— 从配置读，**不写死**。
+
+    🔴 2026-10-10 修。原来这里硬编码 `data/plugin_src`（那是我早期镜像别人的
+       副本目录）。改自建 `plugins/` 之后那目录没了 ⇒ 这条判据**静默 skip**
+       （全量从 `1229 passed` 变成 `1229 passed, 4 skipped`）。
+       **跳过判据 = 假通过**（本项目红线：`mobile_check.py` 就因此放过过真 bug）。
+
+    ⇒ 现在按**配置**找（`EMOTION_PLUGINS_PLUGIN_DIRS`，分号分隔），
+       找不到就**失败而不是跳过** —— 让"判据没跑"这件事本身响起来。
+    ⚠️ 只读第一个存在的目录即可（判据扫的是"插件源码长什么样"，
+       多来源时内容同源）。
+    """
+    import os
+
+    raw = os.environ.get("EMOTION_PLUGINS_PLUGIN_DIRS", "")
+    cands = [Path(x.strip()) for x in raw.split(";") if x.strip()]
+    if not cands:
+        # 没设环境变量时按项目默认值找（与 `.env.example` 一致）
+        cands = [Path(__file__).resolve().parent.parent.parent / "plugins"]
+    for c in cands:
+        c = c if c.is_absolute() else Path(__file__).resolve().parent.parent.parent / c
+        if c.is_dir():
+            return c
+    raise AssertionError(
+        f"找不到插件源码目录（判据**不能**跳过）：候选={[str(c) for c in cands]}。"
+        f" 设 EMOTION_PLUGINS_PLUGIN_DIRS 或确认 plugins/ 存在。"
+    )
+
+
 def test_plugin_sources_construct_event_only_with_supported_shape():
     """扫 `data/plugin_src` 里全部 `AstrMessageEvent(...)` 构造点，形状必须被签名接受。
 
@@ -794,9 +824,7 @@ def test_plugin_sources_construct_event_only_with_supported_shape():
 
     from astrbot_host.compat.core.platform.astr_message_event import AstrMessageEvent
 
-    src_root = Path(__file__).resolve().parent.parent.parent / "data" / "plugin_src"
-    if not src_root.is_dir():
-        pytest.skip(f"插件源码目录不存在：{src_root}")
+    src_root = _plugin_source_root()
 
     sig = inspect.signature(AstrMessageEvent.__init__)
     sites: list[str] = []

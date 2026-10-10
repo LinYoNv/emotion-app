@@ -1,0 +1,234 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import asyncio
+import time
+import unittest
+
+from astrbot_stubs import install_astrbot_stubs
+
+install_astrbot_stubs()
+
+from astrbot_plugin_together_companion.main import TogetherCompanionPlugin
+from astrbot_plugin_together_companion.models import RoomSession
+
+
+class CallProactiveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_idle_event_only_starts_after_configured_wait(self) -> None:
+        plugin = TogetherCompanionPlugin.__new__(TogetherCompanionPlugin)
+        plugin.call_proactive_enabled = True
+        plugin.call_idle_seconds = 120
+        generated = []
+
+        async def generate(_room, *, idle_seconds):
+            generated.append(idle_seconds)
+
+        plugin._generate_call_proactive = generate
+        room = RoomSession("room", "ticket", "call", "995051631", None)
+        room.call_active = True
+        room.call_last_user_activity = time.monotonic()
+
+        await plugin.handle_room_payload(room, {"type": "call_idle"})
+        self.assertEqual([], generated)
+        self.assertIsNone(room.generation_task)
+
+        room.call_last_user_activity = time.monotonic() - 125
+        await plugin.handle_room_payload(room, {"type": "call_idle"})
+        await room.generation_task
+
+        self.assertEqual(1, len(generated))
+        self.assertGreaterEqual(generated[0], 120)
+        self.assertEqual(1, room.call_idle_check_count)
+        self.assertLess(room.call_last_user_activity, time.monotonic() - 120)
+
+    async def test_repeated_silent_checks_accumulate_until_user_activity(self) -> None:
+        plugin = TogetherCompanionPlugin.__new__(TogetherCompanionPlugin)
+        plugin.call_proactive_enabled = True
+        plugin.model_hangup_enabled = True
+        plugin.call_idle_seconds = 60
+        generated = []
+
+        async def generate(_room, *, idle_seconds):
+            generated.append((idle_seconds, _room.call_idle_check_count))
+
+        plugin._generate_call_proactive = generate
+        room = RoomSession("room", "ticket", "call", "995051631", None)
+        room.call_active = True
+        room.call_last_user_activity = time.monotonic() - 190
+
+        for elapsed in (61, 122, 183):
+            room.call_last_proactive_at = time.monotonic() - elapsed
+            await plugin.handle_room_payload(room, {"type": "call_idle"})
+            await room.generation_task
+
+        self.assertEqual([1, 2, 3], [item[1] for item in generated])
+        self.assertTrue(all(item[0] >= 180 for item in generated))
+
+        await plugin.handle_room_payload(room, {"type": "call_activity"})
+        self.assertEqual(0, room.call_idle_check_count)
+
+    async def test_hangup_check_stays_available_when_proactive_topics_are_disabled(self) -> None:
+        plugin = TogetherCompanionPlugin.__new__(TogetherCompanionPlugin)
+        plugin.call_proactive_enabled = False
+        plugin.model_hangup_enabled = True
+        plugin.call_idle_seconds = 60
+        generated = []
+
+        async def generate(_room, *, idle_seconds):
+            generated.append(idle_seconds)
+
+        plugin._generate_call_proactive = generate
+        room = RoomSession("room", "ticket", "call", "995051631", None)
+        room.call_active = True
+        room.call_last_user_activity = time.monotonic() - 65
+
+        await plugin.handle_room_payload(room, {"type": "call_idle"})
+        await room.generation_task
+
+        self.assertEqual(1, len(generated))
+
+    async def test_disabled_proactive_and_hangup_skip_idle_model_call(self) -> None:
+        plugin = TogetherCompanionPlugin.__new__(TogetherCompanionPlugin)
+        plugin.call_proactive_enabled = False
+        plugin.model_hangup_enabled = False
+        plugin.call_idle_seconds = 60
+        room = RoomSession("room", "ticket", "call", "995051631", None)
+        room.call_active = True
+        room.call_last_user_activity = time.monotonic() - 65
+
+        await plugin.handle_room_payload(room, {"type": "call_idle"})
+
+        self.assertIsNone(room.generation_task)
+
+    async def test_user_activity_prevents_stale_idle_trigger(self) -> None:
+        plugin = TogetherCompanionPlugin.__new__(TogetherCompanionPlugin)
+        plugin.call_proactive_enabled = True
+        plugin.call_idle_seconds = 60
+        room = RoomSession("room", "ticket", "call", "995051631", None)
+
+        await plugin.handle_room_payload(room, {"type": "call_state", "active": True})
+        before = room.call_last_user_activity
+        await asyncio.sleep(0)
+        await plugin.handle_room_payload(room, {"type": "call_activity"})
+
+        self.assertTrue(room.call_active)
+        self.assertGreaterEqual(room.call_last_user_activity, before)
+
+    async def test_watch_mode_preserves_connected_voice_state(self) -> None:
+        plugin = TogetherCompanionPlugin.__new__(TogetherCompanionPlugin)
+        room = RoomSession("room", "ticket", "watch", "995051631", None)
+
+        await plugin.handle_room_payload(room, {"type": "call_state", "active": True})
+        await plugin.handle_room_payload(room, {"type": "call_activity"})
+
+        self.assertTrue(room.call_active)
+        self.assertGreater(room.call_last_user_activity, 0)
+
+    async def test_camera_frame_is_transient_and_cleared_on_hangup(self) -> None:
+        plugin = TogetherCompanionPlugin.__new__(TogetherCompanionPlugin)
+        room = RoomSession("room", "ticket", "call", "995051631", None)
+
+        await plugin.handle_room_payload(room, {"type": "call_state", "active": True})
+        await plugin.handle_room_payload(
+            room,
+            {"type": "call_frame", "active": True, "image": "data:image/jpeg;base64,/9g="},
+        )
+
+        self.assertEqual("data:image/jpeg;base64,/9g=", room.recent_call_camera_frame())
+
+        await plugin.handle_room_payload(room, {"type": "call_state", "active": False})
+        self.assertEqual("", room.call_camera_frame)
+        self.assertEqual(0.0, room.call_camera_updated_at)
+
+    async def test_camera_assisted_semantic_events_are_deduplicated_without_frames(self) -> None:
+        room = RoomSession("room", "ticket", "call", "995051631", None)
+
+        room.append_call_visual_event("我给你看了什么", "看到一瓶椰汁")
+        room.append_call_visual_event("我给你看了什么", "看到一瓶椰汁")
+
+        self.assertEqual(1, len(room.call_visual_events))
+        self.assertIn("一瓶椰汁", room.call_visual_events[0])
+        self.assertNotIn("data:image", room.call_visual_events[0])
+
+    async def test_model_can_choose_to_remain_silent(self) -> None:
+        plugin = TogetherCompanionPlugin.__new__(TogetherCompanionPlugin)
+        plugin.history_turns = 6
+        room = RoomSession("room", "ticket", "call", "995051631", None)
+        room.call_active = True
+        spoken = []
+
+        async def generate(*_args, **_kwargs):
+            return '{"speak":false,"utterance":""}'
+
+        plugin._generate_model_text = generate
+        plugin._push_live_subtitle = lambda *_args, **_kwargs: None
+        plugin._synthesize_and_send = lambda *_args, **_kwargs: spoken.append(_args)
+
+        await plugin._generate_call_proactive(room, idle_seconds=120)
+
+        self.assertEqual([], spoken)
+        self.assertEqual([], room.history)
+
+    async def test_spoken_topic_is_delivered_as_call_proactive(self) -> None:
+        plugin = TogetherCompanionPlugin.__new__(TogetherCompanionPlugin)
+        plugin.history_turns = 6
+        room = RoomSession("room", "ticket", "call", "995051631", None)
+        room.call_active = True
+        delivered = []
+        statuses = []
+
+        async def generate(*_args, **kwargs):
+            self.assertTrue(kwargs["call_proactive"])
+            return '{"speak":true,"utterance":"突然想到，我们上次说的那部电影后来还看吗？"}'
+
+        async def push(*_args, **_kwargs):
+            return None
+
+        async def synthesize(_room, text, **kwargs):
+            delivered.append((text, kwargs))
+
+        async def send(_room, payload):
+            statuses.append(payload)
+
+        plugin._generate_model_text = generate
+        plugin._push_live_subtitle = push
+        plugin._synthesize_and_send = synthesize
+        plugin.send_room_payload = send
+
+        await plugin._generate_call_proactive(room, idle_seconds=120)
+
+        self.assertEqual("assistant", room.history[-1]["role"])
+        self.assertEqual("call_proactive", delivered[0][1]["display_source"])
+        self.assertEqual("listening", statuses[-1]["state"])
+
+    async def test_long_silence_hangup_waits_for_farewell_playback(self) -> None:
+        plugin = TogetherCompanionPlugin.__new__(TogetherCompanionPlugin)
+        plugin.history_turns = 6
+        plugin.model_hangup_enabled = True
+        room = RoomSession("room", "ticket", "call", "995051631", None)
+        room.call_active = True
+        room.call_idle_check_count = 3
+        delivered = []
+
+        async def generate(*_args, **_kwargs):
+            return '{"speak":true,"utterance":"你可能已经休息了，那我先挂啦。","action":"hangup"}'
+
+        async def no_op(*_args, **_kwargs):
+            return None
+
+        async def synthesize(_room, text, **kwargs):
+            delivered.append((text, kwargs))
+            return True
+
+        plugin._generate_model_text = generate
+        plugin._push_live_subtitle = no_op
+        plugin._synthesize_and_send = synthesize
+
+        await plugin._generate_call_proactive(room, idle_seconds=360)
+
+        self.assertEqual("hangup", delivered[0][1]["after_playback_action"])
+        self.assertTrue(room.call_active)
+
+
+if __name__ == "__main__":
+    unittest.main()

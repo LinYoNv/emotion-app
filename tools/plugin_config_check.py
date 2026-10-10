@@ -31,10 +31,6 @@ import websocket  # type: ignore
 
 CHROME = "/usr/bin/google-chrome"
 ROOT = Path(__file__).resolve().parent.parent
-#: 有 `_conf_schema.json` 且顶层是「标量项」的插件 —— 判据要能真的改一个值。
-#: ⚠️ 用 splitter（schema 只有 8 项、依赖简单、加载快），**不用陪伴插件**
-#:    （它 1000+ 项，渲染慢且改它会影响别的判据）。
-PLUGIN_ID = "astrbot_plugin_splitter"
 
 
 def _token() -> str:
@@ -42,6 +38,67 @@ def _token() -> str:
     if not m:
         raise SystemExit("❌ .env 里没有 EMOTION_AUTH_ACCESS_TOKEN")
     return m.group(1).strip().strip("'").strip('"')
+
+
+def _login(base: str, token: str) -> str:
+    """登录取 cookie，返回可直接放进 `Cookie` 头的那一段。"""
+    req = urllib.request.Request(
+        base.rstrip("/") + "/api/v1/auth/login",
+        data=json.dumps({"token": token}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as f:
+        return (f.headers.get("Set-Cookie") or "").split(";")[0]
+
+
+def _api(base: str, path: str, cookie: str):
+    req = urllib.request.Request(base.rstrip("/") + path, headers={"Cookie": cookie})
+    with urllib.request.urlopen(req, timeout=30) as f:
+        return json.loads(f.read())
+
+
+def _pick_plugin(base: str, cookie: str) -> str:
+    """🔴 **从"真正加载着的插件"里挑一个来测，不许写死 id。**
+
+    ⚠️ 这里原本写死 `astrbot_plugin_splitter` —— 那是**别人 AstrBot 的插件**
+       （我们早期误把 `/opt/astrbot/data/plugins` 当插件源时镜像进来的）。
+       插件源改成我们自己的 `plugins/` 之后它就不存在了 ⇒ 本文件 A2/B1/C1/C2
+       四条全红，而**产品完全正常**：**判据指错了对象**。
+       与「表情包管理器」出现在侧边栏是同一类错误的两个面。
+
+    选法（排序键全部取自**接口现场**，不读目录、不读代码）：
+      ① `state == loaded` —— 没跑起来的插件连配置页都打不开，测它没意义；
+      ② 有 `metadata`（即 `_conf_schema.json`）且能画成控件；
+      ③ 优先有**带 `options` 的 string 项**的（C1 要真改一个值，在合法值里换才安全）；
+      ④ 标量项越少越好（渲染快、副作用小）。
+    """
+    d = _api(base, "/api/v1/plugins", cookie)
+    items = d.get("plugins") or d.get("items") or []
+    cands = []
+    for p in items:
+        pid = p.get("id")
+        if p.get("state") != "loaded" or not pid:
+            continue
+        try:
+            c = _api(base, f"/api/v1/plugins/{pid}/config", cookie)
+        except Exception:
+            continue
+        schema = ((c.get("metadata") or {}).get(pid) or {}).get("items") or {}
+        if not schema:
+            continue
+        scalars, has_options = 0, False
+        for _k, v in schema.items():
+            if not isinstance(v, dict) or v.get("invisible") or v.get("type") == "object":
+                continue
+            scalars += 1
+            if v.get("type") == "string" and isinstance(v.get("options"), list) and len(v["options"]) >= 2:
+                has_options = True
+        if scalars:
+            cands.append((not has_options, scalars, pid))
+    if not cands:
+        raise SystemExit("❌ 没有任何【已加载且带 schema】的插件，选不出样本")
+    cands.sort()
+    return cands[0][2]
 
 
 class CDP:
@@ -96,6 +153,14 @@ _INSTALL = """(() => {
 def main() -> int:
     base = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:6191/"
     token = _token()
+
+    # 🔴 样本插件**从接口现场选**（`--plugin <id>` 可覆盖，便于排查）。
+    if len(sys.argv) > 3 and sys.argv[2] == "--plugin":
+        plugin_id = sys.argv[3]
+    else:
+        plugin_id = _pick_plugin(base, _login(base, token))
+    print(f"📌 样本插件：{plugin_id}（从已加载的插件里按 schema 选的，不是写死的）")
+
     port = 9265
     chrome = subprocess.Popen(
         [CHROME, "--headless=new", f"--remote-debugging-port={port}", "--no-sandbox",
@@ -207,7 +272,7 @@ def main() -> int:
                 detail: '点配置前 checked=' + before + '，回来是 ' + after
                         + (after !== before ? '（**误切了启停**！）' : '')
               };
-            })()""".replace("PLUGIN_ID", PLUGIN_ID), aw=True)
+            })()""".replace("PLUGIN_ID", plugin_id), aw=True)
 
         print("\n================ B 渲染：schema 被画成控件 ================")
 
@@ -225,7 +290,7 @@ def main() -> int:
                 ok: fields.length > 0 && ctrls.length > 0,
                 detail: fields.length + ' 个字段，其中 ' + ctrls.length + ' 个是可交互控件'
               };
-            })()""".replace("PLUGIN_ID", PLUGIN_ID), aw=True)
+            })()""".replace("PLUGIN_ID", plugin_id), aw=True)
 
         # 🔴 与接口给的 schema **对得上**（数量判据只能当辅助，这里做集合比较）
         check("B2 画出来的控件覆盖了 schema 里的所有标量项", """(async () => {
@@ -246,7 +311,7 @@ def main() -> int:
                 detail: 'schema 标量项 ' + scalars.length + ' 个，没画出来的：'
                         + (missing.length ? missing.join(',') : '（无）')
               };
-            })()""".replace("PLUGIN_ID", PLUGIN_ID), aw=True)
+            })()""".replace("PLUGIN_ID", plugin_id), aw=True)
 
         print("\n================ C 端到端：改一个值 → 保存 ================")
 
@@ -321,7 +386,7 @@ def main() -> int:
                 detail: key + ': ' + JSON.stringify(cfg[key]) + ' → 保存 ' + JSON.stringify(want)
                         + ' → 服务端读回 ' + JSON.stringify(got) + '（已改回原值）'
               };
-            })()""".replace("PLUGIN_ID", PLUGIN_ID), aw=True)
+            })()""".replace("PLUGIN_ID", plugin_id), aw=True)
 
         check("C2 保存后提示如实说了生效时机", """(() => {
               const h = document.getElementById('plugin-config-hint');

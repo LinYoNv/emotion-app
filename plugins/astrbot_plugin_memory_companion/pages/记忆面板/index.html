@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#e8e5e1" />
+  <title>Memory OS · 拓展页</title>
+  <!-- Load the AstrBot page bridge before the selector runs.  The bridge is
+       required in mobile WebViews where dashboard cookies are unavailable. -->
+  <script src="/api/plugin/page/bridge-sdk.js"></script>
+  <script>
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    function getBridge() {
+      if (window.AstrBotPluginPage) return window.AstrBotPluginPage;
+      try {
+        if (window.parent && window.parent !== window && window.parent.AstrBotPluginPage) {
+          return window.parent.AstrBotPluginPage;
+        }
+      } catch (_) {}
+      return null;
+    }
+
+    /* 配色必须在跳转前就打到 <html> 上，否则新页面第一帧还是默认色，用户会看到
+       一次「颜色跳一下」。appearance.theme 这个配置项过去从来没被任何前端消费过
+       ——这就是它「配了但没用」的原因。 */
+    function applyPalette(payload) {
+      const key = payload?.palette ?? payload?.data?.palette;
+      if (typeof key === "string" && /^[a-z]{2,16}$/.test(key)) {
+        document.documentElement.dataset.palette = key;
+      }
+    }
+
+    async function resolveStyle() {
+      const bridge = getBridge();
+      if (bridge && typeof bridge.apiGet === "function") {
+        // Give the bridge a short opportunity to receive its signed context;
+        // apiGet itself remains safe to call when context delivery is delayed.
+        if (typeof bridge.ready === "function") {
+          await Promise.race([bridge.ready(), wait(800)]).catch(() => {});
+        }
+        try {
+          const payload = await Promise.race([
+            bridge.apiGet("page/ui-preferences"),
+            wait(2500).then(() => { throw new Error("bridge timeout"); }),
+          ]);
+          applyPalette(payload);
+          const value = payload?.ui_style ?? payload?.data?.ui_style;
+          return value === "modern" || value === "new" || value === "新版" ? "modern" : "legacy";
+        } catch (_) {}
+      }
+
+      // Desktop builds expose the authenticated extension endpoint directly;
+      // this fallback also works when a WebView blocks postMessage bridges.
+      for (const endpoint of [
+        "/api/plug/astrbot_plugin_memory_companion/page/ui-preferences",
+        "/api/v1/plugins/extensions/astrbot_plugin_memory_companion/page/ui-preferences",
+      ]) {
+        try {
+          const response = await fetch(endpoint, { credentials: "same-origin", cache: "no-store" });
+          if (!response.ok) continue;
+          const payload = await response.json();
+          applyPalette(payload);
+          const value = payload?.ui_style ?? payload?.data?.ui_style;
+          return value === "modern" || value === "new" || value === "新版" ? "modern" : "legacy";
+        } catch (_) {}
+      }
+      return "legacy";
+    }
+
+    (async () => {
+      const style = await resolveStyle();
+      // AstrBot signs extension page URLs with asset_token. Keep the token
+      // when switching from this selector page to the actual UI; mobile
+      // WebViews often do not have the dashboard cookie available.
+      const target = new URL(style === "modern" ? "./modern.html" : "./legacy.html", location.href);
+      target.search = location.search;
+      target.hash = location.hash;
+      location.replace(target.href);
+    })();
+  </script>
+</head>
+<body><main style="padding:32px;font-family:system-ui;color:#777">正在载入记忆终端…</main></body>
+</html>

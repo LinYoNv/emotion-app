@@ -3830,10 +3830,47 @@ function renderNavPluginPages(d) {
   const box = $("nav-plugin-items");
   if (!group || !box) return;
 
+  // 🔴 **列的资格（两条，缺一不可）**：
+  //    ① **真的有拓展页** —— 没页面的插件在侧边栏里没有可点的东西；
+  //    ② **`state === "loaded"`（正在运行）** —— 2026-10-10 修，情绪当场指出。
+  //
+  // 我第一版只判了 ①，结果把 `meme_manager` 也列了出来 —— 而它 `state=failed`
+  // （`ModuleNotFoundError: No module named 'requests'`），**从加载那天起就没跑起来过**
+  // ⇒ 点进去 iframe 一片空白（页面由插件提供，插件没跑自然没有页面）。
+  //
+  // ⚠️ 更糟的是它**看起来像我们的功能坏了**：用户不会想到"这是别人 AstrBot 的插件、
+  //    而且没装上依赖"，只会觉得"情绪app 的插件页面是坏的"。
+  //    情绪原话：「表情管理器我们平台现在哪来的嘛」—— 他说得对，
+  //    那不是我们平台装的插件，不该出现在我们的导航里。
+  //
+  // ⚠️ 停用（inactivated）/ 失败（failed）/ 未加载（not_loaded）**都不列**。
+  //    它们在「插件」页里照样看得见（那里本来就该显示"为什么没跑"），
+  //    所以**不是隐藏问题**，只是不给一个点不开的导航入口。
   const plugins = ((d && d.plugins) || []).filter(
-    // ⚠️ 只列**真的有拓展页**的插件：没页面的插件在侧边栏里没有可点的东西。
-    (p) => Array.isArray(p.pages) && p.pages.length > 0,
+    (p) => Array.isArray(p.pages) && p.pages.length > 0 && p.state === "loaded",
   );
+
+  // 🔴 **分成两段：「本平台自带」与「外部插件」**（2026-10-10 情绪定）。
+  //
+  //    情绪原话：「只做目前有的插件然后给接口，**安装插件后有独立 ui 的才在这显示**」。
+  //    我们的插件源目录是**可扩展**的（往 `plugins/` 里放 + 重启就会加载，
+  //    见 `tests/test_plugin_dir_extensibility.py`），所以以后装进来的插件**也应该**
+  //    出现在这里 —— 但那不是"我们平台自带的"，得让人一眼分得清。
+  //
+  //    ⚠️ 判据必须是**外部依据**（不能只做"和接口数据一样"的集合比较 ——
+  //       本项目已记：那样两边同源、必然一致，证明不了"该不该列"）。
+  //       这里的外部依据 = **模块路径**：我们的自带插件是**仓库内的顶层包**
+  //       （`astrbot_plugin_xxx.main`，`plugins/` 就在仓库根），
+  //       而外部装进来的插件一定带**命名空间前缀**（如 `data.plugins.xxx.main`）。
+  //       于是"哪些是自带的"由**代码事实**决定，不由我看一眼名单拍板。
+  const isBundled = (p) => {
+    const mp = String(p.module_path || "");
+    if (!mp) {
+      // ⚠️ 拿不到模块路径时**不猜**：宁可归到"外部"，也不能把外来的说成我们的。
+      return false;
+    }
+    return /^astrbot_plugin_[A-Za-z0-9_]+\.main$/.test(mp);
+  };
 
   box.innerHTML = "";
   if (!plugins.length) {
@@ -3843,7 +3880,15 @@ function renderNavPluginPages(d) {
   }
   group.classList.remove("hidden");
 
-  for (const p of plugins) {
+  const subTitle = (text) => {
+    const h = document.createElement("div");
+    h.className = "nav-subhead";
+    h.textContent = text;
+    box.appendChild(h);
+  };
+
+  /** 画一个插件的全部页面为侧边栏子项。 */
+  const renderOne = (p) => {
     // ⚠️ 显示名：`display_name` 可能为空（不是每个插件都声明）→ 退化成 name。
     //    **必须在显示时退化**：数据层保持"有没有声明"这个区别。
     const title = (p.display_name || "").trim() || p.name || p.id;
@@ -3867,6 +3912,22 @@ function renderNavPluginPages(d) {
       a.appendChild(lb);
       box.appendChild(a);
     }
+  };
+
+  const bundled = plugins.filter(isBundled);
+  const external = plugins.filter((p) => !isBundled(p));
+  // 两段都只有一类时**不画小标题**（单个分组下的小标题是纯噪音）。
+  if (bundled.length && external.length) {
+    subTitle("本平台自带");
+  }
+  for (const p of bundled) {
+    renderOne(p);
+  }
+  if (bundled.length && external.length) {
+    subTitle("外部插件");
+  }
+  for (const p of external) {
+    renderOne(p);
   }
   syncNavPluginGroupOpen();
 }

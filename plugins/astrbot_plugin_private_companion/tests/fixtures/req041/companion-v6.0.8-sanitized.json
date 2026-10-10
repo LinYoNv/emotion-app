@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "users": {
+    "10001": {
+      "user_id": "10001",
+      "identity_subject_id": "10001",
+      "nickname": "Fixture Owner",
+      "profile_origin": "private_chat",
+      "auto_profile_created": true,
+      "relationship_score": 87,
+      "relationship_role": "owner",
+      "relationship_mode": "normal",
+      "relationship_positive_stage_cap_key": "deeply_bonded",
+      "companion_memory": {
+        "stable_preferences": ["fixture-private-sentinel"]
+      },
+      "dialogue_episodes": [
+        {"summary": "fixture private episode", "source": "private"}
+      ],
+      "expression_profile": {
+        "learned_rules": [
+          {"pattern": "fixture-private-approved", "source": "private", "status": "approved"}
+        ],
+        "pending_rules": [
+          {"pattern": "fixture-private-pending", "source": "private", "status": "pending"}
+        ],
+        "samples": ["fixture-private-evidence"]
+      }
+    },
+    "10002": {
+      "user_id": "10002",
+      "identity_subject_id": "10002",
+      "nickname": "Fixture Friend",
+      "profile_origin": "private_chat",
+      "auto_profile_created": true,
+      "relationship_score": 12,
+      "relationship_role": "friend",
+      "relationship_mode": "normal"
+    }
+  },
+  "groups": {
+    "20001": {
+      "group_id": "20001",
+      "recent_messages": [
+        {"sender_id": "10001", "text": "fixture-group-a-sentinel"}
+      ],
+      "topic_threads": ["fixture-group-a-topic"],
+      "expression_profile": {
+        "learned_rules": [
+          {"pattern": "fixture-group-a-approved", "source": "group", "status": "approved"}
+        ]
+      },
+      "members": {
+        "10001": {
+          "name": "Owner in A",
+          "group_role": "member",
+          "recent_phrases": ["fixture-member-a-sentinel"],
+          "display_name_events": ["Owner in A"]
+        }
+      }
+    },
+    "20002": {
+      "group_id": "20002",
+      "recent_messages": [
+        {"sender_id": "10001", "text": "fixture-group-b-sentinel"}
+      ],
+      "topic_threads": ["fixture-group-b-topic"],
+      "members": {
+        "10001": {
+          "name": "Owner in B",
+          "group_role": "administrator",
+          "recent_phrases": ["fixture-member-b-sentinel"],
+          "display_name_events": ["Owner in B"]
+        }
+      }
+    }
+  },
+  "persona_lifecycle": {
+    "generation": 1,
+    "reset_at": 0,
+    "previous_backup": ""
+  },
+  "unified_person": {
+    "version": 1,
+    "profiles": {},
+    "identity_links": {},
+    "group_overlays": {},
+    "relation_policies": {
+      "default_friend": {
+        "label": "friend",
+        "capabilities": [],
+        "active": true
+      }
+    },
+    "audit_events": []
+  }
+}

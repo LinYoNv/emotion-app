@@ -72,8 +72,24 @@ _INSTALL = """(() => {
   if (window.__npInstalled) return true;
   window.__npInstalled = true;
   window.__npLive = 0; window.__npBusy = false;
+  // 🔴 合成反例开关（见 A5）。默认关闭 ⇒ 判据 A1~A4 跑的是**真实数据**。
+  window.__npFake = null;
   const of = window.fetch;
   window.fetch = function (...a) {
+    const url = String((a[0] && a[0].url) || a[0] || '');
+    // 🔴 只在"合成反例"模式下改写 /api/v1/plugins 的响应，别的一律放行。
+    if (window.__npFake && url.indexOf('/api/v1/plugins') === 0 && !url.includes('/pages/')) {
+      window.__npLive++; window.__npBusy = true;
+      return of.apply(this, a).then(async (r) => {
+        const d = await r.clone().json();
+        d.plugins = (d.plugins || []).concat(window.__npFake);
+        return new Response(JSON.stringify(d), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      }).finally(() => {
+        window.__npLive--; window.__npBusy = false;
+      });
+    }
     window.__npLive++; window.__npBusy = true;
     return of.apply(this, a).finally(() => {
       window.__npLive--;
@@ -197,6 +213,64 @@ def main() -> int:
               };
             })()""")
 
+        # 🔴🔴 **A4 是这一轮的核心判据**（2026-10-10）。
+        #
+        # 为什么不能只靠 A1：A1 是"子项 == 接口里有 pages 的插件" ——
+        # **两边同源 ⇒ 必然一致**，于是它**永远绿**，证明不了"这个插件该不该被列出来"。
+        # 真实事故就在眼前：`meme_manager` 根本没加载成功（`state=failed`，
+        # 缺 `requests`），却也出现在导航里、点进去一片空白 —— A1 照样全绿。
+        #
+        # 所以 A4 引入**外部依据**（两个，都不来自"接口自己说了什么"）：
+        #   ① `state` 必须是 `loaded`（跑不起来的插件不该有可点的入口）；
+        #   ② 分组归属必须与**模块路径**一致 —— 我们自带的插件是**仓库内顶层包**
+        #      （`astrbot_plugin_xxx.main`，`plugins/` 就在仓库根），
+        #      外部装进来的必然带命名空间前缀。这条直接守"别把别人的插件
+        #      混进「本平台自带」那一栏"。
+        check("A4 只列【跑得起来】的插件，且分组归属与模块路径一致", """(async () => {
+              const r = await fetch('/api/v1/plugins', { cache: 'no-store' });
+              const d = await r.json();
+              const byId = {};
+              for (const p of (d.plugins || [])) byId[p.id] = p;
+
+              // ① 列出来的必须都是 loaded
+              const drawn = [...document.querySelectorAll('#nav-plugin-items .nav-subitem')]
+                              .map(a => (a.dataset.navPage || '').split('/')[0]);
+              const uniq = [...new Set(drawn)];
+              const bad = uniq.filter(id => (byId[id] || {}).state !== 'loaded');
+
+              // ② 分组归属必须与模块路径一致
+              const heads = [...document.querySelectorAll('#nav-plugin-items .nav-subhead')]
+                              .map(h => (h.textContent || '').trim());
+              const boxes = {};
+              let cur = null;
+              for (const el of document.querySelectorAll('#nav-plugin-items > *')) {
+                if (el.classList.contains('nav-subhead')) { cur = (el.textContent||'').trim(); }
+                else if (el.dataset && el.dataset.navPage) {
+                  (boxes[cur] = boxes[cur] || []).push(el.dataset.navPage.split('/')[0]);
+                }
+              }
+              const wrongGroup = [];
+              const isBundled = (id) => /^astrbot_plugin_[A-Za-z0-9_]+\\.main$/.test(
+                String((byId[id] || {}).module_path || ''));
+              for (const [head, ids] of Object.entries(boxes)) {
+                const wantBundled = head.includes('本平台自带');
+                const wantExternal = head.includes('外部插件');
+                if (!wantBundled && !wantExternal) continue;   // 只有一类时不画小标题
+                for (const id of new Set(ids)) {
+                  const real = isBundled(id);
+                  if ((wantBundled && !real) || (wantExternal && real)) {
+                    wrongGroup.push(id + ' 落在了「' + head + '」');
+                  }
+                }
+              }
+              return {
+                ok: uniq.length > 0 && bad.length === 0 && wrongGroup.length === 0,
+                detail: '列了 ' + uniq.length + ' 个插件；小标题=' + JSON.stringify(heads)
+                        + (bad.length ? '  ⚠️ 没在跑却列出来了：' + bad.join(',') : '')
+                        + (wrongGroup.length ? '  ⚠️ 分组归属错：' + wrongGroup.join(',') : '')
+              };
+            })()""", aw=True)
+
         check("A3 分组默认收起，且箭头可展开", """(() => {
               const group = document.getElementById('nav-plugin-group');
               const btn = document.getElementById('nav-plugin-toggle');
@@ -214,6 +288,70 @@ def main() -> int:
                         + ' aria=' + aria + ' 再点收起=' + hiddenAgain
               };
             })()""")
+
+        # 🔴🔴 **A5 给 A4 造反例**（2026-10-10）。没有它，A4 是一句**愿望**。
+        #
+        # 为什么必须造：本机此刻 6 个插件**全部 `state=loaded`、且全部是自带插件**
+        # ⇒ A4 守的两个风险（"列了没跑起来的"、"外部插件混进自带栏"）
+        #   **在当前数据下不可能发生**。实测：我把 `isBundled` 注入成恒 `true`、
+        #   把 `p.state === "loaded"` 整个删掉，A4 **两次都照样全绿**。
+        #   ⚠️ 那是**正确结论**（注入没有可观察差异），不是判据写错 ——
+        #      但这意味着**判据没被验证过**，等于没写。
+        #   （同一个坑本项目踩过：`meme_manager` 那次 A1 全绿，bug 却真的在。）
+        #
+        # 做法：在浏览器里**合成**两条假插件塞进 `/api/v1/plugins` 的响应：
+        #   ① `state=failed` 且带 pages → **不该被列出来**；
+        #   ② `module_path` 带命名空间前缀（=外部插件）且带页面 → 该出现在「外部插件」栏。
+        #   然后重新渲染侧边栏，断言 ① 不在、② 在且落对了组。
+        check("A5 合成反例：没跑起来的插件不该被列 + 外部分组归属正确", """(async () => {
+              // ① 装两条假数据（只改这一条 URL 的响应）
+              window.__npFake = [
+                { id: 'zz_fake_failed_plugin', module_path: 'zz_fake_failed_plugin.main',
+                  name: 'zz_fake_failed_plugin', display_name: '假·没跑起来', version: '0',
+                  state: 'failed', error: 'boom',
+                  pages: [{ name: 'p1', title: '不该出现的页面' }] },
+                { id: 'zz_fake_external_plugin', module_path: 'data.plugins.zz_fake_external_plugin.main',
+                  name: 'zz_fake_external_plugin', display_name: '假·外部插件', version: '0',
+                  state: 'loaded', error: '',
+                  pages: [{ name: 'p1', title: '外部页面' }] }
+              ];
+              // ② 触发重渲染（侧边栏的取数走 fetch，钩子会掺进假数据）
+              const r = await fetch('/api/v1/plugins', { cache: 'no-store' });
+              const d = await r.json();
+              if (typeof renderNavPluginPages === 'function') renderNavPluginPages(d);
+              await new Promise(res => setTimeout(res, 500));
+
+              const items = [...document.querySelectorAll('#nav-plugin-items .nav-subitem')];
+              const ids = items.map(a => (a.dataset.navPage || '').split('/')[0]);
+              const failedListed = ids.includes('zz_fake_failed_plugin');
+              const extListed = ids.includes('zz_fake_external_plugin');
+
+              // ③ 外部插件必须落在「外部插件」小标题下面
+              let cur = null, extGroup = null;
+              for (const el of document.querySelectorAll('#nav-plugin-items > *')) {
+                if (el.classList.contains('nav-subhead')) cur = (el.textContent || '').trim();
+                else if (el.dataset && el.dataset.navPage
+                         && el.dataset.navPage.split('/')[0] === 'zz_fake_external_plugin') {
+                  extGroup = cur;
+                }
+              }
+
+              // ④ 收尾：撤掉假数据，恢复真实渲染（⚠️ 判据改的是浏览器内存，磁盘没动）
+              window.__npFake = null;
+              const r2 = await fetch('/api/v1/plugins', { cache: 'no-store' });
+              const d2 = await r2.json();
+              if (typeof renderNavPluginPages === 'function') renderNavPluginPages(d2);
+              await new Promise(res => setTimeout(res, 300));
+
+              const ok = !failedListed && extListed
+                         && extGroup !== null && extGroup.includes('外部插件');
+              return {
+                ok: ok,
+                detail: '没跑起来的被列出=' + failedListed + '（应为 false）；'
+                        + '外部插件被列出=' + extListed + '（应为 true）；'
+                        + '它落在「' + extGroup + '」'
+              };
+            })()""", aw=True)
 
         print("\n================ B 点击能进那个插件页面 ================")
 

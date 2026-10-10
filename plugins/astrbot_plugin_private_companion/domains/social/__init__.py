@@ -1,0 +1,1 @@
+"""Group-social atmosphere, roleplay strength, moments, and joke-guard domain."""

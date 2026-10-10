@@ -33,6 +33,34 @@ PLUGIN_ID = "astrbot_plugin_nai_image"
 CONFIG_KEY = "openai_director_fallback_images"
 
 
+def _plugin_source_root() -> Path:
+    """插件**源码**根目录 —— 自己读 `.env`，**不写死、也不依赖调用者的环境**。
+
+    🔴 2026-10-10：原来这里硬编码 `data/plugin_src`（早期镜像别人的副本目录），
+       改成自建 `plugins/` 后它没了 ⇒ 判据**假红**。
+
+    ⚠️ **必须自己读 `.env`**：本工具是**独立进程**（不在服务内），
+       调用者未必 source 过 `.env`（我第一版只读 `os.environ`，
+       在同一 shell 里恰好对，换个环境就退化成默认值 —— 那等于半个写死）。
+    """
+    raw = ""
+    envf = ROOT / ".env"
+    if envf.is_file():
+        for line in envf.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("EMOTION_PLUGINS_PLUGIN_DIRS="):
+                raw = line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    cands = [Path(x.strip()) for x in raw.split(";") if x.strip()] or [Path("plugins")]
+    for c in cands:
+        c = c if c.is_absolute() else ROOT / c
+        if c.is_dir():
+            return c
+    raise SystemExit(
+        f"❌ 找不到插件源码目录（判据**不能**跳过）：候选={[str(c) for c in cands]}"
+    )
+
+
 def _token() -> str:
     m = re.search(r"^EMOTION_AUTH_ACCESS_TOKEN=(.+)$", (ROOT / ".env").read_text(encoding="utf-8"), re.M)
     if not m:
@@ -228,7 +256,10 @@ def main() -> int:
               const found = (d.files || []).some(x => x.endsWith('ui_probe.png'));
               return { ok: found, detail: '服务端清单: ' + JSON.stringify(d.files || []) };
             })()""".replace("PLUGIN_ID", PLUGIN_ID).replace("CONFIG_KEY", CONFIG_KEY), aw=True)
-        disk = ROOT / "data" / "plugin_src" / PLUGIN_ID / "files" / CONFIG_KEY / "ui_probe.png"
+        # ⚠️ **别写死插件根目录**（2026-10-10 修）：原来硬编码 `data/plugin_src`
+        #    （我早期镜像别人的副本目录）；改成自建 `plugins/` 后它没了，
+        #    这条判据就**假红**了。
+        disk = _plugin_source_root() / PLUGIN_ID / "files" / CONFIG_KEY / "ui_probe.png"
         if disk.is_file():
             print(f"  ✅ C2 磁盘上真有这个文件 —— {disk}（{disk.stat().st_size} 字节）")
         else:

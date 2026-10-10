@@ -163,19 +163,42 @@ def main() -> int:
         )
 
         # ---- ③ 改一个值并保存，然后从接口读回 ----
+        # 🔴🔴 **2026-10-10 修：判据原来点错了对象（产品是好的，红的是判据）**。
+        #    它原来派发 `#session-form` 的 `submit` 事件 —— 但 `#session-form` 是
+        #    **`<div>`**，**根本没有 submit 事件**，那次"保存"什么都没发生，
+        #    读回自然 `found=False`。第十八轮把「会话」配置搬进设置页时改成了
+        #    `#cfg-session-save` 按钮 → `saveSessionConfig()`（`app.js:1749`）。
+        #    ⚠️ 同 `plugin_config_check.py` 写死别人插件那次：**判据指错对象**。
+        #    ⇒ 现在走**真入口**：先经 `#cfg-session-picker` 把"当前会话"切成夹具会话
+        #      （`saveSessionConfig` 保存的是 `state.currentSession`，不切就会
+        #       **改到别的会话**），再点真按钮。
         save = cdp.eval(
             """
             (async () => {
+              const pick = document.getElementById('cfg-session-picker');
+              if (!pick) return {err: 'no picker'};
+              const opt = [...pick.options].find(o => (o.textContent || '').includes(%s));
+              if (!opt) return {err: 'picker 里找不到夹具会话',
+                               all: [...pick.options].map(o => o.textContent.trim())};
+              pick.value = opt.value;
+              pick.dispatchEvent(new Event('change', {bubbles: true}));
+              await new Promise(r => setTimeout(r, 800));
+
+              const btn = document.getElementById('cfg-session-save');
+              if (!btn) return {err: 'no save button'};
               const inp = document.getElementById('s-user-id');
               if (!inp) return {err: 'no input'};
               inp.value = %s;
-              document.getElementById('session-form').dispatchEvent(
-                new Event('submit', {cancelable: true}));
-              await new Promise(r => setTimeout(r, 1200));
-              return {hint: (document.getElementById('session-hint')||{}).textContent || ''};
+              btn.click();
+              for (let i = 0; i < 60; i++) {
+                await new Promise(r => setTimeout(r, 150));
+                const h = document.getElementById('cfg-session-hint');
+                if (h && /保存|失败|已/.test(h.textContent || '')) break;
+              }
+              return {hint: (document.getElementById('cfg-session-hint')||{}).textContent || ''};
             })()
             """
-            % json.dumps(fresh), await_promise=True,
+            % (json.dumps(fixture_title), json.dumps(fresh)), await_promise=True,
         )
         # 用接口复读（**不信前端提示**：提示可能是"已保存"而请求失败）
         readback = cdp.eval(
@@ -196,15 +219,23 @@ def main() -> int:
         )
 
         # ---- ④ 非法值（带冒号）必须被拒，且**不写进去** ----
+        # ⚠️ 同 ③：原来也派发 `#session-form` 的 submit（一个不存在的事件）。
+        #    现在同样走真按钮；会话已由 ③ 选中，这里不用再切。
         bad = cdp.eval(
             """
             (async () => {
               const inp = document.getElementById('s-user-id');
+              if (!inp) return {err: 'no input'};
               inp.value = 'bad:colon';
-              document.getElementById('session-form').dispatchEvent(
-                new Event('submit', {cancelable: true}));
-              await new Promise(r => setTimeout(r, 1200));
-              const hint = (document.getElementById('session-hint')||{}).textContent || '';
+              const btn = document.getElementById('cfg-session-save');
+              if (!btn) return {err: 'no save button'};
+              btn.click();
+              for (let i = 0; i < 60; i++) {
+                await new Promise(r => setTimeout(r, 150));
+                const h = document.getElementById('cfg-session-hint');
+                if (h && /保存|失败|已|非法|无效/.test(h.textContent || '')) break;
+              }
+              const hint = (document.getElementById('cfg-session-hint')||{}).textContent || '';
               const d = await (await fetch('/api/v1/sessions')).json();
               const items = d.data || d.items || [];
               return {hint, stillOld: items.some(s => s.user_id === %s),
