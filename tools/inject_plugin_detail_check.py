@@ -155,10 +155,22 @@ def main() -> int:
 
     # ---- ① 启动自检：上一次是不是被杀在注入态？ ----
     if base.get(key) and base[key]["sha256"] != _sha(src_now):
-        print("❌ 源码与落盘基线**不一致** —— 上一次注入验证可能被中断、源码停在注入态。")
-        print(f"   基线 sha={base[key]['sha256'][:16]}… 当前 sha={_sha(src_now)[:16]}…")
-        print(f"   基线文件：{BASELINE}")
-        return 2
+        # 🔴 2026-10-10：用 git 区分**基线过期**与**真的停在注入态**。
+        #    基线文件不在 git 里 ⇒ 源码每正常提交一次，"当前 ≠ 基线"就成立
+        #    （实测批量跑时 13 套工具全是这个**假报警**，而产品完全正常）。
+        #    ⚠️ 不能删掉这个保护（2026-09-25 真事故的产物）。
+        import subprocess as _sp
+        _r = _sp.run(["git", "status", "--porcelain", "--", "host", "emotion_app"],
+                     cwd=ROOT, capture_output=True, text=True, timeout=60)
+        if _r.returncode == 0 and not _r.stdout.strip():
+            print("ℹ️ 源码与基线不一致，但工作区干净 ⇒ "
+                  "是正常提交造成基线过期，按当前源码刷新基线")
+            _save_baseline({key: {"sha256": _sha(src_now)}})
+        else:
+            print("❌ 源码与落盘基线**不一致** —— 上一次注入验证可能被中断、源码停在注入态。")
+            print(f"   基线 sha={base[key]['sha256'][:16]}… 当前 sha={_sha(src_now)[:16]}…")
+            print(f"   基线文件：{BASELINE}")
+            return 2
 
     if not base.get(key):
         _save_baseline({key: {"sha256": _sha(src_now)}})

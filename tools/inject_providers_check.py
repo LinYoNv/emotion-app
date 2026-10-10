@@ -320,10 +320,14 @@ INJECTIONS: list[tuple[str, Path, str, str]] = [
         "        port = None\n        if True:  # 注入：没有后端也接空壳",
     ),
     (
-        "⑪-i 形状不对的后端也硬接（不检查 complete）",
+        "⑪-i 形状不对的后端也硬接（不检查 complete/chat）",
         API,
-        '        if not hasattr(backend, "complete"):',
-        "        if False:",
+        # ⚠️ 锚点必须跟被测代码走（2026-10-10 修）：判据在第十一轮从
+        #    "只认 complete" 改成了 "**complete 或 chat 任一即可**"
+        #    （继续只认 complete 会错杀 `OpenAIChatBackend`），
+        #    旧锚点 `if not hasattr(backend, "complete"):` 已不存在 ⇒ 必然"抓不住"。
+        '        if not (hasattr(backend, "complete") or hasattr(backend, "chat")):',
+        "        if False:  # 注入：形状不对也硬接",
     ),
     # ---- 装配 ----
     (

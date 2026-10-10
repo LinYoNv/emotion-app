@@ -57,6 +57,7 @@ def check_baseline(
     base: dict,
     sha: Callable[[str], str],
     label: str = "源码",
+    nest: bool = True,
 ) -> tuple[str, dict]:
     """比对当前快照与落盘基线，返回 `(裁决, 新的基线)`。
 
@@ -66,8 +67,19 @@ def check_baseline(
       * `"stale"`—— 与基线不一致且**工作区有未提交改动** ⇒ **必须停下来**。
 
     `base` 的形状兼容两种历史写法（11 份副本里有两种）：
-      * `{path: {"sha256": ...}}`（新）
-      * `{path: "<literal source text>"}`（`inject_nav_plugin_pages_check.py` 那种）
+      * `{path: {"sha256": ...}}`（`inject_conversation_manager` 那种）
+      * `{path: "<literal source text>"}`（`inject_nav_plugin_pages` /
+        `inject_ui_tokens` 那种）
+
+    🔴 `nest`：**返回/写回的形状必须与调用方期望的一致**（2026-10-10 踩到）。
+       两种历史写法里，调用方后面是这么用 `snap` 的：
+         * 嵌套式工具：`base[path]["sha256"]`；
+         * 平铺式工具（`ui_tokens`/`plugin_config`/`settings_ping` 等）：
+           **直接 `snap[rel]` 当源码文本用**。
+       ⇒ 平铺式工具必须传 `nest=False`，否则自动前进后写回嵌套形状，
+         调用方拿到 dict 当文本用 → `TypeError: data must be str, not dict`
+         （实测：`ui_tokens` 就是这么挂的，而且**只在"提交后第一次跑"才发作**——
+          因为不 stale 时我原样返回 `base`，形状恰好还对）。
     """
     def _want(v):
         if isinstance(v, dict):
@@ -76,8 +88,13 @@ def check_baseline(
             return sha(v)
         return None
 
+    def _pack() -> dict:
+        if nest:
+            return {p: {"sha256": sha(t)} for p, t in snap.items()}
+        return {p: sha(t) for p, t in snap.items()}
+
     if not base:
-        return "exist", {p: {"sha256": sha(t)} for p, t in snap.items()}
+        return "exist", _pack()
 
     stale = [p for p, t in snap.items() if _want(base.get(p)) and _want(base.get(p)) != sha(t)]
     if not stale:
@@ -86,7 +103,7 @@ def check_baseline(
     if git_is_clean(root):
         print(f"ℹ️ {len(stale)} 个文件与基线不一致，但工作区干净 ⇒ "
               f"是正常提交造成基线过期，按当前{label}刷新基线")
-        return "ok", {p: {"sha256": sha(t)} for p, t in snap.items()}
+        return "ok", _pack()
 
     print(f"❌ {label}与落盘基线不一致，且工作区**有未提交改动** —— "
           f"上次可能停在注入态，请先还原（`git diff` 看一眼）")

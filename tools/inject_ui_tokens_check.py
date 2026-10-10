@@ -149,11 +149,11 @@ def main() -> int:
         _raw = json.loads(BASELINE.read_text(encoding="utf-8"))
         cur = {rel: (ROOT / rel).read_text(encoding="utf-8") for rel in files}
         # 🔴 2026-10-10：抽到 `tools/_inject_guard.py`（原 11 份副本会漂移）。
-        _v, _new = check_baseline(root=ROOT, snap=cur, base=_raw, sha=lambda t: t)
+        _v, _new = check_baseline(root=ROOT, snap=cur, base=_raw, sha=lambda t: t, nest=False)
         if _v == "stale":
             print("   请先还原（`git diff` 看一眼），再运行本工具。")
             return 2
-        snap = _new
+        snap = cur
         BASELINE.write_text(json.dumps(snap, ensure_ascii=False, indent=1), encoding="utf-8")
     else:
         snap = {rel: (ROOT / rel).read_text(encoding="utf-8") for rel in files}

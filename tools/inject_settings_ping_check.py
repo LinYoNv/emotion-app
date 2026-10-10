@@ -158,7 +158,7 @@ def main() -> int:
         snap = json.loads(BASELINE.read_text(encoding="utf-8"))
         # 🔴 2026-10-10：抽到 `tools/_inject_guard.py`（原 11 份副本会漂移）——
         #    工作区干净 ⇒ 基线过期、自动前进；有未提交改动 ⇒ 拒绝运行。
-        _v, snap = check_baseline(root=ROOT, snap=snap, base=snap, sha=lambda t: t)
+        _v, snap = check_baseline(root=ROOT, snap=snap, base=snap, sha=lambda t: t, nest=False)
         if _v == "stale":
             return 2
         BASELINE.write_text(json.dumps(snap, ensure_ascii=False, indent=1), encoding="utf-8")
