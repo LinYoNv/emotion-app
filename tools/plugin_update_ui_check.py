@@ -234,6 +234,76 @@ def main() -> int:
         bad_ver = [r["ver"] for r in rows if r["ver"].lower().startswith("vv")]
         check(not bad_ver, "③b 版本号没有重复的 v 前缀", f"异常: {bad_ver}")
 
+        # ---- ③c 两列网格（情绪 2026-10-17：「并排一行排两个卡片」）----
+        # 🔴 判据要验**几何**，不能只看 CSS 写了 `grid`：
+        #    乱动 `grid-template-columns`（比如写成 `1fr` 而非 `minmax(0,1fr)`）
+        #    在长内容下会变成不等宽甚至溢出，而 DOM 结构完全没变。
+        layout = cdp.eval(
+            """
+            (() => {
+              const l = document.getElementById('plugin-update-list');
+              const cs = getComputedStyle(l);
+              const cards = [...l.querySelectorAll('.plugin-card')].map(c => {
+                const r = c.getBoundingClientRect();
+                return {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width)};
+              });
+              const rows = {};
+              cards.forEach(c => { (rows[c.y] = rows[c.y] || []).push(c); });
+              const rowSizes = Object.values(rows).map(r => r.length);
+              const widths = [...new Set(cards.map(c => c.w))];
+              return {
+                display: cs.display,
+                cols: cs.gridTemplateColumns.split(' ').filter(Boolean).length,
+                rowSizes,
+                widths,
+                scrollW: document.documentElement.scrollWidth,
+                clientW: document.documentElement.clientWidth,
+              };
+            })()
+            """
+        )
+        check(layout and layout.get("display") == "grid", "③c 升级列表是 CSS Grid", str(layout))
+        check(
+            layout and layout.get("cols") == 2,
+            "③c 网格是 2 列",
+            f"实际 {layout.get('cols') if layout else '?'} 列（{layout.get('cols')=}）",
+        )
+        check(
+            layout and max(layout.get("rowSizes") or [0]) == 2,
+            "③c 同一行真的排了 2 张卡片",
+            f"每行张数={layout.get('rowSizes') if layout else '?'}",
+        )
+        check(
+            layout and len(layout.get("widths") or []) == 1,
+            "③c 两列等宽（不等宽说明 minmax(0,1fr) 被改坏了）",
+            f"各卡片宽度={layout.get('widths') if layout else '?'}",
+        )
+        check(
+            layout and layout["scrollW"] <= layout["clientW"] + 1,
+            "③c 两列没有撑出横向滚动",
+            f"scrollW={layout.get('scrollW')} clientW={layout.get('clientW')}",
+        )
+
+        # ---- ③d 标签截断（窄卡片必做，否则 8 个标签堆成半屏）----
+        chip_info = cdp.eval(
+            """
+            (() => {
+              const out = [];
+              document.querySelectorAll('#plugin-update-list .plugin-card').forEach(c => {
+                const chips = c.querySelectorAll('.plugin-chip');
+                const more = c.querySelectorAll('.plugin-chip--more');
+                out.push({n: chips.length, more: more.length ? more[0].textContent : ''});
+              });
+              return out;
+            })()
+            """
+        ) or []
+        check(
+            all(c["n"] <= 5 for c in chip_info),
+            "③d 每张卡片的 chip 数不超过 5（分类+3标签+溢出）",
+            f"实际={[c['n'] for c in chip_info]}",
+        )
+
         # ---- ⑦ 与启停列表同源（集合相等）----
         # 🔴 两个列表用的**字段本来就不同**，不能直接比：
         #    * `#plugin-switch-list` 的 `data-module-path` = 停用名单里的原文

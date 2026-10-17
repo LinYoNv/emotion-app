@@ -4229,10 +4229,18 @@ function renderPluginUpdate() {
     meta.appendChild(titleRow);
 
     // chip 组：分类 + 标签（照真实现的 extension-chip-group）
+    // 🔴 **两列布局必须截断标签**：`astrbot_plugin_memory_companion` 有 8 个标签，
+    //    全画出来在窄卡片里会堆成 4~5 行、把卡片撑得一屏高（实测）。
+    //    规则：分类 + 前 3 个标签 + `+N`。`+N` 是**纯信息**、不是按钮。
+    const MAX_TAGS = 3;
     const chips = [];
     if (p.category) chips.push({ text: p.category, kind: "primary" });
-    (p.tags || []).forEach((t) => chips.push({ text: String(t), kind: "default" }));
-    // 加载失败的插件必须一眼看出来（不许和正常插件长得一样）
+    const allTags = (p.tags || []).map((t) => String(t));
+    allTags.slice(0, MAX_TAGS).forEach((t) => chips.push({ text: t, kind: "default" }));
+    // 加载失败的插件必须一眼看出来（不许和正常插件长得一样）——它**优先占位**，
+    // 不能被标签截断规则挤掉：先算它，再回退标签数量。
+    const overflow = Math.max(0, allTags.length - MAX_TAGS);
+    if (overflow > 0) chips.push({ text: `+${overflow}`, kind: "more" });
     if (p.state === "failed") chips.push({ text: "加载失败", kind: "danger" });
     if (chips.length) {
       const chipGroup = document.createElement("div");
@@ -4241,6 +4249,10 @@ function renderPluginUpdate() {
         const chip = document.createElement("span");
         chip.className = "plugin-chip" + (c.kind === "default" ? "" : ` plugin-chip--${c.kind}`);
         chip.textContent = c.text;
+        // `+N` 用 title 补全，鼠标悬停能看到被藏起来的标签（不额外占空间）
+        if (c.kind === "more") {
+          chip.title = allTags.slice(MAX_TAGS).join("、");
+        }
         chipGroup.appendChild(chip);
       });
       meta.appendChild(chipGroup);
