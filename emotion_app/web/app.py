@@ -1549,3 +1549,112 @@ def _mount_plugin_routes(
                 500,
             )
         return jsonify({"ok": True, "message": f"已删除 {out['deleted']}"}), 200
+
+    # ---- 插件升级（从 metadata.yaml 的 repo: 拉新版本）----
+    #
+    # 🔴 契约照抄 AstrBot v4.27.5 的真实现（只读源码）：
+    #    `dashboard/api/plugins.py:1143  POST /plugins/{plugin_id}/update`
+    #    请求体 `{proxy}` —— **代理是每次请求传的，后端不存**。
+    #    服务层 `plugin_service.py:1775`，实现在 `core/star/updater.py:225`。
+    #
+    # 🔴 **鉴权必须走 `_plugin_guard()`**（本项目真事故：漏了它 ⇒ 未登录也能操作，
+    #    而服务绑 0.0.0.0）。它会先 `require_auth()`，再判宿主就绪/插件存在。
+
+    @app.post("/api/v1/plugins/<plugin_id>/update")
+    async def plugin_update(plugin_id: str):  # type: ignore[no-untyped-def]
+        """把一个已安装插件升级到它仓库的最新版本（**需重启生效**）。
+
+        请求体（都可选）：
+            `{"proxy": "http://127.0.0.1:8118"}` —— 出口由**调用方**决定，留空 = 直连。
+                本项目面向自部署，所以**不写死任何代理地址、也不读环境变量兜底**
+                （否则"换个地方部署就行为不同"）。
+            `{"repo": "..."}` —— 覆盖 metadata 里的 `repo:`（默认不用）。
+            `{"preserve": ["files/"]}` —— 覆盖时跳过的路径，默认见 `DEFAULT_PRESERVE`。
+        """
+        guard = _plugin_guard(plugin_id)
+        if guard is not None:
+            return guard
+
+        # 🔴 升级实现在 `host/` 里，而 `astrbot_host` **不在 `emotion_app` 包内**
+        #    （它是并列交付物）。挂路由阶段早于 `host.start()`，所以必须先补
+        #    `sys.path` —— 这正是 `plugin_host.ensure_host_on_path()` 文档里写的
+        #    "任何在 start() 之前 import 的地方都必须先调它"那条硬约束
+        #    （漏掉的后果是 ModuleNotFoundError ⇒ 整个服务起不来）。
+        from .plugin_host import ensure_host_on_path
+
+        ensure_host_on_path()
+        from astrbot_host.plugin_updater import (
+            DEFAULT_PRESERVE,
+            PluginUpdateError,
+            update_plugin,
+        )
+
+        body = await request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request"}}), 400
+        proxy = str(body.get("proxy") or "").strip()
+        repo_override = str(body.get("repo") or "").strip()
+        preserve: tuple[str, ...] = DEFAULT_PRESERVE
+        preserve_raw = body.get("preserve")
+        if isinstance(preserve_raw, list):
+            items = tuple(str(x).strip() for x in preserve_raw if str(x).strip())
+            if items:
+                preserve = items
+
+        loader = getattr(service.host, "loader", None)
+        record = getattr(loader, "records", {}).get(plugin_id) if loader else None
+        if record is None:
+            return (
+                jsonify({"error": {"message": f"插件不存在：{plugin_id}", "type": "not_found"}}),
+                404,
+            )
+        plugin_dir = Path(str(record.path))
+
+        try:
+            out = await update_plugin(
+                plugin_dir=plugin_dir,
+                proxy=proxy,
+                repo_override=repo_override,
+                preserve=preserve,
+            )
+        except PluginUpdateError as exc:
+            # 失败消息必须能指导下一步动作（网络？认证？仓库不存在？）
+            log.warning(
+                "插件升级失败：%s（plugin=%s）",
+                exc,
+                plugin_id,
+                extra={"data": {"plugin": plugin_id}},
+            )
+            return jsonify({"error": {"message": str(exc), "type": "upgrade_failed"}}), 400
+        except Exception as exc:  # noqa: BLE001
+            log.exception("插件升级异常（plugin=%s）", plugin_id)
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": f"升级失败：{type(exc).__name__}: {exc}",
+                            "type": "internal_error",
+                        }
+                    }
+                ),
+                500,
+            )
+
+        same = bool(out.old_version) and out.old_version == out.new_version
+        if same:
+            msg = f"已同步到最新（版本号仍是 {out.new_version}）"
+        else:
+            msg = f"已从 {out.old_version or '未知'} 升级到 {out.new_version or '未知'}"
+        if out.preserved:
+            msg += f"；保留了用户数据 {', '.join(out.preserved)}"
+        return (
+            jsonify(
+                {
+                    "ok": True,
+                    "result": out.as_dict(),
+                    "message": msg + "。**需要重启服务**才生效",
+                    "note": "宿主没有热重载 —— 必须重启服务，新版本才会真正加载",
+                }
+            ),
+            200,
+        )

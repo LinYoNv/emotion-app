@@ -3789,6 +3789,9 @@ async function loadPluginSwitch() {
     const d = await api("GET", "/api/v1/plugins");
     state.pluginSwitch = d;
     renderPluginSwitch();
+    // 🔴 升级列表与启停列表**同一份数据**（`state.pluginSwitch`）——
+    //    另开一条 `/api/v1/plugins` 请求会漂（本项目踩过"同源数据各取一份"）。
+    renderPluginUpdate();
     // 🔴 侧边栏的插件分组**跟这一份数据同源**（同一次请求的结果）——
     //    它是"哪个插件有拓展页"的唯一数据来源，另开一条请求就会漂。
     renderNavPluginPages(d);
@@ -3797,6 +3800,8 @@ async function loadPluginSwitch() {
     // 🔴 读失败 → 说清原因 + 清空（不把"没读到"显示成"没有插件"）
     state.pluginSwitch = null;
     host.innerHTML = "";
+    // 升级列表同样要跟着清（否则会留着上一次的插件，点"升级"打空）
+    renderPluginUpdate();
     // ⚠️ 侧边栏也要清掉：留着上一次的分组会显示**已经不存在的插件**，
     //    点进去 404（比"没有"更糟 —— 用户会以为插件还在）。
     renderNavPluginPages(null);
@@ -4117,6 +4122,134 @@ async function savePluginSwitch() {
 }
 
 $("plugin-switch-save").onclick = savePluginSwitch;
+
+/* ==================== 插件升级 ====================
+ * 照真 AstrBot 的 `POST /plugins/{plugin_id}/update`
+ * （`dashboard/api/plugins.py:1143`；实现 `core/star/updater.py:225`）。
+ *
+ * 🔴 **数据来源与 `loadPluginSwitch` 同一份**（`state.pluginSwitch`）——
+ *    另开一条 `/api/v1/plugins` 请求会漂（本项目踩过"两处同源数据各取一份"）。
+ * 🔴 **代理不落盘**：每次请求从输入框读，留空 = 直连（与真实现一致）。
+ * 🔴 **升级完必须重启**：宿主没有热重载。端点返回的 `restart_required` 恒为真，
+ *    但文案不许含糊 —— 用户最容易误解成"点完就生效了"。
+ */
+
+/** 画「插件升级」列表：一行一个已加载插件 + 版本 + 升级按钮。 */
+function renderPluginUpdate() {
+  const host = $("plugin-update-list");
+  const hint = $("plugin-update-hint");
+  const d = state.pluginSwitch;
+  if (!host) return;
+  host.innerHTML = "";
+  if (!d) {
+    // 没读到清单 ≠ 没有插件（那是误导性最强的失败）
+    if (hint) {
+      hint.style.color = "var(--danger)";
+      hint.textContent = "还没读到插件清单（见上方「插件启停」的失败原因）。";
+    }
+    return;
+  }
+  const plugins = d.plugins || [];
+  if (!plugins.length) {
+    if (hint) {
+      hint.style.color = "";
+      hint.textContent = "当前没有已发现的插件。";
+    }
+    return;
+  }
+
+  plugins.forEach((p) => {
+    const row = document.createElement("div");
+    row.className = "switch-row";
+    row.dataset.pluginId = p.id;
+
+    const label = document.createElement("span");
+    label.className = "switch-label";
+    const strong = document.createElement("strong");
+    strong.textContent = p.display_name || p.name || p.id;
+    label.appendChild(strong);
+    const ver = document.createElement("small");
+    ver.className = "switch-ver";
+    // 版本号是"用户判断有没有更新的唯一依据"，必须有
+    ver.textContent = p.version ? ` v${p.version}` : " （未声明版本）";
+    label.appendChild(ver);
+    row.appendChild(label);
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "link-btn plugin-update-btn";
+    btn.textContent = "升级";
+    btn.title = "从这个插件的仓库拉取最新版本";
+    btn.onclick = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      upgradePlugin(p, btn);
+    };
+    row.appendChild(btn);
+    host.appendChild(row);
+  });
+
+  if (hint) hint.style.color = "";
+}
+
+/** 升级一个插件。`btn` 用来做"进行中"状态，避免重复点。 */
+async function upgradePlugin(p, btn) {
+  const out = $("plugin-update-result");
+  const proxyEl = $("plugin-update-proxy");
+  const proxy = proxyEl ? proxyEl.value.trim() : "";
+  const name = p.display_name || p.name || p.id;
+
+  // 二次确认 —— 它会**改写插件源码目录**，不是纯只读操作
+  const ok = confirm(
+    `升级「${name}」？\n\n` +
+      `会从它的仓库拉取最新版本并覆盖插件源码。\n` +
+      `· 不会删除插件数据与已上传文件（files/ 等会被跳过）\n` +
+      `· 升级后需要重启服务才生效\n` +
+      (proxy ? `· 使用代理：${proxy}\n` : `· 直连（未填代理）\n`)
+  );
+  if (!ok) return;
+
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "升级中…";
+  if (out) {
+    out.style.color = "";
+    out.textContent = `正在升级「${name}」…（拉取仓库可能要几十秒，勿关页面）`;
+  }
+  try {
+    const res = await api("POST", `/api/v1/plugins/${encodeURIComponent(p.id)}/update`, {
+      proxy,
+    });
+    const r = (res && res.result) || {};
+    const bits = [res.message || "升级完成"];
+    if (r.new_version) bits.push(`新版本 ${r.old_version || "?"} → ${r.new_version}`);
+    if ((r.preserved || []).length) {
+      bits.push(`已保护用户数据：${r.preserved.join(", ")}`);
+    }
+    if ((r.kept_extra || []).length) {
+      bits.push(`保留旧文件 ${r.kept_extra.length} 个（新版本里没有，未删除）`);
+    }
+    if (out) {
+      out.style.color = "var(--warn)";
+      out.textContent = bits.join(" · ") + " ⚠️ 请重启服务（./run.sh serve）后再验证。";
+    }
+    // 版本号可能变了 —— 重取清单（不自己改 DOM，避免和真实状态漂）
+    await loadPluginSwitch();
+  } catch (e) {
+    // 🔴 失败要说清"下一步怎么办"，不能只报一句"失败"
+    if (out) {
+      out.style.color = "var(--danger)";
+      out.textContent = `升级失败：${e.message}`;
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+}
+
+// ⚠️ 不在这里打猴子补丁（`renderPluginSwitch = ...`）——那会让"改了函数名
+//    就静默失效"。升级列表由 `loadPluginSwitch()` **显式**调用 `renderPluginUpdate()`。
+
 
 async function loadPluginPages() {
   const ul = $("plugin-page-list");
