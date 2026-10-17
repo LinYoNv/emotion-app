@@ -329,10 +329,20 @@ def test_resolve_timeout_priority(monkeypatch):
     assert resolve_timeout(999999) == 3600
 
 
-def test_default_timeout_is_generous_enough_for_slow_networks(monkeypatch):
-    """默认超时必须**明显大于**真实现的 180s（慢网络下 180s 不够，实测）。"""
+def test_default_timeout_is_the_agreed_value():
+    """默认超时 = **360s**（情绪 2026-10-17 拍板）。
+
+    > 「不用加就设置360s算超时，让用户自己解决代理问题」
+
+    这个值的**定位**要说清楚（别以后有人又"顺手调大"）：
+    它是"给一个合理上限，超了就是网络/代理的问题"，
+    **不是**"把超时调大到能容忍任何网速" —— 后者会让失败来得太晚、还白占连接。
+    真实现的 180s 实测确实不够（慢网络下 25MB 要 ~27 分钟），但也不该无限放宽。
+    """
     from astrbot_host.plugin_updater import GIT_CLONE_TIMEOUT_SECONDS
 
-    assert GIT_CLONE_TIMEOUT_SECONDS >= 600, (
-        f"默认超时 {GIT_CLONE_TIMEOUT_SECONDS}s 太小：实测慢网络下 25MB 仓库要 ~27 分钟"
+    assert GIT_CLONE_TIMEOUT_SECONDS == 360, (
+        f"默认超时应为 360s（约定值），实际 {GIT_CLONE_TIMEOUT_SECONDS}s"
     )
+    # 但仍必须**明显大于**真实现的 180s（实测 180s 在慢网络下不够）
+    assert GIT_CLONE_TIMEOUT_SECONDS > 180

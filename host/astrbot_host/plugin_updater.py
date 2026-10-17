@@ -52,16 +52,22 @@ METADATA_MAX_BYTES: int = 1024 * 1024
 #: 仓库探测超时（真实现 `PLUGIN_REPOSITORY_TIMEOUT_SECONDS` = 15）
 REPOSITORY_TIMEOUT_SECONDS: int = 15
 
-#: clone 超时（真实现 `PLUGIN_GIT_CLONE_TIMEOUT_SECONDS` = 180）。
+#: clone 超时。
 #:
-#: 🔴 **真实现的 180s 在慢网络下不够 —— 实测踩到**（2026-10-17）：
-#:   当时 GitHub 下行只有 **~15 KB/s**，`astrbot_plugin_memory_companion`（25 MB）
-#:   需要约 **27 分钟** ⇒ 180s 必然超时，而**用户看到的是"代理没生效"**（误导）。
-#:   真实现能留 180s 是因为它面向"服务器 VPS 直连 GitHub"；我们没有那个前提。
+#: 真实现是 `PLUGIN_GIT_CLONE_TIMEOUT_SECONDS = 180`。
 #:
-#: ⇒ 默认放宽到 **600s**，并允许**每次请求覆盖**（`timeout` 参数 / 环境变量）。
-#:   超时不再是"写死的值"，因为最佳值取决于部署地的网速。
-GIT_CLONE_TIMEOUT_SECONDS: int = 600
+#: 🔴 **实测（2026-10-17）**：本机 GitHub 下行只有 **~15 KB/s**，
+#:   `astrbot_plugin_memory_companion`（25 MB）需要约 **27 分钟** ⇒ 180s 必然超时。
+#:   而当时的失败文案把用户引向"代理配错了"（误导）。
+#:
+#: ✅ **情绪 2026-10-17 拍板：360 秒，慢就慢、超时就换代理** ——
+#:    「不用加就设置360s算超时，让用户自己解决代理问题」。
+#:    这个值的定位是"**给一个合理上限，超了就是你网络/代理的问题**"，
+#:    而不是"把超时调大到能容忍任何网速"（那会让失败来得太晚、还占着连接）。
+#:
+#: ⚠️ 仍允许部署者用环境变量 `EMOTION_PLUGIN_UPDATE_TIMEOUT_SECONDS` 覆盖 ——
+#:    不同部署地的网速可以差两个数量级，写死一个值总会有人不合适。
+GIT_CLONE_TIMEOUT_SECONDS: int = 360
 
 #: 允许部署者用环境变量覆盖（不改代码）。非法值忽略、不报错（不该因为一个
 #: 环境变量写错就让升级功能整个不可用）。
@@ -279,9 +285,12 @@ async def _clone(repo_url: str, dest: Path, proxy: str, timeout: int | None = No
         proc.kill()
         await proc.wait()
         raise PluginUpdateError(
-            f"拉取超时（{limit}s）。仓库较大或网速较慢时会这样："
-            f"① 在「代理」里填一个更快的出口再试；"
-            f"② 或用环境变量 {_ENV_TIMEOUT} 放宽超时（当前 {limit}s）"
+            # 文案定位：**超时是网络/代理的问题，让用户换出口**（情绪 2026-10-17 拍板
+            # 「让用户自己解决代理问题」）。不要把"改超时"当首选建议推给用户 ——
+            # 那是在教他绕过症状，而真因是他的出口慢。
+            f"拉取超时（{limit} 秒）。这是网络或代理太慢导致的，不是插件本身的问题。"
+            f"请在「代理」里换一个更快的出口再试（例如自建或就近的代理）。"
+            f"（高级：环境变量 {_ENV_TIMEOUT} 可调整这个上限，当前 {limit} 秒）"
         ) from None
     if proc.returncode != 0:
         text = (out or b"").decode("utf-8", errors="replace").strip()
