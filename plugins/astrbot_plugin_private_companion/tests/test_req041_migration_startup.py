@@ -10,6 +10,7 @@ import math
 from pathlib import Path
 import sqlite3
 import tempfile
+import threading
 import types
 import unittest
 from typing import Any
@@ -192,6 +193,40 @@ class MigrationStartupTests(unittest.IsolatedAsyncioTestCase):
             migration_epoch=status["migration_epoch"], policy_version=status["policy_version"],
         )
         return remote
+
+    async def test_scoped_sync_captures_legacy_snapshot_off_event_loop(self) -> None:
+        host = self._host(source=False)
+        loop_thread_id = threading.get_ident()
+        copy_thread_ids: list[int] = []
+        copy_lock_states: list[bool] = []
+
+        class _ThreadRecordingDict(dict):
+            def __deepcopy__(self, memo):
+                copy_thread_ids.append(threading.get_ident())
+                copy_lock_states.append(host._data_lock.locked())
+                duplicate = {}
+                memo[id(self)] = duplicate
+                for key, value in self.items():
+                    duplicate[deepcopy(key, memo)] = deepcopy(value, memo)
+                return duplicate
+
+        class _Synchronizer:
+            def mark_dirty(self) -> None:
+                pass
+
+            def sync_snapshot(self, snapshot, *, source_scope):
+                return {"ok": True, "records": len(snapshot), "errors": 0}
+
+        host._data_default = _ThreadRecordingDict({"users": {}})
+        host.data = host._data_default
+        host.req041_scoped_projection_sync = _Synchronizer()
+
+        result = await host._req041_sync_scoped_now()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(1, len(copy_thread_ids))
+        self.assertNotEqual(loop_thread_id, copy_thread_ids[0])
+        self.assertEqual([True], copy_lock_states)
 
     async def test_new_install_without_source_initializes_stable_scoped_runtime(self) -> None:
         host = self._host(source=False)

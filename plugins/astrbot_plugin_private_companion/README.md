@@ -1,5 +1,7 @@
 # 我会永远陪着你
 
+> **群聊通知（2026-10-11）：** 原群聊被停用一周，期间可先加入 bot 群：**145326153**。
+
 > [!IMPORTANT]
 > **插件正在进行大规模重构。** 当前正持续调整模块划分、提示词编排、数据存储与扩展接口，重构期间功能行为、配置和兼容性可能发生变化。升级前请备份插件配置与数据，并阅读更新日志；遇到问题请附上插件版本、相关日志和复现步骤。
 >
@@ -118,7 +120,7 @@ Proactive Chat 的深度联动如果遇到版本不兼容或缺少上游方法�
 - 按主题查阅契约、领域设计与参考：[设计主题目录](./docs/FRAMEWORK_DESIGN_INDEX.md)
 - 问题反馈：[GitHub Issues](https://github.com/menglimi/astrbot_plugin_private_companion/issues)
 - 版本记录：[CHANGELOG.md](./CHANGELOG.md)
-- 交流群：QQ 群 <code>1097283005</code>
+- 交流群：原 QQ 群 <code>1097283005</code> 被停用一周，期间可先加入 bot 群：<code>145326153</code>。
 - 开发者：<code>menglimi</code>
 - 自愿支持：[爱发电](https://ifdian.net/a/xuhaun)
 
