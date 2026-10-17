@@ -294,3 +294,45 @@ def test_update_failure_leaves_installed_dir_intact(tmp_path):
 
     after = sorted(p.relative_to(installed).as_posix() for p in installed.rglob("*") if p.is_file())
     assert before == after, f"升级失败后已安装目录被改了：{set(before) ^ set(after)}"
+
+
+# ---------------------------------------------------------------- 超时可配置
+
+
+def test_resolve_timeout_priority(monkeypatch):
+    """超时优先级：显式参数 → 环境变量 → 默认值。
+
+    🔴 来历（2026-10-17 实测）：GitHub 下行只有 ~15 KB/s 时，
+    25MB 仓库要 ~27 分钟，而真实现的 180s 必然超时 ——
+    用户看到的却是"代理没生效"（误导性最强的失败）。所以超时不能写死。
+    """
+    from astrbot_host.plugin_updater import (
+        GIT_CLONE_TIMEOUT_SECONDS,
+        resolve_timeout,
+    )
+
+    monkeypatch.delenv("EMOTION_PLUGIN_UPDATE_TIMEOUT_SECONDS", raising=False)
+    assert resolve_timeout() == GIT_CLONE_TIMEOUT_SECONDS
+    assert resolve_timeout(900) == 900, "显式参数应优先于默认值"
+
+    monkeypatch.setenv("EMOTION_PLUGIN_UPDATE_TIMEOUT_SECONDS", "1234")
+    assert resolve_timeout() == 1234, "环境变量应生效"
+    assert resolve_timeout(60) == 60, "显式参数应优先于环境变量"
+
+    # 非法值忽略（不能因为一个环境变量写错就让升级功能整个不可用）
+    for bad in ("abc", "", "0", "-5"):
+        monkeypatch.setenv("EMOTION_PLUGIN_UPDATE_TIMEOUT_SECONDS", bad)
+        assert resolve_timeout() == GIT_CLONE_TIMEOUT_SECONDS, f"非法值 {bad!r} 应被忽略"
+
+    # 上限 3600（再长就不该在 HTTP 请求里等）
+    monkeypatch.delenv("EMOTION_PLUGIN_UPDATE_TIMEOUT_SECONDS", raising=False)
+    assert resolve_timeout(999999) == 3600
+
+
+def test_default_timeout_is_generous_enough_for_slow_networks(monkeypatch):
+    """默认超时必须**明显大于**真实现的 180s（慢网络下 180s 不够，实测）。"""
+    from astrbot_host.plugin_updater import GIT_CLONE_TIMEOUT_SECONDS
+
+    assert GIT_CLONE_TIMEOUT_SECONDS >= 600, (
+        f"默认超时 {GIT_CLONE_TIMEOUT_SECONDS}s 太小：实测慢网络下 25MB 仓库要 ~27 分钟"
+    )

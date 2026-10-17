@@ -52,8 +52,42 @@ METADATA_MAX_BYTES: int = 1024 * 1024
 #: 仓库探测超时（真实现 `PLUGIN_REPOSITORY_TIMEOUT_SECONDS` = 15）
 REPOSITORY_TIMEOUT_SECONDS: int = 15
 
-#: clone 超时（真实现 `PLUGIN_GIT_CLONE_TIMEOUT_SECONDS` = 180）
-GIT_CLONE_TIMEOUT_SECONDS: int = 180
+#: clone 超时（真实现 `PLUGIN_GIT_CLONE_TIMEOUT_SECONDS` = 180）。
+#:
+#: 🔴 **真实现的 180s 在慢网络下不够 —— 实测踩到**（2026-10-17）：
+#:   当时 GitHub 下行只有 **~15 KB/s**，`astrbot_plugin_memory_companion`（25 MB）
+#:   需要约 **27 分钟** ⇒ 180s 必然超时，而**用户看到的是"代理没生效"**（误导）。
+#:   真实现能留 180s 是因为它面向"服务器 VPS 直连 GitHub"；我们没有那个前提。
+#:
+#: ⇒ 默认放宽到 **600s**，并允许**每次请求覆盖**（`timeout` 参数 / 环境变量）。
+#:   超时不再是"写死的值"，因为最佳值取决于部署地的网速。
+GIT_CLONE_TIMEOUT_SECONDS: int = 600
+
+#: 允许部署者用环境变量覆盖（不改代码）。非法值忽略、不报错（不该因为一个
+#: 环境变量写错就让升级功能整个不可用）。
+_ENV_TIMEOUT = "EMOTION_PLUGIN_UPDATE_TIMEOUT_SECONDS"
+
+
+def resolve_timeout(override: int | None = None) -> int:
+    """本次 clone 的超时秒数。优先级：显式参数 → 环境变量 → 默认值。
+
+    ⚠️ 上限 **3600s**（1 小时）：再长就不该在 HTTP 请求里等了 ——
+       真需要那么久说明网络不可用，早失败比挂一小时更好。
+    """
+    candidates: list[object] = []
+    if override is not None:
+        candidates.append(override)
+    candidates.append(os.environ.get(_ENV_TIMEOUT))
+    for raw in candidates:
+        if raw is None:
+            continue
+        try:
+            val = int(str(raw).strip())
+        except (TypeError, ValueError):
+            continue
+        if val > 0:
+            return min(val, 3600)
+    return GIT_CLONE_TIMEOUT_SECONDS
 
 #: 插件入口模块名 —— 我们宿主的 `discover()` 依赖它（真实现没有这条，是我们的额外校验）
 ENTRY_MODULE: str = "main.py"
@@ -211,6 +245,9 @@ def _git_env_with_proxy(proxy: str) -> dict[str, str]:
     ⚠️ 只作用于本次子进程 —— 不影响机器上其它 git 操作。
     """
     env = dict(os.environ)
+    # 🔴 私有仓库时 git 会想交互式要账号 ⇒ 子进程里等于永久挂起。禁掉。
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = "echo"
     if proxy:
         env["HTTP_PROXY"] = proxy
         env["HTTPS_PROXY"] = proxy
@@ -221,8 +258,14 @@ def _git_env_with_proxy(proxy: str) -> dict[str, str]:
     return env
 
 
-async def _clone(repo_url: str, dest: Path, proxy: str) -> None:
-    """浅克隆到 `dest`（真实现同样是 shallow 语义的临时目录 checkout）。"""
+async def _clone(repo_url: str, dest: Path, proxy: str, timeout: int | None = None) -> None:
+    """浅克隆到 `dest`（真实现同样是 shallow 语义的临时目录 checkout）。
+
+    ⚠️ 额外设 `GIT_TERMINAL_PROMPT=0`：仓库若是**私有**的，git 会尝试弹
+       交互式用户名提示，在子进程里那就是**永久挂起**（比超时更糟）。
+       禁止交互 ⇒ 立刻报"认证失败"，用户能看懂。
+    """
+    limit = resolve_timeout(timeout)
     cmd = ["git", "clone", "--depth", "1", repo_url, str(dest)]
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -231,13 +274,14 @@ async def _clone(repo_url: str, dest: Path, proxy: str) -> None:
         env=_git_env_with_proxy(proxy),
     )
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=GIT_CLONE_TIMEOUT_SECONDS)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=limit)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
         raise PluginUpdateError(
-            f"拉取超时（{GIT_CLONE_TIMEOUT_SECONDS}s）。"
-            "若目标在境外，请在「代理」里填一个可用的出口再试"
+            f"拉取超时（{limit}s）。仓库较大或网速较慢时会这样："
+            f"① 在「代理」里填一个更快的出口再试；"
+            f"② 或用环境变量 {_ENV_TIMEOUT} 放宽超时（当前 {limit}s）"
         ) from None
     if proc.returncode != 0:
         text = (out or b"").decode("utf-8", errors="replace").strip()
@@ -247,11 +291,12 @@ async def _clone(repo_url: str, dest: Path, proxy: str) -> None:
 
 async def _fetch_archive(url: str, dest: Path, proxy: str) -> None:
     """下载 zip 包（真实现的 `download_url` 分支）。"""
-    cmd = ["curl", "-fsSL", "--max-time", str(GIT_CLONE_TIMEOUT_SECONDS), "-o", str(dest)]
+    limit = resolve_timeout()
+    cmd = ["curl", "-fsSL", "--max-time", str(limit), "-o", str(dest)]
     if proxy:
         cmd[1:1] = ["-x", proxy]
     cmd.append(url)
-    code, out = await _run(cmd, timeout=GIT_CLONE_TIMEOUT_SECONDS + 10)
+    code, out = await _run(cmd, timeout=limit + 10)
     if code != 0:
         raise PluginUpdateError(f"下载压缩包失败：{out.strip() or f'curl 退出码 {code}'}")
 
@@ -350,6 +395,7 @@ async def update_plugin(
     proxy: str = "",
     repo_override: str = "",
     preserve: tuple[str, ...] = DEFAULT_PRESERVE,
+    timeout: int | None = None,
 ) -> UpdateResult:
     """把 `plugin_dir` 升级到它 `metadata.yaml` 里 `repo:` 指向的最新版本。
 
@@ -358,6 +404,7 @@ async def update_plugin(
         proxy: 本次请求使用的代理；**空串 = 直连**（不读环境变量兜底）。
         repo_override: 显式指定仓库地址（通常留空，走 metadata 的 `repo`）。
         preserve: 覆盖时跳过的相对路径清单。
+        timeout: clone 超时秒数（`None` = 走 `resolve_timeout()` 的默认/环境变量）。
 
     Raises:
         PluginUpdateError: 任何一步失败，消息可直接展示给用户。
@@ -409,7 +456,7 @@ async def update_plugin(
             new_meta = _validate_plugin_tree(root)
             written, preserved, kept = _merge_tree(src=root, dst=plugin_dir, preserve=preserve)
         else:
-            await _clone(repo, checkout, proxy)
+            await _clone(repo, checkout, proxy, timeout)
             new_meta = _validate_plugin_tree(checkout)
             written, preserved, kept = _merge_tree(
                 src=checkout, dst=plugin_dir, preserve=preserve

@@ -1645,6 +1645,34 @@ def _mount_plugin_routes(
             return jsonify({"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request"}}), 400
         proxy = str(body.get("proxy") or "").strip()
         repo_override = str(body.get("repo") or "").strip()
+        #: 拉取超时（秒）。`None` = 走默认/环境变量 `EMOTION_PLUGIN_UPDATE_TIMEOUT_SECONDS`。
+        #: 🔴 实测（2026-10-17）：GitHub 慢到 **~15 KB/s** 时 25MB 仓库要 ~27 分钟，
+        #:    真实现的 180s 必然超时，而用户看到的却是"代理没生效"（误导）。
+        #:    所以超时**必须可传**，不能写死 —— 最佳值取决于部署地的网速。
+        timeout_raw = body.get("timeout")
+        timeout: int | None = None
+        if timeout_raw is not None:
+            try:
+                timeout = int(str(timeout_raw).strip())
+            except (TypeError, ValueError):
+                return (
+                    jsonify(
+                        {
+                            "error": {
+                                "message": "timeout 必须是正整数（秒）",
+                                "type": "invalid_request",
+                            }
+                        }
+                    ),
+                    400,
+                )
+            if timeout <= 0:
+                return (
+                    jsonify(
+                        {"error": {"message": "timeout 必须大于 0", "type": "invalid_request"}}
+                    ),
+                    400,
+                )
         preserve: tuple[str, ...] = DEFAULT_PRESERVE
         preserve_raw = body.get("preserve")
         if isinstance(preserve_raw, list):
@@ -1667,6 +1695,7 @@ def _mount_plugin_routes(
                 proxy=proxy,
                 repo_override=repo_override,
                 preserve=preserve,
+                timeout=timeout,
             )
         except PluginUpdateError as exc:
             # 失败消息必须能指导下一步动作（网络？认证？仓库不存在？）
