@@ -1550,6 +1550,57 @@ def _mount_plugin_routes(
             )
         return jsonify({"ok": True, "message": f"已删除 {out['deleted']}"}), 200
 
+    # ---- 插件图标（照 AstrBot 卡片：logo 是**磁盘上的文件**，不是外链）----
+    #
+    # `metadata.yaml` 的 `icon:` 是**相对插件目录**的文件名（实测
+    # `astrbot_plugin_memory_companion` 声明 `icon: logo.png`，文件也在那儿）。
+    # 真 AstrBot 由它自己的静态服务直接吐；我们加这一条。
+    #
+    # 🔴 **这是"把用户可控字符串变成文件路径"的路由 —— 路径穿越是首要风险**：
+    #    必须 ① 只认 `records` 里真实存在的插件（不信 URL 里的任意目录名）
+    #         ② `resolve()` 后确认仍在插件目录内（挡 `../../` 与符号链接）
+    #         ③ 只放行图片后缀（挡 `.py` / `.json` 被当静态文件读走）
+    #    三者缺一不可；只做①仍可能被符号链接绕过。
+    _ICON_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"})
+
+    @app.get("/api/v1/plugins/<plugin_id>/icon")
+    async def plugin_icon(plugin_id: str):  # type: ignore[no-untyped-def]
+        """返回某个插件 `metadata.yaml` 里 `icon:` 指向的图片。"""
+        guard = _plugin_guard(plugin_id)
+        if guard is not None:
+            return guard
+
+        loader = getattr(service.host, "loader", None)
+        record = getattr(loader, "records", {}).get(plugin_id) if loader else None
+        if record is None:
+            return jsonify({"error": {"message": "插件不存在", "type": "not_found"}}), 404
+        icon_rel = str(getattr(record, "icon", "") or "").strip()
+        if not icon_rel:
+            # 没声明 icon 是**正常情况**（不是错误）—— 前端画占位字母。
+            return jsonify({"error": {"message": "该插件没有声明 icon", "type": "not_found"}}), 404
+
+        plugin_dir = Path(str(record.path)).resolve()
+        target = (plugin_dir / icon_rel).resolve()
+        # ② 必须仍在插件目录内（`..` 与符号链接都会被 resolve 拆穿）
+        try:
+            target.relative_to(plugin_dir)
+        except ValueError:
+            log.warning(
+                "插件 icon 路径越界，已拒绝：plugin=%s icon=%r", plugin_id, icon_rel
+            )
+            return jsonify({"error": {"message": "icon 路径非法", "type": "invalid_request"}}), 400
+        # ③ 只放行图片
+        if target.suffix.lower() not in _ICON_EXTS:
+            return jsonify({"error": {"message": "icon 不是图片文件", "type": "invalid_request"}}), 400
+        if not target.is_file():
+            return jsonify({"error": {"message": "icon 文件不存在", "type": "not_found"}}), 404
+
+        resp = await send_from_directory(str(target.parent), target.name)
+        # 图标随插件升级而变 ⇒ 短缓存 + ETag，别用长 max-age
+        # （本项目踩过：可删资源用长 max-age ⇒ 删了浏览器还显示旧图）
+        resp.headers["Cache-Control"] = "private, no-cache"
+        return resp
+
     # ---- 插件升级（从 metadata.yaml 的 repo: 拉新版本）----
     #
     # 🔴 契约照抄 AstrBot v4.27.5 的真实现（只读源码）：

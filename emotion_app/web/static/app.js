@@ -4159,37 +4159,151 @@ function renderPluginUpdate() {
   }
 
   plugins.forEach((p) => {
-    const row = document.createElement("div");
-    row.className = "switch-row";
-    row.dataset.pluginId = p.id;
+    /* 🔴 结构照 AstrBot 的 `InstalledPluginsTab` 卡片（逐层对齐它的类名语义）：
+     *     卡片
+     *       ├ card-text
+     *       │   └ content-row
+     *       │       ├ image-container → logo (64×64, radius 10)
+     *       │       └ meta-group
+     *       │           ├ title-row → title__text + version
+     *       │           ├ chip 组（category / tags）
+     *       │           └ desc（2 行截断）
+     *       └ actions（右下按钮组）
+     *   真实现用 Vuetify 组件；我们是零构建原生 DOM，所以**自己搭同样的层次**。
+     */
+    const card = document.createElement("div");
+    card.className = "plugin-card";
+    card.dataset.pluginId = p.id;
 
-    const label = document.createElement("span");
-    label.className = "switch-label";
-    const strong = document.createElement("strong");
-    strong.textContent = p.display_name || p.name || p.id;
-    label.appendChild(strong);
-    const ver = document.createElement("small");
-    ver.className = "switch-ver";
-    // 版本号是"用户判断有没有更新的唯一依据"，必须有
-    ver.textContent = p.version ? ` v${p.version}` : " （未声明版本）";
-    label.appendChild(ver);
-    row.appendChild(label);
+    const body = document.createElement("div");
+    body.className = "plugin-card-text";
+
+    const row = document.createElement("div");
+    row.className = "plugin-content-row";
+
+    // ---- 左：logo ----
+    const imgWrap = document.createElement("div");
+    imgWrap.className = "plugin-image-container";
+    const logo = document.createElement("img");
+    logo.className = "plugin-logo";
+    logo.alt = "";
+    logo.loading = "lazy";
+    // `icon` 是 metadata 里的**相对文件名**，走我们的 icon 路由取。
+    // 没有 icon / 取不到 ⇒ **不显示破图**，退化成首字母方块（真实现也用占位逻辑）。
+    logo.onerror = () => {
+      logo.remove();
+      if (!imgWrap.querySelector(".plugin-logo-fallback")) {
+        imgWrap.appendChild(_pluginLogoFallback(p));
+      }
+    };
+    if (p.icon) {
+      logo.src = `/api/v1/plugins/${encodeURIComponent(p.id)}/icon`;
+      imgWrap.appendChild(logo);
+    } else {
+      imgWrap.appendChild(_pluginLogoFallback(p));
+    }
+    row.appendChild(imgWrap);
+
+    // ---- 右：元信息 ----
+    const meta = document.createElement("div");
+    meta.className = "plugin-meta-group";
+
+    const titleRow = document.createElement("div");
+    titleRow.className = "plugin-title-row";
+    const title = document.createElement("h4");
+    title.className = "plugin-title-text";
+    title.textContent = p.display_name || p.name || p.id;
+    title.title = p.id;
+    titleRow.appendChild(title);
+    // 版本号：用户判断"有没有更新"的唯一依据，紧跟标题（真实现同位置）
+    if (p.version) {
+      const ver = document.createElement("span");
+      ver.className = "plugin-version";
+      // ⚠️ 有的插件 metadata 里**自带 `v` 前缀**（实测 `astrbot_plugin_nai_image`
+      //    写的是 `version: v2.7.3`），硬拼就变成 `vv2.7.3`。
+      //    这里只在缺 `v` 时补 —— 原值原样显示，不擅自改用户的版本号。
+      const raw = String(p.version).trim();
+      ver.textContent = /^v/i.test(raw) ? raw : `v${raw}`;
+      titleRow.appendChild(ver);
+    }
+    meta.appendChild(titleRow);
+
+    // chip 组：分类 + 标签（照真实现的 extension-chip-group）
+    const chips = [];
+    if (p.category) chips.push({ text: p.category, kind: "primary" });
+    (p.tags || []).forEach((t) => chips.push({ text: String(t), kind: "default" }));
+    // 加载失败的插件必须一眼看出来（不许和正常插件长得一样）
+    if (p.state === "failed") chips.push({ text: "加载失败", kind: "danger" });
+    if (chips.length) {
+      const chipGroup = document.createElement("div");
+      chipGroup.className = "plugin-chip-group";
+      chips.forEach((c) => {
+        const chip = document.createElement("span");
+        chip.className = "plugin-chip" + (c.kind === "default" ? "" : ` plugin-chip--${c.kind}`);
+        chip.textContent = c.text;
+        chipGroup.appendChild(chip);
+      });
+      meta.appendChild(chipGroup);
+    }
+
+    // 描述：2 行截断（真实现是 -webkit-line-clamp:2）
+    if (p.desc) {
+      const desc = document.createElement("p");
+      desc.className = "plugin-desc";
+      desc.textContent = p.desc;
+      desc.title = p.desc;
+      meta.appendChild(desc);
+    }
+
+    row.appendChild(meta);
+    body.appendChild(row);
+    card.appendChild(body);
+
+    // ---- 底：按钮组（真实现放右下角）----
+    const actions = document.createElement("div");
+    actions.className = "plugin-actions";
+
+    // 「详情」—— 已经有的能力，顺手放在卡片里（真实现也有"信息"入口）
+    const detailBtn = document.createElement("button");
+    detailBtn.type = "button";
+    detailBtn.className = "plugin-act-btn";
+    detailBtn.textContent = "详情";
+    detailBtn.title = "看这个插件注册了什么";
+    detailBtn.onclick = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      go(`plugins/${encodeURIComponent(p.id)}`);
+    };
+    actions.appendChild(detailBtn);
 
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "link-btn plugin-update-btn";
+    btn.className = "plugin-act-btn plugin-act-btn--primary plugin-update-btn";
     btn.textContent = "升级";
     btn.title = "从这个插件的仓库拉取最新版本";
+    btn.disabled = p.state === "failed";
     btn.onclick = (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
       upgradePlugin(p, btn);
     };
-    row.appendChild(btn);
-    host.appendChild(row);
+    actions.appendChild(btn);
+
+    card.appendChild(actions);
+    host.appendChild(card);
   });
 
   if (hint) hint.style.color = "";
+}
+
+/** 没有 icon 时的占位：**首字母方块**（不用破图图标 —— 那看起来像坏了）。 */
+function _pluginLogoFallback(p) {
+  const el = document.createElement("div");
+  el.className = "plugin-logo-fallback";
+  const nm = String(p.display_name || p.name || p.id || "?");
+  // 中文取第一个字，英文取首字母大写
+  el.textContent = nm.slice(0, 1).toUpperCase();
+  return el;
 }
 
 /** 升级一个插件。`btn` 用来做"进行中"状态，避免重复点。 */

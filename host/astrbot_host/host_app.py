@@ -364,6 +364,14 @@ class PluginHost:
                     #    显示方用 `display_name || name` 退化 —— 数据层不硬填。
                     "display_name": rec.display_name,
                     "version": rec.version,
+                    # 🔴 照 AstrBot 真卡片（`InstalledPluginsTab`）补的三个字段：
+                    #    那张卡片要显示 **logo / 分类 / 标签**，没有它们做不出来。
+                    #    `icon` 是**相对插件目录**的文件名（不是 URL），前端拼下载地址。
+                    "author": rec.author,
+                    "desc": rec.desc,
+                    "icon": rec.icon,
+                    "category": rec.category,
+                    "tags": list(rec.tags),
                     "state": rec.state,
                     # 拓展页（`pages/` 目录扫出来的，照真实现）。侧边栏分组要用。
                     # ⚠️ 形状已由 `discover_plugin_pages` 定好：`{name, title}`。

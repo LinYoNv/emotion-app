@@ -909,31 +909,133 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
    这里要把它留在状态标签**右边**且不换行（手机端会 wrap，是预期）。 */
 .switch-detail { flex: 0 0 auto; font-size: 11.5px; padding: 2px 8px; }
 
-/* ---- 插件升级列表 ----
-   `.switch-row` 默认 `cursor:pointer`（因为启停那边整行是 `<label>`）。
-   升级列表这里**整行不可点**，只有「升级」按钮可点 —— 不覆盖的话
-   鼠标会变成手型，暗示"点哪都行"，实际点了没反应。 */
-#plugin-update-list .switch-row { cursor: default; }
-#plugin-update-list .switch-label {
-  display: flex; align-items: baseline; gap: 6px;
-  flex: 0 1 auto; min-width: 0;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+/* ==================== 插件升级：卡片式 ====================
+   结构照 AstrBot 的「已安装插件」卡片（`InstalledPluginsTab-Djk2B9wl.css`），
+   **尺寸逐条对齐它的实测值**：
+     * 卡片文字区 padding  12px 14px 8px
+     * content-row gap     14px（<=600px 时 10px）
+     * logo                64×64, border-radius 10px（<=600px 时 52×52）
+     * 按钮组              margin-top:auto; gap:6px; justify-content:flex-end
+     * 版本号              .875rem, 弱色, margin-left:10px
+     * 描述                2 行截断（-webkit-line-clamp:2）
+   ⚠️ AstrBot 用 Vuetify 的 `rgba(var(--v-theme-*), x)`；我们换成本项目自己的
+      token，**不引入 Vuetify 的变量**（否则值全是 undefined、整块失效）。 */
+
+.plugin-card-list {
+  display: flex; flex-direction: column; gap: 10px;
+  margin-top: 10px;
 }
-/* 版本号：用户判断"有没有更新"的唯一依据，用等宽字体好对齐 */
-#plugin-update-list .switch-ver {
-  color: var(--muted); font-size: 11.5px; font-family: var(--font-mono);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+
+.plugin-card {
+  display: flex; flex-direction: column;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  transition: border-color var(--ease), background var(--ease);
 }
-/* 「升级」按钮推到最右（与启停那边 `.switch-state` 的 margin-left:auto 同款） */
-#plugin-update-list .plugin-update-btn {
-  margin-left: auto; flex: 0 0 auto; font-size: 11.5px; padding: 2px 10px;
+.plugin-card:hover { border-color: var(--border-strong); }
+
+/* 上层：logo + 元信息 */
+.plugin-card-text { padding: 12px 14px 8px; width: 100%; box-sizing: border-box; }
+.plugin-content-row { display: flex; gap: 14px; align-items: flex-start; }
+
+.plugin-image-container { display: flex; align-items: flex-start; flex-shrink: 0; }
+.plugin-logo {
+  width: 64px; height: 64px; border-radius: 10px;
+  object-fit: cover; flex-shrink: 0;
+  /* 兜底底色：图标本身透明时也能看出边界，不至于"一片空白像坏了" */
+  background: var(--panel);
 }
-#plugin-update-list .plugin-update-btn:disabled { opacity: 0.55; cursor: wait; }
-/* 代理输入框：撑开（手机端输入长 URL 需要宽度） */
-#plugin-update-proxy {
+.plugin-logo-fallback {
+  width: 64px; height: 64px; border-radius: 10px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 26px; font-weight: 700;
+  border: 1px solid var(--accent-line);
+  box-sizing: border-box;
+}
+
+.plugin-meta-group { flex: 1; min-width: 0; }
+
+.plugin-title-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; min-width: 0;
+}
+.plugin-title-text {
+  margin: 0; font-size: 15px; font-weight: 650; color: var(--fg);
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* 版本号：真实现 `.875rem` + 弱色 + `margin-left:10px` */
+.plugin-version {
+  color: var(--faint); flex-shrink: 0; font-size: .875rem; font-weight: 500;
+  margin-left: 10px; white-space: nowrap;
+  font-family: var(--font-mono);
+}
+
+/* chip 组（分类 / 标签 / 加载失败）—— 真实现 gap:6px */
+.plugin-chip-group { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.plugin-chip {
+  flex-shrink: 0;
+  font-size: 11.5px; line-height: 1.6;
+  padding: 0 7px; border-radius: 9px;
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.plugin-chip--primary {
+  color: var(--accent); background: var(--accent-soft); border-color: var(--accent-line);
+}
+.plugin-chip--danger {
+  color: var(--danger); border-color: var(--danger); background: transparent;
+}
+
+/* 描述：真实现 2 行截断，90% 字号，margin-top:6px */
+.plugin-desc {
+  margin: 6px 0 0; font-size: 90%; color: var(--muted); line-height: 1.5;
+  display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2;
+  -webkit-box-orient: vertical; overflow: hidden;
+}
+
+/* 底部按钮组：真实现 margin-top:auto / gap:6px / 右对齐 / min-height:42px */
+.plugin-actions {
+  margin-top: auto; display: flex; gap: 6px; justify-content: flex-end;
+  min-height: 42px; padding: 0 12px 10px; box-sizing: border-box;
+}
+.plugin-act-btn {
+  font-size: 12px; padding: 4px 12px; cursor: pointer;
+  background: var(--panel); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  transition: background var(--ease), border-color var(--ease);
+}
+.plugin-act-btn:hover { background: var(--hover); border-color: var(--border-strong); }
+.plugin-act-btn--primary {
+  color: var(--accent); background: var(--accent-soft); border-color: var(--accent-line);
+}
+.plugin-act-btn--primary:hover { background: var(--accent-soft); border-color: var(--accent); }
+.plugin-act-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* 手机端：真实现 <=600px 时 gap 10px、logo 52×52 */
+@media (max-width: 600px) {
+  .plugin-content-row { gap: 10px; }
+  .plugin-logo, .plugin-logo-fallback { width: 52px; height: 52px; }
+  .plugin-logo-fallback { font-size: 22px; }
+}
+
+/* 工具栏（代理输入） */
+.plugin-toolbar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 10px 0 2px;
+}
+.plugin-proxy-label { font-size: 13px; color: var(--muted); flex: 0 0 auto; }
+.plugin-proxy-input {
   flex: 1 1 260px; min-width: 0;
   font-family: var(--font-mono); font-size: 12.5px;
 }
+.plugin-proxy-note { flex: 0 0 auto; }
+.plugin-update-result { min-height: 1.2em; }
 /* 失败原因另起一行（不挤掉状态标签，也不被省略号吃掉） */
 .switch-err {
   flex-basis: 100%; color: var(--danger); font-size: 11.5px;

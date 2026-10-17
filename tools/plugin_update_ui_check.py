@@ -170,24 +170,34 @@ def main() -> int:
 
         # 等列表渲染出来（异步取数，别用固定 sleep 赌）
         for _ in range(40):
-            n = cdp.eval("document.querySelectorAll('#plugin-update-list .switch-row').length")
+            n = cdp.eval("document.querySelectorAll('#plugin-update-list .plugin-card').length")
             if n and n > 0:
                 break
             time.sleep(0.25)
 
+        # 🔴 结构照 AstrBot 的卡片（`InstalledPluginsTab`）：
+        #    logo / 标题 / 版本 / chip / 描述 / 按钮组。判据也要按这个结构查，
+        #    否则"改了 UI 忘了改判据"会让判据永远绿（本项目踩过）。
         rows = cdp.eval(
             """
             (() => {
               const out = [];
-              document.querySelectorAll('#plugin-update-list .switch-row').forEach(r => {
-                const name = r.querySelector('.switch-label strong');
-                const ver = r.querySelector('.switch-ver');
+              document.querySelectorAll('#plugin-update-list .plugin-card').forEach(r => {
+                const name = r.querySelector('.plugin-title-text');
+                const ver = r.querySelector('.plugin-version');
                 const btn = r.querySelector('.plugin-update-btn');
+                const desc = r.querySelector('.plugin-desc');
+                const logo = r.querySelector('.plugin-logo');
+                const fallback = r.querySelector('.plugin-logo-fallback');
+                const chips = r.querySelectorAll('.plugin-chip');
                 out.push({
                   name: name ? name.textContent : '',
                   ver: ver ? ver.textContent.trim() : '',
                   hasBtn: !!btn,
                   id: r.dataset.pluginId || '',
+                  hasDesc: !!desc,
+                  hasLogo: !!logo || !!fallback,
+                  chipCount: chips.length,
                 });
               });
               return out;
@@ -208,6 +218,21 @@ def main() -> int:
             "③ 每行都有「升级」按钮",
             f"缺按钮: {[r['name'] for r in rows if not r['hasBtn']]}",
         )
+
+        # ---- ③b 卡片结构与 AstrBot 对齐 ----
+        check(
+            all(r["hasLogo"] for r in rows),
+            "③b 每张卡片都有 logo 或首字母占位（不出现破图）",
+            f"缺 logo: {[r['name'] for r in rows if not r['hasLogo']]}",
+        )
+        check(
+            any(r["chipCount"] > 0 for r in rows),
+            "③b 至少一张卡片渲染了 chip（分类/标签）",
+            f"各行 chip 数: {[r['chipCount'] for r in rows]}",
+        )
+        # 版本号不许出现 `vv`（实测 NAI 的 metadata 自带 v 前缀，硬拼会变 vv2.7.3）
+        bad_ver = [r["ver"] for r in rows if r["ver"].lower().startswith("vv")]
+        check(not bad_ver, "③b 版本号没有重复的 v 前缀", f"异常: {bad_ver}")
 
         # ---- ⑦ 与启停列表同源（集合相等）----
         # 🔴 两个列表用的**字段本来就不同**，不能直接比：

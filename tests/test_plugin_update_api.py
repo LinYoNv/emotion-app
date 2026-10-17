@@ -296,3 +296,123 @@ def test_update_targets_the_directory_the_plugin_actually_loads(tmp_path):
     # ② 新版本文件必须在那个目录里
     assert (loaded_path / "v2_marker.py").is_file(), "新版本文件没落在实际加载目录"
     assert (loaded_path / "metadata.yaml").read_text(encoding="utf-8").count("2.0.0") >= 1
+
+
+def _make_harness_with_icon(tmp_path: Path, icon: str):
+    """造一个带指定 `icon:` 的插件，返回 (app_getter, TOKEN)。
+
+    复用于 icon 路由的守卫判据（越界 / 非图片 / 未鉴权）。
+    """
+    proot = tmp_path / "plugins_icon"
+    proot.mkdir(parents=True, exist_ok=True)
+    pkg = proot / "icon_plugin"
+    pkg.mkdir()
+    (pkg / "metadata.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "name": "icon_plugin",
+                "display_name": "图标样本",
+                "version": "1.0.0",
+                "author": "t",
+                "desc": "t",
+                "icon": icon,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (pkg / "main.py").write_text(MAIN_PY, encoding="utf-8")
+
+    cfg = Config()
+    cfg.auth.access_token = TOKEN
+    cfg.storage.sqlite_path = str(tmp_path / "icon.db")
+    cfg.plugins.enabled = True
+    cfg.plugins.mount_web_apis = True
+    cfg.plugins.plugin_dirs = str(proot)
+    cfg.plugins.data_dir = str(tmp_path / "icon_pd")
+    cfg.plugins.source_mirror_dir = str(tmp_path / "icon_ps")
+    cfg.plugins.mirror_sources = False
+    cfg.plugins.auto_initialize = False
+    cfg.validate()
+
+    async def _run():
+        store = build_store(cfg.storage)
+        await store.open()
+        app = create_app(cfg, store, AuthManager(access_token=TOKEN))
+        app.config["EMOTION_CONFIG_PROFILE_PATH"] = str(tmp_path / "icon_cp.json")
+        svc = app.config["EMOTION_PLUGIN_HOST"]
+        await svc.start()
+        try:
+            client = app.test_client()
+            r = await client.get(
+                "/api/v1/plugins/icon_plugin/icon", headers={"Authorization": f"Bearer {TOKEN}"}
+            )
+            code = r.status_code
+            await store.close()
+            return code, pkg
+        except Exception:
+            await store.close()
+            raise
+
+    return _run
+
+
+def test_icon_route_requires_auth(tmp_path):
+    """🔴 icon 路由也要鉴权（新增路由的默认风险：漏 `require_auth`）。"""
+    (tmp_path / "unused").mkdir()
+
+    async def _go():
+        proot = tmp_path / "plugins_noauth"
+        proot.mkdir()
+        pkg = proot / "icon_plugin"
+        pkg.mkdir()
+        (pkg / "metadata.yaml").write_text(
+            yaml.safe_dump(
+                {"name": "icon_plugin", "display_name": "x", "version": "1", "author": "t", "desc": "t"}
+            ),
+            encoding="utf-8",
+        )
+        (pkg / "main.py").write_text(MAIN_PY, encoding="utf-8")
+        cfg = Config()
+        cfg.auth.access_token = TOKEN
+        cfg.storage.sqlite_path = str(tmp_path / "na.db")
+        cfg.plugins.enabled = True
+        cfg.plugins.mount_web_apis = True
+        cfg.plugins.plugin_dirs = str(proot)
+        cfg.plugins.data_dir = str(tmp_path / "na_pd")
+        cfg.plugins.source_mirror_dir = str(tmp_path / "na_ps")
+        cfg.plugins.mirror_sources = False
+        cfg.plugins.auto_initialize = False
+        cfg.validate()
+        store = build_store(cfg.storage)
+        await store.open()
+        app = create_app(cfg, store, AuthManager(access_token=TOKEN))
+        app.config["EMOTION_CONFIG_PROFILE_PATH"] = str(tmp_path / "na_cp.json")
+        svc = app.config["EMOTION_PLUGIN_HOST"]
+        await svc.start()
+        try:
+            client = app.test_client()
+            r = await client.get("/api/v1/plugins/icon_plugin/icon")  # 无 Authorization
+            return r.status_code
+        finally:
+            await store.close()
+
+    assert asyncio.run(_go()) == 401
+
+
+def test_icon_rejects_path_traversal(tmp_path):
+    """🔴 **路径穿越必须被拦住**。
+
+    `icon:` 是 metadata 里的字符串（插件作者可控）。若直接拼进路径，
+    `../../.env` 就能把面板令牌读走 —— 这是这条路由最大的风险。
+    判据：`resolve()` 后必须仍在插件目录内，否则 400。
+    """
+    run = _make_harness_with_icon(tmp_path, "../../../../../../etc/passwd")
+    code, _pkg = asyncio.run(run())
+    assert code == 400, f"越界路径没被拦住（实际 {code}）"
+
+
+def test_icon_rejects_non_image_suffix(tmp_path):
+    """🔴 只放行图片后缀 —— 否则能把 `main.py` / 配置 `.json` 当静态文件读走。"""
+    run = _make_harness_with_icon(tmp_path, "main.py")
+    code, _pkg = asyncio.run(run())
+    assert code == 400, f"非图片后缀没被拦住（实际 {code}）"

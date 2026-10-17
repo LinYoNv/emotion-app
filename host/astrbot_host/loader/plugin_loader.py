@@ -132,6 +132,12 @@ class PluginRecord:
     version: str = ""
     author: str = ""
     desc: str = ""
+    #: `metadata.yaml` 的 `icon:` —— **相对插件目录**的文件名（如 `logo.png`），
+    #: 不是 URL。为空 = 没声明，显示方自己画一个占位（别硬编一个假图标）。
+    icon: str = ""
+    #: `metadata.yaml` 的 `category:` / `tags:` —— 照 AstrBot 卡片显示的分类与标签。
+    category: str = ""
+    tags: list[str] = field(default_factory=list)
     #: 加载过程中的错误（**不静默吞**）
     error: str = ""
     #: 完整堆栈 —— 插件加载失败时用户需要知道是哪一行
@@ -405,6 +411,16 @@ class PluginLoader:
             rec.version = str(meta.get("version") or "")
             rec.author = str(meta.get("author") or "")
             rec.desc = str(meta.get("desc") or "")
+            # 🔴 下面三个是**照 AstrBot 真卡片补的**（`InstalledPluginsTab` 那张卡片
+            #    要显示 logo / 分类 / 标签）。在此之前全项目只读 name/version/desc，
+            #    面板做不出"和 AstrBot 一样的插件卡片"。
+            #    ⚠️ `icon` 是**相对插件目录**的文件名（实测 `astrbot_plugin_memory_companion`
+            #       声明 `icon: logo.png`），**不是 URL** ⇒ 存原值，由 Web 层拼下载地址。
+            rec.icon = str(meta.get("icon") or "")
+            rec.category = str(meta.get("category") or "")
+            #: `tags` 在 metadata 里是 YAML 列表；容错：非列表就当空（不静默改类型）
+            _tags = meta.get("tags")
+            rec.tags = [str(t) for t in _tags] if isinstance(_tags, list) else []
             # 🔴 页面发现必须**扫 `pages/` 目录**，不能只看 metadata 声明（2026-10-08 修）
             rec.pages = discover_plugin_pages(path, meta.get("pages"))
 

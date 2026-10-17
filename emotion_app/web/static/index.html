@@ -736,7 +736,16 @@
     </div>
 
     <!-- ==================== 插件升级 ====================
-         照真 AstrBot 的 `POST /plugins/{id}/update`（`dashboard/api/plugins.py:1143`）。
+         照真 AstrBot 的 `POST /plugins/{id}/update`（`dashboard/api/plugins.py:1143`），
+         **界面结构也照它的「已安装插件」卡片**（`InstalledPluginsTab` 的构建产物）：
+             extension-card-text
+               └ extension-content-row
+                   ├ extension-image-container → extension-logo (64×64, radius 10)
+                   └ extension-meta-group
+                       ├ extension-title-row → title__text + extension-version
+                       ├ chip 组（category / tags）
+                       └ extension-desc（2 行截断）
+             extension-actions（右下按钮组）
 
          🔴 **代理是【每次请求传】的，后端不存** —— 与真实现一致。
             本项目面向自部署，"用什么出口"由部署者自己决定，
@@ -745,26 +754,29 @@
             由后端保护清单跳过（判据见 `tests/test_plugin_updater.py`）。
          🔴 宿主没有热重载 ⇒ 升级后**必须重启服务**才生效，提示写清楚，
             不许让用户以为点完就生效了。 -->
-    <h3>插件升级 <small>（从插件仓库拉新版本）</small></h3>
-    <p class="hint" id="plugin-update-hint">
-      从插件 <code>metadata.yaml</code> 里的 <code>repo:</code> 拉取最新版本。<br />
-      升级<b>不会删除</b>已有的插件数据与上传文件（<code>files/</code> 等会被跳过）。<br />
-      升级完成后<b>需要重启服务</b>才会生效。
-    </p>
-    <div class="row">
-      <label for="plugin-update-proxy">代理（可选）</label>
+    <div class="plugin-market-head">
+      <h3>插件升级 <small>（从插件仓库拉新版本）</small></h3>
+      <p class="hint" id="plugin-update-hint">
+        从插件 <code>metadata.yaml</code> 的 <code>repo:</code> 拉最新版本。
+        升级<b>不会删除</b>插件数据与已上传文件（<code>files/</code> 等会被跳过）。
+        完成后<b>需要重启服务</b>才生效。
+      </p>
+    </div>
+
+    <div class="plugin-toolbar">
+      <label class="plugin-proxy-label" for="plugin-update-proxy">代理</label>
       <input
         type="text"
         id="plugin-update-proxy"
+        class="plugin-proxy-input"
         placeholder="留空 = 直连；例：http://127.0.0.1:8118"
         autocomplete="off"
       />
+      <span class="hint plugin-proxy-note">不会保存到任何配置</span>
     </div>
-    <p class="hint">
-      插件仓库在境外且直连失败时，在这里填一个可用的出口。代理地址<b>不会</b>被保存到任何配置里。
-    </p>
-    <div id="plugin-update-list" class="switch-list"></div>
-    <p class="hint" id="plugin-update-result"></p>
+
+    <div id="plugin-update-list" class="plugin-card-list"></div>
+    <p class="hint plugin-update-result" id="plugin-update-result"></p>
 
     <h3>插件拓展页 <small>（AstrBot 插件自带的面板）</small></h3>
     <p class="hint" id="plugins-hint">正在读取…</p>
