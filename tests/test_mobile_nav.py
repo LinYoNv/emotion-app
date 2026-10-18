@@ -29,7 +29,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 HTML = ROOT / "emotion_app" / "web" / "static" / "index.html"
 CSS = ROOT / "emotion_app" / "web" / "static" / "app.css"
-JS = ROOT / "emotion_app" / "web" / "static" / "app.js"
+STATIC = ROOT / "emotion_app" / "web" / "static"
+# 🔴 2026-10-17 重构：前端从单文件 `app.js` 拆成 ES 模块。
+#    这些判据是**对源码做静态检查**（找某个函数/字面量在不在），
+#    语义没变 ⇒ 改成"把所有模块拼起来看"，比钉死某一个文件更不容易漏。
+#    ⚠️ 若某个断言其实只想查某个具体文件，请显式用那个文件，别用拼接结果。
 
 
 def _html() -> str:
@@ -41,7 +45,11 @@ def _css() -> str:
 
 
 def _js() -> str:
-    return JS.read_text(encoding="utf-8")
+    """所有前端 JS（入口 + 核心 + 各视图 + 事件绑定）拼起来的全文。"""
+    parts = [STATIC / "js" / "main.js", STATIC / "js" / "bootstrap.js"]
+    parts += sorted((STATIC / "js" / "core").glob("*.js"))
+    parts += sorted((STATIC / "js" / "views").glob("*.js"))
+    return "\n".join(p.read_text(encoding="utf-8") for p in parts if p.is_file())
 
 
 # ===========================================================================

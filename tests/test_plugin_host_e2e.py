@@ -1023,7 +1023,11 @@ def test_panel_static_assets_are_not_cached(tmp_path):
         app = create_app(cfg, store, AuthManager(access_token=TOKEN))
         try:
             client = app.test_client()
-            for path in ("/", "/static/app.css", "/static/app.js"):
+            # ⚠️ 2026-10-17 重构：前端拆成 ES 模块，入口从 `/static/app.js`
+            #    换成 `/static/js/main.js`。这里**同时验模块文件** ——
+            #    "入口 no-cache 但子模块被长缓存"同样会让用户"改完看不见"。
+            for path in ("/", "/static/app.css", "/static/js/main.js",
+                         "/static/js/core/core.js", "/static/js/bootstrap.js"):
                 resp = await client.get(path)
                 assert resp.status_code == 200, f"{path} → {resp.status_code}"
                 cc = resp.headers.get("Cache-Control", "")

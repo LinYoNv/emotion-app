@@ -258,7 +258,11 @@ def test_no_legacy_hardcoded_theme_in_js():
     但不许出现 `var(--muted)` / `var(--fg)` / `var(--panel)` 这类**底色/前景**令牌
     （那些该由样式表决定），也不许出现裸色值。
     """
-    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    # ⚠️ 2026-10-17：前端拆成 ES 模块 ⇒ 检查**全部模块**，不是某一个文件。
+    _parts = [STATIC / "js" / "main.js", STATIC / "js" / "bootstrap.js"]
+    _parts += sorted((STATIC / "js" / "core").glob("*.js"))
+    _parts += sorted((STATIC / "js" / "views").glob("*.js"))
+    js = "\n".join(p.read_text(encoding="utf-8") for p in _parts if p.is_file())
     # 🔴 取**整条语句的右侧**（到行尾的 `;`），不是只取紧跟在 `=` 后的那个字符串。
     #    原因（注入验证当场抓到）：改版前那处写的是**三元**——
     #        el.style.color = bad ? "var(--danger)" : "var(--muted)";
