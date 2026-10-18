@@ -117,9 +117,31 @@
        别处不许再写裸 20/9999（改版前 `.modal` 就是裸 20，
        低于侧边栏的 50，弹层在抽屉开着时会被压住）。 */
 
-  /* ---------- 圆角 ---------- */
-  --radius:    10px;   /* 外层容器：卡片 / 弹层 / 面板块 */
-  --radius-sm: 7px;    /* 内层控件：按钮 / 输入框 / 列表行 */
+  /* ---------- 圆角（Vuetify 风：外层更圆，内层更紧）----------
+   * 照 AstrBot 的观感：容器 12、控件 8、小片 6。
+   * 🔴 **不要所有东西用同一个圆角** —— 那是"模板感"的主要来源。 */
+  --radius-lg: 14px;   /* 弹层 / 大面板 */
+  --radius:    12px;   /* 卡片 / 面板块 */
+  --radius-sm: 8px;    /* 按钮 / 输入框 / 列表行 */
+  --radius-xs: 6px;    /* 小标签 / chip / 徽章 */
+
+  /* ---------- 间距刻度（4 的倍数，照 Vuetify）----------
+   * 🔴 全部间距**只从这里取**，禁止再写裸数值。
+   *    重构前实测混用了 `8px 10px`/`9px 10px`/`7px 9px`/`3px 9px` 等十几种组合。 */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+
+  /* ---------- 内容宽度 ----------
+   * 🔴 1440 屏幕上原来铺满整行，正文一行 200+ 字符、气泡挤在左边一条。
+   *    skill：「limit to ~65 characters」+「No max-width container」。 */
+  --content-max: 1080px;
+  --chat-max:  760px;   /* 聊天列宽：中文正文一行 ~35 字，阅读舒适 */
 
   /* ---------- 字体 ---------- */
   --font-sans: "Geist", ui-sans-serif, system-ui, -apple-system,
@@ -150,6 +172,26 @@
   --text: var(--fg);
   --input-bg: var(--sunken);
 }
+/* 🔴 **全局动效收敛**（无障碍硬要求，不是可选项）：
+ *    系统开了"减少动效"时，所有过渡/动画一律降到接近 0 ——
+ *    前庭功能障碍用户会因为 180ms 的位移/呼吸动画产生眩晕。
+ *    ⚠️ 不要用 `animation: none` 之外的花样：`transition: none` 会让
+ *       某些依赖 `transitionend` 的逻辑**永不触发**（本项目踩过同类）。
+ *        这里只把时长压到 0.01ms，事件仍会触发。 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* 锚点跳转用平滑滚动（skill：Scroll jumping）——
+ * ⚠️ 只对**滚动容器**生效，不要写 `html { scroll-behavior }` 那样会把
+ *    程序化的 `scrollTop=` 也变慢（本项目聊天气泡滚动依赖即时定位）。 */
+.sidebar-nav, .list, .messages { scroll-behavior: smooth; }
+
 * { box-sizing: border-box; }
 
 body {
@@ -194,7 +236,7 @@ h1, h2, h3, h4 { text-wrap: balance; }
 }
 .sidebar-head {
   display: flex; align-items: center; gap: 10px;
-  padding: 12px 12px; border-bottom: 1px solid var(--border);
+  padding: var(--sp-3); border-bottom: 1px solid var(--border);
   min-height: 56px;
 }
 .brand {
@@ -229,7 +271,7 @@ h1, h2, h3, h4 { text-wrap: balance; }
 .sidebar-nav { flex: 1; min-height: 0; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 2px; }
 .nav-item {
   display: flex; align-items: center; gap: 10px;
-  padding: 9px 10px; border-radius: var(--radius-sm);
+  padding: var(--sp-2); border-radius: var(--radius-sm);
   color: var(--muted); text-decoration: none; font-size: 13.5px; font-weight: 500;
   white-space: nowrap; position: relative;
   transition: background var(--ease), color var(--ease);
@@ -269,7 +311,7 @@ h1, h2, h3, h4 { text-wrap: balance; }
 .nav-item.active .nav-badge { background: var(--danger); color: #fff; }
 
 .sidebar-foot {
-  padding: 10px 12px; border-top: 1px solid var(--border);
+  padding: var(--sp-2) var(--sp-3); border-top: 1px solid var(--border);
   font-size: 11.5px; color: var(--muted);
 }
 .status { color: var(--muted); font-size: 11.5px; }
@@ -301,7 +343,7 @@ h1, h2, h3, h4 { text-wrap: balance; }
   position: absolute; left: calc(100% + 8px); top: 50%;
   transform: translateY(-50%) scale(.96);
   transform-origin: left center;
-  padding: 4px 9px; border-radius: var(--radius-sm);
+  padding: var(--sp-1) var(--sp-2); border-radius: var(--radius-sm);
   background: var(--panel-2); color: var(--fg);
   border: 1px solid var(--border-strong);
   box-shadow: var(--shadow);
@@ -383,7 +425,21 @@ button.danger:hover { border-color: var(--danger); color: var(--danger); backgro
 /* 内容体：顶栏下面那块，撑满剩余高度（面板自己管滚动） */
 .content-body { flex: 1; min-width: 0; min-height: 0; display: flex; }
 
-.panel { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 16px; gap: 12px; overflow: auto; }
+/* 内容面板：**最大宽度约束** + 更松的留白。
+ * 🔴 `margin-inline:auto` 做居中；`.panel` 是 column flex，
+ *    必须显式 `width:100%` 否则会缩成内容宽。
+ * 🔴 底部留白比顶部大（光学补偿，skill 的 "Symmetrical vertical padding"）。 */
+.panel {
+  flex: 1; min-height: 0;
+  display: flex; flex-direction: column;
+  padding: var(--sp-5) var(--sp-6) var(--sp-8);
+  gap: var(--sp-3);
+  overflow: auto;
+  width: 100%;
+  max-width: var(--content-max);
+  margin-inline: auto;
+  box-sizing: border-box;
+}
 .hidden { display: none !important; }
 
 /* 聊天
@@ -394,15 +450,34 @@ button.danger:hover { border-color: var(--danger); color: var(--danger); backgro
       这是聊天气泡的通用语汇，用户不用学就知道哪个是自己说的。
    ⚠️ 对方气泡**加了一层描边**：`--bot` 与页面底色 `--bg` 在暗色下只差 6 级亮度，
       实测对比度很低，气泡边界基本看不出来（尤其长回复的时候像一段裸文字）。 */
-.chatbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.chatbar {
+  display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap;
+  width: 100%; max-width: var(--chat-max); margin-inline: auto;
+  box-sizing: border-box;
+}
 .chatbar select { min-width: 200px; }
 .chatbar .hint { margin-left: auto; }
 
-.messages { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding-right: 6px; }
+/* 🔴 消息列表也限宽：气泡的 `max-width:%` 是相对**容器**算的，
+ *    容器铺满 1440 时一条回复能拉成 1000px 宽，没法读。 */
+/* 🔴 聊天三块（顶栏 / 消息列 / 输入区）**必须同宽同左**：
+ *    只给消息列限宽会让它和顶栏错开，看着像两块拼错的东西（实测截图确认）。 */
+.messages {
+  flex: 1; overflow-y: auto;
+  display: flex; flex-direction: column;
+  gap: var(--sp-3);
+  padding-right: var(--sp-2);
+  width: 100%;
+  max-width: var(--chat-max);
+  margin-inline: auto;
+  box-sizing: border-box;
+}
 .msg {
-  padding: 9px 13px; border-radius: var(--radius);
-  max-width: 76%; white-space: pre-wrap; word-break: break-word;
-  line-height: 1.65;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius);
+  max-width: 78%; white-space: pre-wrap; word-break: break-word;
+  /* 中文行高 1.75 比 1.65 透气（skill：increase line-height） */
+  line-height: 1.75;
 }
 .msg.user {
   align-self: flex-end; background: var(--user);
@@ -418,11 +493,16 @@ button.danger:hover { border-color: var(--danger); color: var(--danger); backgro
   font-size: 13px; border-radius: var(--radius-sm);
 }
 .msg .meta { display: block; color: var(--faint); font-size: 11px; margin-top: 5px; }
-.composer { display: flex; gap: 8px; align-items: flex-end; }
+.composer {
+  display: flex; gap: var(--sp-2); align-items: flex-end;
+  width: 100%; max-width: var(--chat-max); margin-inline: auto;
+  padding-top: var(--sp-2);
+  box-sizing: border-box;
+}
 .composer textarea {
   flex: 1; background: var(--sunken); color: var(--fg);
   border: 1px solid var(--border-strong);
-  border-radius: var(--radius); padding: 10px; resize: none; font: inherit;
+  border-radius: var(--radius); padding: var(--sp-3); resize: none; font: inherit;
   transition: border-color var(--ease), box-shadow var(--ease);
 }
 .composer textarea:focus {
@@ -456,7 +536,7 @@ button.danger:hover { border-color: var(--danger); color: var(--danger); backgro
   width: auto;
   height: auto;
   object-fit: contain;
-  margin-top: 8px;
+  margin-top: var(--sp-2);
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   cursor: zoom-in;
@@ -471,17 +551,39 @@ button.danger:hover { border-color: var(--danger); color: var(--danger); backgro
       都是"描边变成强调色"，两者肉眼分不出 ⇒ 用户不知道自己选中的到底是哪条
       （而这个列表是"点开进详情"的入口，选错 = 看错人的数据）。
       现在 `:hover` 只加中性底，`.active` 加**柔强调底 + 左侧标记条**，两级分明。 */
-.split { display: flex; gap: 16px; flex: 1; min-height: 0; }
-.split aside { width: 240px; flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
-.editor { flex: 1; overflow-y: auto; }
+/* 左右分栏（人设 / 供应商 复用）。
+ * ⚠️ 左栏**只在有内容时不显得空**；内容少时右栏一大片空白是数据问题不是布局问题 ——
+ *    不要为了让截图好看去硬加宽度或占位图（那是自欺）。 */
+.split {
+  display: flex; gap: var(--sp-4); flex: 1; min-height: 0;
+  width: 100%;
+}
+.split aside {
+  width: 260px; flex-shrink: 0;
+  display: flex; flex-direction: column; gap: var(--sp-2);
+}
+.editor { flex: 1; overflow-y: auto; min-width: 0; }
 .list { list-style: none; margin: 0; padding: 0; overflow-y: auto; }
+/* 列表项（照 AstrBot 的卡片观感）：
+ *   * 圆角用 `--radius`（12）而不是 sm —— 卡片比控件更圆，层级更清楚
+ *   * 内边距更松：挤压的列表在暗色下会糊成一片
+ *   * hover 用**描边 + 微亮底**双重反馈（只改底色在暗色里几乎看不出来） */
 .list li {
   position: relative;
-  padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm);
-  margin-bottom: 6px; cursor: pointer; font-size: 13px;
-  transition: background var(--ease), border-color var(--ease);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: var(--sp-2);
+  cursor: pointer; font-size: 13px;
+  transition: background var(--ease), border-color var(--ease),
+              transform var(--ease-out), box-shadow var(--ease);
 }
-.list li:hover { background: var(--hover); border-color: var(--border-strong); }
+.list li:hover {
+  background: var(--hover); border-color: var(--border-strong);
+  box-shadow: var(--shadow-sm);
+}
+/* 🔴 按下要有**物理反馈**（skill：add `scale(0.98)` / `translateY(1px)` on press） */
+.list li:active { transform: translateY(1px); }
 .list li.active {
   background: var(--accent-soft); border-color: var(--accent-line);
 }
@@ -509,13 +611,13 @@ button.danger:hover { border-color: var(--danger); color: var(--danger); backgro
    `.empty-ico`（图标）与 `<strong>`（一句话标题）。 */
 .empty {
   color: var(--muted);
-  padding: 40px 24px;
+  padding: var(--sp-10) var(--sp-6);
   text-align: center;
   font-size: 13px;
   line-height: 1.75;
   display: flex; flex-direction: column;
   align-items: center; justify-content: center;
-  gap: 6px;
+  gap: var(--sp-2);
   min-height: 34vh;
   /* `margin:auto 0` 让它在 `.editor` 这类纵向 flex 容器的**剩余空间**里居中，
      而不是顶在最上面（顶在上面的那版观感像"内容没加载出来"）。 */
@@ -527,6 +629,42 @@ button.danger:hover { border-color: var(--danger); color: var(--danger); backgro
   font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji",
                "Segoe UI Symbol", var(--font-sans);
 }
+
+/* ==================== 骨架屏（加载态）====================
+ * 🔴 本次重构补：项目原先**完全没有加载态** —— 取数期间一片空白，
+ *    用户分不清"在加载"和"没有数据"（skill 明确列为缺失状态）。
+ *
+ * ⚠️ 用**骨架块**而不是转圈：转圈不告诉你"将要出现什么"，
+ *    骨架屏的形状本身就在交代布局（skill：replace spinners with skeletons）。
+ * ⚠️ 动效只动 `background-position`（GPU 合成），**不动 width/height**（会触发布局）。 */
+.skeleton {
+  background: linear-gradient(90deg, var(--panel-2) 0%, var(--hover) 50%, var(--panel-2) 100%);
+  background-size: 200% 100%;
+  border-radius: var(--radius-xs);
+  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+}
+@keyframes skeleton-shimmer {
+  0%   { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+/* 尊重系统的"减少动效"设置 —— 无障碍要求 */
+@media (prefers-reduced-motion: reduce) {
+  .skeleton { animation: none; background: var(--panel-2); }
+}
+
+/* 骨架行：列表类页面用 */
+.skeleton-row {
+  display: flex; align-items: center; gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+}
+.skeleton-row .skeleton { height: 12px; }
+.skeleton-row .skeleton.is-avatar { width: 32px; height: 32px; flex-shrink: 0; border-radius: 50%; }
+.skeleton-row .skeleton.is-title  { flex: 0 0 32%; }
+.skeleton-row .skeleton.is-text   { flex: 1 1 auto; }
+.skeleton-row .skeleton.is-meta   { flex: 0 0 56px; }
 
 form { display: flex; flex-direction: column; gap: 10px; }
 label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
@@ -573,7 +711,7 @@ table.sections tr.empty-row td { color: var(--muted); text-align: center; font-s
 
 .preview {
   background: var(--sunken); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  padding: 12px; overflow: auto; max-height: 55vh; white-space: pre-wrap;
+  padding: var(--sp-3); overflow: auto; max-height: 55vh; white-space: pre-wrap;
   font: 12px/1.6 var(--font-mono); color: var(--fg);
 }
 
@@ -611,7 +749,7 @@ table.sections tr.empty-row td { color: var(--muted); text-align: center; font-s
 .import-box code { background: var(--sunken); padding: 1px 4px; border-radius: var(--radius-sm); font-size: 12px; }
 .import-box input[type=file] {
   /* 文件选择器在深色主题下默认很丑，统一一下 */
-  padding: 8px; background: var(--sunken); border: 1px dashed var(--border);
+  padding: var(--sp-2); background: var(--sunken); border: 1px dashed var(--border);
 }
 #import-result { margin-top: 10px; max-height: 40vh; }
 
@@ -623,10 +761,10 @@ table.sections tr.empty-row td { color: var(--muted); text-align: center; font-s
 .ref-block {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 8px 10px;
+  padding: var(--sp-2);
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--sp-2);
 }
 .ref-title { color: var(--muted); font-size: 13px; }
 .ref-title small { color: var(--muted); font-weight: 400; font-size: 12px; }
@@ -679,7 +817,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   /* --- 手机端顶栏：**唯一**的抽屉开关（侧边栏里那个跟着抽屉一起藏起来） --- */
   .mobile-bar {
     display: flex; align-items: center; gap: 10px;
-    padding: 8px 12px;
+    padding: var(--sp-2) var(--sp-3);
     min-height: 52px;
     background: var(--panel);
     border-bottom: 1px solid var(--border);
@@ -722,7 +860,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
         正解：保持 .panel 是 flex 列容器（默认规则已够），只把 split 改成竖排。 */
   .split {
     flex-direction: column;
-    gap: 10px;
+    gap: var(--sp-2);
     min-height: 0;
     flex: 1;
   }
@@ -754,7 +892,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   input, textarea, select {
     /* ⚠️ iOS：<16px 会在聚焦时自动放大整个页面 */
     font-size: 16px;
-    padding: 10px;
+    padding: var(--sp-2);
   }
   label { gap: 5px; }
   .row { gap: 6px; }
@@ -778,16 +916,16 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   table.sections tr {
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    padding: 8px;
-    margin-bottom: 10px;
+    padding: var(--sp-2);
+    margin-bottom: var(--sp-2);
     background: var(--panel-2);
   }
   table.sections td {
     border: none;
-    padding: 5px 0;
+    padding: var(--sp-1) 0;
     display: flex;
     align-items: flex-start;
-    gap: 8px;
+    gap: var(--sp-2);
   }
   table.sections td::before {
     /* 用 CSS 造"字段名"，无需改 JS */
@@ -795,7 +933,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
     flex: 0 0 64px;
     color: var(--muted);
     font-size: 12px;
-    padding-top: 9px;
+    padding-top: var(--sp-2);
   }
   table.sections td input, table.sections td textarea { flex: 1 1 auto; }
   table.sections td.narrow { width: auto; }
@@ -886,7 +1024,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 }
 .switch-row {
   display: flex; flex-direction: row; align-items: center; gap: 10px; flex-wrap: wrap;
-  padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: var(--sp-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
   font-size: 13px; cursor: pointer;
   transition: background var(--ease), border-color var(--ease);
 }
@@ -935,8 +1073,8 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
      写成 `1fr` 时网格项的默认 `min-width:auto` 会让长标题/长标签**撑破列宽**
      （CSS Grid 的经典坑：内容一长就把两列挤成不等宽、甚至溢出容器）。 */
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-  margin-top: 10px;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
   align-items: stretch;   /* 同一行两张卡片等高 */
 }
 
@@ -981,7 +1119,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 
 .plugin-title-row {
   display: flex; align-items: baseline; justify-content: space-between;
-  gap: 8px; min-width: 0;
+  gap: var(--sp-2); min-width: 0;
 }
 .plugin-title-text {
   margin: 0; font-size: 13.5px; font-weight: 650; color: var(--fg);
@@ -990,7 +1128,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 /* 版本号：缩到 11.5px，两列下要省横向空间 */
 .plugin-version {
   color: var(--faint); flex-shrink: 0; font-size: 11.5px; font-weight: 500;
-  margin-left: 8px; white-space: nowrap;
+  margin-left: var(--sp-2); white-space: nowrap;
   font-family: var(--font-mono);
 }
 
@@ -999,7 +1137,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 .plugin-chip {
   flex-shrink: 0;
   font-size: 10.5px; line-height: 1.55;
-  padding: 0 6px; border-radius: 8px;
+  padding: 0 var(--sp-2); border-radius: 8px;
   background: var(--panel);
   color: var(--muted);
   border: 1px solid var(--border);
@@ -1017,7 +1155,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 
 /* 描述：2 行截断，两列下字号再收一点 */
 .plugin-desc {
-  margin: 5px 0 0; font-size: 12px; color: var(--muted); line-height: 1.45;
+  margin: var(--sp-1) 0 0; font-size: 12px; color: var(--muted); line-height: 1.45;
   display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2;
   -webkit-box-orient: vertical; overflow: hidden;
 }
@@ -1050,7 +1188,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 /* 工具栏（代理输入） */
 .plugin-toolbar {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  margin: 10px 0 2px;
+  margin: var(--sp-2) 0 2px;
 }
 .plugin-proxy-label { font-size: 13px; color: var(--muted); flex: 0 0 auto; }
 .plugin-proxy-input {
@@ -1072,7 +1210,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 }
 .detail-group {
   border: 1px solid var(--border); border-radius: var(--radius);
-  padding: 10px 12px; background: var(--panel);
+  padding: var(--sp-2) var(--sp-3); background: var(--panel);
 }
 /* 详情里的次级块：比外层卡片再低一档，形成两层而不是"框里套同色的框" */
 .detail-group .detail-item { background: var(--panel-2); }
@@ -1088,7 +1226,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 .detail-items { display: flex; flex-direction: column; gap: 8px; }
 .detail-item {
   border: 1px solid var(--border); border-radius: var(--radius-sm);
-  padding: 7px 9px; background: var(--panel-2);
+  padding: var(--sp-2); background: var(--panel-2);
 }
 .detail-item-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 3px; }
 .detail-badge {
@@ -1143,7 +1281,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 /* 源列表项：id + api_base 两行（照截图），选中有高亮态，右侧删除 */
 #provider-source-list li {
   display: flex; align-items: center; gap: 8px;
-  padding: 9px 10px; border-radius: var(--radius-sm);
+  padding: var(--sp-2); border-radius: var(--radius-sm);
 }
 #provider-source-list li .src-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 #provider-source-list li .src-id {
@@ -1167,7 +1305,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 /* 未选源的空态：图标 + 一句话，居中在详情区（参考站也是"请选择一个提供商源"） */
 #provider-source-placeholder {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
-  gap: 6px; min-height: 45vh; padding: 24px;
+  gap: var(--sp-2); min-height: 45vh; padding: 24px;
 }
 #provider-source-placeholder .empty-ico {
   font-size: 28px; opacity: .75;
@@ -1201,7 +1339,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 /* 字段：左说明 / 右控件（参考站的观感） */
 .field-labeled {
   display: grid; grid-template-columns: minmax(190px, 280px) 1fr;
-  gap: 14px; align-items: start; padding: 9px 0;
+  gap: var(--sp-3); align-items: start; padding: 9px 0;
 }
 .fl-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .fl-text label { color: var(--fg); font-size: 13.5px; font-weight: 500; display: block; }
@@ -1223,7 +1361,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 .ps-models { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .ps-models li {
   display: flex; align-items: center; gap: 10px;
-  padding: 7px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: var(--sp-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
   background: var(--panel-2); font-size: 13px;
 }
 .ps-models li .mid {
@@ -1266,7 +1404,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
    ⚠️ 对话类**不挂**徽标：默认视图里每条都是对话，挂上去纯属噪音；
       切到「全部」时非对话项才靠它一眼分出来。 */
 #provider-source-list li .src-type {
-  margin-left: 6px; padding: 0 5px; border-radius: var(--radius-sm);
+  margin-left: var(--sp-2); padding: 0 5px; border-radius: var(--radius-sm);
   font-size: 10.5px; font-weight: 500; vertical-align: 1px;
   background: var(--border-strong); color: var(--muted); border: 1px solid var(--border);
 }
@@ -1292,7 +1430,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 .preset-box .row { justify-content: space-between; }
 .preset-groups { display: flex; flex-wrap: wrap; gap: 5px; }
 .preset-groups .preset-group-btn {
-  padding: 4px 10px; font-size: 12px; border-radius: 999px;
+  padding: var(--sp-1) var(--sp-2); font-size: 12px; border-radius: 999px;
   background: transparent; color: var(--muted);
 }
 .preset-groups .preset-group-btn.active {
@@ -1305,7 +1443,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 .preset-list li {
   display: grid; grid-template-columns: 1fr auto; gap: 2px 10px;
   align-items: center; cursor: pointer;
-  padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: var(--sp-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
   background: var(--panel-2);
 }
 .preset-list li:hover { border-color: var(--accent); }
@@ -1393,8 +1531,8 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
  * 所以样式必须对"运行时才出现的元素"生效 —— 不能用只覆盖既有 id 的写法。
  */
 .cfg-section {
-  margin: 14px 0 18px;
-  padding: 12px 14px;
+  margin: var(--sp-3) 0 var(--sp-4);
+  padding: var(--sp-3);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--panel, transparent);
@@ -1404,7 +1542,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 .cfg-form .cfg-fields {
   display: grid;
   grid-template-columns: 1fr;
-  gap: 12px;
+  gap: var(--sp-3);
 }
 /* 桌面宽屏两列；手机单列（面板本来就有移动端布局，别把它挤坏） */
 @media (min-width: 720px) {
@@ -1418,7 +1556,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 .cfg-field textarea {
   width: 100%;
   box-sizing: border-box;
-  padding: 7px 9px;
+  padding: var(--sp-2);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
   background: var(--input-bg, transparent);
@@ -1552,7 +1690,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 /* 列表行：标题 + 元信息在左，删除按钮在右 */
 .session-grid li {
   display: flex; align-items: center; gap: 10px;
-  padding: 10px 12px; cursor: pointer;
+  padding: var(--sp-2) var(--sp-3); cursor: pointer;
 }
 .session-grid .sess-main {
   flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
@@ -1578,7 +1716,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 /* 设置页的「选择会话」工具条 */
 .sev-picker {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  padding: 10px 12px; margin-bottom: 4px;
+  padding: var(--sp-2) var(--sp-3); margin-bottom: 4px;
   border: 1px solid var(--border); border-radius: var(--radius);
   background: var(--panel-2);
 }
@@ -1592,7 +1730,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 
 /* 段内小标题（「其他会话设置」）—— 与段标题区分开，别长得一样 */
 .cfg-head-sub {
-  margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border);
+  margin-top: var(--sp-3); padding-top: 12px; border-top: 1px solid var(--border);
 }
 .cfg-head-sub h4 { font-size: 13px; color: var(--muted); font-weight: 600; }
 
@@ -1605,7 +1743,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 
 #plugin-config-body {
   flex: 1; min-height: 0; overflow-y: auto;
-  padding: 12px 14px;
+  padding: var(--sp-3);
 }
 
 /* 配置项之间的间隔：插件的 schema 动辄几十项，挤在一起根本扫不动 */
@@ -1615,7 +1753,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 .plugin-cfg-group {
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 10px 12px;
+  padding: var(--sp-2) var(--sp-3);
   background: var(--panel-2);
   display: flex; flex-direction: column; gap: 8px;
 }
@@ -1633,7 +1771,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 .plugin-cfg-unsupported {
   border: 1px dashed var(--border);
   border-radius: var(--radius);
-  padding: 8px 10px;
+  padding: var(--sp-2);
   background: var(--sunken);
 }
 .plugin-cfg-unsupported .hint { color: var(--warn); }
@@ -1641,7 +1779,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 /* 底部动作条：跟着 body 走（不随内容滚动），否则几十项配置时要滚到底才能点保存 */
 .plugin-config-actions {
   flex: 0 0 auto;
-  padding: 10px 14px;
+  padding: var(--sp-2) var(--sp-3);
   border-top: 1px solid var(--border);
   background: var(--panel-2);
 }
@@ -1661,7 +1799,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 /* 分组头：长得像 nav-item 但**不是链接**（它只负责展开/收起） */
 .nav-group-head {
   display: flex; align-items: center; gap: 8px;
-  padding: 7px 10px 7px 30px;   /* 左侧多缩进：明确它是「插件」的下级 */
+  padding: var(--sp-2) var(--sp-2) 30px;   /* 左侧多缩进：明确它是「插件」的下级 */
   border: 0; background: transparent; cursor: pointer;
   color: var(--muted); font-size: 12.5px; font-weight: 500;
   font-family: inherit; text-align: left; white-space: nowrap;
@@ -1685,7 +1823,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 /* 单条插件页面。⚠️ 缩进比分组头**再多一层**，让"插件 > 分组 > 页面"的层级看得出来 */
 .nav-subitem {
   display: flex; align-items: center; gap: 8px;
-  padding: 6px 8px 6px 44px;
+  padding: var(--sp-2) var(--sp-2) 44px;
   border-radius: var(--radius-sm); text-decoration: none;
   color: var(--muted); font-size: 12.5px; font-weight: 400;
   white-space: nowrap; position: relative;
@@ -1708,7 +1846,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
    ⚠️ 比子项更弱（`--faint` / 更小字号）：它是**分类说明**，不是可点的东西，
       抢了子项的视觉权重会让人以为它也能点。 */
 .nav-subhead {
-  padding: 8px 8px 2px 42px;
+  padding: var(--sp-2) 2px 42px;
   color: var(--faint); font-size: 11px; font-weight: 600;
   letter-spacing: .02em; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis;
@@ -1731,7 +1869,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 
 .plugin-cfg-file {
   display: flex; flex-direction: column; gap: 6px;
-  padding: 10px 12px; border-radius: var(--radius-sm);
+  padding: var(--sp-2) var(--sp-3); border-radius: var(--radius-sm);
   border: 1px solid var(--border); background: var(--sunken);
 }
 
@@ -1742,7 +1880,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
    而这里外层是 div 不受影响，但保持与别处一致的显式声明习惯。 */
 .plugin-file-row {
   display: flex; flex-direction: row; align-items: center; gap: 8px;
-  padding: 4px 6px; border-radius: 4px; /* ⚠️ 用已定义的 `--panel`（不是 `--surface` —— 那个令牌**不存在**，
+  padding: var(--sp-1) var(--sp-2); border-radius: 4px; /* ⚠️ 用已定义的 `--panel`（不是 `--surface` —— 那个令牌**不存在**，
      `var()` 引用未定义者**不报错**、静默解析成空 ⇒ 背景色悄悄没了。
      这正是 `tests/test_ui_tokens.py` 守的东西，本轮真被抓到过一次。 */
   background: var(--panel);
