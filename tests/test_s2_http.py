@@ -400,21 +400,49 @@ async def test_chat_without_persona_still_works(ctx):
 
 
 async def test_panel_served(ctx):
+    """面板 HTML 必须引用**模块化后的入口**。
+
+    ⚠️ 2026-10-17 重构：前端从单文件 `app.js` 拆成 ES 模块
+    （`js/main.js` + `js/core/` + `js/views/` + `js/bootstrap.js`）。
+    这条判据原本断言 `/static/app.js`，重构后**必然红** —— 不是产品坏了，
+    是路径契约变了。改成断言新入口。
+    """
     client, _ = ctx
     r = await client.get("/")
     assert r.status_code == 200
     html = await r.get_data(as_text=True)
     assert "情绪app" in html
-    assert "/static/app.js" in html
+    assert '/static/js/main.js' in html
+    # `type="module"` 是**必须的**：去掉它浏览器不会按模块解析，`import` 直接语法错
+    assert 'type="module"' in html
 
 
 async def test_static_assets_served(ctx):
+    """静态资源能取到，且内容对。
+
+    🔴 除了入口，还**逐个验各模块**：模块化最典型的坏法是
+    "入口 200、子模块 404"（相对路径算错），而只验入口的判据**看不出来**
+    —— 本次重构就真踩到过（`bootstrap.js` 里 `../views/` 解析成 `/static/views/`）。
+    """
     client, _ = ctx
-    for path, needle in (("/static/app.js", "loadPersonas"),
-                         ("/static/app.css", "--accent")):
+    #: (路径, 必须出现的片段) —— 片段挑的是**该文件独有的标识**
+    modules = (
+        ("/static/js/main.js", "GLOBALS"),          # 兼容层清单
+        ("/static/js/bootstrap.js", "addEventListener"),  # 事件绑定
+        ("/static/js/core/core.js", "export async function applyRoute"),
+        ("/static/js/views/chat.js", "export async function loadChat"),
+        ("/static/js/views/persona.js", "export async function loadPersonas"),
+        ("/static/js/views/session.js", "export async function loadSessions"),
+        ("/static/js/views/settings.js", "export async function loadLogs"),
+        ("/static/js/views/providers.js", "export async function loadProviderSources"),
+        ("/static/js/views/plugins.js", "export async function loadPluginSwitch"),
+        ("/static/app.css", "--accent"),
+    )
+    for path, needle in modules:
         r = await client.get(path)
-        assert r.status_code == 200, path
-        assert needle in await r.get_data(as_text=True), path
+        assert r.status_code == 200, f"{path} 取不到（{r.status_code}）"
+        body = await r.get_data(as_text=True)
+        assert needle in body, f"{path} 内容里没有 {needle!r}"
 
 
 async def test_panel_is_open_but_data_is_not(ctx):

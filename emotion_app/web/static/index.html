@@ -968,6 +968,9 @@
   </div>
 </div>
 
-<script src="/static/app.js"></script>
+<!-- 面板脚本：**原生 ES 模块，零构建**（见 js/main.js 顶部注释）。
+     拆自原单文件 app.js（5418 行）；模块间用 window 全局桥接，
+     保证 tools/*.py 里 24 个直接调用的名字仍然可见。 -->
+<script type="module" src="/static/js/main.js"></script>
 </body>
 </html>
