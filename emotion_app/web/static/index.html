@@ -651,16 +651,23 @@
           <p class="hint" id="session-hint"></p>
         </div>
 
-        <header class="cfg-head cfg-head-sub">
-          <h4>其他会话设置</h4>
-          <span class="hint">这一节是**所有会话共用**的默认值（后端 schema 提供）</span>
-        </header>
-        <!-- 其余字段由 renderConfigSections() 按 schema.session 注入 -->
-        <div class="cfg-fields" id="cfg-session-fields"></div>
-        <div class="row cfg-actions">
-          <button type="submit" id="cfg-session-save" class="primary">保存</button>
-          <p class="hint" id="cfg-session-hint"></p>
-        </div>
+        <!-- 🔴 **整节包进 `.cfg-section` 方框**（2026-10-18 情绪：
+             「这些文本都没有明确的分割线，能不能用方框圆角包裹住」）。
+             原来这里只有 header + 裸 `.cfg-fields` —— 而 `.cfg-section`
+             只加在「会话」那一段上 ⇒ 「其他会话设置」整段**没有任何边界**，
+             十几个字段和它们的说明文字在视觉上连成一片，分不出哪句属于哪个控件。 -->
+        <section class="cfg-section">
+          <header class="cfg-head cfg-head-sub">
+            <h4>其他会话设置</h4>
+            <span class="hint">这一节是**所有会话共用**的默认值（后端 schema 提供）</span>
+          </header>
+          <!-- 其余字段由 renderConfigSections() 按 schema.session 注入 -->
+          <div class="cfg-fields" id="cfg-session-fields"></div>
+          <div class="row cfg-actions">
+            <button type="submit" id="cfg-session-save" class="primary">保存</button>
+            <p class="hint" id="cfg-session-hint"></p>
+          </div>
+        </section>
       </form>
     </section>
 

@@ -278,3 +278,40 @@ def test_no_legacy_hardcoded_theme_in_js():
             assert bad not in v, (
                 f"JS 内联样式里写了主题令牌 {bad}（应交给样式表）：{v}"
             )
+
+
+def test_settings_fields_are_visually_grouped():
+    """🔴 设置页每个字段都要有**可见的块边界**。
+
+    情绪 2026-10-18：「这些文本都没有明确的分割线，能不能用方框圆角包裹住
+    或者别的更好的办法区分」。
+
+    根因是**两类字段渲染方式不同**：
+      * schema 驱动 → `buildConfigField()` 生成，带 `.cfg-field`
+      * 手写在 `index.html` 里的 `<label>`（会话那一段 9 个）→ **什么都没有**
+    只给前者加边界 ⇒ 同一页前半段裸的、后半段有框。
+
+    这条判据守两头：
+      ① CSS 里必须给 `.cfg-field` 和 `.cfg-section label` 都有块样式；
+      ② 那个手写选择器**必须按真实 DOM 写**
+         （实测 `#cfg-session-form` 的孩子是 `div#session-form`，
+          手写 label 在它里面 —— 我第一版猜 `form > label` 没命中，
+          截图 sha256 与改动前完全一致才发现）。
+    """
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+
+    # ① `.cfg-field` 有底色块
+    m = re.search(r"\.cfg-field\s*\{([^}]*)\}", css)
+    assert m, "找不到 .cfg-field 规则"
+    body = m.group(1)
+    assert "background" in body, f".cfg-field 没有底色块边界：{body!r}"
+    assert "padding" in body, f".cfg-field 没有内边距：{body!r}"
+
+    # ② 手写 label 也要有（且用 `.cfg-section label` 这种**能命中**的写法）
+    assert ".cfg-section label:not(.cfg-field)" in css, (
+        "缺少手写字段的块样式选择器 —— 只给 .cfg-field 加会让同一页"
+        "前半段裸的、后半段有框"
+    )
+    # ③ 字段之间的间距要大于字段内部的（格式塔接近性原则）
+    m2 = re.search(r"\.cfg-fields\s*\{([^}]*)\}", css)
+    assert m2 and "gap" in m2.group(1), "`.cfg-fields` 没有 gap —— 字段会挤在一起"

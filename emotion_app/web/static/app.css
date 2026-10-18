@@ -1548,8 +1548,55 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 @media (min-width: 720px) {
   .cfg-form .cfg-fields { grid-template-columns: 1fr 1fr; }
 }
-.cfg-field { display: flex; flex-direction: column; gap: 4px; }
-.cfg-field .cfg-label { font-size: 13px; color: var(--text, inherit); }
+/* 单个配置字段。
+ *
+ * 🔴 **加一层"字段卡片"边界**（2026-10-18 情绪：「这些文本都没有明确的分割线，
+ *    能不能用方框圆角包裹住或者别的更好的办法区分」）。
+ *
+ *    根因：字段 = 标签 + 控件 + 说明文字，原来三者只有 `gap:4px`，
+ *    而字段与字段之间**连 4px 都没有**（`.cfg-fields` 的 gap 也很小）
+ *    ⇒ 一屏十几项读起来是一整段连续文字，分不清哪句说明属于哪个控件。
+ *
+ *    做法：每个字段一块**浅底方框**（`--panel-2`），比外层 `.cfg-section`
+ *    再深一级 —— 层级靠**底色差**而不是再加描边（描边套描边会很吵）。
+ *    ⚠️ 只用底色 + 圆角，不加 `border`：`.cfg-section` 已经有描边了，
+ *       孩子再加一圈会变成"框套框"视觉噪音。 */
+.cfg-field {
+  display: flex; flex-direction: column; gap: var(--sp-1);
+  padding: var(--sp-3);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+}
+/* 字段之间的间距要**明显大于**字段内部的间距，否则分组读不出来
+   （这是格式塔的接近性原则：距离决定归属）。 */
+.cfg-fields { display: flex; flex-direction: column; gap: var(--sp-2); }
+
+/* 🔴 **手写字段也要同一套外观**（2026-10-18 修）。
+ *
+ * 设置页有两类字段：
+ *   ① `schema` 驱动、由 `buildConfigField()` 生成 → 带 `.cfg-field`
+ *   ② **手写在 `index.html` 里的** `<label>...</label>`（会话那一段 9 个）
+ * 只给 ① 加边界 ⇒ 同一页前半段"裸的"、后半段"有框"，看起来像两个人的手笔。
+ *
+ * ⇒ 给 `.cfg-section` 里的裸 `<label>` 补上同样的块样式。
+ *   ⚠️ 用 `:not(.cfg-field)` 排除已由 JS 生成的那些（否则 padding 会叠双份）。
+ *   ⚠️ 也不要命中 `label` 里嵌套的 `label`（本项目没有，但这样写更稳）。 */
+/* ⚠️ 选择器要**按真实 DOM 写**（实测 `#cfg-session-form` 的孩子是
+ *    `div.cfg-fields#cfg-session-model-fields` 与 `div#session-form`，
+ *    手写 `<label>` 在**后者里面**，不是直接在 form 下）——
+ *    第一版我猜 `form > label` 没命中，截图 sha256 与改动前完全一致才发现。
+ *    这里用 `:not(.cfg-field)` 排除 JS 生成的那些，避免 padding 叠双份。 */
+.cfg-section label:not(.cfg-field) {
+  display: flex; flex-direction: column; gap: var(--sp-1);
+  padding: var(--sp-3);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  font-size: 13px; font-weight: 500;
+}
+.cfg-field .cfg-label {
+  font-size: 13px; font-weight: 500;
+  color: var(--text, inherit);
+}
 .cfg-field input[type="text"],
 .cfg-field input[type="number"],
 .cfg-field select,

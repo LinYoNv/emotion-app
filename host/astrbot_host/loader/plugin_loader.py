@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import importlib
 import importlib.util
 import logging
@@ -1117,6 +1118,60 @@ class PluginLoader:
         md.module = module
 
 
+#: 指纹计算时单文件最多读这么多字节（见 `_page_dir_fingerprint` 的说明）
+_PAGE_FP_MAX_FILE_BYTES = 512 * 1024
+
+
+def _page_dir_fingerprint(page_dir: Path) -> str | None:
+    """算一个页面目录的**内容指纹**（用于识别"同一份页面的冗余副本"）。
+
+    为什么要这个（2026-10-18 情绪报「插件扩展页显示两个我会永远陪你」）：
+    上游 `astrbot_plugin_private_companion/pages/` 下有 `companion-panel/` 与
+    `陪伴面板/` 两个目录，`diff -rq` **完全相同**（`app.css` 765591 字节、
+    `app.js` 2292006 字节）。我们按目录扫描 ⇒ 两个都当页面 ⇒ 侧边栏两条一样。
+
+    ## 指纹怎么算
+    遍历目录下所有文件，把 **(相对路径, 字节数, 内容 sha256)** 按路径排序后
+    再整体哈希。用相对路径而**不是**绝对路径 —— 两个目录名不同，
+    但内容相同就该同指纹；反过来，同名文件内容不同也必须判为不同。
+
+    ## 返回
+    * 正常 → 十六进制指纹串
+    * 读不动（权限/IO 错误）→ `None`（调用方**不去重**，宁可多显示一个
+      也不要把两个都吞掉 —— 去重是为了少噪音，不能变成丢功能）
+    * 目录里一个文件都没有 → `None`（空目录不参与去重，让调用方按原逻辑处理）
+
+    ⚠️ 单个文件超过 `_PAGE_FP_MAX_FILE_BYTES` 时只取**前 N 字节**参与哈希：
+       陪伴插件那两个 `app.js` 各 2.2MB，全量读会让插件加载变慢；
+       前 512KB 已足够区分不同页面（同一份副本必然连前 512KB 也相同）。
+    """
+    try:
+        files: list[tuple[str, int, str]] = []
+        for f in sorted(page_dir.rglob("*")):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(page_dir).as_posix()
+            size = f.stat().st_size
+            digest = hashlib.sha256()
+            with f.open("rb") as fh:
+                remaining = _PAGE_FP_MAX_FILE_BYTES
+                while remaining > 0:
+                    chunk = fh.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+            files.append((rel, size, digest.hexdigest()))
+    except OSError as exc:
+        logger.warning("算插件页指纹失败（将不做去重）：%s: %s", page_dir, exc)
+        return None
+    if not files:
+        return None
+    joined = "\n".join(f"{rel}\t{size}\t{h}" for rel, size, h in files)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+
 def discover_plugin_pages(plugin_root: Path, declared: Any) -> list[dict[str, str]]:
     """发现插件的页面 —— **扫 `pages/` 目录为准**，并与 metadata 声明**合并**。
 
@@ -1154,6 +1209,8 @@ def discover_plugin_pages(plugin_root: Path, declared: Any) -> list[dict[str, st
     """
     out: list[dict[str, str]] = []
     seen: set[str] = set()
+    #: 页面指纹 → 第一次见到它的目录名（用于日志说清"和谁重复了"）
+    seen_fingerprints: dict[str, str] = {}
 
     # 1) 目录扫描（权威，照真实现 plugin_page_service.py:508-535）
     pages_root = plugin_root / PLUGIN_PAGE_DIR_NAME
@@ -1178,12 +1235,50 @@ def discover_plugin_pages(plugin_root: Path, declared: Any) -> list[dict[str, st
                     "插件页目录缺少 %s，已跳过：%s", PLUGIN_PAGE_ENTRY_FILE, page_dir
                 )
                 continue
+            # 🔴 **同内容目录去重**（2026-10-18 情绪报「插件扩展页显示两个我会永远陪着你」）。
+            #
+            # 实测 `astrbot_plugin_private_companion` 的 `pages/` 下有**两个**目录：
+            #   `companion-panel/` 与 `陪伴面板/` —— `diff -rq` **完全相同**
+            #   （`app.css` 都是 765591 字节、`app.js` 都是 2292006 字节）。
+            # 上游 `metadata.yaml` 只声明了 `companion-panel` 一个。
+            # 而我们按目录扫描 ⇒ 两个都算页面 ⇒ 侧边栏出现**两条一样的**。
+            #
+            # 判据是**内容指纹**（不是目录名）：
+            #   拿目录下所有文件（文件名+大小+内容哈希）算一个指纹，
+            #   同一个插件的两个页面指纹相同 ⇒ 是同一份页面的冗余副本 ⇒ 只留一个。
+            #
+            # ⚠️ 只在这个**插件内部**去重，不跨插件比 —— 两个不同插件碰巧有同样的
+            #    页面（比如共用一份通用 UI）时，它们仍然是**两个独立的入口**，
+            #    各自该出现在自己插件名下。
+            fp = _page_dir_fingerprint(page_dir)
+            if fp is not None and fp in seen_fingerprints:
+                logger.info(
+                    "插件页 %r 与 %r 内容完全相同，判为上游冗余副本，已跳过"
+                    "（避免侧边栏出现两条一样的入口）：%s",
+                    name, seen_fingerprints[fp], pages_root,
+                )
+                continue
+            if fp is not None:
+                seen_fingerprints[fp] = name
             out.append({"name": name, "title": name})
             seen.add(name)
 
-    # 2) 合并 metadata 声明（补上"声明了但目录不存在"的，便于诊断）
+    # 2) 合并 metadata 声明
+    #
+    #   * 声明了但目录不存在 → **仍然保留**（见上方 docstring：让用户看到
+    #     "声明了却没页面"这个事实，比静默丢弃强）；
+    #   * 声明了且目录存在 → **用声明的 `title` 覆盖目录名**。
+    #     ⚠️ 这一点是 2026-10-18 补的：上游 `private_companion` 声明的是
+    #     `{name: companion-panel, title: 陪伴面板}`，而真实现（目录扫描）
+    #     把 `title` 取成**目录名**，于是侧边栏显示 `companion-panel` ——
+    #     用户看到一串英文目录名，而插件的本意是「陪伴面板」。
+    #     既然插件**显式声明了**中文标题，就该用它（声明优先于推断）。
     for item in _normalize_pages(declared):
         if item["name"] in seen:
+            # 目录存在且声明了 ⇒ 用声明的 title 覆盖目录名（保留 name 不变）
+            for pg in out:
+                if pg["name"] == item["name"] and item.get("title"):
+                    pg["title"] = item["title"]
             continue
         out.append(item)
         seen.add(item["name"])

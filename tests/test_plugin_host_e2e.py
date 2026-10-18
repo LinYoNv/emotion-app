@@ -775,12 +775,18 @@ def test_normalize_pages_accepts_real_world_shapes():
 # ---------------------------------------------------------------------------
 
 
-def _mk_page(plugin_root, name: str, *, with_entry: bool = True):
-    """造一个插件页目录 `<plugin_root>/pages/<name>/index.html`。"""
+def _mk_page(plugin_root, name: str, *, with_entry: bool = True, body: str = ""):
+    """造一个插件页目录 `<plugin_root>/pages/<name>/index.html`。
+
+    `body` 用来让**两个页面的内容不同** —— 内容相同会被
+    `discover_plugin_pages` 判为"冗余副本"而只保留一个
+    （见 `test_duplicate_page_dirs_are_deduplicated`）。
+    """
     d = plugin_root / "pages" / name
     d.mkdir(parents=True, exist_ok=True)
     if with_entry:
-        (d / "index.html").write_text("<html>ok</html>", encoding="utf-8")
+        # 默认带上目录名，保证不同页面**内容不同**（否则触发去重）
+        (d / "index.html").write_text(body or f"<html>{name}</html>", encoding="utf-8")
     return d
 
 
@@ -812,15 +818,20 @@ def test_page_dirs_win_over_metadata_declaration(tmp_path):
     """
     from astrbot_host.loader.plugin_loader import discover_plugin_pages
 
-    _mk_page(tmp_path, "companion-panel")
-    _mk_page(tmp_path, "陪伴面板")
+    # ⚠️ 两个页面**内容要不同** —— 这里验的是"不同页面都保留"，
+    #    内容相同的副本会被去重（那是另一条判据）。
+    _mk_page(tmp_path, "companion-panel", body="<html>panel A</html>")
+    _mk_page(tmp_path, "陪伴面板", body="<html>panel B</html>")
     discovered = discover_plugin_pages(
         tmp_path, [{"name": "companion-panel", "title": "陪伴面板"}]
     )
     names = [p["name"] for p in discovered]
     # 两个目录页都在，且**不重复**
-    assert sorted(names) == ["companion-panel", "陪伴面板"], names
+    assert sorted(names) == sorted(["companion-panel", "陪伴面板"]), names
     assert len(names) == len(set(names)), f"去重失败：{names}"
+    # 声明的中文标题要覆盖目录名（否则侧边栏显示一串英文目录名）
+    by_name = {p["name"]: p["title"] for p in discovered}
+    assert by_name["companion-panel"] == "陪伴面板", by_name
 
 
 def test_directory_without_entry_file_is_not_a_page(tmp_path):
@@ -1676,20 +1687,33 @@ def test_memory_companion_page_is_discovered_end_to_end(tmp_path_factory):
     )
 
 
-def test_companion_plugin_lists_both_page_dirs(tmp_path_factory):
-    """陪伴插件的两个页面目录**都要**在（metadata 只声明了其中 1 个）。
+def test_companion_plugin_lists_its_page_once(tmp_path_factory):
+    """陪伴插件**只列一个**页面，且标题用 metadata 声明的中文名。
 
-    实测：`pages/` 下有 `companion-panel` 与 `陪伴面板` 两个目录（各有 index.html），
-    而 metadata **只声明了 `companion-panel`** ⇒ 旧实现漏掉「陪伴面板」。
-    ⚠️ 连"声明过"的插件也漏，说明**发现方式本身错了**，不是个别特例。
+    ## 这条判据为什么被改过（2026-10-18）
+
+    原来它断言 `{"companion-panel", "陪伴面板"} <= names` —— 也就是
+    「两个目录都是真页面」。**那个前提是错的**：
+
+    * 两个目录 `diff -rq` **完全相同**（`app.css` 都 765591 字节、
+      `app.js` 都 2292006 字节）⇒ 是上游的冗余副本，不是两个功能；
+    * 上游 `metadata.yaml` 只声明了 **一个**（`companion-panel` / 标题「陪伴面板」）。
+
+    我当初看到"两个目录"就推断"漏了一个页面"，实际是**没去看内容是否相同**。
+    后果是情绪在侧边栏看到**两条一模一样的「我会永远陪着你」**。
+
+    ⚠️ 判据改成"只列一次 + 用声明的中文标题"。
+       反向保护在 `test_duplicate_page_dirs_are_deduplicated` /
+       `test_different_content_pages_are_kept_and_dedup_is_per_plugin`。
     """
     if not (PLUGIN_ROOT / "astrbot_plugin_private_companion").is_dir():
         pytest.fail("依赖的真插件不存在 —— 本判据不许跳过")
     rec = _load_real_plugin_once(tmp_path_factory, "astrbot_plugin_private_companion")
-    names = {p["name"] for p in (rec.pages or [])}
-    assert {"companion-panel", "陪伴面板"} <= names, (
-        f"陪伴插件的两个页面目录没都列出来：{sorted(names)}"
-    )
+    pages = rec.pages or []
+    assert len(pages) == 1, f"陪伴插件应只列 1 个页面，实际 {len(pages)} 个：{pages}"
+    assert pages[0]["name"] == "companion-panel", pages
+    # 声明了中文标题就该用它（否则侧边栏显示一串英文目录名）
+    assert pages[0]["title"] == "陪伴面板", pages
 
 
 def test_across_all_real_plugins_no_page_dir_is_missed(tmp_path_factory):
@@ -1720,3 +1744,47 @@ def test_across_all_real_plugins_no_page_dir_is_missed(tmp_path_factory):
             missing[plugin_dir.name] = sorted(absent)
 
     assert not missing, f"这些页面目录被漏掉：{missing}"
+
+
+def test_duplicate_page_dirs_are_deduplicated(tmp_path):
+    """🔴 **内容完全相同的两个页面目录 → 只保留一个**。
+
+    情绪 2026-10-18 报：「插件扩展页也显示两个我会永远陪着你」。
+    实测 `astrbot_plugin_private_companion/pages/` 下有
+    `companion-panel/` 与 `陪伴面板/` **两个目录**，`diff -rq` 完全相同
+    （`app.css` 都 765591 字节、`app.js` 都 2292006 字节）——
+    是上游的冗余副本，而 `metadata.yaml` 只声明了 `companion-panel`。
+    我们按目录扫描 ⇒ 两个都算页面 ⇒ 侧边栏出现两条一模一样的入口。
+
+    ⚠️ 判据用的是**内容指纹**而不是目录名：目录名不可靠
+       （上游可能改成 `panel` / `面板` / 任意名字），
+       而"两份内容逐字节相同"是这件事的本质。
+    """
+    from astrbot_host.loader.plugin_loader import discover_plugin_pages
+
+    a = _mk_page(tmp_path, "companion-panel", body="<html>same</html>")
+    b = _mk_page(tmp_path, "陪伴面板", body="<html>same</html>")
+    # 连带资源文件也相同（真实形态：两个 app.css / app.js 完全一样）
+    (a / "app.css").write_text(".x{color:red}", encoding="utf-8")
+    (b / "app.css").write_text(".x{color:red}", encoding="utf-8")
+
+    pages = discover_plugin_pages(
+        tmp_path, [{"name": "companion-panel", "title": "陪伴面板"}]
+    )
+    assert len(pages) == 1, f"内容相同的页面没去重：{pages}"
+    assert pages[0]["name"] == "companion-panel"
+    # 保留的那个要用**声明的中文标题**，不是目录名
+    assert pages[0]["title"] == "陪伴面板", pages[0]
+
+
+def test_different_content_pages_are_kept_and_dedup_is_per_plugin(tmp_path):
+    """内容不同 ⇒ 都保留（去重不能误伤真页面）。
+
+    这是上一条的**反向判据** —— 只测"能去重"会掩盖"把不同页面也吞了"。
+    """
+    from astrbot_host.loader.plugin_loader import discover_plugin_pages
+
+    _mk_page(tmp_path, "panel-a", body="<html>A</html>")
+    _mk_page(tmp_path, "panel-b", body="<html>B</html>")
+    pages = discover_plugin_pages(tmp_path, None)
+    assert sorted(p["name"] for p in pages) == ["panel-a", "panel-b"], pages

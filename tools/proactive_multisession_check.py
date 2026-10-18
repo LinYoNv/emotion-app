@@ -263,6 +263,40 @@ def main() -> int:
     finally:
         for sid in created.values():
             api.req("DELETE", f"/api/v1/sessions/{sid}")
+        # 🔴 **顺手清掉本轮造的插件用户**（2026-10-18 加）。
+        #
+        # 原来只删会话、**不删插件 user** —— 于是每跑一次判据就在陪伴的用户列表里
+        # 多留 3 条 `e2e_<tag>_*`，情绪在面板上看见的是「一堆测试用户删不掉」。
+        #
+        # ⚠️ 插件那两个删除接口对"已绑统一人物"的用户**按设计**拒绝
+        #    （`page_api_users_groups.py:1196`：要求走「身份与隔离 → 归档」，
+        #      而归档又要求迁移不在 paused —— 当前正是 paused ⇒ 删不掉）。
+        #    ⇒ 只删会话**根本不够**，用户记录会永久留下。
+        #
+        # ✅ 调 `tools/plugin_e2e_user_purge.py --prefix=e2e_ --apply`
+        #    离线改 `companions.json` + 各 sqlite，绕过插件那层 fail-closed 检查。
+        #    它只动 **user_id 以 e2e_ 开头**的记录，不碰任何真人数据。
+        #
+        # ⚠️ 它要求**服务已停**（插件把 json 缓存在内存里、运行中改会被覆盖）。
+        #    判据跑的时候服务必然是**开着的** ⇒ 这里只能改文件，
+        #    插件的内存态要等下次重启才对齐 —— **那正好**，我们只要
+        #    "下次重启后用户列表是干净的"。
+        try:
+            import subprocess, sys as _sys
+            r = subprocess.run(
+                [_sys.executable,
+                 str(Path(__file__).resolve().parent / "plugin_e2e_user_purge.py"),
+                 "--apply", f"--prefix={UID_PREFIX}"],
+                check=False, timeout=180,
+                capture_output=True, text=True,
+            )
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout or "")[-300:])
+        except Exception as exc:
+            # ⚠️ 清理失败**不影响判据结论**（判据验的是隔离性，不是清理），
+            #    但必须让人看见 —— 静默失败是本项目最贵的 bug 类型。
+            print(f"  ⚠️ 本轮 e2e 用户没清掉（{exc}）——"
+                  " 请停服务后手工跑 tools/plugin_e2e_user_purge.py --apply --prefix=e2e_")
 
     print()
     allok = True
