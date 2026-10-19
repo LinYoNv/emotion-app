@@ -43,8 +43,21 @@ import pytest
 HOST_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HOST_DIR))
 
-PLUGIN_ROOT = Path("/opt/astrbot/data/plugins")
+#: 🔴 **插件源 = 仓库内 `plugins/`**（2026-10-19，情绪拍板）
+#:
+#: 原来指向 `/opt/astrbot/data/plugins` —— 别人 AstrBot 的生产目录：
+#:   ① 违反 AGENTS.md 铁律「绝不碰 AstrBot」；
+#:   ② 与 `tests/test_plugin_host_e2e.py`（读仓库内插件）**同名不同源**，
+#:      同一个 pytest 进程里先后加载 ⇒ `sys.modules` 里留下旧版模块
+#:      ⇒ 全量跑时 12 条判据互相污染（单独跑全绿）。
+#: 换成本仓库的 6 个陪伴系插件后，判的是「我们的插件能不能被加载」。
+PLUGIN_ROOT = Path(__file__).resolve().parents[2] / "plugins"
 PLUGIN_NAME = "astrbot_plugin_private_companion"
+
+#: 🔴 **7.0.0 里真正注册 LLM 工具的插件**（陪伴自己不再注册，见 fixture 说明）
+TOOL_PLUGIN = "astrbot_plugin_memory_companion"
+#: 用它其中一个工具做代表（原先用陪伴的 `pc_generate_photo`）
+TOOL_NAME = "memory_companion_recall"
 PLUGIN_DIR = PLUGIN_ROOT / PLUGIN_NAME
 
 
@@ -708,10 +721,18 @@ def loaded_real_plugin(tmp_path_factory):
     from astrbot_host.shadow import install_shadow_package
 
     install_shadow_package()
-    mirror = tmp_path_factory.mktemp("tool-loop-mirror")
+    # 🔴 **2026-10-19：改加载 `memory_companion`**
+    #
+    # 陪伴 7.0.0 **不再自己注册 LLM 工具**（改由拓展插件提供，见
+    # `test_loader_real_plugin.py::test_llm_tools_registered_with_schema`）。
+    # 而本文件要验的是「**工具循环机制**」：handler 有没有绑实例、
+    # 工具会不会并进 `req.func_tool`、重载后会不会重绑。
+    # ⇒ 换成 7.0.0 里**真正注册工具**的插件（记忆插件实测 11 个工具）。
+    from conftest import shared_mirror_root
+    mirror = shared_mirror_root()
     loader = PluginLoader(plugin_dirs=[PLUGIN_ROOT], mirror_root=mirror)
     report = asyncio.run(
-        loader.load_all(ports=HostPorts(config={}), only=[PLUGIN_NAME])
+        loader.load_all(ports=HostPorts(config={}), only=[TOOL_PLUGIN])
     )
     assert report.records, "加载器没有发现真插件"
     return report
@@ -723,17 +744,17 @@ def test_real_plugin_tool_handler_is_bound_to_instance(loaded_real_plugin):
 
     真实现靠 `star_manager.py:1273-1299` 把
     `ft.handler` 换成 `functools.partial(raw, 插件实例)`。
-    我们漏了这一步时的实测症状：`get_func("pc_generate_photo").handler`
+    我们漏了这一步时的实测症状：`get_func(TOOL_NAME).handler`
     是**裸函数**，签名 `(self, event, ...)` —— 缺 `self`。
     """
     from astrbot_host.registry import llm_tools
 
-    spec = llm_tools.get_func("pc_generate_photo")
-    assert spec is not None, "插件应当注册了 pc_generate_photo"
+    spec = llm_tools.get_func(TOOL_NAME)
+    assert spec is not None, f"插件应当注册了 {TOOL_NAME}"
     assert isinstance(spec.handler, functools.partial), (
         "工具 handler 没有绑定插件实例 —— 调用时必然缺 self（TypeError）"
     )
-    assert spec.handler_module_path == f"{PLUGIN_NAME}.main"
+    assert spec.handler_module_path == f"{TOOL_PLUGIN}.main"
     assert getattr(spec, "active", None) is True
 
 
@@ -757,10 +778,11 @@ def test_real_plugin_tools_merge_into_request(loaded_real_plugin):
     assert req.func_tool is None
     n = _merge_plugin_tools(req, _Ctx())
 
-    assert n >= 15, f"并进来的工具太少（{n}）—— 插件实测注册 ≥20 个"
+    # 🔴 2026-10-19：记忆插件实测注册 11 个工具（陪伴 7.0.0 自己注册 0 个）
+    assert n >= 10, f"并进来的工具太少（{n}）—— 记忆插件实测注册 11 个"
     assert req.func_tool is not None
     names = req.func_tool.names()
-    assert "pc_generate_photo" in names, f"缺少核心工具：{names[:10]}"
+    assert TOOL_NAME in names, f"缺少核心工具：{names[:10]}"
 
 
 @pytestmark_real
@@ -780,7 +802,7 @@ def test_real_plugin_tool_loop_really_executes(loaded_real_plugin):
 
     #: 拿真工具，但把 handler 包一层计数器 —— 这样"有没有被执行"可观测，
     #: 又不依赖插件内部的生图运行时（那需要完整面板配置，属于另一层）。
-    spec = llm_tools.get_func("pc_generate_photo")
+    spec = llm_tools.get_func(TOOL_NAME)
     assert spec is not None
     raw_handler = spec.handler
     hits: list[tuple] = []
@@ -802,8 +824,8 @@ def test_real_plugin_tool_loop_really_executes(loaded_real_plugin):
             _FakeChatResult(
                 tool_calls=[
                     _tool_call(
-                        "pc_generate_photo",
-                        '{"prompt": "窗边的猫", "kind": "selfie"}',
+                        TOOL_NAME,
+                        '{"query": "窗边的猫"}',
                     )
                 ]
             ),
@@ -814,7 +836,7 @@ def test_real_plugin_tool_loop_really_executes(loaded_real_plugin):
         from astrbot_host.compat.core.astr_main_agent import _merge_plugin_tools
 
         _merge_plugin_tools(req, _Ctx())
-        assert req.func_tool is not None and "pc_generate_photo" in req.func_tool.names()
+        assert req.func_tool is not None and TOOL_NAME in req.func_tool.names()
 
         llm = _ScriptedLLM(script)
         runner = _AgentRunner(
@@ -830,8 +852,8 @@ def test_real_plugin_tool_loop_really_executes(loaded_real_plugin):
         asyncio.run(drive())
 
         assert hits, "真插件的工具**没有被执行** —— 工具循环没接上"
-        assert hits[0][1].get("prompt") == "窗边的猫"
-        assert hits[0][1].get("kind") == "selfie"
+        # 记忆插件的 `recall` 工具参数是 `query`（陪伴的生图工具才是 prompt/kind）
+        assert hits[0][1].get("query") == "窗边的猫"
         # 事件作为第一个位置参数（真实现 `astr_agent_tool_exec.py:738`）
         assert hits[0][0], "handler 的第一个位置参数（event）没传"
         # 结果回填 + 循环收尾
@@ -846,9 +868,10 @@ def test_real_plugin_tool_loop_really_executes(loaded_real_plugin):
 def test_loader_reports_llm_tool_binding_count(loaded_real_plugin):
     """加载报告要**如实暴露**绑定了几个工具（为 0 而插件有工具 = 执行必错）。"""
     rec = loaded_real_plugin.records[0]
-    assert getattr(rec, "llm_tool_bind_count", 0) >= 15, (
+    # 🔴 2026-10-19：≥15 → ≥10（记忆插件实测注册 11 个工具；陪伴 7.0.0 注册 0 个）
+    assert getattr(rec, "llm_tool_bind_count", 0) >= 10, (
         f"llm_tool_bind_count={getattr(rec, 'llm_tool_bind_count', None)} —— "
-        "插件有 20 个工具，绑少了说明归属匹配写错"
+        "记忆插件有 11 个工具，绑少了说明归属匹配写错"
     )
 
 
@@ -884,26 +907,28 @@ def test_reload_rebinds_tools_to_the_new_instance(tmp_path_factory):
     from astrbot_host.registry import llm_tools
 
     def _load_once(tag: str):
-        mirror = tmp_path_factory.mktemp(f"reload-{tag}")
+        from conftest import shared_mirror_root
+
+        mirror = shared_mirror_root()
         loader = PluginLoader(plugin_dirs=[PLUGIN_ROOT], mirror_root=mirror)
         return asyncio.run(
-            loader.load_all(ports=HostPorts(config={}), only=[PLUGIN_NAME])
+            loader.load_all(ports=HostPorts(config={}), only=[TOOL_PLUGIN])
         )
 
     first = _load_once("a")
-    spec1 = llm_tools.get_func("pc_generate_photo")
+    spec1 = llm_tools.get_func(TOOL_NAME)
     inst1 = spec1.handler.args[0]
-    assert first.records[0].llm_tool_bind_count >= 15
+    assert first.records[0].llm_tool_bind_count >= 10  # 记忆插件实测 11
 
     second = _load_once("b")
     rec2 = second.records[0]
-    spec2 = llm_tools.get_func("pc_generate_photo")
+    spec2 = llm_tools.get_func(TOOL_NAME)
 
-    assert rec2.llm_tool_bind_count >= 15, (
+    assert rec2.llm_tool_bind_count >= 10, (
         f"重载后绑定被跳过（bind_count={rec2.llm_tool_bind_count}）—— "
         "工具会继续用**旧实例**执行"
     )
-    assert spec2.handler_module_path == f"{PLUGIN_NAME}.main"
+    assert spec2.handler_module_path == f"{TOOL_PLUGIN}.main"
     assert isinstance(spec2.handler, _ft.partial)
     # ⚠️ 必须是**新实例**（旧实例 = 静默用错对象）
     assert spec2.handler.args[0] is not inst1, "重载后工具仍绑在【旧】插件实例上"

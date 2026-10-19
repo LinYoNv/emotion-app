@@ -55,7 +55,15 @@ import pytest
 HOST_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HOST_DIR))
 
-PLUGIN_ROOT = Path("/opt/astrbot/data/plugins")
+#: 🔴 **插件源 = 仓库内 `plugins/`**（2026-10-19，情绪拍板）
+#:
+#: 原来指向 `/opt/astrbot/data/plugins` —— 别人 AstrBot 的生产目录：
+#:   ① 违反 AGENTS.md 铁律「绝不碰 AstrBot」；
+#:   ② 与 `tests/test_plugin_host_e2e.py`（读仓库内插件）**同名不同源**，
+#:      同一个 pytest 进程里先后加载 ⇒ `sys.modules` 里留下旧版模块
+#:      ⇒ 全量跑时 12 条判据互相污染（单独跑全绿）。
+#: 换成本仓库的 6 个陪伴系插件后，判的是「我们的插件能不能被加载」。
+PLUGIN_ROOT = Path(__file__).resolve().parents[2] / "plugins"
 PRIVATE_PLUGIN = "astrbot_plugin_private_companion"
 MEMORY_PLUGIN = "astrbot_plugin_memory_companion"
 PRIVATE_DIR = PLUGIN_ROOT / PRIVATE_PLUGIN
@@ -129,7 +137,8 @@ def loaded(tmp_path_factory):
     install_shadow_package()
     # 🔴 必须镜像：`PLUGIN_ROOT` 是别人 AstrBot 的生产目录，
     #    插件会回写自己的源码目录（见 `astrbot_host/source_mirror.py`）。
-    mirror = tmp_path_factory.mktemp("star-meta-src-mirror")
+    from conftest import shared_mirror_root
+    mirror = shared_mirror_root()
     loader = PluginLoader(plugin_dirs=[PLUGIN_ROOT], mirror_root=mirror)
     report = asyncio.run(
         loader.load_all(
@@ -312,84 +321,103 @@ def test_failed_instantiation_leaves_star_cls_none(isolated_star_registry, tmp_p
 # --------------------------------------------------------------------------- #
 
 
-def test_bridge_is_found_end_to_end(loaded):
-    """⭐⭐ **端到端判据**：陪伴实例的 `_memory_companion_bridge()` **不是 None**。
+def test_cross_plugin_api_is_reachable(loaded):
+    """⭐⭐ **端到端判据**：陪伴实例的 `extension_api` **可调用且返回真实数据**。
 
-    这是本 bug 的最终验收 —— 它同时经过
-    `get_all_stars()` → `md.star_cls` / `md.module` 两条读法。
+    ## 这条判据的前身与它为什么要重写（2026-10-19）
 
-    ⚠️ **不许 skip**：插件在磁盘上、也加载成功了，桥拿不到就是**失败**。
+    前身是 `test_bridge_is_found_end_to_end`，断言
+    `inst._memory_companion_bridge() is not None` + `_bridge_last_status`
+    的 `capability_state == "available"`、`contract_version == 3`。
+
+    **那整套是 6.7.0 的内部实现**。陪伴 7.0.0 把它整个换掉了：
+
+    | 6.7.0 | 7.0.0 |
+    |---|---|
+    | `_memory_companion_bridge()` | `extension_api`（`UnifiedCompanionExtensionAPI`） |
+    | `_bridge_last_status` | `extension_api.api_version` / `.capabilities` |
+    | `_memory_companion_presence()` | `integration/manifest` 里的 `integration_state` |
+
+    实测 7.0.0 实例上**没有** `_memory_companion_bridge` /
+    `_memory_companion_presence` 这两个属性（`dir()` 里零命中）。
+
+    ## ⚠️ 但**判据要守的那件事没变**
+
+    它守的是：**跨插件读取要真的通**（`StarMetadata.star_cls` / `module`
+    两个运行时字段没填的话，这条链就断）。7.0.0 的等价入口是
+    `extension_api` —— 只要它是个能用的对象、`api_version` 能取到，
+    就证明"实例被正确装配、且对外暴露了真实接口"。
     """
     loader, _ = loaded
     inst = loader.records[PRIVATE_PLUGIN].instance
 
-    bridge = inst._memory_companion_bridge()
-    assert bridge is not None, (
-        "陪伴拿不到记忆插件的桥 —— `StarMetadata` 的运行时字段又没填了。\n"
-        f"最后状态：{getattr(inst, '_bridge_last_status', {})}"
+    api = getattr(inst, "extension_api", None)
+    assert api is not None, (
+        "陪伴实例没有 `extension_api` —— 跨插件接口断了（7.0.0 的对应物）"
     )
-    # 桥要**可用**，不只是"非 None"（`available=False` 的桥等于没桥）
-    status = dict(getattr(inst, "_bridge_last_status", {}))
-    assert status.get("reason") != "bridge_missing", (
-        f"桥找到了但状态说 bridge_missing（自相矛盾）：{status}"
+    assert type(api).__name__ == "UnifiedCompanionExtensionAPI", (
+        f"`extension_api` 类型不对：{type(api).__name__}"
     )
-    assert status.get("available") is True, f"桥不可用：{status}"
-    assert status.get("capability_state") == "available", (
-        f"capability_state 不是 available：{status.get('capability_state')!r}"
+    # `api_version` 是它对外声明的契约版本 —— ⚠️ **是属性，不是方法**
+    # （实测 `TypeError: 'str' object is not callable`，第一次写成 `()` 了）
+    version = api.api_version
+    assert isinstance(version, str) and version, (
+        f"`extension_api.api_version` 不是非空字符串：{version!r}"
     )
-    # 契约版本 —— 实测补字段后是 3
-    assert str(status.get("contract_version") or "") == "3", (
-        f"契约版本不是 3：{status.get('contract_version')!r}"
-    )
+    # 还有一组真实能力方法（7.0.0 实测 14 个）
+    methods = [m for m in dir(api) if m.startswith("companion_v2_")]
+    assert len(methods) >= 5, f"`extension_api` 暴露的方法太少：{methods}"
 
 
-def test_presence_reports_loaded(loaded):
-    """⭐ `_memory_companion_presence()["loaded"] is True`。
+def test_star_metadata_runtime_fields_are_filled(loaded):
+    """⭐ `StarMetadata.star_cls` / `module` 两个运行时字段必须**真的填了**。
 
-    它读的就是 `metadata.star_cls is not None` —— 字段没填时恒为 `False`，
-    而面板上表现为"记忆插件没装/没加载"（**误诊**）。
+    ## 这条替代了 `test_presence_reports_loaded`
+
+    前身读 `inst._memory_companion_presence()["loaded"]` —— 而 7.0.0
+    没有这个方法了（它读的是 `metadata.star_cls is not None`）。
+
+    ⇒ **直接断言根源**（那两个字段），不依赖插件某个具体方法的存在性。
+    这样无论插件怎么改名/重构，只要"加载器没填字段"这条回归出现，它必红。
+    """
+    from astrbot_host.compat.core.star.base import star_registry
+
+    md = next((m for m in star_registry if getattr(m, "name", "") == PRIVATE_PLUGIN), None)
+    assert md is not None, f"`star_registry` 里找不到 {PRIVATE_PLUGIN}"
+
+    # `star_cls` 在真 AstrBot 里是**实例**（类在 `star_cls_type`）
+    assert getattr(md, "star_cls", None) is not None, (
+        "`StarMetadata.star_cls` 没填 —— 跨插件读取 `md.star_cls` 的插件会拿到 None"
+    )
+    assert getattr(md, "module", None) is not None, (
+        "`StarMetadata.module` 没填 —— 跨插件读取 `md.module.xxx` 的插件会拿到 None"
+    )
+    # 这两个必须指向**真的那个**实例/模块，不是占位
+    loader_inst = loaded[0].records[PRIVATE_PLUGIN].instance
+    assert md.star_cls is loader_inst, "`star_cls` 指向的不是加载器里那个实例"
+    assert md.module is loaded[0].records[PRIVATE_PLUGIN].module
+
+
+def test_capabilities_are_reported_honestly(loaded):
+    """诚实形式：`extension_api.capabilities()` 要返回**结构化**的能力声明。
+
+    ## 这条替代了 `test_req041_availability_is_not_blocked_by_missing_bridge`
+
+    前身断言 `req041_migration_status` 是 dict 且有 `code` —— 那是 6.7.0
+    迁移状态机的字段。7.0.0 把它收进了 V2 的 `identity_policy`，
+    实例上**没有** `req041_migration_status` 这个属性了。
+
+    ⚠️ 这条**不**断言某个能力必须为 True（那是插件侧业务状态），
+       只守"能力声明读得到、且是结构化的"。
     """
     loader, _ = loaded
     inst = loader.records[PRIVATE_PLUGIN].instance
+    api = getattr(inst, "extension_api", None)
+    assert api is not None, "没有 `extension_api`，后面的判断没有意义"
 
-    # 先拿一次桥，让 `_bridge_last_status` 有值（与产品运行顺序一致）
-    inst._memory_companion_bridge()
-    presence = inst._memory_companion_presence()
-
-    assert presence["loaded"] is True, (
-        f"陪伴认为记忆插件『未加载』：{presence}\n"
-        "→ 根因在 `StarMetadata.star_cls` 没填（它读 `star_cls is not None`）"
+    capabilities = api.capabilities()
+    assert isinstance(capabilities, (list, tuple, dict)), (
+        f"`capabilities()` 返回的不是结构化数据：{type(capabilities).__name__}"
     )
-    assert presence["detected"] is True, f"没检测到记忆插件：{presence}"
-    assert presence["installed"] is True, f"没检测到已安装：{presence}"
-    assert presence["activated"] is True, f"插件未被激活：{presence}"
+    assert capabilities, "`capabilities()` 返回空 —— 能力声明丢了"
 
-
-def test_req041_availability_is_not_blocked_by_missing_bridge(loaded):
-    """诚实形式：`_req041_scoped_archive_available()` 的真值目前是 `False`，
-    **但原因必须是插件自己的业务状态**（迁移未开始 / 同步器未初始化），
-    **不能**是 `bridge_missing`。
-
-    ⚠️ 这条**不**断言它必须为 True —— 那是插件侧业务状态（迁移 paused/未开始），
-        不是本轮要修的东西。本轮要守的是"**桥找得到**"。
-    """
-    loader, _ = loaded
-    inst = loader.records[PRIVATE_PLUGIN].instance
-
-    bridge = inst._memory_companion_bridge()
-    assert bridge is not None, "桥都没拿到，后面的判断没有意义"
-
-    # 桥在 → 这个能力项即便为 False，也必须是插件自己的迁移状态所致
-    status = getattr(inst, "req041_migration_status", None)
-    assert isinstance(status, dict), (
-        f"`req041_migration_status` 不是 dict：{status!r} —— 迁移状态读不到"
-    )
-    assert str(status.get("code") or ""), (
-        f"迁移状态没有 code，无法解释 `_req041_scoped_archive_available()` 为何为 False：{status}"
-    )
-
-    # 反向：桥不可用时它会因为"没桥"而不可用 —— 这条区分得开两种 False
-    last = dict(getattr(inst, "_bridge_last_status", {}))
-    assert last.get("reason") != "bridge_missing", (
-        f"`_req041` 相关的不可用原因里出现了 bridge_missing：{last}"
-    )

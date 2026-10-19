@@ -33,7 +33,15 @@ import pytest
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 HOST_DIR = APP_ROOT / "host"
-PLUGIN_ROOT = Path("/opt/astrbot/data/plugins")
+#: 🔴 **插件源 = 仓库内 `plugins/`**（2026-10-19 修）
+#:
+#: 原来指向 `/opt/astrbot/data/plugins` —— 别人 AstrBot 的生产目录：
+#:   ① 违反 AGENTS.md 铁律（「绝不碰 AstrBot」）；
+#:   ② 它与 `test_plugin_host_e2e.py`（已改用仓库内插件）**不是同一份代码**，
+#:      同一个 pytest 进程里两边先后加载同名插件 ⇒ `sys.modules` 里留下旧版
+#:      模块 ⇒ e2e 拿到的是 6.7.0 的路由表（实测报「找不到 /host/status」，
+#:      而单独跑时全绿）。这就是典型的"单独跑绿、全量跑红"的测试污染。
+PLUGIN_ROOT = APP_ROOT / "plugins"
 TOKEN = "test-token-plugin-config-0001"
 
 for p in (str(APP_ROOT), str(HOST_DIR)):
@@ -47,7 +55,12 @@ from emotion_app.web.auth import AuthManager  # noqa: E402
 
 #: 一个有 `_conf_schema.json`、且依赖简单的插件（**不用陪伴插件**：
 #: 它 1000+ 配置项，加载慢且与别的判据抢资源；这里要的是"能加载 + 有 schema"）
-PLUGIN_ID = "astrbot_plugin_splitter"
+#:
+#: ⚠️ 原来是 `astrbot_plugin_splitter` —— 那插件**只在别人的生产目录里有**，
+#:    仓库内没有。改用 `astrbot_plugin_content_companion`：
+#:    schema 16KB、有 7 个「带 options 的 string 键」（本文件两条判据都要用），
+#:    加载快且不起后台线程，符合上面这条选型理由。
+PLUGIN_ID = "astrbot_plugin_nai_image"
 
 
 def _cfg(tmp_path: Path) -> Config:

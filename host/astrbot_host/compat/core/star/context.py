@@ -29,6 +29,8 @@ from typing import Any, Protocol
 
 from astrbot_host.registry import FunctionToolManager, llm_tools
 
+from astrbot_host.compat.core.db.adapter import HostDbAdapter
+
 logger = logging.getLogger("astrbot")
 
 #: 照真实现 `context.py:53-54`：
@@ -324,6 +326,15 @@ class Context:
         #:    插件对 None 有处理路径（会如实报"读不到人格"），
         #:    但**能力诊断里会如实显示 False**。
         self.persona_manager: Any = getattr(self._ports, "persona_manager", None)
+        #: 🔴 **数据库句柄**（真实现 `context.py:132` 是 `db: BaseDatabase`）。
+        #:
+        #: 2026-10-19 补：陪 7.0.0 用 `context._db.get_db()` 读会话人格，
+        #: 见 `get_db()` 的 docstring 与 `compat/core/db/adapter.py`。
+        #: ⚠️ **惰性创建**：`HostDbAdapter` 要拿 `conversation_manager`，
+        #:    而那个端口可能在 `HostPorts` 装配后才注入。
+        self._db: Any = None
+        #: 真实现里 `_db` 的同义公开名（部分插件写 `context.db`）
+        self.db: Any = self._db
         #: 🔴 **照真实现的【属性】形态与【活列表】语义**（`context.py:126`）：
         #:    `registered_web_apis: list[RegisteredWebApi] = []`,
         #:    元素是元组 `(route, view_handler, methods, desc)`。
@@ -662,11 +673,29 @@ class Context:
         return None
 
     def get_db(self) -> Any:
-        """⚠️ 未实现（插件不该直接摸宿主的库）。"""
-        raise NotImplementedError(
-            "宿主不向插件暴露数据库句柄（`get_db`）——"
-            "请通过领域端口访问数据。"
-        )
+        """取会话数据库句柄（**最小暴露面**，2026-10-19 补）。
+
+        🔴 **为什么从"不实现"改成"受限实现"**：陪伴 7.0.0
+        （`astrbot_host/native.py:84`）用它读"这个会话选了什么人格"：
+
+            async with database.get_db() as session:
+                result = await session.execute(
+                    select(ConversationV2.persona_id).where(...))
+
+        不实现 ⇒ 人设映射永远解析不出来。完整的原因与边界见
+        `compat/core/db/adapter.py` 的模块 docstring。
+
+        ⚠️ **它只支持"按 conversation_id 查 persona_id"这一种语句**，
+        别的查询**显式抛 NotImplementedError**。这是有意的：
+        假装能跑任意 SQL，会让插件误以为能读对话正文（越界）。
+        """
+        if self._db is None:
+            # ⚠️ 从 `_ports` 直接读，**不要** `self.conversation_manager` ——
+            #    那是会抛 NotImplementedError 的 property（未注入时）。
+            self._db = HostDbAdapter(
+                conversation_manager=getattr(self._ports, "conversation_manager", None)
+            )
+        return self._db.get_db()
 
     def register_web_api(
         self,

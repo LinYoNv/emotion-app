@@ -1,7 +1,19 @@
-# AstrBot itself supplies the astrbot package and is intentionally not listed here.
-# These libraries back the plugin's network, image, and calendar integrations.
-aiohttp>=3.9,<4
-Pillow>=10,<13
-chinese-calendar>=1.9.2
+# AstrBot provides its SDK, aiocqhttp, aiohttp and Pillow.
+# Windows does not ship an IANA timezone database for zoneinfo.
+tzdata>=2025.2; sys_platform == "win32"
+# QWeather official-alert JWT signing (AstrBot's bundled runtime already includes it).
+cryptography>=42
+# Explicit lunar anniversaries in proactive greetings.
 lunarcalendar>=0.0.9
-markdown-it-py>=3,<5
+# Bounded execution for administrator-configured presentation cleanup patterns.
+regex>=2024.11.6
+# Local Reality audio device enumeration, decoding, and playback.
+numpy>=1.26
+sounddevice>=0.5
+soundfile>=0.13
+# Local Reality camera capture and JPEG encoding.
+opencv-python-headless>=4.11,<4.12
+# Embedded MiHome SDK; keep its MCP dependency on AstrBot's verified v1 contract.
+mijiaAPI==4.1.3
+fastmcp==3.4.2
+mcp>=1.26,<2

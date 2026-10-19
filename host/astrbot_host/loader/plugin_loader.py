@@ -249,6 +249,7 @@ class LoadReport:
 
 
 class PluginLoader:
+
     """从目录加载 AstrBot 插件。
 
     用法::
@@ -289,6 +290,7 @@ class PluginLoader:
                 ⚠️ 名单本身由**装配层**（`emotion_app/web/plugin_host.py`）从配置读出来
                 再传进来：`host/` 不许反向依赖 `emotion_app`（单向依赖铁律）。
         """
+        # 🔴 **同源复用镜像根**（2026-10-19）：见下面 `mirror_root` 分支的说明。
         self.requested_dirs = [Path(d) for d in plugin_dirs]
         self.plugin_dirs = list(self.requested_dirs)
         self.mirror_report: Any = None
@@ -595,9 +597,248 @@ class PluginLoader:
            `from astrbot_plugin_private_companion.xxx import ...`）。
         """
         d = str(directory.resolve())
-        if d not in sys.path:
+        if d in sys.path:
+            # 🔴 **已在列表里也要提到最前面**（2026-10-19 修）
+            #
+            # 原来是"已在就不动"。但同一个插件目录名可能在**多个父目录**下
+            # 各有一份（实测：`/opt/astrbot/data/plugins/astrbot_plugin_xxx`
+            # 与 `<仓库>/plugins/astrbot_plugin_xxx` 同名）。
+            # `import_module(name)` 是按 `sys.path` 顺序解析的 ⇒
+            # 先加载哪个父目录，它就一直排在前面，
+            # **后加载的那份永远被遮住**（`sys.modules[name].__file__`
+            # 实测仍指向旧目录）。
+            #
+            # 正确语义：**本次要加载哪份，就把它排到最前**
+            # —— 这样"最后加载的赢"，与 `load_all` 的调用顺序一致。
+            try:
+                sys.path.remove(d)
+            except ValueError:
+                pass
+            sys.path.insert(0, d)
+            logger.debug("已把插件目录提到 sys.path 最前：%s", d)
+        else:
             sys.path.insert(0, d)
             logger.debug("已加入 sys.path：%s", d)
+
+    @staticmethod
+    def _same_source(dir_name: str, path: Path) -> bool:
+        """`sys.modules` 里的那个包，是不是**就从这次这个目录**加载的？
+
+        ⚠️ 为什么不能用 `importlib.reload` 之后看 `__file__`：
+        reload **保留模块对象的身份**，`__file__` 仍是第一次导入时的路径
+        —— 实测两次加载（生产目录 → 仓库内）后 `sys.modules[...].__file__`
+        还是旧的那条。所以必须在**导入之前**判断。
+        """
+        target = Path(path).resolve()
+
+        # 🔴 **`companion_v2` 必须一起判断**（2026-10-19 实测）
+        #
+        # 陪伴 7.0.0 把核心放在**另一个顶层包** `companion_v2` 里，它和插件目录
+        # 是**两个独立的 `sys.modules` 条目**。只看插件包会出现这种致命的组合：
+        #
+        #   插件包 `astrbot_plugin_private_companion` → 已指向 m2（看着"同源"）
+        #   `companion_v2`                          → 仍指向 m1（旧根！）
+        #
+        # ⇒ `_same_source` 返回 True ⇒ 走 `reload` 分支 ⇒ 不清缓存 ⇒
+        #    `main.py` 里 `activate_plugin_imports()` 立刻抛
+        #    `RuntimeError: another companion_v2 package is already loaded
+        #    from a different source root`。
+        #    实测现场：第 2 次加载 `loaded=5`、陪伴那个 `failed`。
+        #
+        # ⇒ 判据改成「**插件包与 `companion_v2` 都指向本次 path**」才算同源。
+        for core_name in (dir_name, "companion_v2"):
+            core = sys.modules.get(core_name)
+            if core is None:
+                if core_name == dir_name:
+                    return False  # 插件包还没加载过 → 首次加载
+                continue
+            if not PluginLoader._module_belongs_to(core, target):
+                return False
+        return True
+
+    @staticmethod
+    def _module_belongs_to(module: object, target: Path) -> bool:
+        """模块（普通包或命名空间包）是否**落在 `target` 目录下**。"""
+        source = getattr(module, "__file__", None)
+        if isinstance(source, str) and source:
+            try:
+                return Path(source).resolve().parent == target
+            except (OSError, ValueError):
+                return False
+        module_path = getattr(module, "__path__", None)
+        if module_path is None:
+            return False
+        for entry in module_path:
+            try:
+                if Path(entry).resolve() == target:
+                    return True
+            except (OSError, ValueError):
+                continue
+        return False
+
+    @staticmethod
+    def _purge_plugin_modules(dir_name: str, path: Path | None = None) -> int:
+        """把某插件的**整个导入图**从 `sys.modules` 里清掉。返回清掉的数量。
+
+        ## 🔴 为什么必须整树清，而不是 `importlib.reload`
+
+        1. **`reload` 只重跑顶层 `__init__`，不递归重载子模块**（官方文档：
+           *"submodules ... are not reloaded"*）⇒ 插件新增/改名的子模块会
+           留下"磁盘上有、缓存里是旧对象"的错位，实测报
+           `ModuleNotFoundError: No module named 'xxx.core.event_query'`。
+
+        2. **陪伴 7.0.0 还额外引进了两个顶层包** `companion_v2` 与 `astrbot_host`
+           （插件自己 `sys.path.insert` 进来的，不挂在插件目录名下）。
+           它们必须一并清 —— 见下。
+
+        ## 清理范围照抄 7.0.0 自己的实现
+
+        `astrbot_host/import_lifecycle.py:35-58`（`retire_plugin_imports`）
+        用的就是这三个前缀：`(namespace, "companion_v2", "astrbot_host")`，
+        且**只清 `__file__`/`__path__` 落在该根之内的模块**。这里照抄 ——
+        那是插件的权威语义，不是我们的臆测。
+
+        ## ⚠️ 为什么 `companion_v2` 必须清（我一开始判反了）
+
+        7.0.0 的 `activate_plugin_imports()`（同文件 `:16-24`）在**每次**加载前检查：
+
+            existing = sys.modules.get("companion_v2")
+            if existing is not None and not _belongs_to_root(existing, root):
+                raise RuntimeError("another companion_v2 package is already "
+                                   "loaded from a different source root")
+
+        我最初以为"清了它反而会破坏它的隔离契约"，于是刻意跳过 ——
+        **结果恰恰相反**：不清才留下旧根的对象，下一次加载（换了镜像目录）
+        必然撞上这个 `RuntimeError`。实测症状就是
+        「`✅` 5 个插件成功、`❌` 陪伴失败」，且单独跑该文件时全绿。
+
+        Args:
+            dir_name: 插件目录名（顶层包名）。
+            path: 插件目录。给了才做"只清属于该根"的精确过滤；
+                不给则清该前缀下的全部条目（兼容旧调用）。
+        """
+        #: 7.0.0 自己认定的三个前缀，见 `import_lifecycle.py:44`
+        prefixes = (dir_name, "companion_v2", "astrbot_host")
+        if path is not None:
+            try:
+                root = Path(path).resolve()
+            except (OSError, ValueError):
+                root = None
+        else:
+            root = None
+
+        def _belongs_to_root(module: object) -> bool:
+            """照抄 `import_lifecycle._belongs_to_root`。"""
+            if root is None:
+                return True
+            source = getattr(module, "__file__", None)
+            paths = (source,) if isinstance(source, str) else getattr(module, "__path__", ())
+            try:
+                return any(Path(p).resolve().is_relative_to(root) for p in paths)
+            except (OSError, TypeError, ValueError):
+                return False
+
+        alias_prefix = f"{REAL_ASTRBOT_MODULE_PREFIX}{dir_name}"
+        removed = 0
+        owned: list[tuple[str, object]] = []
+
+        #: 宿主的 `astrbot_host` 装在仓库 `host/` 下 —— **绝不能清**。
+        #: 插件的那个在同名包 `astrbot_host` 里，但来源是**插件目录**。
+        #: 判据：模块文件路径里出现过插件目录名。
+        def _is_plugin_owned(module: object) -> bool:
+            source = getattr(module, "__file__", None)
+            if isinstance(source, str) and source:
+                return dir_name in source
+            for entry in getattr(module, "__path__", ()) or ():
+                if dir_name in str(entry):
+                    return True
+            return False
+
+        # 🔴 **清缓存后还要摘掉"已失效的旧父目录"**（2026-10-19 实测）
+        #
+        # `import_module(dir_name)` 是按 `sys.path` 顺序解析的。实测场景：
+        # 合成插件 `beta_probe` 第一次从 `tmpA/plugins` 加载，第二次从
+        # `tmpB/plugins`（目录名相同）。清掉缓存后重新 import，若 `tmpA` 还留在
+        # `sys.path` 里，就可能解析回 `tmpA`（那时它甚至已被 pytest 删掉）——
+        # 实测第二次 `sys.modules["beta_probe"].__file__` 仍指向 tmpA，
+        # 于是 `initialize()` 把 flag 写进了**已删除的目录**，判据以为"没跑"。
+        #
+        # 只摘**同时满足**这两条的条目（避免误伤宿主自己的路径）：
+        #   ① 里面有同名插件目录，且 ② 那个目录**不是**本次要用的 `path`。
+        if root is not None:
+            #: ⚠️ 要保住的不是 `root` 本身（它是**插件包目录**），
+            #: 而是它的**父目录** —— `sys.path` 里登记的是父目录。
+            #: 我第一版拿 `parent == root` 比较，结果把本次该用的新目录
+            #: 也一起摘掉了，随后 `import_module` 直接 `ModuleNotFoundError`。
+            keep_parent = root.parent
+            for entry in list(sys.path):
+                try:
+                    parent = Path(entry or ".").resolve()
+                except (OSError, ValueError):
+                    continue
+                if parent == keep_parent:
+                    continue
+                candidate = parent / dir_name
+                if not candidate.is_dir():
+                    continue
+                try:
+                    sys.path.remove(entry)
+                except ValueError:
+                    continue
+                logger.debug(
+                    "摘掉会遮蔽本次加载的旧 sys.path 条目：%s（它下面也有 %s）",
+                    entry, dir_name,
+                )
+        for name, module in list(sys.modules.items()):
+            is_candidate = (
+                any(name == p or name.startswith(f"{p}.") for p in prefixes)
+                or name == alias_prefix or name.startswith(f"{alias_prefix}.")
+            )
+            if not is_candidate:
+                continue
+            # 🔴 **判据要反着用**（2026-10-19 修，我第一版写反了）
+            #
+            # 清理的**目的**是"把**旧根**的残留拿掉"，所以该清的是
+            # **不属于本次新根**的模块。我第一版写成 `_belongs_to_root(module)`
+            # （只清属于新根的），恰好把该留的删了、该删的留下 ——
+            # 实测症状：第二次加载后 `sys.modules[<包>].__file__` 仍指向旧目录。
+            #
+            # ⚠️ 两个例外要排除：
+            #   * 宿主的 `astrbot_host`（装在仓库 `host/` 下）—— 不是插件的东西；
+            #   * 别名条目 `data.plugins.<dir>` —— 由 `_register_real_astrbot_alias`
+            #     当场重建，清掉即可（`_is_plugin_owned` 对它为 False，
+            #     但它的名字带 `<dir>` 前缀，仍应清）。
+            if name == alias_prefix or name.startswith(f"{alias_prefix}."):
+                owned.append((name, module))
+                continue
+            if name.split(".")[0] == "astrbot_host" and not _is_plugin_owned(module):
+                continue  # 宿主自己的那个包，别动
+            if root is not None and _belongs_to_root(module):
+                # 已经指向本次新根 → 不必清（避免把刚导入的同源模块删掉）
+                continue
+            owned.append((name, module))
+
+        # 深的先删（照 `import_lifecycle.py:52` 的排序），
+        # 同时**摘掉父包上的同名属性** —— 否则 `from pkg import child` 会拿回旧对象
+        for name, module in sorted(owned, key=lambda it: it[0].count("."), reverse=True):
+            if sys.modules.get(name) is not module:
+                continue
+            sys.modules.pop(name, None)
+            parent_name, _, child_name = name.rpartition(".")
+            parent = sys.modules.get(parent_name)
+            if parent is not None and getattr(parent, child_name, None) is module:
+                try:
+                    delattr(parent, child_name)
+                except AttributeError:
+                    pass
+            removed += 1
+
+        if removed:
+            logger.info(
+                "插件 %s 的来源目录变了 → 已清理 %d 个旧模块后重新导入",
+                dir_name, removed,
+            )
+        return removed
 
     @staticmethod
     def _check_name_conflict(dir_name: str) -> None:
@@ -670,12 +911,29 @@ class PluginLoader:
             插件**包**对象（`main` 子模块可作为属性访问）。
         """
         name = path.name
-        #: 包**本来就在** sys.modules 里 = 这是同进程的重复加载（才需要 reload）
-        was_loaded = name in sys.modules
-        if was_loaded:
-            pkg = importlib.reload(sys.modules[name])
-        else:
+        # 🔴 **来源目录变了 → 整树清掉、彻底重导**（2026-10-19）
+        #
+        # ⚠️ 判据必须是"`__file__` 指向的目录 vs 本次 path"，**不能**靠
+        #    `importlib.reload` —— 实测 reload 之后 `sys.modules[name].__file__`
+        #    **仍然是旧路径**（它改的是模块的内容，不是它的身份）。
+        #    这正是下面那句 `was_loaded` 判断会走错分支的根因。
+        same_source = PluginLoader._same_source(name, path)
+        if not same_source:
+            # ⚠️ 清完缓存还不够：**旧目录还留在 `sys.path` 里**，而
+            #    `import_module` 是按 `sys.path` 顺序解析的。更麻烦的是
+            #    旧版（≤6.7.0）是**普通包**（有 `__init__.py`），新版 7.0.0 是
+            #    **隐式命名空间包**（没有 `__init__.py`）—— 普通包优先级更高，
+            #    于是即便把新目录插到最前，解析仍可能落到旧目录（实测）。
+            #    ⇒ 清缓存后把**旧目录从 `sys.path` 里摘掉**（只摘同名插件的
+            #    那个父目录，不动别的）。
+            PluginLoader._purge_plugin_modules(name, path)
+            PluginLoader._ensure_on_sys_path(Path(path).parent)  # ⚠️ 清理后重新确认顺序
+            was_loaded = False
             pkg = importlib.import_module(name)
+        else:
+            #: 包**本来就在** sys.modules 里 = 同进程、**同一份代码**的重复加载
+            was_loaded = True
+            pkg = importlib.reload(sys.modules[name])
 
         # ⚠️ 入口模块：真 AstrBot 用 `main.py`；同时把 main 挂成包属性，
         #    这样 `_find_star_class` 能在包命名空间里看到插件类。

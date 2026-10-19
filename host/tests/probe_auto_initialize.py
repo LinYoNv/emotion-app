@@ -27,7 +27,15 @@ for p in (str(APP_ROOT), str(HOST_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-PLUGIN_ROOT = Path("/opt/astrbot/data/plugins")
+#: 🔴 **插件源 = 仓库内 `plugins/`**（2026-10-19，情绪拍板）
+#:
+#: 原来指向 `/opt/astrbot/data/plugins` —— 别人 AstrBot 的生产目录：
+#:   ① 违反 AGENTS.md 铁律「绝不碰 AstrBot」；
+#:   ② 与 `tests/test_plugin_host_e2e.py`（读仓库内插件）**同名不同源**，
+#:      同一个 pytest 进程里先后加载 ⇒ `sys.modules` 里留下旧版模块
+#:      ⇒ 全量跑时 12 条判据互相污染（单独跑全绿）。
+#: 换成本仓库的 6 个陪伴系插件后，判的是「我们的插件能不能被加载」。
+PLUGIN_ROOT = Path(__file__).resolve().parents[2] / "plugins"
 
 
 def snapshot_prod() -> dict[str, float]:

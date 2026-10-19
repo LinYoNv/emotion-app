@@ -325,6 +325,54 @@ class ProviderManager:
         self.inst_map: dict[str, Provider] = {}
         #: 当前默认对话供应商 id（空 = 未设置 → `get_using_provider` 返回 None）
         self.default_provider_id: str = ""
+        #: 🔴 人格管理器（真实现 `manager.py:130` 的 `persona_mgr`）。
+        #: 由宿主装配时注入；未注入 ⇒ `personas` 返回空列表（如实"没有人格"）。
+        self.persona_manager: Any = None
+
+    # ---- 人格转发（2026-10-19 补，真实现 `core/provider/manager.py:136-138`）----
+    #
+    # 🔴 **真实现的 `personas` 是 property，转发给 persona_mgr**：
+    #
+    #     @property
+    #     def personas(self) -> list:
+    #         return self.persona_mgr.personas_v3
+    #
+    # 我们**有** persona_manager（`astrbot_host/persona_manager.py`，它的
+    # `personas` / `personas_v3` 同源同形），但 `ProviderManager` 之前没转发
+    # ⇒ 插件写 `context.provider_manager.personas` 直接 AttributeError。
+    #
+    # 实测现场（2026-10-19）：`meme_manager/main.py:821`
+    # `personas = self.context.provider_manager.personas` → 插件加载失败。
+    # 那是**别人的插件**，但它暴露的是**我们真实的兼容缺口**（真 AstrBot 有这属性）。
+    #
+    # ⚠️ **没注入 persona_manager 时返回空列表**（不是抛错）：
+    #    真实现里 `persona_mgr` 总是存在；我们没有时"没有人格"是如实状态，
+    #    而插件对空列表有处理路径。**但这里绝不编造人格**。
+
+    def _persona_source(self) -> Any:
+        """找人格来源：优先显式注入的，其次从 Context 拿。"""
+        if self.persona_manager is not None:
+            return self.persona_manager
+        return None
+
+    @property
+    def personas(self) -> list:
+        """动态获取最新 personas（照真实现 `manager.py:136-138`）。"""
+        source = self._persona_source()
+        value = getattr(source, "personas_v3", None) if source is not None else None
+        if isinstance(value, list):
+            return list(value)
+        return []
+
+    @property
+    def persona_configs(self) -> list:
+        """动态获取最新 persona 配置（照真实现 `manager.py:131-134`）。"""
+        source = self._persona_source()
+        value = getattr(source, "persona_v3_config", None) if source is not None else None
+        if isinstance(value, list):
+            return list(value)
+        # 真实现里 `persona_v3_config` 与 `personas_v3` 同源，退化到它
+        return self.personas
 
     # ---- 注册/查询 ----
 

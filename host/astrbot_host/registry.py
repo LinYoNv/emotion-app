@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import copy
 import enum
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -175,6 +176,36 @@ class StarHandlerRegistry(Generic[H]):
             out[h.event_type.name] = out.get(h.event_type.name, 0) + 1
         return out
 
+    def remove(self, handler: "StarHandlerMetadata") -> None:
+        """移除**单个** handler（照真实现 `star_handler.py:205-207`）。
+
+        🔴 **2026-10-19 补：这是陪伴 7.0.0 加载失败的直接原因**
+
+        `astrbot_host/import_lifecycle.py:28-32` 在**模块顶层**执行：
+
+            for handler in tuple(star_handlers_registry):
+                if handler.handler_module_path == entry_name:
+                    star_handlers_registry.remove(handler)
+
+        它的意图是"重新 import 前先清掉上一次注册的 handler"
+        （注释原文：*A fresh import must replace those handlers before
+        the decorators register again*）。
+
+        我们原来**只有 `remove_plugin(前缀)`、没有 `remove(handler)`**
+        ⇒ 报 `AttributeError: 'StarHandlerRegistry' object has no attribute 'remove'`
+        ⇒ **整个插件加载失败**。
+
+        ⚠️ 与 `remove_plugin` 的区别：那个按**模块前缀**批量删，
+        这个删**特定那个对象**。两者都保留 —— 批量删是我们自己的便利方法，
+        `remove(handler)` 是真实现在用的契约，**不能互相替代**
+        （按前缀删会把同模块的其它 handler 一起干掉）。
+        """
+        # 照真实现：先从 map 里按 full_name 摘掉，再按**身份**过滤列表
+        # ⚠️ 用 `!=`（真实现是 `h != handler`）—— dataclass 的默认相等比较，
+        #    与真实现行为一致；不是 `is not`。
+        self.star_handlers_map.pop(getattr(handler, "handler_full_name", None), None)
+        self._handlers = [h for h in self._handlers if h != handler]
+
     def remove_plugin(self, module_path_prefix: str) -> int:
         """移除某插件的全部 handler（重载/卸载用）。返回移除数量。"""
         before = len(self._handlers)
@@ -226,7 +257,10 @@ class FunctionToolSpec:
     """
 
     name: str
-    parameters: list[dict[str, Any]]
+    #: 🔴 **JSON Schema dict**（照真实现 `FunctionTool.parameters`）。
+    #: ⚠️ 2026-10-19 前这里存的是 `list[dict]`（参数描述列表），已改；
+    #: `to_openai_schema()` 仍兼容 list，见 `json_schema()` 的 docstring。
+    parameters: dict[str, Any] | list[dict[str, Any]]
     description: str
     handler: Callable[..., Any]
     #: 是否启用（照真实现 `FunctionTool.active`，默认 True）
@@ -237,39 +271,70 @@ class FunctionToolSpec:
     def json_schema(self) -> dict[str, Any]:
         """参数部分的 **JSON Schema**（= 真实现 `FunctionTool.parameters` 的形状）。
 
-        ⚠️ **与 `parameters` 字段的区别**（别搞混）：
-          * `self.parameters` 是**参数描述列表**
-            （`add_func(name, func_args, ...)` 传进来的那个 list，真实现同样入参）；
-          * `json_schema()` 是 OpenAI 要的 `{"type":"object","properties":{...}}`。
+        ⚠️ **2026-10-19 改：`self.parameters` 现在也是 JSON Schema dict**
 
-        真实现里 `FunctionTool.parameters` **直接就是** JSON Schema dict；
-        我们保留 list 是为了不改既有判据，用本方法产出等价形状
-        —— 工具执行器要按它过滤参数（`tool_loop_agent_runner.py:1169-1176`）。
+        原来这里写的是"`self.parameters` 是参数描述列表，`json_schema()` 产出
+        JSON Schema"。那个设计是错的 —— 真实现的 `FunctionTool.parameters`
+        **直接就是** JSON Schema dict（`astrbot/core/agent/tool.py:36-71` +
+        `func_tool_manager.py:343-363` 的 `spec_to_func()`）：
+        插件、`openai_schema()`、工具执行器的参数过滤**全都按 dict 读**。
+
+        保留 list 的实际代价（2026-10-19 实测）：`memory_companion` 的
+        `initialize()` 崩在 `tool.parameters.get(...)` —— 一个插件初始化失败，
+        而报错完全指不到根因。
+
+        ⇒ 现在 `FunctionToolSpec.parameters` **恒为**
+        `{"type": "object", "properties": {...}}`。
+        本方法与 `to_openai_schema()` **兼容两种形状**：既接受老的 list
+        （外部构造 / 历史判据），也接受新的 dict（所有正常注册路径）。
         """
         return self.to_openai_schema()["function"]["parameters"]
 
     def to_openai_schema(self) -> dict[str, Any]:
-        """转成 OpenAI `tools` 格式 —— 宿主的模型调用需要它。"""
-        props: dict[str, Any] = {}
-        required: list[str] = []
-        for p in self.parameters:
-            entry: dict[str, Any] = {"type": p.get("type", "string")}
-            if p.get("description"):
-                entry["description"] = p["description"]
-            if p.get("items"):
-                entry["items"] = p["items"]
-            props[p["name"]] = entry
-            required.append(p["name"])
+        """转成 OpenAI `tools` 格式 —— 宿主的模型调用需要它。
+
+        ⚠️ **两种形状都接受**（见 `json_schema()` 的 docstring）：
+          * `parameters` 是 **dict**（正常注册路径，`add_func` 已转换）→ 直接用；
+          * `parameters` 是 **list**（外部构造 / 历史判据）→ 就地转成 schema。
+        """
+        parameters = self.parameters
+        if isinstance(parameters, dict):
+            # 已是 JSON Schema：补一个 `required`（真实现要求每个参数都必填，
+            # 见 `spec_to_func()` —— 它把 func_args 的每一项都当必填）
+            schema = copy.deepcopy(parameters)
+            schema.setdefault("type", "object")
+            schema.setdefault("properties", {})
+            if "required" not in schema and schema["properties"]:
+                schema["required"] = list(schema["properties"].keys())
+        else:
+            props: dict[str, Any] = {}
+            required: list[str] = []
+            for p in parameters or []:
+                if not isinstance(p, dict):
+                    raise TypeError(
+                        f"工具 {self.name} 的 parameters 里出现了非 dict 项："
+                        f"{type(p).__name__} —— 这是注册方写错了，不是格式偏好问题"
+                    )
+                entry: dict[str, Any] = {"type": p.get("type", "string")}
+                if p.get("description"):
+                    entry["description"] = p["description"]
+                if p.get("items"):
+                    entry["items"] = p["items"]
+                name = p.get("name")
+                if name:
+                    props[name] = entry
+                    required.append(name)
+            schema = {
+                "type": "object",
+                "properties": props,
+                "required": required,
+            }
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": props,
-                    "required": required,
-                },
+                "parameters": schema,
             },
         }
 
@@ -291,8 +356,43 @@ class FunctionToolManager:
         desc: str,
         handler: Callable[..., Any],
     ) -> None:
+        """注册一个 function-calling 工具（**语义照真实现 `add_func`**）。
+
+        🔴 **2026-10-19 修的一个真 bug（`memory_companion` 初始化崩溃的根因）**
+
+        原来这里写的是 `parameters=args` —— 把 `@filter.llm_tool` 的
+        **参数列表**原样塞进了 `parameters`。而真实现的 `add_func`
+        （`core/provider/func_tool_manager.py:365-390`）会先走
+        `spec_to_func()`（`:343-363`）把它转成 JSON Schema：
+
+            params = {"type": "object", "properties": {}}
+            for param in func_args:
+                p = copy.deepcopy(param); p.pop("name", None)
+                params["properties"][param["name"]] = p
+
+        **为什么这是真 bug 而不是格式偏好**：
+          * 模型看到的 `tools[].function.parameters` 会是一个 **list**，
+            而 OpenAI 协议要求它是 **object** ⇒ 严格上游直接 400；
+          * 插件侧会按 dict 读 `tool.parameters.get("properties", {})`
+            —— 实测 `astrbot_plugin_memory_companion/core/query_session.py:550`
+            就崩在 `'list' object has no attribute 'get'`，
+            表现成「插件 initialize() 失败」，而根因离它三层；
+          * `openai_schema()` 里 `parameters.get("properties")` 同样会炸。
+
+        ⚠️ 与真实现一致的两处细节：
+          ① **`name` 键要从属性里删掉**（它只是我们的内部占位，不属于 JSON Schema）；
+          ② 用 `copy.deepcopy`，不要改调用方传进来的那批 dict
+             （真实现也 deepcopy —— 否则插件复用同一个参数表会互相污染）。
+        """
+        params: dict[str, Any] = {"type": "object", "properties": {}}
+        for param in args or []:
+            p = copy.deepcopy(param)
+            # 照真实现：`name` 只用于作 properties 的键，不出现在值里
+            key = p.pop("name", None)
+            if key:
+                params["properties"][key] = p
         self._tools[name] = FunctionToolSpec(
-            name=name, parameters=args, description=desc, handler=handler
+            name=name, parameters=params, description=desc, handler=handler
         )
 
     def get_func(self, name: str) -> FunctionToolSpec | None:

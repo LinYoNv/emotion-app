@@ -32,7 +32,15 @@ import pytest
 HOST_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HOST_DIR))
 
-PLUGIN_ROOT = Path("/opt/astrbot/data/plugins")
+#: 🔴 **插件源 = 仓库内 `plugins/`**（2026-10-19，情绪拍板）
+#:
+#: 原来指向 `/opt/astrbot/data/plugins` —— 别人 AstrBot 的生产目录：
+#:   ① 违反 AGENTS.md 铁律「绝不碰 AstrBot」；
+#:   ② 与 `tests/test_plugin_host_e2e.py`（读仓库内插件）**同名不同源**，
+#:      同一个 pytest 进程里先后加载 ⇒ `sys.modules` 里留下旧版模块
+#:      ⇒ 全量跑时 12 条判据互相污染（单独跑全绿）。
+#: 换成本仓库的 6 个陪伴系插件后，判的是「我们的插件能不能被加载」。
+PLUGIN_ROOT = Path(__file__).resolve().parents[2] / "plugins"
 
 pytestmark = pytest.mark.skipif(
     not PLUGIN_ROOT.is_dir(), reason=f"插件目录不存在：{PLUGIN_ROOT}"
@@ -45,13 +53,17 @@ COMPANION_PLUGINS = (
     "astrbot_plugin_image_companion",
     "astrbot_plugin_content_companion",
     "astrbot_plugin_together_companion",
+    "astrbot_plugin_nai_image",
 )
 
 #: 已知的"插件自身依赖缺失"（不是我们的兼容缺口）——
 #: 列出来是为了**区分**"我们没实现"与"它缺库"。
-KNOWN_ENV_FAILURES = {
-    "meme_manager": "第三方图床插件，缺 requests/boto3 等自身依赖",
-}
+#:
+#: 🔴 **2026-10-19 清空**：源目录换成仓库内 `plugins/` 之后，
+#: 这里只剩**我们自己的 6 个插件**，它们**一个都不许失败**
+#: （原先是给 `/opt/astrbot/data/plugins` 里别人那堆杂牌留的宽容，
+#: 例如 `meme_manager` —— 本项目从不需要它）。
+KNOWN_ENV_FAILURES: set[str] = set()
 
 
 @pytest.fixture(scope="module")
@@ -71,14 +83,21 @@ def report():
     #    AstrBot 生产目录** → 我们每跑一次测试就覆盖一次对方的配置，
     #    偏偏**35 项测试全绿、毫无提示**（污染完全静默）。
     #    镜像后加载的是副本，源目录只读。
-    mirror = _Path(tempfile.mkdtemp(prefix="host-test-mirror-"))
+    from conftest import shared_mirror_root
+    mirror = shared_mirror_root()
     loader = PluginLoader(plugin_dirs=[PLUGIN_ROOT], mirror_root=mirror)
     return asyncio.run(loader.load_all(ports=HostPorts(config={})))
 
 
 def test_most_plugins_load(report):
-    """≥11 个插件加载成功（磁盘共 12 个）。"""
-    assert len(report.loaded) >= 11, (
+    """本仓库的 6 个插件全部加载成功。
+
+    🔴 **2026-10-19：11 → 6**
+    原判据是"≥11 个（磁盘共 12 个）"，基于**别人的生产目录**
+    （`/opt/astrbot/data/plugins` 有 15 个杂牌插件）。
+    源换成仓库内 `plugins/` 后，我们的插件集就是 **6 个**（且一个都不许失败）。
+    """
+    assert len(report.loaded) >= 6, (
         f"只成功 {len(report.loaded)} 个：{report.summary()}"
     )
 
@@ -107,9 +126,15 @@ def test_only_known_env_failures(report):
 
 
 def test_total_handler_count(report):
-    """累计 handler ≥180（实测 203）—— 证明装饰器机制被大面积用上。"""
+    """累计 handler ≥60 —— 证明装饰器机制被大面积用上。
+
+    🔴 **2026-10-19：180（实测 203）→ 60（7.0.0 实测 68）**
+    数值下降是 7.0.0 架构变化：它把"每个功能一个 handler"
+    改成"按事件类型各挂一个总管"（路由分派进 `astrbot_host/event_routing.py`）。
+    判据改成"**至少 60**"锁住"装饰器没整体失效"，不锁死具体数目。
+    """
     total = sum(r.handler_count for r in report.loaded)
-    assert total >= 180, f"累计 handler 只有 {total}"
+    assert total >= 60, f"累计 handler 只有 {total}（7.0.0 实测 68）"
 
 
 def test_web_apis_attributed_per_plugin(report):
@@ -127,14 +152,19 @@ def test_web_apis_attributed_per_plugin(report):
     """
     by_dir = {r.dir_name: r for r in report.loaded}
     main = by_dir["astrbot_plugin_private_companion"]
-    prompts = by_dir["prompt_tools"]
+    # 🔴 `prompt_tools` 是**别人生产目录里**的插件（仓库内没有），
+    #    改用仓库内另一个插件做"小户"对照 —— `image_companion` 实测 0 条 API。
+    small = by_dir["astrbot_plugin_image_companion"]
 
-    assert main.web_api_count >= 150, f"主插件 API 只有 {main.web_api_count}"
-    assert prompts.web_api_count < main.web_api_count, (
-        "prompt_tools 的 API 数不该 ≥ 主插件 —— 这几乎肯定是又取了全局累计值"
+    # 🔴 2026-10-19：150 → 70（7.0.0 把二十多个 WebAPI 类聚合后实测 71 条）
+    assert main.web_api_count >= 70, f"主插件 API 只有 {main.web_api_count}"
+    assert small.web_api_count < main.web_api_count, (
+        "`image_companion` 的 API 数不该 ≥ 主插件 —— "
+        "这几乎肯定是又取了全局累计值"
     )
+    # 🔴 2026-10-19：260（实测 266）→ 140（7.0.0 实测 148）
     total = sum(r.web_api_count for r in report.loaded)
-    assert total >= 260, f"各插件 API 之和只有 {total}（实测 266）"
+    assert total >= 140, f"各插件 API 之和只有 {total}（7.0.0 实测 148）"
 
 
 def test_web_apis_are_real_route_tuples():
@@ -220,8 +250,11 @@ def test_main_companion_plugin_specifics(report):
         r for r in report.loaded
         if r.dir_name == "astrbot_plugin_private_companion"
     )
-    assert rec.version == "6.6.2"
-    assert rec.handler_count >= 100
+    # 🔴 **2026-10-19：6.6.2 → 7.0.0、handler ≥100 → ≥10**
+    #    （7.0.0 实测 16 个 handler；架构从"每功能一个"改成"每事件类型一个总管"，
+    #     详见 `test_loader_real_plugin.py::test_handler_count` 的说明）
+    assert rec.version == "7.0.0"
+    assert rec.handler_count >= 10
     assert rec.star_cls is not None
 
 

@@ -1,0 +1,2018 @@
+{
+ "provider": {
+  "type": "list",
+  "config_template": {
+   "OpenAI Compatible": {
+    "id": "openai",
+    "provider": "openai",
+    "type": "openai_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://api.openai.com/v1",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "OpenAI Responses": {
+    "id": "openai-responses",
+    "provider": "openai",
+    "type": "openai_responses",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://api.openai.com/v1",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "Google Gemini": {
+    "id": "google_gemini",
+    "provider": "google",
+    "type": "googlegenai_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://generativelanguage.googleapis.com/",
+    "timeout": 120,
+    "gm_resp_image_modal": false,
+    "gm_native_search": false,
+    "gm_native_coderunner": false,
+    "gm_url_context": false,
+    "gm_safety_settings": {
+     "harassment": "BLOCK_MEDIUM_AND_ABOVE",
+     "hate_speech": "BLOCK_MEDIUM_AND_ABOVE",
+     "sexually_explicit": "BLOCK_MEDIUM_AND_ABOVE",
+     "dangerous_content": "BLOCK_MEDIUM_AND_ABOVE"
+    },
+    "gm_thinking_config": {
+     "budget": 0,
+     "level": "HIGH"
+    },
+    "proxy": ""
+   },
+   "Anthropic": {
+    "id": "anthropic",
+    "provider": "anthropic",
+    "type": "anthropic_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://api.anthropic.com/v1",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {},
+    "anth_thinking_config": {
+     "type": "",
+     "budget": 0,
+     "effort": ""
+    }
+   },
+   "Kimi Coding Plan": {
+    "id": "kimi-code",
+    "provider": "kimi-code",
+    "type": "kimi_code_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://api.kimi.com/coding",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {
+     "User-Agent": "claude-code/0.1.0"
+    },
+    "anth_thinking_config": {
+     "type": "",
+     "budget": 0,
+     "effort": ""
+    }
+   },
+   "Moonshot": {
+    "id": "moonshot",
+    "provider": "moonshot",
+    "type": "openai_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "timeout": 120,
+    "api_base": "https://api.moonshot.cn/v1",
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "MiniMax": {
+    "id": "minimax",
+    "provider": "minimax",
+    "type": "openai_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://api.minimaxi.com/v1",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "MiniMax Token Plan": {
+    "id": "minimax-token-plan",
+    "provider": "minimax-token-plan",
+    "type": "minimax_token_plan",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://api.minimaxi.com/anthropic",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {
+     "User-Agent": "claude-code/0.1.0"
+    },
+    "anth_thinking_config": {
+     "type": "",
+     "budget": 0,
+     "effort": ""
+    }
+   },
+   "Xiaomi": {
+    "id": "xiaomi",
+    "provider": "xiaomi",
+    "type": "xiaomi_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://api.xiaomimimo.com/v1",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "Xiaomi Token Plan": {
+    "id": "xiaomi-token-plan",
+    "provider": "xiaomi-token-plan",
+    "type": "xiaomi_token_plan",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://token-plan-cn.xiaomimimo.com/anthropic",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {
+     "User-Agent": "claude-code/0.1.0"
+    },
+    "anth_thinking_config": {
+     "type": "",
+     "budget": 0,
+     "effort": ""
+    }
+   },
+   "xAI": {
+    "id": "xai",
+    "provider": "xai",
+    "type": "openai_responses",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://api.x.ai/v1",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "DeepSeek": {
+    "id": "deepseek",
+    "provider": "deepseek",
+    "type": "openai_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://api.deepseek.com/v1",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "DeepSeek Responses": {
+    "id": "deepseek-responses",
+    "provider": "deepseek",
+    "type": "openai_responses",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://api.deepseek.com/v1",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "Zhipu": {
+    "id": "zhipu",
+    "provider": "zhipu",
+    "type": "zhipu_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "timeout": 120,
+    "api_base": "https://open.bigmodel.cn/api/paas/v4/",
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "LongCat": {
+    "id": "longcat",
+    "provider": "longcat",
+    "type": "longcat_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://api.longcat.chat/openai",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "AIHubMix": {
+    "id": "aihubmix",
+    "provider": "aihubmix",
+    "type": "aihubmix_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "timeout": 120,
+    "api_base": "https://aihubmix.com/v1",
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "OpenRouter": {
+    "id": "openrouter",
+    "provider": "openrouter",
+    "type": "openrouter_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "timeout": 120,
+    "api_base": "https://openrouter.ai/api/v1",
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "SSYCloud(胜算云)": {
+    "id": "ssycloud",
+    "provider": "ssycloud",
+    "type": "ssycloud_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "timeout": 120,
+    "api_base": "https://router.shengsuanyun.com/api/v1",
+    "proxy": "",
+    "custom_headers": {
+     "X-Title": "AstrBot"
+    }
+   },
+   "NVIDIA": {
+    "id": "nvidia",
+    "provider": "nvidia",
+    "type": "openai_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://integrate.api.nvidia.com/v1",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "Azure OpenAI": {
+    "id": "azure_openai",
+    "provider": "azure",
+    "type": "openai_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "api_version": "2024-05-01-preview",
+    "key": [],
+    "api_base": "",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "Ollama": {
+    "id": "ollama",
+    "provider": "ollama",
+    "type": "openai_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [
+     "ollama"
+    ],
+    "api_base": "http://127.0.0.1:11434/v1",
+    "proxy": "",
+    "custom_headers": {},
+    "ollama_disable_thinking": false
+   },
+   "LM Studio": {
+    "id": "lm_studio",
+    "provider": "lm_studio",
+    "type": "openai_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [
+     "lmstudio"
+    ],
+    "api_base": "http://127.0.0.1:1234/v1",
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "Gemini_OpenAI_API": {
+    "id": "google_gemini_openai",
+    "provider": "google",
+    "type": "openai_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "Groq": {
+    "id": "groq",
+    "provider": "groq",
+    "type": "groq_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://api.groq.com/openai/v1",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "302.AI": {
+    "id": "302ai",
+    "provider": "302ai",
+    "type": "openai_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://api.302.ai/v1",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "SiliconFlow": {
+    "id": "siliconflow",
+    "provider": "siliconflow",
+    "type": "openai_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "timeout": 120,
+    "api_base": "https://api.siliconflow.cn/v1",
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "PPIO": {
+    "id": "ppio",
+    "provider": "ppio",
+    "type": "openai_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://api.ppinfra.com/v3/openai",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "TokenPony": {
+    "id": "tokenpony",
+    "provider": "tokenpony",
+    "type": "openai_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://api.tokenpony.cn/v1",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "Compshare": {
+    "id": "compshare",
+    "provider": "compshare",
+    "type": "openai_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://api.modelverse.cn/v1",
+    "timeout": 120,
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "ModelScope": {
+    "id": "modelscope",
+    "provider": "modelscope",
+    "type": "openai_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "timeout": 120,
+    "api_base": "https://api-inference.modelscope.cn/v1",
+    "proxy": "",
+    "custom_headers": {}
+   },
+   "Dify": {
+    "id": "dify_app_default",
+    "provider": "dify",
+    "type": "dify",
+    "provider_type": "agent_runner",
+    "enable": true,
+    "dify_api_type": "chat",
+    "dify_api_key": "",
+    "dify_api_base": "https://api.dify.ai/v1",
+    "dify_workflow_output_key": "astrbot_wf_output",
+    "dify_query_input_key": "astrbot_text_query",
+    "variables": {},
+    "timeout": 60,
+    "proxy": ""
+   },
+   "Coze": {
+    "id": "coze",
+    "provider": "coze",
+    "provider_type": "agent_runner",
+    "type": "coze",
+    "enable": true,
+    "coze_api_key": "",
+    "bot_id": "",
+    "coze_api_base": "https://api.coze.cn",
+    "timeout": 60,
+    "proxy": ""
+   },
+   "阿里云百炼应用": {
+    "id": "dashscope",
+    "provider": "dashscope",
+    "type": "dashscope",
+    "provider_type": "agent_runner",
+    "enable": true,
+    "dashscope_app_type": "agent",
+    "dashscope_api_key": "",
+    "dashscope_app_id": "",
+    "rag_options": {
+     "pipeline_ids": [],
+     "file_ids": [],
+     "output_reference": false
+    },
+    "variables": {},
+    "timeout": 60,
+    "proxy": ""
+   },
+   "DeerFlow": {
+    "id": "deerflow",
+    "provider": "deerflow",
+    "type": "deerflow",
+    "provider_type": "agent_runner",
+    "enable": true,
+    "deerflow_api_base": "http://127.0.0.1:2026",
+    "deerflow_api_key": "",
+    "deerflow_auth_header": "",
+    "deerflow_assistant_id": "lead_agent",
+    "deerflow_model_name": "",
+    "deerflow_thinking_enabled": false,
+    "deerflow_plan_mode": false,
+    "deerflow_subagent_enabled": false,
+    "deerflow_max_concurrent_subagents": 3,
+    "deerflow_recursion_limit": 1000,
+    "timeout": 300,
+    "proxy": ""
+   },
+   "FastGPT": {
+    "id": "fastgpt",
+    "provider": "fastgpt",
+    "type": "openai_chat_completion",
+    "provider_type": "chat_completion",
+    "enable": true,
+    "key": [],
+    "api_base": "https://api.fastgpt.in/api/v1",
+    "timeout": 60,
+    "proxy": "",
+    "custom_headers": {},
+    "custom_extra_body": {}
+   },
+   "Whisper(API)": {
+    "id": "whisper",
+    "provider": "openai",
+    "type": "openai_whisper_api",
+    "provider_type": "speech_to_text",
+    "enable": false,
+    "api_key": "",
+    "api_base": "",
+    "model": "whisper-1",
+    "proxy": ""
+   },
+   "MiMo STT(API)": {
+    "id": "mimo_stt",
+    "provider": "mimo",
+    "type": "mimo_stt_api",
+    "provider_type": "speech_to_text",
+    "enable": false,
+    "api_key": "",
+    "api_base": "https://api.xiaomimimo.com/v1",
+    "model": "mimo-v2.5-asr",
+    "timeout": "20",
+    "proxy": ""
+   },
+   "Whisper(Local)": {
+    "provider": "openai",
+    "type": "openai_whisper_selfhost",
+    "provider_type": "speech_to_text",
+    "enable": false,
+    "id": "whisper_selfhost",
+    "model": "tiny",
+    "whisper_device": "cpu"
+   },
+   "SenseVoice(Local)": {
+    "type": "sensevoice_stt_selfhost",
+    "provider": "sensevoice",
+    "provider_type": "speech_to_text",
+    "enable": false,
+    "id": "sensevoice",
+    "stt_model": "iic/SenseVoiceSmall",
+    "is_emotion": false
+   },
+   "OpenAI TTS(API)": {
+    "id": "openai_tts",
+    "type": "openai_tts_api",
+    "provider": "openai",
+    "provider_type": "text_to_speech",
+    "enable": false,
+    "api_key": "",
+    "api_base": "",
+    "model": "tts-1",
+    "openai-tts-voice": "alloy",
+    "timeout": "20",
+    "proxy": ""
+   },
+   "MiMo TTS(API)": {
+    "id": "mimo_tts",
+    "type": "mimo_tts_api",
+    "provider": "mimo",
+    "provider_type": "text_to_speech",
+    "enable": false,
+    "api_key": "",
+    "api_base": "https://api.xiaomimimo.com/v1",
+    "model": "mimo-v2.5-tts",
+    "mimo-tts-voice": "mimo_default",
+    "mimo-tts-format": "wav",
+    "mimo-tts-style-prompt": "",
+    "mimo-tts-dialect": "",
+    "mimo-tts-seed-text": "Hello, MiMo, have you had lunch?",
+    "timeout": "20",
+    "proxy": ""
+   },
+   "Genie TTS": {
+    "id": "genie_tts",
+    "provider": "genie_tts",
+    "type": "genie_tts",
+    "provider_type": "text_to_speech",
+    "enable": false,
+    "genie_character_name": "mika",
+    "genie_onnx_model_dir": "CharacterModels/v2ProPlus/mika/tts_models",
+    "genie_language": "Japanese",
+    "genie_refer_audio_path": "",
+    "genie_refer_text": "",
+    "timeout": 20
+   },
+   "Edge TTS": {
+    "id": "edge_tts",
+    "provider": "microsoft",
+    "type": "edge_tts",
+    "provider_type": "text_to_speech",
+    "enable": false,
+    "edge-tts-voice": "zh-CN-XiaoxiaoNeural",
+    "rate": "+0%",
+    "volume": "+0%",
+    "pitch": "+0Hz",
+    "timeout": 20
+   },
+   "GSV TTS(Local)": {
+    "id": "gsv_tts",
+    "enable": false,
+    "provider": "gpt_sovits",
+    "type": "gsv_tts_selfhost",
+    "provider_type": "text_to_speech",
+    "api_base": "http://127.0.0.1:9880",
+    "gpt_weights_path": "",
+    "sovits_weights_path": "",
+    "timeout": 60,
+    "gsv_default_parms": {
+     "gsv_ref_audio_path": "",
+     "gsv_prompt_text": "",
+     "gsv_prompt_lang": "zh",
+     "gsv_aux_ref_audio_paths": "",
+     "gsv_text_lang": "zh",
+     "gsv_top_k": 5,
+     "gsv_top_p": 1.0,
+     "gsv_temperature": 1.0,
+     "gsv_text_split_method": "cut3",
+     "gsv_batch_size": 1,
+     "gsv_batch_threshold": 0.75,
+     "gsv_split_bucket": true,
+     "gsv_speed_factor": 1,
+     "gsv_fragment_interval": 0.3,
+     "gsv_streaming_mode": false,
+     "gsv_seed": -1,
+     "gsv_parallel_infer": true,
+     "gsv_repetition_penalty": 1.35,
+     "gsv_media_type": "wav"
+    }
+   },
+   "GSVI TTS(API)": {
+    "id": "gsvi_tts",
+    "type": "gsvi_tts_api",
+    "provider": "gpt_sovits_inference",
+    "provider_type": "text_to_speech",
+    "enable": false,
+    "api_key": "",
+    "api_base": "http://127.0.0.1:8000",
+    "version": "v4",
+    "character": "",
+    "prompt_text_lang": "中文",
+    "emotion": "默认",
+    "text_lang": "中文",
+    "timeout": 20
+   },
+   "FishAudio TTS(API)": {
+    "id": "fishaudio_tts",
+    "provider": "fishaudio",
+    "type": "fishaudio_tts_api",
+    "provider_type": "text_to_speech",
+    "enable": false,
+    "api_key": "",
+    "api_base": "https://api.fish.audio/v1",
+    "model": "s2-pro",
+    "fishaudio-tts-character": "可莉",
+    "fishaudio-tts-reference-id": "",
+    "timeout": "20",
+    "proxy": ""
+   },
+   "阿里云百炼 TTS(API)": {
+    "hint": "API Key 从 https://bailian.console.aliyun.com/?tab=model#/api-key 获取。模型和音色的选择文档请参考: 阿里云百炼语音合成音色名称。具体可参考 https://help.aliyun.com/zh/model-studio/speech-synthesis-and-speech-recognition",
+    "id": "dashscope_tts",
+    "provider": "dashscope",
+    "type": "dashscope_tts",
+    "provider_type": "text_to_speech",
+    "enable": false,
+    "api_key": "",
+    "model": "cosyvoice-v1",
+    "dashscope_tts_voice": "loongstella",
+    "timeout": "20"
+   },
+   "Azure TTS": {
+    "id": "azure_tts",
+    "type": "azure_tts",
+    "provider": "azure",
+    "provider_type": "text_to_speech",
+    "enable": true,
+    "azure_tts_voice": "zh-CN-YunxiaNeural",
+    "azure_tts_style": "cheerful",
+    "azure_tts_role": "Boy",
+    "azure_tts_rate": "1",
+    "azure_tts_volume": "100",
+    "azure_tts_subscription_key": "",
+    "azure_tts_region": "eastus",
+    "proxy": ""
+   },
+   "MiniMax TTS(API)": {
+    "id": "minimax_tts",
+    "type": "minimax_tts_api",
+    "provider": "minimax",
+    "provider_type": "text_to_speech",
+    "enable": false,
+    "api_key": "",
+    "api_base": "https://api.minimax.chat/v1/t2a_v2",
+    "minimax-group-id": "",
+    "model": "speech-02-turbo",
+    "minimax-langboost": "auto",
+    "minimax-voice-speed": 1.0,
+    "minimax-voice-vol": 1.0,
+    "minimax-voice-pitch": 0,
+    "minimax-is-timber-weight": false,
+    "minimax-voice-id": "female-shaonv",
+    "minimax-timber-weight": "[\n    {\n        \"voice_id\": \"Chinese (Mandarin)_Warm_Girl\",\n        \"weight\": 25\n    },\n    {\n        \"voice_id\": \"Chinese (Mandarin)_BashfulGirl\",\n        \"weight\": 50\n    }\n]",
+    "minimax-voice-emotion": "auto",
+    "minimax-voice-latex": false,
+    "minimax-voice-english-normalization": false,
+    "timeout": 20,
+    "proxy": ""
+   },
+   "火山引擎_TTS(API)": {
+    "id": "volcengine_tts",
+    "type": "volcengine_tts",
+    "provider": "volcengine",
+    "provider_type": "text_to_speech",
+    "enable": false,
+    "api_key": "",
+    "appid": "",
+    "volcengine_cluster": "volcano_tts",
+    "volcengine_voice_type": "",
+    "volcengine_speed_ratio": 1.0,
+    "api_base": "https://openspeech.bytedance.com/api/v1/tts",
+    "timeout": 20,
+    "proxy": ""
+   },
+   "Gemini TTS": {
+    "id": "gemini_tts",
+    "type": "gemini_tts",
+    "provider": "google",
+    "provider_type": "text_to_speech",
+    "enable": false,
+    "gemini_tts_api_key": "",
+    "gemini_tts_api_base": "",
+    "gemini_tts_timeout": 20,
+    "gemini_tts_model": "gemini-2.5-flash-preview-tts",
+    "gemini_tts_prefix": "",
+    "gemini_tts_voice_name": "Leda",
+    "proxy": ""
+   },
+   "ElevenLabs TTS(API)": {
+    "hint": "API Key 从 https://elevenlabs.io/app/settings/api-keys 获取。Voice ID 可在 https://elevenlabs.io/app/voice-library 浏览选择。",
+    "id": "elevenlabs_tts",
+    "type": "elevenlabs_tts_api",
+    "provider": "elevenlabs",
+    "provider_type": "text_to_speech",
+    "enable": false,
+    "api_key": "",
+    "api_base": "https://api.elevenlabs.io/v1",
+    "model": "eleven_multilingual_v2",
+    "elevenlabs-tts-voice-id": "JBFqnCBsd6RMkjVDRZzb",
+    "elevenlabs-tts-output-format": "mp3_44100_128",
+    "elevenlabs-tts-stability": "",
+    "elevenlabs-tts-similarity-boost": "",
+    "elevenlabs-tts-style": "",
+    "elevenlabs-tts-use-speaker-boost": true,
+    "timeout": "20",
+    "proxy": ""
+   },
+   "OpenAI Embedding": {
+    "id": "openai_embedding",
+    "type": "openai_embedding",
+    "provider": "openai",
+    "provider_type": "embedding",
+    "hint": "provider_group.provider.openai_embedding.hint",
+    "enable": true,
+    "embedding_api_key": "",
+    "embedding_api_base": "",
+    "embedding_model": "",
+    "embedding_dimensions": 1024,
+    "embedding_dimensions_mode": "auto",
+    "timeout": 20,
+    "proxy": ""
+   },
+   "Gemini Embedding": {
+    "id": "gemini_embedding",
+    "type": "gemini_embedding",
+    "provider": "google",
+    "provider_type": "embedding",
+    "hint": "provider_group.provider.gemini_embedding.hint",
+    "enable": true,
+    "embedding_api_key": "",
+    "embedding_api_base": "",
+    "embedding_model": "gemini-embedding-exp-03-07",
+    "embedding_dimensions": 768,
+    "timeout": 20,
+    "proxy": ""
+   },
+   "NVIDIA Embedding": {
+    "id": "nvidia_embedding",
+    "type": "nvidia_embedding",
+    "provider": "nvidia",
+    "provider_type": "embedding",
+    "hint": "provider_group.provider.nvidia_embedding.hint",
+    "enable": true,
+    "embedding_api_key": "",
+    "embedding_api_base": "https://integrate.api.nvidia.com/v1",
+    "embedding_model": "nvidia/llama-nemotron-embed-1b-v2",
+    "input_type": "passage",
+    "embedding_dimensions": 1024,
+    "timeout": 20,
+    "proxy": ""
+   },
+   "Ollama Embedding": {
+    "id": "ollama_embedding",
+    "type": "ollama_embedding",
+    "provider": "ollama",
+    "provider_type": "embedding",
+    "hint": "provider_group.provider.ollama_embedding.hint",
+    "enable": true,
+    "embedding_api_base": "http://localhost:11434",
+    "embedding_model": "nomic-embed-text",
+    "embedding_dimensions": 768,
+    "timeout": 60,
+    "proxy": ""
+   },
+   "DashScope Embedding": {
+    "id": "dashscope_embedding",
+    "type": "dashscope_embedding",
+    "provider": "dashscope",
+    "provider_type": "embedding",
+    "hint": "provider_group.provider.dashscope_embedding.hint",
+    "enable": true,
+    "embedding_api_key": "",
+    "embedding_api_base": "https://dashscope.aliyuncs.com/api/v1",
+    "embedding_model": "text-embedding-v4",
+    "embedding_dimensions": 1024,
+    "timeout": 60,
+    "proxy": ""
+   },
+   "vLLM Rerank": {
+    "id": "vllm_rerank",
+    "type": "vllm_rerank",
+    "provider": "vllm",
+    "provider_type": "rerank",
+    "enable": true,
+    "rerank_api_key": "",
+    "rerank_api_base": "http://127.0.0.1:8000",
+    "rerank_api_suffix": "/v1/rerank",
+    "rerank_model": "BAAI/bge-reranker-base",
+    "timeout": 20
+   },
+   "Xinference Rerank": {
+    "id": "xinference_rerank",
+    "type": "xinference_rerank",
+    "provider": "xinference",
+    "provider_type": "rerank",
+    "enable": true,
+    "rerank_api_key": "",
+    "rerank_api_base": "http://127.0.0.1:9997",
+    "rerank_model": "BAAI/bge-reranker-base",
+    "timeout": 20,
+    "launch_model_if_not_running": false
+   },
+   "阿里云百炼重排序": {
+    "id": "bailian_rerank",
+    "type": "bailian_rerank",
+    "provider": "bailian",
+    "provider_type": "rerank",
+    "enable": true,
+    "rerank_api_key": "",
+    "rerank_api_base": "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+    "rerank_model": "qwen3-rerank",
+    "timeout": 30,
+    "return_documents": false,
+    "instruct": ""
+   },
+   "NVIDIA Rerank": {
+    "id": "nvidia_rerank",
+    "type": "nvidia_rerank",
+    "provider": "nvidia",
+    "provider_type": "rerank",
+    "enable": true,
+    "nvidia_rerank_api_key": "",
+    "nvidia_rerank_api_base": "https://ai.api.nvidia.com/v1/retrieval",
+    "nvidia_rerank_model": "nv-rerank-qa-mistral-4b:1",
+    "nvidia_rerank_model_endpoint": "/reranking",
+    "timeout": 20,
+    "nvidia_rerank_truncate": ""
+   },
+   "TEI Rerank": {
+    "id": "tei_rerank",
+    "type": "tei_rerank",
+    "provider": "huggingface",
+    "provider_type": "rerank",
+    "enable": true,
+    "rerank_api_key": "",
+    "rerank_api_base": "http://127.0.0.1:8080",
+    "timeout": 20,
+    "tei_rerank_truncate": false,
+    "tei_rerank_truncation_direction": "Right",
+    "tei_rerank_raw_scores": false,
+    "tei_rerank_return_text": false
+   },
+   "Xinference STT": {
+    "id": "xinference_stt",
+    "type": "xinference_stt",
+    "provider": "xinference",
+    "provider_type": "speech_to_text",
+    "enable": false,
+    "api_key": "",
+    "api_base": "http://127.0.0.1:9997",
+    "model": "whisper-large-v3",
+    "timeout": 180,
+    "launch_model_if_not_running": false
+   }
+  },
+  "items": {
+   "genie_onnx_model_dir": {
+    "description": "ONNX Model Directory",
+    "type": "string",
+    "hint": "The directory path containing the ONNX model files"
+   },
+   "genie_language": {
+    "description": "Language",
+    "type": "string",
+    "options": [
+     "Japanese",
+     "English",
+     "Chinese"
+    ]
+   },
+   "provider_source_id": {
+    "invisible": true,
+    "type": "string"
+   },
+   "xai_native_search": {
+    "description": "启用原生搜索功能",
+    "type": "bool",
+    "hint": "启用后，将通过 xAI 的 Chat Completions 原生 Live Search 进行联网检索（按需计费）。仅对 xAI 提供商生效。",
+    "condition": {
+     "provider": "xai",
+     "type": "xai_chat_completion"
+    }
+   },
+   "rerank_api_base": {
+    "description": "重排序模型 API Base URL",
+    "type": "string",
+    "hint": "最终请求路径由 Base URL 和路径后缀拼接而成（默认为 /v1/rerank）。"
+   },
+   "rerank_api_suffix": {
+    "description": "API URL 路径后缀",
+    "type": "string",
+    "hint": "追加到 base_url 后的路径，如 /v1/rerank。留空则不追加。"
+   },
+   "rerank_api_key": {
+    "description": "API Key",
+    "type": "string",
+    "hint": "如果不需要 API Key, 请留空。"
+   },
+   "rerank_model": {
+    "description": "重排序模型名称",
+    "type": "string"
+   },
+   "return_documents": {
+    "description": "是否在排序结果中返回文档原文",
+    "type": "bool",
+    "hint": "默认值false，以减少网络传输开销。"
+   },
+   "instruct": {
+    "description": "自定义排序任务类型说明",
+    "type": "string",
+    "hint": "仅在使用 qwen3-rerank 模型时生效。建议使用英文撰写。"
+   },
+   "launch_model_if_not_running": {
+    "description": "模型未运行时自动启动",
+    "type": "bool",
+    "hint": "如果模型当前未在 Xinference 服务中运行，是否尝试自动启动它。在生产环境中建议关闭。"
+   },
+   "nvidia_rerank_api_base": {
+    "description": "API Base URL",
+    "type": "string"
+   },
+   "nvidia_rerank_api_key": {
+    "description": "API Key",
+    "type": "string"
+   },
+   "nvidia_rerank_model": {
+    "description": "重排序模型名称",
+    "type": "string",
+    "hint": "请参照NVIDIA Docs中模型名称填写。"
+   },
+   "nvidia_rerank_model_endpoint": {
+    "description": "自定义模型端点",
+    "type": "string",
+    "hint": "自定义URL末尾端点，默认为 /reranking"
+   },
+   "nvidia_rerank_truncate": {
+    "description": "文本截断策略",
+    "type": "string",
+    "hint": "当输入文本过长时，是否截断输入以适应模型的最大上下文长度。",
+    "options": [
+     "",
+     "NONE",
+     "END"
+    ]
+   },
+   "tei_rerank_truncate": {
+    "description": "截断超长文本",
+    "type": "bool",
+    "hint": "当输入超过模型最大上下文长度时，是否自动截断。启用后需配合 截断方向 使用。"
+   },
+   "tei_rerank_truncation_direction": {
+    "description": "截断方向",
+    "type": "string",
+    "options": [
+     "left",
+     "right"
+    ],
+    "hint": "选择从文本的左侧(left)还是右侧(right)开始截断。仅在 截断超长文本 为 True 时生效。"
+   },
+   "tei_rerank_raw_scores": {
+    "description": "返回原始分数",
+    "type": "bool",
+    "hint": "如果为 True，返回模型原始 logit 分数（可能为负值），不经过 sigmoid 归一化。默认 False。"
+   },
+   "tei_rerank_return_text": {
+    "description": "返回排序结果中的文档原文",
+    "type": "bool",
+    "hint": "如果为 True，每个排序结果将附带原始文本。默认 False 以减少网络传输。"
+   },
+   "modalities": {
+    "description": "模型能力",
+    "type": "list",
+    "items": {
+     "type": "string"
+    },
+    "options": [
+     "text",
+     "image",
+     "audio",
+     "tool_use"
+    ],
+    "labels": [
+     "文本",
+     "图像",
+     "音频",
+     "工具使用"
+    ],
+    "render_type": "checkbox",
+    "hint": "模型支持的模态及能力。"
+   },
+   "custom_headers": {
+    "description": "自定义请求头",
+    "type": "dict",
+    "items": {},
+    "hint": "此处添加的键值对将被合并到 OpenAI SDK 的 default_headers 中，用于自定义 HTTP 请求头。"
+   },
+   "ollama_disable_thinking": {
+    "description": "关闭思考模式",
+    "type": "bool",
+    "hint": "关闭 Ollama 思考模式。"
+   },
+   "custom_extra_body": {
+    "description": "自定义请求体参数",
+    "type": "dict",
+    "items": {},
+    "hint": "用于在请求时添加额外的参数，如 temperature, top_p, max_tokens, reasoning_effort 等。",
+    "template_schema": {
+     "temperature": {
+      "name": "Temperature",
+      "description": "温度参数",
+      "hint": "控制输出的随机性，范围通常为 0-2。值越高越随机。",
+      "type": "float",
+      "default": 0.6,
+      "slider": {
+       "min": 0,
+       "max": 2,
+       "step": 0.1
+      }
+     },
+     "top_p": {
+      "name": "Top-p",
+      "description": "Top-p 采样",
+      "hint": "核采样参数，范围通常为 0-1。控制模型考虑的概率质量。",
+      "type": "float",
+      "default": 1.0,
+      "slider": {
+       "min": 0,
+       "max": 1,
+       "step": 0.01
+      }
+     },
+     "max_tokens": {
+      "name": "Max Tokens",
+      "description": "最大词元（Tokens）数",
+      "hint": "生成的最大词元（Tokens）数。",
+      "type": "int",
+      "default": 8192
+     },
+     "reasoning_effort": {
+      "name": "Reasoning Effort",
+      "description": "推理强度",
+      "hint": "控制推理模型的推理强度，支持的值取决于具体模型。",
+      "type": "string",
+      "default": "high"
+     }
+    }
+   },
+   "provider": {
+    "type": "string",
+    "invisible": true
+   },
+   "gpt_weights_path": {
+    "description": "GPT模型文件路径",
+    "type": "string",
+    "hint": "即“.ckpt”后缀的文件，请使用绝对路径，路径两端不要带双引号，不填则默认用GPT_SoVITS内置的SoVITS模型(建议直接在GPT_SoVITS中改默认模型)"
+   },
+   "sovits_weights_path": {
+    "description": "SoVITS模型文件路径",
+    "type": "string",
+    "hint": "即“.pth”后缀的文件，请使用绝对路径，路径两端不要带双引号，不填则默认用GPT_SoVITS内置的SoVITS模型(建议直接在GPT_SoVITS中改默认模型)"
+   },
+   "gsv_default_parms": {
+    "description": "GPT_SoVITS默认参数",
+    "hint": "参考音频文件路径、参考音频文本必填，其他参数根据个人爱好自行填写",
+    "type": "object",
+    "items": {
+     "gsv_ref_audio_path": {
+      "description": "参考音频文件路径",
+      "type": "string",
+      "hint": "必填！请使用绝对路径！路径两端不要带双引号！"
+     },
+     "gsv_prompt_text": {
+      "description": "参考音频文本",
+      "type": "string",
+      "hint": "必填！请填写参考音频讲述的文本"
+     },
+     "gsv_prompt_lang": {
+      "description": "参考音频文本语言",
+      "type": "string",
+      "hint": "请填写参考音频讲述的文本的语言，默认为中文"
+     },
+     "gsv_aux_ref_audio_paths": {
+      "description": "辅助参考音频文件路径",
+      "type": "string",
+      "hint": "辅助参考音频文件，可不填"
+     },
+     "gsv_text_lang": {
+      "description": "文本语言",
+      "type": "string",
+      "hint": "默认为中文"
+     },
+     "gsv_top_k": {
+      "description": "生成语音的多样性",
+      "type": "int",
+      "hint": ""
+     },
+     "gsv_top_p": {
+      "description": "核采样的阈值",
+      "type": "float",
+      "hint": ""
+     },
+     "gsv_temperature": {
+      "description": "生成语音的随机性",
+      "type": "float",
+      "hint": ""
+     },
+     "gsv_text_split_method": {
+      "description": "切分文本的方法",
+      "type": "string",
+      "hint": "可选值：  `cut0`：不切分    `cut1`：四句一切   `cut2`：50字一切    `cut3`：按中文句号切    `cut4`：按英文句号切    `cut5`：按标点符号切",
+      "options": [
+       "cut0",
+       "cut1",
+       "cut2",
+       "cut3",
+       "cut4",
+       "cut5"
+      ]
+     },
+     "gsv_batch_size": {
+      "description": "批处理大小",
+      "type": "int",
+      "hint": ""
+     },
+     "gsv_batch_threshold": {
+      "description": "批处理阈值",
+      "type": "float",
+      "hint": ""
+     },
+     "gsv_split_bucket": {
+      "description": "将文本分割成桶以便并行处理",
+      "type": "bool",
+      "hint": ""
+     },
+     "gsv_speed_factor": {
+      "description": "语音播放速度",
+      "type": "float",
+      "hint": "1为原始语速"
+     },
+     "gsv_fragment_interval": {
+      "description": "语音片段之间的间隔时间",
+      "type": "float",
+      "hint": ""
+     },
+     "gsv_streaming_mode": {
+      "description": "启用流模式",
+      "type": "bool",
+      "hint": ""
+     },
+     "gsv_seed": {
+      "description": "随机种子",
+      "type": "int",
+      "hint": "用于结果的可重复性"
+     },
+     "gsv_parallel_infer": {
+      "description": "并行执行推理",
+      "type": "bool",
+      "hint": ""
+     },
+     "gsv_repetition_penalty": {
+      "description": "重复惩罚因子",
+      "type": "float",
+      "hint": ""
+     },
+     "gsv_media_type": {
+      "description": "输出媒体的类型",
+      "type": "string",
+      "hint": "建议用wav"
+     }
+    }
+   },
+   "embedding_dimensions": {
+    "description": "嵌入维度",
+    "type": "int",
+    "hint": "嵌入向量的维度。根据模型不同，可能需要调整，请参考具体模型的文档。此配置项请务必填写正确，否则将导致向量数据库无法正常工作。",
+    "_special": "get_embedding_dim"
+   },
+   "embedding_dimensions_mode": {
+    "description": "嵌入维度参数发送模式",
+    "type": "string",
+    "options": [
+     "auto",
+     "always",
+     "never"
+    ],
+    "hint": "控制是否在 OpenAI 兼容 Embedding 请求中发送 dimensions 参数。auto 会仅对官方 OpenAI embedding-3 模型自动发送；第三方兼容 API 如需该参数可改为 always，报错时改为 never。"
+   },
+   "embedding_model": {
+    "description": "嵌入模型",
+    "type": "string",
+    "hint": "嵌入模型名称。"
+   },
+   "embedding_api_key": {
+    "description": "API Key",
+    "type": "string"
+   },
+   "embedding_api_base": {
+    "description": "API Base URL",
+    "type": "string"
+   },
+   "volcengine_cluster": {
+    "type": "string",
+    "description": "火山引擎集群",
+    "hint": "若使用语音复刻大模型，可选volcano_icl或volcano_icl_concurr，默认使用volcano_tts"
+   },
+   "volcengine_voice_type": {
+    "type": "string",
+    "description": "火山引擎音色",
+    "hint": "输入声音id(Voice_type)"
+   },
+   "volcengine_speed_ratio": {
+    "type": "float",
+    "description": "语速设置",
+    "hint": "语速设置，范围为 0.2 到 3.0,默认值为 1.0"
+   },
+   "volcengine_volume_ratio": {
+    "type": "float",
+    "description": "音量设置",
+    "hint": "音量设置，范围为 0.0 到 2.0,默认值为 1.0"
+   },
+   "azure_tts_voice": {
+    "type": "string",
+    "description": "音色设置",
+    "hint": "API 音色"
+   },
+   "azure_tts_style": {
+    "type": "string",
+    "description": "风格设置",
+    "hint": "声音特定的讲话风格。 可以表达快乐、同情和平静等情绪。"
+   },
+   "azure_tts_role": {
+    "type": "string",
+    "description": "模仿设置（可选）",
+    "hint": "讲话角色扮演。 声音可以模仿不同的年龄和性别，但声音名称不会更改。 例如，男性语音可以提高音调和改变语调来模拟女性语音，但语音名称不会更改。 如果角色缺失或不受声音的支持，则会忽略此属性。",
+    "options": [
+     "Boy",
+     "Girl",
+     "YoungAdultFemale",
+     "YoungAdultMale",
+     "OlderAdultFemale",
+     "OlderAdultMale",
+     "SeniorFemale",
+     "SeniorMale",
+     "禁用"
+    ]
+   },
+   "azure_tts_rate": {
+    "type": "string",
+    "description": "语速设置",
+    "hint": "指示文本的讲出速率。可在字词或句子层面应用语速。 速率变化应为原始音频的 0.5 到 2 倍。"
+   },
+   "azure_tts_volume": {
+    "type": "string",
+    "description": "语音音量设置",
+    "hint": "指示语音的音量级别。 可在句子层面应用音量的变化。以从 0.0 到 100.0（从最安静到最大声，例如 75）的数字表示。 默认值为 100.0。"
+   },
+   "azure_tts_region": {
+    "type": "string",
+    "description": "API 地区",
+    "hint": "Azure_TTS 处理数据所在区域，具体参考 https://learn.microsoft.com/zh-cn/azure/ai-services/speech-service/regions",
+    "options": [
+     "southafricanorth",
+     "eastasia",
+     "southeastasia",
+     "australiaeast",
+     "centralindia",
+     "japaneast",
+     "japanwest",
+     "koreacentral",
+     "canadacentral",
+     "northeurope",
+     "westeurope",
+     "francecentral",
+     "germanywestcentral",
+     "norwayeast",
+     "swedencentral",
+     "switzerlandnorth",
+     "switzerlandwest",
+     "uksouth",
+     "uaenorth",
+     "brazilsouth",
+     "qatarcentral",
+     "centralus",
+     "eastus",
+     "eastus2",
+     "northcentralus",
+     "southcentralus",
+     "westcentralus",
+     "westus",
+     "westus2",
+     "westus3"
+    ]
+   },
+   "azure_tts_subscription_key": {
+    "type": "string",
+    "description": "服务订阅密钥",
+    "hint": "Azure_TTS 服务的订阅密钥（注意不是令牌）"
+   },
+   "dashscope_tts_voice": {
+    "description": "音色",
+    "type": "string"
+   },
+   "gm_resp_image_modal": {
+    "description": "启用图片模态",
+    "type": "bool",
+    "hint": "启用后，将支持返回图片内容。需要模型支持，否则会报错。具体支持模型请查看 Google Gemini 官方网站。温馨提示，如果您需要生成图片，请关闭 `启用群员识别` 配置获得更好的效果。"
+   },
+   "gm_native_search": {
+    "description": "启用原生搜索功能",
+    "type": "bool",
+    "hint": "启用后所有函数工具将全部失效，免费次数限制请查阅官方文档"
+   },
+   "gm_native_coderunner": {
+    "description": "启用原生代码执行器",
+    "type": "bool",
+    "hint": "启用后所有函数工具将全部失效"
+   },
+   "gm_url_context": {
+    "description": "启用URL上下文功能",
+    "type": "bool",
+    "hint": "启用后所有函数工具将全部失效"
+   },
+   "gm_safety_settings": {
+    "description": "安全过滤器",
+    "type": "object",
+    "hint": "设置模型输入的内容安全过滤级别。过滤级别分类为NONE(不屏蔽)、HIGH(高风险时屏蔽)、MEDIUM_AND_ABOVE(中等风险及以上屏蔽)、LOW_AND_ABOVE(低风险及以上时屏蔽)，具体参见Gemini API文档。",
+    "items": {
+     "harassment": {
+      "description": "骚扰内容",
+      "type": "string",
+      "hint": "负面或有害评论",
+      "options": [
+       "BLOCK_NONE",
+       "BLOCK_ONLY_HIGH",
+       "BLOCK_MEDIUM_AND_ABOVE",
+       "BLOCK_LOW_AND_ABOVE"
+      ]
+     },
+     "hate_speech": {
+      "description": "仇恨言论",
+      "type": "string",
+      "hint": "粗鲁、无礼或亵渎性质内容",
+      "options": [
+       "BLOCK_NONE",
+       "BLOCK_ONLY_HIGH",
+       "BLOCK_MEDIUM_AND_ABOVE",
+       "BLOCK_LOW_AND_ABOVE"
+      ]
+     },
+     "sexually_explicit": {
+      "description": "露骨色情内容",
+      "type": "string",
+      "hint": "包含性行为或其他淫秽内容的引用",
+      "options": [
+       "BLOCK_NONE",
+       "BLOCK_ONLY_HIGH",
+       "BLOCK_MEDIUM_AND_ABOVE",
+       "BLOCK_LOW_AND_ABOVE"
+      ]
+     },
+     "dangerous_content": {
+      "description": "危险内容",
+      "type": "string",
+      "hint": "宣扬、助长或鼓励有害行为的信息",
+      "options": [
+       "BLOCK_NONE",
+       "BLOCK_ONLY_HIGH",
+       "BLOCK_MEDIUM_AND_ABOVE",
+       "BLOCK_LOW_AND_ABOVE"
+      ]
+     }
+    }
+   },
+   "gm_thinking_config": {
+    "description": "Thinking Config",
+    "type": "object",
+    "items": {
+     "budget": {
+      "description": "Thinking Budget",
+      "type": "int",
+      "hint": "Guides the model on the specific number of thinking tokens to use for reasoning. See: https://ai.google.dev/gemini-api/docs/thinking#set-budget"
+     },
+     "level": {
+      "description": "Thinking Level",
+      "type": "string",
+      "hint": "Recommended for Gemini 3 models and onwards, lets you control reasoning behavior.See: https://ai.google.dev/gemini-api/docs/thinking#thinking-levels",
+      "options": [
+       "MINIMAL",
+       "LOW",
+       "MEDIUM",
+       "HIGH"
+      ]
+     }
+    }
+   },
+   "anth_thinking_config": {
+    "description": "思考配置",
+    "type": "object",
+    "items": {
+     "type": {
+      "description": "思考类型",
+      "type": "string",
+      "options": [
+       "",
+       "adaptive"
+      ],
+      "hint": "Opus 4.6+ / Sonnet 4.6+ 推荐设为 'adaptive'。留空则使用手动 budget 模式。参见: https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking"
+     },
+     "budget": {
+      "description": "思考预算",
+      "type": "int",
+      "hint": "手动 budget_tokens，需 >= 1024。仅在 type 为空时生效。Opus 4.6 / Sonnet 4.6 上已弃用。参见: https://platform.claude.com/docs/en/build-with-claude/extended-thinking"
+     },
+     "effort": {
+      "description": "思考深度",
+      "type": "string",
+      "options": [
+       "",
+       "low",
+       "medium",
+       "high",
+       "max"
+      ],
+      "hint": "type 为 'adaptive' 时控制思考深度。默认 'high'。'max' 仅限 Opus 4.6。参见: https://platform.claude.com/docs/en/build-with-claude/effort"
+     }
+    }
+   },
+   "minimax-group-id": {
+    "type": "string",
+    "description": "用户组",
+    "hint": "于账户管理->基本信息中可见"
+   },
+   "minimax-langboost": {
+    "type": "string",
+    "description": "指定语言/方言",
+    "hint": "增强对指定的小语种和方言的识别能力，设置后可以提升在指定小语种/方言场景下的语音表现",
+    "options": [
+     "Chinese",
+     "Chinese,Yue",
+     "English",
+     "Arabic",
+     "Russian",
+     "Spanish",
+     "French",
+     "Portuguese",
+     "German",
+     "Turkish",
+     "Dutch",
+     "Ukrainian",
+     "Vietnamese",
+     "Indonesian",
+     "Japanese",
+     "Italian",
+     "Korean",
+     "Thai",
+     "Polish",
+     "Romanian",
+     "Greek",
+     "Czech",
+     "Finnish",
+     "Hindi",
+     "auto"
+    ]
+   },
+   "minimax-voice-speed": {
+    "type": "float",
+    "description": "语速",
+    "hint": "生成声音的语速, 取值[0.5, 2], 默认为1.0, 取值越大，语速越快"
+   },
+   "minimax-voice-vol": {
+    "type": "float",
+    "description": "音量",
+    "hint": "生成声音的音量, 取值(0, 10], 默认为1.0, 取值越大，音量越高"
+   },
+   "minimax-voice-pitch": {
+    "type": "int",
+    "description": "语调",
+    "hint": "生成声音的语调, 取值[-12, 12], 默认为0"
+   },
+   "minimax-is-timber-weight": {
+    "type": "bool",
+    "description": "启用混合音色",
+    "hint": "启用混合音色, 支持以自定义权重混合最多四种音色, 启用后自动忽略单一音色设置"
+   },
+   "minimax-timber-weight": {
+    "type": "string",
+    "description": "混合音色",
+    "editor_mode": true,
+    "hint": "混合音色及其权重, 最多支持四种音色, 权重为整数, 取值[1, 100]. 可在官网API语音调试台预览代码获得预设以及编写模板, 需要严格按照json字符串格式编写, 可以查看控制台判断是否解析成功. 具体结构可参照默认值以及官网代码预览."
+   },
+   "minimax-voice-id": {
+    "type": "string",
+    "description": "单一音色",
+    "hint": "单一音色编号, 详见官网文档"
+   },
+   "minimax-voice-emotion": {
+    "type": "string",
+    "description": "情绪",
+    "hint": "控制合成语音的情绪。当为 auto 时，将根据文本内容自动选择情绪。",
+    "options": [
+     "auto",
+     "happy",
+     "sad",
+     "angry",
+     "fearful",
+     "disgusted",
+     "surprised",
+     "calm",
+     "fluent",
+     "whisper"
+    ]
+   },
+   "minimax-voice-latex": {
+    "type": "bool",
+    "description": "支持朗读latex公式",
+    "hint": "朗读latex公式, 但是需要确保输入文本按官网要求格式化"
+   },
+   "minimax-voice-english-normalization": {
+    "type": "bool",
+    "description": "支持英语文本规范化",
+    "hint": "可提升数字阅读场景的性能，但会略微增加延迟"
+   },
+   "rag_options": {
+    "description": "RAG 选项",
+    "type": "object",
+    "hint": "检索知识库设置, 非必填。仅 Agent 应用类型支持(智能体应用, 包括 RAG 应用)。阿里云百炼应用开启此功能后将无法多轮对话。",
+    "items": {
+     "pipeline_ids": {
+      "description": "知识库 ID 列表",
+      "type": "list",
+      "items": {
+       "type": "string"
+      },
+      "hint": "对指定知识库内所有文档进行检索, 前往 https://bailian.console.aliyun.com/ 数据应用->知识索引创建和获取 ID。"
+     },
+     "file_ids": {
+      "description": "非结构化文档 ID, 传入该参数将对指定非结构化文档进行检索。",
+      "type": "list",
+      "items": {
+       "type": "string"
+      },
+      "hint": "对指定非结构化文档进行检索。前往 https://bailian.console.aliyun.com/ 数据管理创建和获取 ID。"
+     },
+     "output_reference": {
+      "description": "是否输出知识库/文档的引用",
+      "type": "bool",
+      "hint": "在每次回答尾部加上引用源。默认为 False。"
+     }
+    }
+   },
+   "sensevoice_hint": {
+    "description": "部署SenseVoice",
+    "type": "string",
+    "hint": "启用前请 pip 安装 funasr、funasr_onnx、torchaudio、torch、modelscope、jieba 库（默认使用CPU，大约下载 1 GB），并且安装 ffmpeg。否则将无法正常转文字。"
+   },
+   "is_emotion": {
+    "description": "情绪识别",
+    "type": "bool",
+    "hint": "是否开启情绪识别。happy｜sad｜angry｜neutral｜fearful｜disgusted｜surprised｜unknown"
+   },
+   "stt_model": {
+    "description": "模型名称",
+    "type": "string",
+    "hint": "modelscope 上的模型名称。默认：iic/SenseVoiceSmall。"
+   },
+   "variables": {
+    "description": "工作流固定输入变量",
+    "type": "object",
+    "items": {},
+    "hint": "可选。工作流固定输入变量，将会作为工作流的输入。也可以在对话时使用 /set 指令动态设置变量。如果变量名冲突，优先使用动态设置的变量。",
+    "invisible": true
+   },
+   "dashscope_app_type": {
+    "description": "应用类型",
+    "type": "string",
+    "hint": "百炼应用的应用类型。",
+    "options": [
+     "agent",
+     "agent-arrange",
+     "dialog-workflow",
+     "task-workflow"
+    ]
+   },
+   "timeout": {
+    "description": "超时时间",
+    "type": "int",
+    "hint": "超时时间，单位为秒。"
+   },
+   "openai-tts-voice": {
+    "description": "voice",
+    "type": "string",
+    "hint": "OpenAI TTS 的声音。OpenAI 默认支持：'alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'"
+   },
+   "mimo-tts-voice": {
+    "description": "音色",
+    "type": "string",
+    "hint": "MiMo TTS 的音色名称。可选值包括 'mimo_default'、'default_en'、'default_zh'。"
+   },
+   "mimo-tts-format": {
+    "description": "输出格式",
+    "type": "string",
+    "hint": "MiMo TTS 生成音频的格式。支持 'wav'、'mp3'、'pcm'。"
+   },
+   "mimo-tts-style-prompt": {
+    "description": "风格提示词",
+    "type": "string",
+    "hint": "会以 <style>...</style> 标签形式添加到待合成文本开头，用于控制语速、情绪、角色或风格，例如 开心、变快、孙悟空、悄悄话。可留空。"
+   },
+   "mimo-tts-dialect": {
+    "description": "方言",
+    "type": "string",
+    "hint": "会与风格提示词一起写入开头的 <style>...</style> 标签中，例如 东北话、四川话、河南话、粤语。可留空。"
+   },
+   "mimo-tts-seed-text": {
+    "description": "种子文本",
+    "type": "string",
+    "hint": "作为可选的 user 消息发送，用于辅助调节语气和风格，不会拼接到待合成文本中。"
+   },
+   "fishaudio-tts-character": {
+    "description": "character",
+    "type": "string",
+    "hint": "fishaudio TTS 的角色。默认为可莉。更多角色请访问：https://fish.audio/zh-CN/discovery"
+   },
+   "fishaudio-tts-reference-id": {
+    "description": "reference_id",
+    "type": "string",
+    "hint": "fishaudio TTS 的参考模型ID（可选）。如果填入此字段，将直接使用模型ID而不通过角色名称查询。例如：626bb6d3f3364c9cbc3aa6a67300a664。更多模型请访问：https://fish.audio/zh-CN/discovery，进入模型详情界面后可复制模型ID"
+   },
+   "whisper_hint": {
+    "description": "本地部署 Whisper 模型须知",
+    "type": "string",
+    "hint": "启用前请 pip 安装 openai-whisper 库（N卡用户大约下载 2GB，主要是 torch 和 cuda，CPU 用户大约下载 1 GB），并且安装 ffmpeg。否则将无法正常转文字。"
+   },
+   "whisper_device": {
+    "description": "推理设备",
+    "type": "string",
+    "hint": "Whisper 推理设备。Apple Silicon 可选 mps；其他环境建议使用 cpu。若指定 mps 但当前环境不可用，将自动回退到 cpu。",
+    "options": [
+     "cpu",
+     "mps"
+    ]
+   },
+   "id": {
+    "description": "ID",
+    "type": "string"
+   },
+   "type": {
+    "description": "模型提供商种类",
+    "type": "string",
+    "invisible": true
+   },
+   "provider_type": {
+    "description": "模型提供商能力种类",
+    "type": "string",
+    "invisible": true
+   },
+   "enable": {
+    "description": "启用",
+    "type": "bool"
+   },
+   "key": {
+    "description": "API Key",
+    "type": "list",
+    "items": {
+     "type": "string"
+    }
+   },
+   "api_base": {
+    "description": "API Base URL",
+    "type": "string"
+   },
+   "proxy": {
+    "description": "provider_group.provider.proxy.description",
+    "type": "string",
+    "hint": "provider_group.provider.proxy.hint"
+   },
+   "model": {
+    "description": "模型 ID",
+    "type": "string",
+    "hint": "模型名称，如 gpt-4o-mini, deepseek-chat。"
+   },
+   "max_context_tokens": {
+    "description": "模型上下文窗口大小",
+    "type": "int",
+    "hint": "模型最大上下文 Token 大小。如果为 0，则会自动从模型元数据填充（如有）"
+   },
+   "dify_api_key": {
+    "description": "API Key",
+    "type": "string",
+    "hint": "Dify API Key。此项必填。"
+   },
+   "dify_api_base": {
+    "description": "API Base URL",
+    "type": "string",
+    "hint": "Dify API Base URL。默认为 https://api.dify.ai/v1"
+   },
+   "dify_api_type": {
+    "description": "Dify 应用类型",
+    "type": "string",
+    "hint": "Dify API 类型。根据 Dify 官网，目前支持 chat, chatflow, agent, workflow 三种应用类型。",
+    "options": [
+     "chat",
+     "chatflow",
+     "agent",
+     "workflow"
+    ]
+   },
+   "dify_workflow_output_key": {
+    "description": "Dify Workflow 输出变量名",
+    "type": "string",
+    "hint": "Dify Workflow 输出变量名。当应用类型为 workflow 时才使用。默认为 astrbot_wf_output。"
+   },
+   "dify_query_input_key": {
+    "description": "Prompt 输入变量名",
+    "type": "string",
+    "hint": "发送的消息文本内容对应的输入变量名。默认为 astrbot_text_query。",
+    "obvious": true
+   },
+   "coze_api_key": {
+    "description": "Coze API Key",
+    "type": "string",
+    "hint": "Coze API 密钥，用于访问 Coze 服务。"
+   },
+   "bot_id": {
+    "description": "Bot ID",
+    "type": "string",
+    "hint": "Coze 机器人的 ID，在 Coze 平台上创建机器人后获得。"
+   },
+   "coze_api_base": {
+    "description": "API Base URL",
+    "type": "string",
+    "hint": "Coze API 的基础 URL 地址，默认为 https://api.coze.cn"
+   },
+   "deerflow_api_base": {
+    "description": "API Base URL",
+    "type": "string",
+    "hint": "DeerFlow API 网关地址，默认为 http://127.0.0.1:2026"
+   },
+   "deerflow_api_key": {
+    "description": "DeerFlow API Key",
+    "type": "string",
+    "hint": "可选。若 DeerFlow 网关配置了 Bearer 鉴权，则在此填写。"
+   },
+   "deerflow_auth_header": {
+    "description": "Authorization Header",
+    "type": "string",
+    "hint": "可选。自定义 Authorization 请求头，优先级高于 DeerFlow API Key。"
+   },
+   "deerflow_assistant_id": {
+    "description": "Assistant ID",
+    "type": "string",
+    "hint": "DeerFlow 2.0 LangGraph assistant_id，默认为 lead_agent。"
+   },
+   "deerflow_model_name": {
+    "description": "模型名称覆盖",
+    "type": "string",
+    "hint": "可选。覆盖 DeerFlow 默认模型（对应运行时 configurable 的 model_name）。"
+   },
+   "deerflow_thinking_enabled": {
+    "description": "启用思考模式",
+    "type": "bool"
+   },
+   "deerflow_plan_mode": {
+    "description": "启用计划模式",
+    "type": "bool",
+    "hint": "对应 DeerFlow 2.0 运行时 configurable 的 is_plan_mode。"
+   },
+   "deerflow_subagent_enabled": {
+    "description": "启用子智能体",
+    "type": "bool",
+    "hint": "对应 DeerFlow 2.0 运行时 configurable 的 subagent_enabled。"
+   },
+   "deerflow_max_concurrent_subagents": {
+    "description": "子智能体最大并发数",
+    "type": "int",
+    "hint": "对应 DeerFlow 2.0 运行时 configurable 的 max_concurrent_subagents。仅在启用子智能体时生效，默认 3。"
+   },
+   "deerflow_recursion_limit": {
+    "description": "递归深度上限",
+    "type": "int",
+    "hint": "对应 LangGraph recursion_limit。"
+   },
+   "auto_save_history": {
+    "description": "由 Coze 管理对话记录",
+    "type": "bool",
+    "hint": "启用后，将由 Coze 进行对话历史记录管理, 此时 AstrBot 本地保存的上下文不会生效(仅供浏览), 对 AstrBot 的上下文进行的操作也不会生效。如果为禁用, 则使用 AstrBot 管理上下文。"
+   }
+  }
+ },
+ "provider_settings": {
+  "type": "object",
+  "items": {
+   "enable": {
+    "type": "bool"
+   },
+   "default_provider_id": {
+    "type": "string"
+   },
+   "fallback_chat_models": {
+    "type": "list",
+    "items": {
+     "type": "string"
+    }
+   },
+   "request_max_retries": {
+    "type": "int"
+   },
+   "wake_prefix": {
+    "type": "string"
+   },
+   "web_search": {
+    "type": "bool"
+   },
+   "web_search_link": {
+    "type": "bool"
+   },
+   "display_reasoning_text": {
+    "type": "bool"
+   },
+   "identifier": {
+    "type": "bool"
+   },
+   "group_name_display": {
+    "type": "bool"
+   },
+   "datetime_system_prompt": {
+    "type": "bool"
+   },
+   "default_personality": {
+    "type": "string"
+   },
+   "prompt_prefix": {
+    "type": "string"
+   },
+   "max_context_length": {
+    "type": "int"
+   },
+   "dequeue_context_length": {
+    "type": "int"
+   },
+   "streaming_response": {
+    "type": "bool"
+   },
+   "show_tool_use_status": {
+    "type": "bool"
+   },
+   "show_tool_call_result": {
+    "type": "bool"
+   },
+   "buffer_intermediate_messages": {
+    "type": "bool"
+   },
+   "unsupported_streaming_strategy": {
+    "type": "string"
+   },
+   "agent_runner_type": {
+    "type": "string"
+   },
+   "dify_agent_runner_provider_id": {
+    "type": "string"
+   },
+   "coze_agent_runner_provider_id": {
+    "type": "string"
+   },
+   "dashscope_agent_runner_provider_id": {
+    "type": "string"
+   },
+   "deerflow_agent_runner_provider_id": {
+    "type": "string"
+   },
+   "max_agent_step": {
+    "type": "int"
+   },
+   "tool_call_timeout": {
+    "type": "int"
+   },
+   "tool_schema_mode": {
+    "type": "string"
+   },
+   "file_extract": {
+    "type": "object",
+    "items": {
+     "enable": {
+      "type": "bool"
+     },
+     "provider": {
+      "type": "string"
+     },
+     "moonshotai_api_key": {
+      "type": "string"
+     }
+    }
+   },
+   "proactive_capability": {
+    "type": "object",
+    "items": {
+     "add_cron_tools": {
+      "type": "bool"
+     }
+    }
+   }
+  }
+ },
+ "provider_stt_settings": {
+  "type": "object",
+  "items": {
+   "enable": {
+    "type": "bool"
+   },
+   "provider_id": {
+    "type": "string"
+   }
+  }
+ },
+ "provider_tts_settings": {
+  "type": "object",
+  "items": {
+   "enable": {
+    "type": "bool"
+   },
+   "provider_id": {
+    "type": "string"
+   },
+   "dual_output": {
+    "type": "bool"
+   },
+   "use_file_service": {
+    "type": "bool"
+   },
+   "trigger_probability": {
+    "type": "float"
+   }
+  }
+ },
+ "provider_ltm_settings": {
+  "type": "object",
+  "items": {
+   "group_icl_enable": {
+    "type": "bool"
+   },
+   "group_message_max_cnt": {
+    "type": "int"
+   },
+   "image_caption": {
+    "type": "bool"
+   },
+   "image_caption_provider_id": {
+    "type": "string"
+   },
+   "image_caption_prompt": {
+    "type": "string"
+   },
+   "group_message_history_enable": {
+    "type": "bool"
+   },
+   "group_message_history_max_cnt": {
+    "type": "int"
+   },
+   "active_reply": {
+    "type": "object",
+    "items": {
+     "enable": {
+      "type": "bool"
+     },
+     "whitelist": {
+      "type": "list",
+      "items": {
+       "type": "string"
+      }
+     },
+     "method": {
+      "type": "string",
+      "options": [
+       "possibility_reply"
+      ]
+     },
+     "possibility_reply": {
+      "type": "float"
+     }
+    }
+   }
+  }
+ }
+}

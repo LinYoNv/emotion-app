@@ -49,7 +49,7 @@ async def main() -> int:
 
     install_shadow_package()
     loader = PluginLoader(
-        plugin_dirs=["/opt/astrbot/data/plugins"],
+        plugin_dirs=[str(Path(__file__).resolve().parents[2] / "plugins")],
         mirror_root=tmp / "plugin_src",
     )
     report = await loader.load_all(ports=HostPorts(config={}))

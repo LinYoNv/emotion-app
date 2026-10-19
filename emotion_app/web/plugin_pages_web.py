@@ -29,6 +29,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from pathlib import Path
+
 from quart import Response, jsonify, redirect, request
 
 logger = logging.getLogger("emotion_app.plugins")
@@ -164,6 +166,38 @@ def mount_plugin_page_routes(app: Any, service: Any, require_auth: Any) -> None:
     #      /pages/companion-panel   → 目录是 /pages/         → ./app.css 打到 ../app.css ❌
     #      /pages/companion-panel/  → 目录是 companion-panel/ → ./app.css 正确 ✅
     #    所以不带斜杠的那条**必须重定向**，否则插件页所有静态资源 404、页面白屏。
+    # ---------------- ②·b `/api/plugin/page/bridge-sdk.js` 兼容路由 ----------------
+    #
+    # 🔴 **为什么必须加**（2026-10-19，陪 7.0.0 实测）：
+    #    新版陪伴页面**自己会去找** AstrBot 的官方桥 SDK，候选地址第一个就是
+    #    `/api/plugin/page/bridge-sdk.js`（见 `pages/陪伴小屋/product-page.js`
+    #    的 `SDK_CANDIDATES`）。宿主没有这条路由 ⇒ 404 ⇒ `window.AstrBotPluginPage`
+    #    永远是 undefined ⇒ 整页每个工作区都渲染
+    #    「请从已登录的 AstrBot 管理界面打开陪伴小屋」，
+    #    而**页面本身看起来是好的**（3D 小屋能显示）—— 这正是最难查的那类：
+    #    视觉正常、功能全废。
+    #
+    #    ⚠️ 我们原本只在自己的入口 HTML 里注入 `/static/plugin_page_bridge.js`，
+    #       但新版页会**先试自己的候选**、且注入时机晚于脚本执行 ⇒
+    #       只靠"入口注入"覆盖不到这条路径。
+    #
+    # ✅ 做法：把同源桥垫片**按官方路径再挂一份**。内容与 `/static/...` 完全一致
+    #    （同一个文件），所以两条路径的行为天然同步，不会出现两份实现分叉。
+    @app.get("/api/plugin/page/bridge-sdk.js")
+    async def plugin_page_bridge_sdk():  # type: ignore[no-untyped-def]
+        # ⚠️ **不要求鉴权**：真 AstrBot 的 bridge-sdk.js 是公开的脚本，
+        #    它自己不含任何数据；鉴权发生在它转发出去的 API 请求上
+        #    （`apiGet` → 宿主的插件派发器 → 那里有 require_auth）。
+        #    这里加 require_auth 反而会让 `<script src>` 因无 Authorization 头而 401。
+        # 与 `app.py:733` 同款取法（`emotion_app/web/static/`）
+        path = Path(__file__).parent / "static" / "plugin_page_bridge.js"
+        if not path.is_file():
+            return jsonify({"error": "bridge sdk 缺失", "type": "not_found"}), 404
+        resp = Response(path.read_bytes(), mimetype="application/javascript; charset=utf-8")
+        # 桥要能随宿主升级立刻生效 —— 与插件页资源同款 no-cache
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return resp
+
     @app.get("/api/v1/plugins/<plugin_id>/pages/<page_name>")
     async def plugin_page_entry(plugin_id: str, page_name: str):  # type: ignore[no-untyped-def]
         denied = require_auth()

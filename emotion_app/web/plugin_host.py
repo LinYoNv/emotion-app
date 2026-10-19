@@ -516,6 +516,19 @@ class PluginHostService:
             #    （两个缓存写入口都在 `manager` 分支之后），所以只能靠补桥修好。
             persona_manager = await self._build_persona_manager()
 
+            # 🔴 **让 ProviderManager 能读到人格**（2026-10-19 补）。
+            #
+            # 真 AstrBot 的 `ProviderManager.personas` 是 **property**，
+            # 转发给 `persona_mgr.personas_v3`（`core/provider/manager.py:136-138`）。
+            # 我们两个管理器各自独立构造，不接线的话
+            # `context.provider_manager.personas` 永远是空列表
+            # ⇒ 插件拿不到人格（实测 `meme_manager/main.py:821` 直接 AttributeError）。
+            #
+            # ⚠️ 顺序上必须在 `persona_manager` 建好**之后**接线
+            #    （`provider_manager` 在 `:490` 就建了）。
+            if provider_manager is not None and persona_manager is not None:
+                provider_manager.persona_manager = persona_manager
+
             # 🔴 **对话历史端口**（2026-09-27 第八轮续，情绪明确要求修）。
             #
             # 之前 `conversation_manager=` **从来没传过** →

@@ -333,7 +333,8 @@ def real_host(tmp_path_factory):
         _sys.modules.pop(_name, None)
 
     # 🔴 必须镜像：真插件会回写自己的源码目录（`source_mirror` 模块说明）。
-    mirror = tmp_path_factory.mktemp("detail-mirror")
+    from conftest import shared_mirror_root
+    mirror = shared_mirror_root()
     host = PluginHost(
         plugin_dirs=[str(REAL_ROOT)],
         auto_initialize=False,
@@ -373,14 +374,29 @@ def test_real_companion_components(real_host):
     #      * 绝对条数用 **`>=` 下界**（只锁"插件没退化到几乎没注册东西"，
     #        这能抓住"兼容层把 handler 弄丢了"这类真回归）；
     #      * "有没有漏/多"交给下面那条**与注册表现场快照的集合比较**（同源，不漂）。
-    assert by_type.get("command") == 3, f"指令数变了：{by_type}"
+    # 🔴 **2026-10-19：7.0.0 不再注册任何 QQ 命令**（`command` 类归零）
+    #
+    # 6.7.0 注册了 3 个 `@filter.command`（如「陪伴 状态」）；
+    # 7.0.0 改成**纯事件钩子驱动**（`AdapterMessageEvent` 38 个 listener +
+    # 各 `On*` hook），用户在聊天里不再靠斜杠命令交互。
+    # ⇒ 断言改成"**没有** command 组件"，这正是 7.0.0 的设计。
+    assert by_type.get("command") is None, (
+        f"陪伴 7.0.0 不该注册 QQ 命令（改为事件钩子驱动）；实际：{by_type}"
+    )
     # 🔴 **能写精确值了**（2026-10-10）：`real_host` 夹具现在会先把插件模块
     #    从 `sys.modules` 逐出再加载 ⇒ 装饰器必然重跑 ⇒ 计数**确定**，
     #    不再随"套件里 9 处 `star_handlers_registry.clear()`"漂移。
     #    ⚠️ 本条经历过 `22`（单跑）→ 全量 `7`（被 clear 过、装饰器没重跑）；
     #       最后的修法是**让夹具造出确定前提**，而不是把断言放宽 ——
     #       放宽成下界会**掩盖真回归**（少注册几个工具照样绿）。
-    assert by_type.get("llm_tool") == 22, f"LLM 工具数变了：{by_type}"
+    # 🔴 **2026-10-19：7.0.0 不再自己注册 LLM 工具**（归零）
+    #
+    # 6.7.0 注册了 22 个（`pc_generate_photo` 等）；
+    # 7.0.0 改成「能力由拓展插件提供」—— 工具来自 memory/nai/together。
+    # 工具机制的回归保护在 `test_tool_loop.py`（那边加载会注册工具的插件）。
+    assert by_type.get("llm_tool") is None, (
+        f"陪伴 7.0.0 不该自己注册 LLM 工具（改由拓展插件提供）；实际：{by_type}"
+    )
     # 🔴 **2026-10-18 从 2 改回 1 —— 上一版的 `2` 是【错的】**，理由如下：
     #
     #    2026-10-08 我把这条从 1 改成 2，理由是"`pages/` 下有两个真实目录，
@@ -398,9 +414,11 @@ def test_real_companion_components(real_host):
     #       `test_duplicate_page_dirs_are_deduplicated`（相同 → 只留一个）
     #       `test_different_content_pages_are_kept_and_dedup_is_per_plugin`（不同 → 都留）
     assert by_type.get("page") == 1, f"拓展页数变了：{by_type}"
-    assert by_type.get("listener") >= 11, f"监听器数退化了：{by_type}"
+    # 7.0.0 实测 listener=4（6.7.0 是 ≥11）
+    assert by_type.get("listener") >= 4, f"监听器数退化了：{by_type}"
     # ⚠️ 同上：夹具确定 ⇒ 可以写精确值（原来写 `>= 76` 是因为会漂到 76/77）
-    assert by_type.get("hook") == 77, f"钩子数变了：{by_type}"
+    # 7.0.0 实测 hook=12（6.7.0 是 77）
+    assert by_type.get("hook") == 12, f"钩子数变了：{by_type}"
 
     # ⭐ 数量自洽判据（⚠️ **注意减掉 page**）：
     #     `components` = **handler 类**（command/llm_tool/listener/hook）
@@ -468,11 +486,18 @@ def test_real_companion_components(real_host):
             f"子模块里的 handler 没被列进详情：{sorted(sub_module_handlers - got)}"
         )
     # 工具条数必须与"绑定成功的工具数"一致（本项目最贵那类 bug 的探针）
-    assert by_type.get("llm_tool") == d["llm_tool_bind_count"], (
+    #
+    # ⚠️ 用 `or 0` 归一：没有 `llm_tool` 组件时 `by_type.get(...)` 是 `None`，
+    #    而 `llm_tool_bind_count` 是 `0` —— 直接比较会 `None == 0` 假红。
+    #    （7.0.0 的陪伴自己注册 0 个工具，两边都该是 0。）
+    assert (by_type.get("llm_tool") or 0) == d["llm_tool_bind_count"], (
         f"列出的工具({by_type.get('llm_tool')}) != 绑定数({d['llm_tool_bind_count']})"
     )
+    # 🔴 2026-10-19：7.0.0 不再注册「陪伴」指令（见上面 `command is None` 的说明）
     names = {c["cmd"] for c in d["components"] if c["type"] == "command"}
-    assert "陪伴" in names, f"没列出「陪伴」指令：{names}"
+    assert "陪伴" not in names, (
+        f"陪伴 7.0.0 不该有 QQ 命令（改为事件钩子驱动）；实际：{names}"
+    )
 
 
 def test_real_readme(real_host):

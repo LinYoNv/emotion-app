@@ -299,7 +299,7 @@ def test_no_duplicate_filters_on_real_plugins():
 
     import pytest as _pytest
 
-    root = Path("/opt/astrbot/data/plugins")
+    root = Path(__file__).resolve().parents[2] / "plugins"
     if not root.is_dir():
         _pytest.skip(f"插件目录不存在：{root}")
 
@@ -319,11 +319,32 @@ def test_no_duplicate_filters_on_real_plugins():
     star_handlers_registry.clear()
 
     # 快照 → 跑 → finally 还原（免得污染后续测试）
+    #
+    # 🔴 **2026-10-19：快照范围必须包含陪伴 7.0.0 新增的两个顶层包**
+    #
+    # 6.7.0 的全部代码都挂在插件目录名下（`astrbot_plugin_private_companion.*`），
+    # 所以按"目录名"快照就够了。**7.0.0 不是**：它把核心放进了两个**平级顶层包**
+    #
+    #   * `companion_v2`    —— 业务核心
+    #   * `astrbot_host`    —— 插件自带的宿主适配层（注意与我们自己的
+    #                          `host/astrbot_host` **同名**，但来源不同）
+    #
+    # 它们是插件自己 `sys.path.insert` 进来的，**不带插件目录名前缀**。
+    # 只按 `plugin_names` 快照/还原 ⇒ 这两个包会**残留**在那个已经被删掉的
+    # tempdir 里 ⇒ 下一个测试加载插件时，7.0.0 的
+    # `activate_plugin_imports()` 检查到 `companion_v2.__path__` 不在新根之内，
+    # 抛 `RuntimeError: another companion_v2 package is already loaded
+    # from a different source root`。
+    # 实测症状：`test_compat_regressions` + `test_star_metadata` 一起跑就红，
+    # 各自单独跑全绿。
     plugin_names = {q.name for q in root.iterdir() if q.is_dir()}
-    saved = {
-        k: v for k, v in list(_sys.modules.items())
-        if k.split(".")[0] in plugin_names
-    }
+    #: 7.0.0 里**不带插件目录名前缀**的顶层包（见上）
+    plugin_extra_roots = {"companion_v2", "astrbot_host"}
+
+    def _owned(key: str) -> bool:
+        return key.split(".")[0] in plugin_names or key.split(".")[0] in plugin_extra_roots
+
+    saved = {k: v for k, v in list(_sys.modules.items()) if _owned(k)}
     try:
         with tempfile.TemporaryDirectory() as mirror:
             loader = PluginLoader(plugin_dirs=[str(root)], mirror_root=mirror)
@@ -350,7 +371,7 @@ def test_no_duplicate_filters_on_real_plugins():
         )
     finally:
         # 还原 sys.modules（移除本测试新导入的插件模块）
-        for k in [k for k in list(_sys.modules) if k.split(".")[0] in plugin_names]:
+        for k in [k for k in list(_sys.modules) if _owned(k)]:
             if k not in saved:
                 del _sys.modules[k]
         _sys.modules.update(saved)

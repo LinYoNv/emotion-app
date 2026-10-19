@@ -8,6 +8,34 @@ dependencies = [
     "hypercorn>=0.17",
     "aiosqlite>=0.20",
     "httpx>=0.27",
+    # ---- 2026-10-19：陪伴插件 7.0.0 的宿主侧依赖（实测逐个撞出来的）----
+    # ⚠️ 这些不是"我们想加"，是**插件在 import 期就硬要**的：
+    #    aiocqhttp     -> 插件顶层 `from aiocqhttp.api_impl import WebSocketReverseApi`
+    #    sqlmodel      -> `from astrbot.core.db.po import ConversationV2`
+    #    regex         -> companion_v2 的分段/文本处理（顶层 import）
+    #    lunarcalendar -> 农历纪念日
+    #    cryptography  -> 和风天气预警 JWT 签名
+    #    google-genai  -> `from google.genai import types`（视频理解）
+    #    defusedxml    -> RSS/资讯解析（顶层 import）
+    #    mcp           -> `from mcp.types import CallToolResult`（工具结果）
+    #    jsonschema    -> 工具参数校验
+    #    其余是运行期可选能力的轻量依赖（惰性 import，缺了只影响对应功能）。
+    "aiocqhttp>=1.4",
+    "sqlmodel>=0.0.48",
+    "regex>=2024.11.6",
+    "lunarcalendar>=0.0.9",
+    "lunardate>=0.3",
+    "cryptography>=42",
+    "google-genai>=2.31",
+    "defusedxml>=0.7",
+    "mcp>=1.26,<2",
+    "jsonschema>=4.26",
+    "brotli>=1.2",
+    "psutil>=7",
+    "pypinyin>=0.55",
+    "qrcode>=8",
+    "requests>=2.34",
+    "starlette>=1.9",
 ]
 
 [project.optional-dependencies]

@@ -164,7 +164,36 @@
     return payload;
   }
 
-  /** 登录/鉴权状态检查：页面加载时先确认自己拿得到数据。 */
+  /**
+   * 登录/鉴权状态检查 + **返回上下文对象**。
+   *
+   * ## 🔴 `ready()` 必须**返回上下文**，不能只做检查（2026-10-19 修）
+   *
+   * 陪伴 7.0.0 的页面（`pages/陪伴小屋/product-page.js:499-501`）是这样用的：
+   *
+   *     const context = await bounded(bridge.ready());
+   *     if (context?.pluginName !== HOST) throw fail("dashboard_identity_required");
+   *
+   * 也就是说它把 `ready()` 的**返回值**当作上下文，并校验
+   * `pluginName === "astrbot_plugin_private_companion"`。
+   *
+   * 我们原来只做 fetch 检查、**不返回任何值** ⇒ `context` 是 `undefined`
+   * ⇒ `context?.pluginName` 恒为 `undefined` ⇒ 页面永远判失败，
+   * 显示「请从已登录的 AstrBot 管理界面打开陪伴小屋」。
+   *
+   * 实测现场（2026-10-19）：页面 59 个脚本、104 个资源全 200、零 JS 异常，
+   * **但一次插件 API 都没调** —— 因为它在 `ready()` 这一步就放弃了。
+   *
+   * ## 返回什么
+   *
+   * 照真 AstrBot 插件页桥的上下文形状，给出页面真正会读的字段：
+   *   * `pluginName` —— 本页所属插件目录名（页面拿它做身份校验）
+   *   * `loggedIn`   —— 会话可用（能取到数据）
+   *   * `username`   —— 面板用户名；我们没这个概念，给空串（页面按 falsy 处理）
+   *
+   * ⚠️ **不认识的字段一律不编**：多塞字段会让"看起来有、其实是假的"
+   *    这类问题更难查。只给页面确实会读的那几个。
+   */
   async function ready() {
     try {
       var r = await fetch("/api/v1/status", {
@@ -178,6 +207,12 @@
           (err && err.message ? err.message : err),
       );
     }
+    return {
+      pluginName: PLUGIN_ID,
+      loggedIn: true,
+      // 我们没有"面板用户名"这个概念（单用户自用），给空串而不是编一个。
+      username: "",
+    };
   }
 
   window.AstrBotPluginPage = {

@@ -71,3 +71,80 @@ class Stats:
 
 
 __all__ = ["Conversation", "Platform", "Stats"]
+
+
+# ======================================================================
+# 2026-10-19 补：`ConversationV2` / `ProviderStat`（陪伴 7.0.0 需要）
+#
+# 🔴 与上面的 `Conversation` **不是同一个类**（真实现里也是两个）：
+#    `Conversation`    = 纯 dataclass，老 API 用
+#    `ConversationV2`  = SQLModel 表，新 API 用（陪伴读它）
+#
+# 陪伴 `astrbot_host/native.py:21` 顶层导入 `ConversationV2`，
+# 并在 `load_persona_snapshot_selection()` 里执行：
+#
+#     select(ConversationV2.persona_id).where(ConversationV2.conversation_id == cid)
+#
+# ⇒ **只用到 `conversation_id` 与 `persona_id` 两列**。我们照真实字段定义，
+#    但**没有引入 SQLAlchemy 建表逻辑**（宿主不建这张表，见 `get_db()` 适配器）。
+#
+# ⚠️ sqlmodel 现在是硬依赖了（`astrbot_host/main.py` 链上 import 它）。
+#    pyproject 的 dependencies 已加（见同批改动）。
+# ======================================================================
+
+try:  # pragma: no cover —— 环境缺 sqlmodel 时给出**可读**的错，不是裸 ImportError
+    from sqlmodel import Field, SQLModel
+except ImportError as _sqlmodel_error:  # noqa: N816
+    raise ImportError(
+        "`astrbot.core.db.po` 需要 `sqlmodel`（陪伴 7.0.0 的 ConversationV2 依赖它）。"
+        "请执行：.venv/bin/pip install sqlmodel"
+    ) from _sqlmodel_error
+
+from datetime import datetime, timezone
+
+
+class TimestampMixin(SQLModel):
+    """创建/更新时间（照真实现 `po.py:12-18`）。"""
+
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ConversationV2(TimestampMixin, SQLModel, table=True):
+    """会话表（照真实现 `po.py:67-107` 的字段与表名）。
+
+    ⚠️ **只定义字段，不负责建表** —— 宿主的作用域见 `Context.get_db()`。
+    """
+
+    __tablename__: str = "conversations"  # type: ignore[misc]
+
+    inner_conversation_id: int | None = Field(
+        default=None, primary_key=True, sa_column_kwargs={"autoincrement": True}
+    )
+    conversation_id: str = Field(max_length=36, nullable=False, unique=True)
+    platform_id: str = Field(nullable=False, default="")
+    user_id: str = Field(nullable=False, default="")
+    title: str | None = Field(default=None, max_length=255)
+    persona_id: str | None = Field(default=None)
+    token_usage: int = Field(default=0, nullable=False)
+
+
+class ProviderStat(TimestampMixin, SQLModel, table=True):
+    """Provider 用量统计（照真实现 `po.py:43-64`）。"""
+
+    __tablename__: str = "provider_stats"  # type: ignore[misc]
+
+    id: int | None = Field(
+        default=None, primary_key=True, sa_column_kwargs={"autoincrement": True}
+    )
+    agent_type: str = Field(default="internal", nullable=False)
+    status: str = Field(default="completed", nullable=False)
+    umo: str = Field(nullable=False, default="")
+    conversation_id: str | None = Field(default=None)
+    provider_id: str = Field(nullable=False, default="")
+    provider_model: str | None = Field(default=None)
+    token_input_other: int = Field(default=0, nullable=False)
+    token_input_cached: int = Field(default=0, nullable=False)
+    token_output: int = Field(default=0, nullable=False)
+    start_time: float = Field(default=0.0, nullable=False)
+    end_time: float = Field(default=0.0, nullable=False)

@@ -5,7 +5,7 @@
    而是**第三方真实插件在真 API 面上能加载**。
 
 判据（全部实测得出，不是估计）：
-  * 插件类 `PrivateCompanionPlugin` 能被发现并实例化
+  * 插件类 `PrivateCompanionV2StagingPlugin`（7.0.0；6.7.0 叫 `PrivateCompanionPlugin`）能被发现并实例化
   * **≥100 个 handler** 注册到**正确的事件类型**
   * **≥15 个 LLM 工具**（`pc_generate_photo` 等）解析出 schema
   * **≥150 个 Web API** 登记
@@ -23,7 +23,15 @@ import pytest
 HOST_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HOST_DIR))
 
-PLUGIN_ROOT = Path("/opt/astrbot/data/plugins")
+#: 🔴 **插件源 = 仓库内 `plugins/`**（2026-10-19，情绪拍板）
+#:
+#: 原来指向 `/opt/astrbot/data/plugins` —— 别人 AstrBot 的生产目录：
+#:   ① 违反 AGENTS.md 铁律「绝不碰 AstrBot」；
+#:   ② 与 `tests/test_plugin_host_e2e.py`（读仓库内插件）**同名不同源**，
+#:      同一个 pytest 进程里先后加载 ⇒ `sys.modules` 里留下旧版模块
+#:      ⇒ 全量跑时 12 条判据互相污染（单独跑全绿）。
+#: 换成本仓库的 6 个陪伴系插件后，判的是「我们的插件能不能被加载」。
+PLUGIN_ROOT = Path(__file__).resolve().parents[2] / "plugins"
 PLUGIN_NAME = "astrbot_plugin_private_companion"
 PLUGIN_DIR = PLUGIN_ROOT / PLUGIN_NAME
 
@@ -45,7 +53,8 @@ def loaded(tmp_path_factory):
     install_shadow_package()
     # 🔴 必须镜像：`PLUGIN_ROOT` 是别人 AstrBot 的生产目录，
     #    插件会回写自己的源码目录（见 `source_mirror` 模块说明）。
-    mirror = tmp_path_factory.mktemp("plugin-src-mirror")
+    from conftest import shared_mirror_root
+    mirror = shared_mirror_root()
     loader = PluginLoader(plugin_dirs=[PLUGIN_ROOT], mirror_root=mirror)
 
     report = asyncio.run(
@@ -64,19 +73,36 @@ def test_plugin_loads(loaded):
 def test_plugin_class_and_instance(loaded):
     rec = loaded.records[0]
     assert rec.star_cls is not None
-    assert rec.star_cls.__name__ == "PrivateCompanionPlugin"
+    # 🔴 2026-10-19：陪伴 7.0.0 把这个类改名了。
+    #    6.7.0 是 `PrivateCompanionPlugin`；7.0.0 是
+    #    `PrivateCompanionV2StagingPlugin`（`main.py` 里 `register(` 的那个类）。
+    #    ⚠️ 断言写成"类名以 PrivateCompanion 开头"而不是写死全名 ——
+    #      上游再改后缀不会假红，而"根本没找到 Star 类"仍会被抓住。
+    assert rec.star_cls.__name__.startswith("PrivateCompanion"), rec.star_cls.__name__
     assert rec.instance is not None
-    assert type(rec.instance).__name__ == "PrivateCompanionPlugin"
+    assert type(rec.instance).__name__ == rec.star_cls.__name__
 
 
 def test_version_from_metadata(loaded):
     """metadata.yaml 要被解析到（版本号可用于诊断）。"""
-    assert loaded.records[0].version == "6.6.2"
+    # 🔴 2026-10-19：6.6.2 → 7.0.0（这是本次升级的目标版本）
+    assert loaded.records[0].version == "7.0.0"
 
 
 def test_handler_count(loaded):
-    """handler 数量 —— 真插件实测 109 个。"""
-    assert loaded.records[0].handler_count >= 100, (
+    """handler 数量 —— 陪伴 7.0.0 实测 **16** 个。
+
+    🔴 **为什么从 100 改到 16（这不是放宽，是事实变了）**
+
+    6.7.0 把每个功能各挂一个 handler（实测 109 个）；7.0.0 重写成
+    「**统一陪伴宿主**」之后，改成**按事件类型各挂一个总管**
+    （`AdapterMessageEvent` 38 个 + 各 `On*` 各 1~3 个），
+    路由分派收进了 `astrbot_host/event_routing.py`。
+
+    ⇒ 判据改成"**至少 10 个**"：锁住"装饰器机制没整体失效"，
+       同时不把"上游又把功能拆细"误判成回归。
+    """
+    assert loaded.records[0].handler_count >= 10, (
         f"handler 只有 {loaded.records[0].handler_count} 个，"
         "说明装饰器机制没完全生效"
     )
@@ -88,14 +114,25 @@ def test_handlers_on_correct_event_types(loaded):
 
     counts = star_handlers_registry.count_by_event()
 
-    # 这些是真插件实测使用的事件类型，各有最低数量要求
+    # 🔴 **2026-10-19 按 7.0.0 重算（数值全线下降是事实，不是放宽标准）**
+    #
+    # 6.7.0：OnDecoratingResult 20 / OnLLMRequest 15 / OnCallingFuncTool 15 /
+    #        AdapterMessage 8 / OnLLMResponse 5 / OnAfterMessageSent 5
+    # ——那时每个功能各挂一个 handler。
+    #
+    # 7.0.0 重写成「统一陪伴宿主」，**按事件类型各挂一个总管**，
+    # 路由分派进 `astrbot_host/event_routing.py`。
+    # 单插件（只加载陪伴）实测分布见下表的注释。
+    #
+    # ⚠️ 这些是**只加载陪伴**时的分布（全量加载 6 个插件是 38/16/…，见
+    #    `/tmp/measure_single.py` 的实测）。判据要守的是"装饰器落在了正确的事件
+    #    类型上"，所以数目取**实测值**，多的不限制（`>=`）。
     expected_min = {
-        "OnDecoratingResultEvent": 20,
-        "OnLLMRequestEvent": 15,
-        "OnCallingFuncToolEvent": 15,
-        "AdapterMessageEvent": 8,
-        "OnLLMResponseEvent": 5,
-        "OnAfterMessageSentEvent": 5,
+        "OnDecoratingResultEvent": 3,   # 实测 3
+        "OnLLMRequestEvent": 1,          # 实测 1
+        "AdapterMessageEvent": 4,        # 实测 4（全量 38）
+        "OnLLMResponseEvent": 1,         # 实测 1
+        "OnAfterMessageSentEvent": 1,    # 实测 1
     }
     for event, minimum in expected_min.items():
         assert counts.get(event, 0) >= minimum, (
@@ -108,10 +145,32 @@ def test_llm_tools_registered_with_schema(loaded):
     """⭐ LLM 工具要被解析出 **JSON Schema**（function calling 的命脉）。"""
     from astrbot_host.registry import llm_tools
 
-    names = llm_tools.names()
-    assert len(names) >= 15, f"LLM 工具只有 {len(names)} 个：{names}"
+    # 🔴 **2026-10-19：7.0.0 的陪伴插件自己不再注册任何 LLM 工具**
+    #
+    # 6.7.0 用 `@filter.llm_tool` 注册了 20 个（`pc_generate_photo` 等）；
+    # 7.0.0 改成「**能力由拓展插件提供、陪伴只做宿主与编排**」
+    # （metadata 原文：*随包提供 Content、Image、Screen、Reality、Together、
+    #  Game、Live 七项原生内部拓展*）。工具现在来自 memory/nai/together 插件。
+    #
+    # ⇒ 这条判据**不能再用陪伴的工具**验证。改为：断言"陪伴自己不注册工具"
+    #   （这正是 7.0.0 的设计），并把"工具有 JSON Schema"的验证交给
+    #   `test_tool_loop.py`（那里全量加载，工具真实存在）。
+    # ⚠️ `llm_tools` 是**全局注册表**，且同进程里可能还有别的插件注册过工具
+    #    （实测单跑本文件时是空的，全量跑时会有 16 个来自别的插件）。
+    #    ⇒ 判据必须**按归属过滤**，不能断言"全局为空"（那是判据写错了，
+    #      不是插件的问题 —— 我第一版就这么写，全量跑直接假红）。
+    owned = [
+        n for n in llm_tools.names()
+        if getattr(llm_tools.get_func(n), "handler_module_path", "").startswith(
+            f"{PLUGIN_NAME}."
+        )
+    ]
+    assert owned == [], (
+        f"陪伴 7.0.0 不该自己注册 LLM 工具（改由拓展插件提供）；实际归属于它：{owned}"
+    )
+    return
 
-    # 生图工具必须存在且有正确 schema
+    # --- 以下为 6.7.0 时代的断言，保留作对照，7.0.0 不会走到 ---
     photo = llm_tools.get_func("pc_generate_photo")
     assert photo is not None, f"缺少生图工具 pc_generate_photo；实际：{names}"
     schema = photo.to_openai_schema()
@@ -125,7 +184,10 @@ def test_llm_tools_registered_with_schema(loaded):
 def test_web_apis_registered(loaded):
     """陪伴面板的 Web API 要被登记（190 个）。"""
     rec = loaded.records[0]
-    assert rec.web_api_count >= 150, f"Web API 只有 {rec.web_api_count} 个"
+    # 🔴 2026-10-19：6.7.0 是 189 条，7.0.0 把二十多个 WebAPI 类聚合后是 **71 条**
+    #    （`astrbot_host/web_api.py:115-137`）。详见
+    #    `tests/test_plugin_host_e2e.py::test_266_apis_mounted` 里更长的说明。
+    assert rec.web_api_count >= 70, f"Web API 只有 {rec.web_api_count} 个"
 
 
 def test_plugin_can_read_config(loaded):
@@ -195,10 +257,15 @@ def test_alias_supports_from_import(loaded):
     )
     ns: dict = {}
     exec(
-        "from data.plugins.astrbot_plugin_private_companion.main import PrivateCompanionPlugin",
+        # 🔴 2026-10-19：6.7.0 是 `PrivateCompanionPlugin`，
+        #    7.0.0 是 `PrivateCompanionV2StagingPlugin`。这里用**当前实际的名字**，
+        #    判据要守的是"`from ... import` 能走通且拿到**同一对象**"，
+        #    不是某个特定类名。
+        "from data.plugins.astrbot_plugin_private_companion.main import "
+        "PrivateCompanionV2StagingPlugin",
         ns,
     )
-    assert ns["PrivateCompanionPlugin"] is alias_mod.PrivateCompanionPlugin
+    assert ns["PrivateCompanionV2StagingPlugin"] is alias_mod.PrivateCompanionV2StagingPlugin
     # 且别名模块必须与记录里的 main 是同一个对象（这才是别名的定义）
     assert alias_mod is loaded.records[0].module.main
 
@@ -244,12 +311,27 @@ def test_alias_registers_intermediate_packages_from_scratch(tmp_path_factory):
     alias_root = "data.plugins"
 
     # ① 先清掉**与别名有关**的中间层，模拟"从零开始"的真实安装场景
+    #
+    # 🔴 **2026-10-19 扩到 `companion_v2` / 插件模块本身**：
+    #    陪伴 7.0.0 的 `astrbot_host/import_lifecycle.py:21-24` 有一道**正确**的
+    #    保护 —— 若 `companion_v2` 已从**别的源根**加载过，就拒绝再次加载
+    #    （`RuntimeError: another companion_v2 package is already loaded from a
+    #    different source root`）。那是防"两份代码混用"的，不该削弱。
+    #    而本判据故意用**新的 mirror 目录**加载 ⇒ 必然撞上它。
+    #    ⇒ 清现场时把上一轮从旧 mirror 加载的那套也清掉，才是真正的"从零开始"。
     saved = {k: sys.modules[k] for k in (alias_main, alias_pkg, alias_root) if k in sys.modules}
     for k in (alias_main, alias_pkg, alias_root):
         sys.modules.pop(k, None)
+    saved.update({k: v for k, v in list(sys.modules.items())
+                  if k == "companion_v2" or k.startswith("companion_v2.")
+                  or k == PLUGIN_NAME or k.startswith(f"{PLUGIN_NAME}.")})
+    for k in list(saved):
+        sys.modules.pop(k, None)
 
     try:
-        mirror = tmp_path_factory.mktemp("alias-scratch")
+        from conftest import shared_mirror_root
+
+        mirror = shared_mirror_root()
         loader = PluginLoader(plugin_dirs=[PLUGIN_ROOT], mirror_root=mirror)
         rec = asyncio.run(
             loader.load_all(ports=HostPorts(config={}), only=[PLUGIN_NAME])

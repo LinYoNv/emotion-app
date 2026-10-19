@@ -131,7 +131,7 @@ def test_host_service_dispatch_real_plugin(tmp_path, monkeypatch):
     ⚠️ 这条**真的加载插件**（走镜像），比上面慢，但它是
        "端到端真的通了"的证据 —— 没有它，上面全是逻辑自证。
     """
-    plugin_root = Path("/opt/astrbot/data/plugins")
+    plugin_root = APP_DIR / "plugins"
     if not plugin_root.is_dir():
         pytest.fail(
             f"插件目录不存在：{plugin_root}（这不是 skip —— 前置条件不满足即判据失败）"
@@ -139,6 +139,7 @@ def test_host_service_dispatch_real_plugin(tmp_path, monkeypatch):
 
     sys.path.insert(0, str(APP_DIR / "host"))
     from astrbot_host.compat.core.star.context import HostPorts
+    from astrbot_host.compat.core.star.star_tools import set_data_root
     from astrbot_host.loader import PluginLoader
     from astrbot_host.shadow import install_shadow_package
 
@@ -149,10 +150,30 @@ def test_host_service_dispatch_real_plugin(tmp_path, monkeypatch):
             umo_user_id = "3412642082"
 
     async def run():
+        # 🔴 **必须隔离数据目录**（2026-10-19 修）
+        #
+        # 原来没调 `set_data_root()` ⇒ 用**全局默认** `data/plugins/`。
+        # 同一个 pytest 进程里别的测试也往那里写过 ⇒ 全量跑时
+        # `memory_companion` 读到的是一个**被别的测试中途留下**的
+        # 空/半初始化库，`core/store.py` 的 `_stats_sync` 查 `memories` 表
+        # 直接 `sqlite3.OperationalError: no such table: memories`。
+        # 实测：单跑本文件绿、全量跑红 —— 正是"判据依赖跨测试漂移的进程级状态"。
+        set_data_root(str(tmp_path / "plugin_data"))
         loader = PluginLoader(
             plugin_dirs=[str(plugin_root)], mirror_root=str(tmp_path / "mirror")
         )
-        await loader.load_all(ports=HostPorts(config={}))
+        report = await loader.load_all(ports=HostPorts(config={}))
+        # 🔴 **必须跑 `initialize_all()`**（2026-10-19 补，真缺陷）
+        #
+        # 记忆插件在**全新的**数据目录里，`memory_companion.db` 是**空文件**，
+        # 建表发生在 `initialize()` 里（实测：只 `load_all` → 0 字节；
+        # 加了 `initialize_all()` → 745KB、`memories` 等表齐全）。
+        # 本判据原来没调它 ⇒ 数据目录一旦是干净的，`cmd_mcomp_status`
+        # 立刻报 `no such table: memories`。
+        # ⚠️ 以前它是绿的，因为默认数据目录 `data/plugins/` 里有**历史库**把
+        #    这个缺陷盖住了 —— 典型的"判据依赖环境里已有的状态"。
+        init_failed = await loader.initialize_all(report)
+        assert init_failed == [], f"插件初始化失败：{init_failed}"
 
         from astrbot_host.dispatch import dispatch
         from astrbot_host.umo import build_inbound_event
@@ -188,25 +209,44 @@ def test_umo_user_id_is_configurable():
 # ---------------------------------------------------------------------------
 # 三、P1-4：绑定链路（面板「已检测到 N 个私聊绑定」的数据来源）
 # ---------------------------------------------------------------------------
-def test_binding_command_is_the_only_path_that_binds(tmp_path):
-    """🔴 **绑定指令是唯一会写 `bound_delivery_umo` 的路径**。
+def test_plain_message_does_not_grant_delivery(tmp_path):
+    """🔴 **收到普通消息 ≠ 同意接收主动消息**（未经同意的行为变更）。
 
-    实测区分（`proactive.py` 里两个函数名字很像，作用不同）：
-      * `_note_private_user_umo`（普通消息触发）→ 只写 `user["umo"]`（**观察**到的）
-      * `_bind_private_delivery_umo`（`陪伴 绑定主动消息` 触发）→ 写 `user["bound_delivery_umo"]`
-        —— 面板 `app.js:9882` 判 `delivery_bound` 读的**正是后者**
+    ## 这条判据的前身与它为什么要重写（2026-10-19）
 
-    ⚠️ 为什么要专门钉这条：如果哪天真把"收到消息就当绑定"了，
-       面板会显示"已绑定"，但**用户从没同意过接收主动消息** ——
-       而主动消息是**会主动打扰用户**的能力，静默开启是严重的行为变化。
+    前身 `test_binding_command_is_the_only_path_that_binds` 验证的是 6.7.0 的
+    两个内部字段：
 
-    本判据从**全新数据目录**开始，逐步验证两条路径的差异。
+      * `user["umo"]`                —— 普通消息触发，只"观察"到
+      * `user["bound_delivery_umo"]` —— `陪伴 绑定主动消息` 指令触发，才算"绑定"
+
+    **7.0.0 把这两样都删了**，实测确认：
+
+      * 实例上**没有 `data` 属性**（`dir()` 零命中）；
+      * 全仓库 grep `绑定主动消息` → **零命中**（那条指令不存在了）；
+      * 投递授权改由 V2 的 `identity_policy`（`delivery_grant`，
+        `companion_v2/identity_policy/grants.py`）承载，且需要
+        **在面板里配置 Bot 账号 + 人格**后才可能建立（未配置时
+        `host_mappings_required`，`astrbot_host/multi_settings.py:167`）。
+
+    ## ⚠️ 但它守的那条安全属性**一点都不过时**
+
+    "主动消息会**主动打扰用户**，所以必须是用户显式同意，绝不能
+    '收到过消息就自动算同意'"。7.0.0 的等价观测点是：
+    **全新数据目录 + 只发普通消息 → 不该产生任何投递授权**。
+
+    判据因此改成（不依赖任何插件私有结构）：
+      ① 派发一条普通消息，插件入站入口**确实收到**（对照组，证明链路通）；
+      ② 临时数据目录里**没有**任何 `companion-v2.sqlite3` 被写出
+         —— 7.0.0 在未注册账号/人格时**完全不落盘**，
+         这本身就是"没有建立任何授权"的机器可验证据；
+      ③ 若将来它落了盘，再按 `delivery_grant` 表查（这里显式留出上升路径）。
     """
     import logging
     import tempfile
 
     logging.disable(logging.ERROR)
-    plugin_root = Path("/opt/astrbot/data/plugins")
+    plugin_root = APP_DIR / "plugins"
     if not plugin_root.is_dir():
         pytest.fail(f"插件目录不存在：{plugin_root}（前置条件不满足=判据失败）")
 
@@ -216,55 +256,64 @@ def test_binding_command_is_the_only_path_that_binds(tmp_path):
     from astrbot_host.dispatch import dispatch
     from astrbot_host.loader import PluginLoader
     from astrbot_host.platform_manager import build_platform_manager
+    from astrbot_host.registry import star_handlers_registry
     from astrbot_host.shadow import install_shadow_package
     from astrbot_host.umo import build_inbound_event
 
     install_shadow_package()
 
+    data_root = tempfile.mkdtemp()
+
     async def run():
-        set_data_root(tempfile.mkdtemp())          # 隔离：全新数据目录
+        set_data_root(data_root)                   # 隔离：全新数据目录
         loader = PluginLoader(
             plugin_dirs=[str(plugin_root)], mirror_root=str(tmp_path / "mirror")
         )
         rep = await loader.load_all(
             ports=HostPorts(config={}, platform_manager=build_platform_manager())
         )
-        inst = next(
+        rec = next(
             r for r in rep.records if r.name == "astrbot_plugin_private_companion"
-        ).instance
-        users = (getattr(inst, "data", {}) or {}).get("users", {})
-        uid = "3412642082"
+        )
+        assert rec.ok, f"插件加载失败：{rec.error}"
 
-        # 1) 普通消息：只观察，不绑定
-        await dispatch(build_inbound_event("你好呀", uid))
-        u = users.get(uid) or {}
-        return {
-            "after_plain_umo": u.get("umo"),
-            "after_plain_bound": u.get("bound_delivery_umo"),
-            "users": users,
-            "uid": uid,
-            "dispatch": dispatch,
-            "build": build_inbound_event,
-        }
+        # 装计数器（包注册表里的 partial，见 `_real_plugin_stream_probe` 的说明）
+        hits: list[str] = []
+        for h in star_handlers_registry:
+            if getattr(h, "handler_name", "") != "receive_companion_message":
+                continue
+            original = h.handler
 
-    st = asyncio.run(run())
+            async def _counting(event, *a, __orig=original, **kw):
+                try:
+                    hits.append(str(getattr(event, "unified_msg_origin", "") or ""))
+                except Exception:  # noqa: BLE001
+                    hits.append("")
+                return await __orig(event, *a, **kw)
 
-    assert st["after_plain_umo"] == "11:FriendMessage:3412642082", (
-        f"普通消息应记录观察到的 umo，实际 {st['after_plain_umo']!r}"
+            h.handler = _counting
+            break
+
+        await dispatch(build_inbound_event("你好呀", "3412642082"))
+        return hits
+
+    hits = asyncio.run(run())
+
+    # ① 对照组：插件确实收到了这条普通消息（否则"没有授权"只是整条链没通）
+    assert hits, (
+        "普通消息根本没送到插件入站入口 —— 那这条判据证明不了任何事"
     )
-    assert not st["after_plain_bound"], (
-        "🔴 普通消息**不该**产生 bound_delivery_umo —— "
-        "否则等于「收到消息就自动同意接收主动消息」（未经用户同意的行为变化）"
-    )
 
-    # 2) 绑定指令：才写 bound_delivery_umo
-    async def bind():
-        await st["dispatch"](st["build"]("陪伴 绑定主动消息", st["uid"]))
-        return (st["users"].get(st["uid"]) or {}).get("bound_delivery_umo")
+    # ② 7.0.0 在未注册账号/人格时**完全不落盘** ⇒ 没有任何持久化授权被写出
+    import pathlib as _pathlib
 
-    bound = asyncio.run(bind())
-    assert bound == "11:FriendMessage:3412642082", (
-        f"绑定指令应写入与 umo 同构的 bound_delivery_umo，实际 {bound!r}"
+    db_files = [
+        p for p in _pathlib.Path(data_root).rglob("companion-v2*.sqlite3")
+    ]
+    assert not db_files, (
+        "🔴 只发了一条普通消息就产生了 V2 数据库（= 建立了持久化状态）："
+        f"{db_files}。若这是 7.0.0 的新行为，判据必须改成直接查 `delivery_grant` 表"
+        "（`companion_v2/identity_policy/grants.py`），而不是简单放行。"
     )
 
 
@@ -418,7 +467,7 @@ def test_real_plugin_hooks_inject_into_messages(tmp_path):
     import logging
 
     logging.disable(logging.ERROR)
-    plugin_root = Path("/opt/astrbot/data/plugins")
+    plugin_root = APP_DIR / "plugins"
     if not plugin_root.is_dir():
         pytest.fail(f"插件目录不存在：{plugin_root}（前置条件不满足=判据失败）")
 
@@ -477,7 +526,7 @@ def test_injected_content_reaches_upstream_payload(tmp_path):
     import logging
 
     logging.disable(logging.ERROR)
-    plugin_root = Path("/opt/astrbot/data/plugins")
+    plugin_root = APP_DIR / "plugins"
     if not plugin_root.is_dir():
         pytest.fail(f"插件目录不存在：{plugin_root}（前置条件不满足=判据失败）")
 
@@ -594,7 +643,7 @@ def _real_plugin_stream_probe(tmp_path):
     import logging
 
     logging.disable(logging.ERROR)
-    plugin_root = Path("/opt/astrbot/data/plugins")
+    plugin_root = APP_DIR / "plugins"
     if not plugin_root.is_dir():
         pytest.fail(f"插件目录不存在：{plugin_root}（这不是 skip，前置不满足=判据失败）")
 
@@ -657,6 +706,72 @@ def _real_plugin_stream_probe(tmp_path):
             r for r in report.records
             if r.name == "astrbot_plugin_private_companion"
         ).instance
+
+        # 🔴 **判据的观察点：包一层入站入口计数**（2026-10-19 改）
+        #
+        # ## 为什么不能再用 `inst.data["users"]`
+        #
+        # 本判据原来读 `inst.data["users"][uid]["umo"]` —— 那是**陪伴 6.7.0
+        # 的内部数据结构**。7.0.0 把它整个换掉了：
+        #   * 实例上**根本没有 `data` 属性**（实测 `dir()` 零命中）；
+        #   * 数据落进 `companion-7/companion-v2.sqlite3`（V2 存储，
+        #     `astrbot_host/storage_location.py:24` 的 `V2_SUBDIRECTORY`）；
+        #   * 且**未注册 Bot 账号与人格时完全不落盘**（`host_mappings_required`，
+        #     `astrbot_host/multi_settings.py:167`）—— 实测派发后临时目录里
+        #     只有 config/*.json，没有任何 sqlite。
+        # ⇒ "查 users 里有没有 umo" 这个观察点在 7.0.0 下**不存在**。
+        #
+        # ## 但判据要守的那件事没变
+        #
+        # 守的是「**流式那条路也把消息派发给了插件**」（2026-09-26 那个真 bug：
+        # 流式分支完全没有派发，而假宿主判据全绿）。7.0.0 的入站入口是
+        # `receive_companion_message`（`main.py:438`，`@filter` 注册在
+        # AdapterMessageEvent 上）⇒ **它有没有被调用**就是"派发了没有"的
+        # 唯一直接证据，且与插件的内部存储模型无关。
+        inbound_hits: list[str] = []
+
+        # ⚠️ **必须包注册表里的那个 handler，不能包实例方法**（2026-10-19 踩到）
+        #
+        # 加载器在注册时就把方法绑成了
+        # `functools.partial(Plugin.receive_companion_message, <实例>)`
+        # 存进 `star_handlers_registry`（照真 AstrBot
+        # `star_manager.py:1273-1299`）。派发走的是**注册表里那份 partial**，
+        # 所以我第一版 `inst.receive_companion_message = _counting` 永远收不到调用
+        # —— 判据于是恒定报"未派发"，把**判据自己的错**说成产品 bug。
+        from astrbot_host.registry import star_handlers_registry
+
+        _patched = []
+
+        def _install_counter() -> int:
+            """给 `receive_companion_message` 的注册表条目装计数器，返回装了几个。"""
+            hits_installed = 0
+            for h in star_handlers_registry:
+                if getattr(h, "handler_name", "") != "receive_companion_message":
+                    continue
+                if getattr(h, "handler_module_path", "") != (
+                    "astrbot_plugin_private_companion.main"
+                ):
+                    continue
+                original = h.handler
+
+                async def _counting(event, *a, __orig=original, **kw):
+                    try:
+                        umo = str(getattr(event, "unified_msg_origin", "") or "")
+                    except Exception:  # noqa: BLE001 - 取 umo 失败不该影响派发
+                        umo = ""
+                    inbound_hits.append(umo)
+                    return await __orig(event, *a, **kw)
+
+                h.handler = _counting
+                _patched.append((h, original))
+                hits_installed += 1
+            return hits_installed
+
+        assert _install_counter() >= 1, (
+            "注册表里找不到 `receive_companion_message` 的 handler —— "
+            "7.0.0 的入站入口改名了？判据的观察点需要跟着更新"
+        )
+
         svc.host = object()          # 非 None 即可（集成层只判空）
         svc.sessions = None          # ⚠️ 由 app 装配时再注入（见下）
 
@@ -686,6 +801,7 @@ def _real_plugin_stream_probe(tmp_path):
         #       所以这不是"懒建"，现取只是**不受实例/时序变化影响**的稳妥写法。
         created: dict[str, str] = {}
         for label, stream in (("s", True), ("n", False)):
+            before_count = len(inbound_hits)
             sid = f"sess-real-{label}"
             uid = f"e2e_stream_{label}"
             await sessions.create(session_id=sid, title=sid, user_id=uid)
@@ -701,22 +817,25 @@ def _real_plugin_stream_probe(tmp_path):
             )
             if stream:
                 await resp.get_data()          # 必须消费掉，否则生成器不跑
-            users = (getattr(inst, "data", {}) or {}).get("users", {}) or {}
-            created[label] = str(
-                ((users.get(uid) or {}).get("umo")) or f"<未建档 status={resp.status_code}>"
+            # 🔴 改读**入站入口的调用记录**（见上面 `_counting_receive` 的说明）：
+            #    只认"这一轮新发生的"调用，用长度差做差分。
+            hits_now = inbound_hits[before_count:]
+            created[label] = (
+                hits_now[0] if hits_now else f"<未派发 status={resp.status_code}>"
             )
 
         await store.close()
-        return created, users, PLUGIN_TAKEOVER_PLACEHOLDER
+        return created, inbound_hits, PLUGIN_TAKEOVER_PLACEHOLDER
 
-    seen, users, _placeholder = asyncio.run(run())
-    return seen, users
+    seen, hits, _placeholder = asyncio.run(run())
+    return seen, hits
 
 
 class _NoopUpstream:
     """假上游：**永远不该被调用**（插件会接管 `打个招呼`？——不会，所以允许它回话）。
 
-    ⚠️ 我们不假设插件会不会接管：两条路的判据都只落在"插件的 users 里有没有建档"，
+    ⚠️ 我们不假设插件会不会接管：两条路的判据都只落在
+       "**插件入站入口有没有被调用**"（`receive_companion_message`），
        而上游回什么都无所谓 —— 那正是差分实验能成立的原因。
     """
 
