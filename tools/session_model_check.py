@@ -230,6 +230,32 @@ def main() -> int:
               return { ok: n > 0 && !hasBlank, detail: n + ' 个选项' };
             })()""")
 
+        # 🔴 B1b：「绑定人设」下拉里**必须有真实人设**（2026-10-31 情绪报障）。
+        #
+        #    现场：他截图里那个下拉**只有**「（当前人设）」一个占位项，
+        #    两个真实人设（liloth / 糯米茨）一个都没出现。
+        #
+        #    🔴 根因**不是**人设没加载（实测 `state.personas` 有值、接口 200）——
+        #       是那个 `<select id="s-persona">` **只由 `fillSessionForm()` 填**，
+        #       而它只从 `selectSession()` 进来。直接深链接进 `#/settings` 时
+        #       `currentSessionId` 是 null ⇒ 一次都没填过。
+        #       "先过人设页再回来"也修不好，因为那条路径同样不选会话。
+        #    修法：`NAV_LOADERS.settings` 里补 `ensureSessionSelected()`。
+        #
+        #    ⚠️ 判据必须验"**选项里有人设名**"，不能只判 select 存在 ——
+        #       那个 select 在 HTML 里**本来就存在**（带一个占位项），
+        #       只判存在的话，这个 bug 永远抓不住。
+        check("B1b 「绑定人设」下拉里有真实人设（不只是占位项）", """(() => {
+              const sel = document.getElementById('s-persona');
+              if (!sel) return { ok: false, detail: '没有 #s-persona' };
+              const real = [...sel.options].filter(o => o.value !== '');
+              return {
+                ok: real.length > 0,
+                detail: sel.options.length + ' 项（真实人设 ' + real.length + '）：'
+                        + real.map(o => o.textContent).join('、'),
+              };
+            })()""")
+
         # 🔴 这条判据**必须检查"选项里真的有模型"**，不能只检查 select 存在。
         #    我第一版就是只判 `!!sel` —— 而当时下拉里**一个模型都没有**
         #    （`renderSessionModelField` 跑在 `cfgModels` 拉回来之前，
