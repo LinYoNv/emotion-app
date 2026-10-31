@@ -337,8 +337,16 @@ async def test_native_reset_rejects_stale_summary_before_and_after_projection(na
     )
 
 
-@pytest.mark.parametrize("mutation", ["append", "clear_messages", "delete", "persona_id", "user_id", "summary", "summarized_upto"])
-async def test_native_projection_history_and_persona_mutations_are_rejected(native, mutation):
+#: 🔴 `persona_id` **已从"必须拒绝"里移出**（2026-10-31）。
+#:    它曾和 `summary` 一起被禁，但两者归属不同：
+#:      * `summary` / `summarized_upto` —— 历史正文的摘要，归陪伴插件 ⇒ 必须拒绝
+#:      * `user_id` —— **umo 第三段**，插件认人的键 ⇒ 必须拒绝
+#:      * `persona_id` —— 我们聊天用哪个系统提示词，**插件不读它** ⇒ 应允许
+#:    禁它的实际后果：设置页点保存 → 红字「历史和人格由陪伴管理」→
+#:    用户以为"不能给人设"（情绪就是这么报的）。
+#:    正向判据见 `test_native_projection_persona_binding_is_allowed_and_persists`。
+@pytest.mark.parametrize("mutation", ["append", "clear_messages", "delete", "user_id", "summary", "summarized_upto"])
+async def test_native_projection_history_and_identity_mutations_are_rejected(native, mutation):
     from emotion_app.domain.session_repo import NativeProjectionReadOnly
 
     stores, managers, sessions = native
@@ -346,7 +354,10 @@ async def test_native_projection_history_and_persona_mutations_are_rejected(nati
     await sessions.ensure("projection")
     await managers[0].project_conversation(UMO, cid, "projection")
     before = await stores[0].load_store()
-    with pytest.raises(NativeProjectionReadOnly, match="陪伴管理"):
+    # ⚠️ 匹配串必须与产品**真正会打的**一致；这里用 "陪伴插件维护"
+    #    （旧文案是"陪伴管理"，2026-10-31 改文案时同步改了这条，否则它会
+    #    永远绿 —— 否定式断言的字面串漂移是假判据的经典成因）
+    with pytest.raises(NativeProjectionReadOnly, match="陪伴插件维护"):
         if mutation == "append":
             await sessions.append("projection", [Message(role="user", content="must not write")])
         elif mutation in ("clear_messages", "delete"):
@@ -354,6 +365,33 @@ async def test_native_projection_history_and_persona_mutations_are_rejected(nati
         else:
             await sessions.update("projection", {mutation: 0 if mutation == "summarized_upto" else "new"})
     assert await stores[0].load_store() == before
+    assert await history(managers[0], cid) == pair("seed")
+
+
+async def test_native_projection_persona_binding_is_allowed_and_persists(native):
+    """原生会话绑人设**允许**，且**真的落盘**。
+
+    🔴 为什么必须有这条正向判据：只把 `persona_id` 从拒绝列表里删掉，
+       "能改"是观测不到的 —— 白名单里也允许它才行，而且必须确认**写进去了**
+       （本项目最忌"面板说保存成功、实际没写"）。
+
+    ⚠️ 同时确认一件容易误伤的事：改人设**不许**动 `history_revision`
+       （那是历史版本，归插件；动它会让在途回复的 CAS 失效）。
+    """
+    stores, managers, sessions = native
+    cid = await managers[0].new_conversation(UMO, content=pair("seed"))
+    await sessions.ensure("projection")
+    await managers[0].project_conversation(UMO, cid, "projection")
+    before = await sessions.get("projection")
+
+    updated = await sessions.update("projection", {"persona_id": "chosen-persona"})
+
+    assert updated.persona_id == "chosen-persona"
+    # 落盘判据：重新读回来还是它（不是只在内存里改了）
+    assert (await sessions.get("projection")).persona_id == "chosen-persona"
+    # 历史相关的版本号不许被这次改动带跑
+    assert updated.history_revision == before.history_revision
+    # 插件那边的历史也没被动
     assert await history(managers[0], cid) == pair("seed")
 
 

@@ -389,11 +389,22 @@ async def test_checkpoint_and_native_tool_history_reach_model_without_internal_r
     assert history == stored[:len(history)]
 
 
+#: 🔴 `persona_id` **不在**这个列表里（2026-10-31 修）。
+#:    它曾被我一起禁掉，但那是个**划宽了**的保护：
+#:    `Session.persona_id` 只决定"我们自己的聊天用哪个系统提示词"
+#:    （`ChatService.resolve_persona()` 的 显式 > 会话 > 全局），
+#:    **陪伴插件根本不读它**（它的角色绑定在自己库里的 `RoleBinding`）。
+#:    禁它的效果是：设置页点保存 → 红字「历史和人格由陪伴管理」→
+#:    用户以为"不能给人设"，其实那个下拉跟插件毫无关系。
+#:
+#:    ✅ 仍必须禁的两类（见 `SessionRepository.update` 的注释）：
+#:      * `user_id` —— 它是 **umo 第三段**，插件认人的键，改它会对不上号；
+#:      * `summary` / `summarized_upto` —— 历史正文的摘要，归插件管。
 @pytest.mark.parametrize("method,path_suffix,body", [
     ("delete", "", None),
     ("post", "/clear", {}),
-    ("patch", "", {"persona_id": "another-persona"}),
     ("patch", "", {"user_id": "another-user"}),
+    ("patch", "", {"summary": "forged summary"}),
 ])
 async def test_http_cannot_fake_mutating_native_history(external_pipeline, method, path_suffix, body):
     from emotion_app.web.default_llm_reply import build_external_chat_request
@@ -428,6 +439,45 @@ async def test_http_chat_rejects_native_projection_before_plugins_and_model(exte
     p.plugins.dispatch_event.assert_not_awaited()
     assert p.requests == p.sent == []
     assert await p.store.load_store() == before
+
+
+async def test_native_projection_can_still_bind_a_persona(external_pipeline):
+    """原生会话**仍然可以**绑人设 —— 那是我们自己的字段，插件不读它。
+
+    🔴 情绪 2026-10-31 报障（截图红字）：「我不能给会话绑定人设了？」
+       真因：`_require_writable` / `update()` 把整个原生会话一刀切禁写，
+       把 `persona_id` 和 `summary` 当成了同一类东西。
+       但两者的归属完全不同：
+
+         * `summary` —— 历史正文的摘要，归**陪伴插件**维护 ⇒ 禁
+         * `persona_id` —— 我们聊天用哪个系统提示词，插件**不读** ⇒ 应允许
+
+    ⚠️ 判据必须验"真的落盘了"，不能只看 200：
+       本项目最忌的失败形态就是"面板说保存成功，实际没写进去"。
+    """
+    from emotion_app.web.default_llm_reply import build_external_chat_request
+
+    p = external_pipeline
+    request = await build_external_chat_request(p.chat, p.plugins, p.event())
+    client = p.app.test_client()
+    headers = {"Authorization": "Bearer isolated-token"}
+
+    # 面板上真的有这个人设可绑（否则下面的"改成功"没意义）
+    personas = (await (await client.get("/api/v1/personas", headers=headers)).get_json()).get("data") or []
+    assert personas, "前置：一个人设都没有，本条判据无法证明任何事"
+    target = personas[0]["id"]
+
+    response = await client.patch(
+        f"/api/v1/sessions/{request.session_id}",
+        json={"persona_id": target},
+        headers=headers,
+    )
+    assert response.status_code == 200, await response.get_json()
+
+    # 🔴 落盘判据：重新读回来必须是刚设的那个
+    got = (await (await client.get(f"/api/v1/sessions/{request.session_id}", headers=headers)).get_json())
+    session = got.get("data") or got
+    assert session.get("persona_id") == target, session.get("persona_id")
 
 
 async def test_native_projection_remains_readable_and_view_settings_can_change(external_pipeline):

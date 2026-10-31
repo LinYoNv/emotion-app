@@ -34,9 +34,23 @@ class SessionNotFound(KeyError):
 
 
 class NativeProjectionReadOnly(ValueError):
-    """原生对话投影的历史和人格由原生对话维护。"""
+    """原生对话投影的**历史正文与身份**由陪伴维护。
 
-    def __init__(self, message: str = "此聊天窗口的历史和人格由陪伴管理，请到陪伴页面修改，或在 QQ 中继续对话。") -> None:
+    ⚠️ 文案必须与**实际被禁的字段**对齐（2026-10-31 修）：
+       原来写的是「历史和**人格**由陪伴管理」，可人格（`persona_id`）**已经解禁**了
+       —— 再这么写就会让用户以为"人设也不能改"，而其实能改、只是别的地方改。
+       这类**过期文案**是假信息的来源：用户按它去"陪伴页面找人格"，
+       而那里根本没有我们要的这个字段。
+    """
+
+    def __init__(
+        self,
+        message: str = (
+            "这个窗口的聊天历史与身份（用户 ID）由陪伴插件维护，"
+            "不能在面板里改。请到陪伴页面处理，或在 QQ 中继续对话。"
+            "（标题、人设、这条会话用的模型仍然可以改。）"
+        ),
+    ) -> None:
         super().__init__(message)
 
 
@@ -415,8 +429,33 @@ class SessionRepository:
                          "native_history_revision", "native_reset_revision"}
             if protected.intersection(patch):
                 raise ValueError("会话来源与历史版本由服务端维护，不能手动修改")
+            # 🔴🔴 原生会话的**写保护要分两类，不能一刀切**（2026-10-31 修）。
+            #
+            #    我第一版把 `persona_id` 和 `summary` 一起禁了，于是情绪在设置页
+            #    点「保存」时红字报「此聊天窗口的历史和人格由陪伴管理」——
+            #    可那个下拉绑的是**我们自己聊天用哪个系统提示词**
+            #    （`ChatService.resolve_persona()`，优先级 显式 > 会话 > 全局），
+            #    **陪伴插件根本不读 `Session.persona_id`**（它的角色绑定在自己库里
+            #    的 `persona_binding_events` / `RoleBinding`，是另一套）。
+            #    ⇒ 禁它没有任何理由，纯属把保护范围划宽了。
+            #
+            #    两类字段，判据不同：
+            #
+            #    Ａ **历史正文**（归插件管）—— 必须禁：
+            #       `summary` / `summarized_upto`：这是**我们自己**的摘要结果，
+            #       而原生会话的历史正文由插件那边维护，改它只会造成
+            #       "面板以为改了、聊天仍按插件的来"的假成功。
+            #    Ｂ **本地展示/选择设置**（插件不读）—— **允许**：
+            #       `persona_id`：我们聊天用哪个提示词（见上）；
+            #       `title`：面板上的名字；
+            #       `model`：这条会话用哪个上游模型（`resolve_session_model`）。
+            #       ⚠️ 这三个都能在 `allowed` 里，且**不会**动插件的任何数据。
+            #    Ｃ **身份**（`user_id`）—— 必须禁：
+            #       它就是 **umo 的第三段**，是插件认人的键
+            #       （`data["users"][<user_id>]`）。改它 = 让面板和插件对不上号
+            #       （面板以为绑好了，插件仍按旧 umo 查记忆/关系）。
             if (s.native_origin or s.native_conversation_id) and {
-                "persona_id", "user_id", "summary", "summarized_upto",
+                "user_id", "summary", "summarized_upto",
             }.intersection(patch):
                 raise NativeProjectionReadOnly()
             if {"summary", "summarized_upto", "policy"}.intersection(patch):
