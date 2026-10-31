@@ -107,11 +107,11 @@ class Summarizer:
         if cursor >= len(dialog):
             return SummarizeOutcome(reason="没有新消息需要总结", cursor=cursor)
 
-        # 只取"滑出保护窗口"且"还没总结过"的部分
-        boundary = max(0, len(dialog) - (policy.protected_tail or 0))
-        chunk = dialog[cursor:boundary]
+        chunk = context_mod.to_summarize(messages, policy, cursor=cursor)
         if not chunk:
             return SummarizeOutcome(reason="窗口内的消息不参与总结", cursor=cursor)
+        summarized = sum(message.role in ("user", "assistant") for message in chunk)
+        boundary = cursor + summarized
 
         async with self._lock(session_id):
             try:
@@ -131,7 +131,7 @@ class Summarizer:
                 # ⚠️ 失败**不推进游标** —— 下次重试同一段（幂等：结果一样）
                 log.warning(
                     "总结失败，游标不推进，下次重试",
-                    extra={"data": {"session": session_id, "chunk": len(chunk),
+                    extra={"data": {"session": session_id, "chunk": summarized,
                                     "error": str(exc)[:120]}},
                 )
                 return SummarizeOutcome(reason=f"总结失败：{exc}", cursor=cursor)
@@ -140,21 +140,21 @@ class Summarizer:
             # 模型认为不值得总结 —— 仍然推进游标（否则会反复问同一段）
             log.info(
                 "模型判断无需总结，游标照常推进",
-                extra={"data": {"session": session_id, "chunk": len(chunk)}},
+                extra={"data": {"session": session_id, "chunk": summarized}},
             )
             return SummarizeOutcome(
-                ran=True, ok=True, summarized=len(chunk), cursor=boundary,
+                ran=True, ok=True, summarized=summarized, cursor=boundary,
                 summary=current_summary,      # 保持旧摘要不变
                 reason="模型输出空摘要",
             )
 
         log.info(
             "总结完成",
-            extra={"data": {"session": session_id, "chunk": len(chunk),
+            extra={"data": {"session": session_id, "chunk": summarized,
                             "chars": len(summary)}},
         )
         return SummarizeOutcome(
-            ran=True, ok=True, summarized=len(chunk),
+            ran=True, ok=True, summarized=summarized,
             summary=summary, summary_chars=len(summary), cursor=boundary,
         )
 

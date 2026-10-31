@@ -1,12 +1,62 @@
 # -*- coding: utf-8 -*-
-"""人设模型。
+"""人设模型 —— **对齐 AstrBot 的 `Persona`**（情绪 2026-10-29 拍板）。
 
-字段来源：爱语真 dex 的 `PersonaInfo.java`（**实测 6 个字段**）。
-⭐ 判据：这 6 个字段恰好是 **SillyTavern 角色卡标准结构** → 可导入现成角色卡生态。
+## 为什么改成 AstrBot 的结构
 
-⚠️ 但人设**不只是字段**（见 `docs/PERSONA_PROMPT_SYSTEM.md`）：
-实测爱语把人物设定**组装成分节的 system prompt**（51 个 `【】` 小节）提交。
-所以这里除 6 字段外，还带 `prompt_sections`（提示词片段）与 per-persona 上游覆盖。
+原来这里是「爱语 `PersonaInfo` 的 6 字段 + `prompt_sections` 片段化」。
+那套结构在**面板上看不全**，而且**陪伴插件根本不认**：
+
+* 面板界面只画 `description` / `personality` / `scenario` / `creator_notes`
+  四个输入框 —— 人设正文如果放进 `prompt_sections`，界面上就是**空白**
+  （实测：莉莉丝 8621 字符全文躺在 `prompt_sections`，面板四个框全空）。
+* 陪伴插件通过 `astrbot_host/persona_manager.py` 读的是 AstrBot 的
+  `Personality`（`provider.meta()` 那一族），字段名是 `prompt` / `name` /
+  `begin_dialogs` / `tools` / `skills` / `custom_error_message`。
+  它**不认识** `description` 那 6 个字段。
+
+情绪原话：「把'人格'改成astrbot的那样……json字段也要按照astrbot那样做，
+感觉这样就不容易出问题」。
+
+## 权威来源（实测读出来的，不是猜的）
+
+`astrbot/core/db/po.py:145` 的 `Persona`（v4 推荐，SQLModel 表）：
+
+```python
+persona_id: str = Field(max_length=255, nullable=False)
+system_prompt: str = Field(sa_type=Text, nullable=False)
+begin_dialogs: list | None = Field(default=None, sa_type=JSON)
+tools: list | None = Field(default=None, sa_type=JSON)
+skills: list | None = Field(default=None, sa_type=JSON)
+custom_error_message: str | None = Field(default=None, sa_type=Text)
+folder_id: str | None = Field(default=None, max_length=36)
+sort_order: int = Field(default=0)
+```
+
+`astrbot/core/db/po.py:581` 的 `Personality`（v3 TypedDict，兼容用）：
+
+```python
+prompt: str; name: str
+begin_dialogs: list[str]; mood_imitation_dialogs: list[str]
+tools: list[str] | None; skills: list[str] | None
+custom_error_message: str | None
+_begin_dialogs_processed: list[dict]; _mood_imitation_dialogs_processed: str
+```
+
+⚠️ 我们**不实现** `_begin_dialogs_processed` / `_mood_imitation_dialogs_processed`
+—— 那是 AstrBot 自己的**缓存字段**（名字带下划线前缀），由它的
+`get_v3_persona_data()` 现算。我们照抄它们只会让"谁是真值"变模糊。
+
+## 关键取舍
+
+1. **`persona_id` == `name`**（AstrBot 就是这么用的：`personas_v3` 里
+   `persona["name"] == persona_id`，见 `persona_mgr.py:56`）。
+   内部仍保留 `id`（uuid）当存储主键 —— 因为它**允许改名**而不丢引用
+   （AstrBot 那边改 `persona_id` 等于换了一个人格）。
+2. **`system_prompt` 是唯一的人设正文**，不再有 6 字段拆分。
+3. **兼容读取**：`from_dict()` 遇到旧数据（只有 6 字段 / `prompt_sections`）
+   会自动**拼成 `system_prompt`** —— 旧数据一行都不丢，只是结构变了。
+4. `api_url` / `api_key` / `model` / `reference_image_path` / `avatar_path`
+   保留（AstrBot 没有，但这是我们自己的扩展，与结构不冲突）。
 """
 from __future__ import annotations
 
@@ -15,133 +65,112 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-#: 提示词片段来源 —— 决定"这段是谁加的"，便于调试与治理
-SECTION_SOURCES = (
-    "builtin",   # 系统内置（如"强制格式约束"）
-    "persona",   # 人设自带（角色卡里的设定）
-    "user",      # 用户手写
-    "memory",    # 记忆注入（S4）
-    "module",    # 模块注入（S5 预留）
+#: AstrBot `Personality`（v3）的字段名 —— 供兼容层按需转换。
+#: ⚠️ 只列**真值字段**，不含 `_` 开头的缓存字段（见模块 docstring）。
+ASTRBOT_PERSONALITY_FIELDS = (
+    "prompt",
+    "name",
+    "begin_dialogs",
+    "mood_imitation_dialogs",
+    "tools",
+    "skills",
+    "custom_error_message",
 )
 
 
-@dataclass(slots=True)
-class PromptSection:
-    """一段提示词。片段化是刻意设计——不是一坨大字符串。
+def _as_str_list(value: Any) -> list[str]:
+    """把 AstrBot 的 `list | None` 归一成 `list[str]`（None → []）。
 
-    理由（见 `PERSONA_PROMPT_SYSTEM.md` §3.2）：
-      ① 片段化 → 可按条件开关；
-      ② 来源可追溯 → 出问题知道是谁加的；
-      ③ 顺序稳定 → 稳定前缀提高缓存命中（爱语"记忆好"的真实机制）。
+    ⚠️ `None` 在 AstrBot 里有**特殊含义**（`tools=None` = 用全部工具，
+    `tools=[]` = 不用任何工具）。所以这个归一**只用于展示/落盘**，
+    真正传给陪伴插件时要保留原始 `None`（见 `to_personality()`）。
     """
-
-    title: str                       # 小节名，如"文生图系统"
-    content: str = ""
-    enabled: bool = True
-    order: int = 100                 # 越小越靠前；易变内容应放后面
-    source: str = "user"
-    condition: str = ""              # 条件表达式（S3+ 用，暂不解析）
-
-    def validate(self) -> None:
-        if not self.title or not self.title.strip():
-            raise ValueError("PromptSection.title 不能为空")
-        if self.source not in SECTION_SOURCES:
-            raise ValueError(f"未知 source：{self.source!r}，允许 {SECTION_SOURCES}")
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "title": self.title,
-            "content": self.content,
-            "enabled": self.enabled,
-            "order": self.order,
-            "source": self.source,
-            "condition": self.condition,
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> PromptSection:
-        return cls(
-            title=d["title"],
-            content=d.get("content", ""),
-            enabled=bool(d.get("enabled", True)),
-            order=int(d.get("order", 100)),
-            source=d.get("source", "user"),
-            condition=d.get("condition", ""),
-        )
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(x) for x in value if str(x).strip()]
+    return []
 
 
 @dataclass(slots=True)
 class Persona:
-    """一个人设（角色卡）。
+    """一个人设 —— 字段与 AstrBot `Persona` 对齐。
 
-    ⚠️ 情绪 2026-09-18：「就是一个人用，但是**角色卡可以有多张**就像爱语一样」
+    ⚠️ 情绪 2026-09-18：「就是一个人用，但是**角色卡可以有多张**」
     → **不做多用户**，但人设是一对多。
     """
 
-    # ---- 爱语 PersonaInfo 的 6 个字段（照抄，可导入 SillyTavern 卡）----
+    # ---- AstrBot `Persona` 的核心（照抄字段名与语义）----
+    #: 人格名 = AstrBot 的 `persona_id`（两者同值，见模块 docstring）
     name: str = ""
-    description: str = ""
-    personality: str = ""
-    scenario: str = ""
-    creator_notes: str = ""
-    avatar_path: str = ""
+    #: **完整系统提示词**（`.txt` 全文就放这里）。AstrBot 的 `system_prompt`。
+    system_prompt: str = ""
+    #: 开场对话（AstrBot `begin_dialogs`）
+    begin_dialogs: list[str] = field(default_factory=list)
+    #: 工具白名单：`None` = 用全部，`[]` = 不用任何（**语义不同，别归一**）
+    tools: list[str] | None = None
+    #: Skills 白名单：同上
+    skills: list[str] | None = None
+    #: 出错时的自定义回复
+    custom_error_message: str | None = None
+    #: 所属文件夹（AstrBot `folder_id`）
+    folder_id: str | None = None
+    #: 排序（AstrBot `sort_order`）
+    sort_order: int = 0
 
-    # ---- 元数据 ----
+    # ---- 存储主键与元数据（AstrBot 用自增 id，我们用 uuid 以便改名）----
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
-    # ---- 提示词组装（⭐ 核心，见 PERSONA_PROMPT_SYSTEM.md）----
-    prompt_sections: list[PromptSection] = field(default_factory=list)
-
-    # ---- per-persona 上游覆盖（爱语实测支持）----
+    # ---- 我们的扩展（AstrBot 没有，但与本结构不冲突）----
+    avatar_path: str = ""
+    #: per-persona 上游覆盖
     api_url: str = ""
     api_key: str = ""
     model: str = ""
-
-    #: 🆕 **人设参考图**（2026-09-25，情绪「用户能填的就让用户改」）。
-    #: 这个角色生图（`kind=selfie`）时的固定参考图 —— 否则同一个角色每次画出来都不一样。
-    #:
-    #: 存**纯文件名**（落在 `data/persona_refs/`），理由同 `avatar_path`：
-    #: 不把宿主机目录结构写进数据，整个 `data/` 搬走依然有效。
-    #:
-    #: 🔴 **为什么是 per-persona 而不是全局一个**：人设是**一对多**的
-    #: （见类 docstring），切角色就该换脸；全局单值会让所有角色共用一张参考图。
-    #: 全局那份（`EMOTION_IMAGE_PERSONA_REFERENCE`）**降为兜底**。
-    #:
-    #: ⚠️ 它**不是**爱语 `PersonaInfo` 的 6 字段之一（那是照抄的原始结构，
-    #: 见 `docs/PERSONA_IMPORT_FORMAT.md`）—— 这是我们自己的扩展字段。
-    #: 导入/导出时它跟着走（否则换个机器参考图就丢了）。
+    #: 生图固定参考图（纯文件名，落在 `data/persona_refs/`）
     reference_image_path: str = ""
 
+    # ------------------------------------------------------------------
+
     def validate(self) -> None:
+        """校验。**名称必填，正文可以为空**（空正文 = 纯默认人格，合法）。"""
         if not self.name or not self.name.strip():
             raise ValueError("Persona.name 不能为空")
         if len(self.name) > 200:
             raise ValueError("Persona.name 过长（>200）")
-        for s in self.prompt_sections:
-            s.validate()
+        if self.sort_order < 0:
+            raise ValueError("Persona.sort_order 不能为负")
+        for i, dialog in enumerate(self.begin_dialogs):
+            if not isinstance(dialog, str):
+                raise ValueError(f"begin_dialogs[{i}] 必须是字符串")
 
     # ---- 序列化 ----
 
     def to_dict(self, *, include_secrets: bool = False) -> dict[str, Any]:
-        """转 dict。
+        """转 dict（**字段名与 AstrBot 一致**，另加我们自己的几个）。
 
         Args:
             include_secrets: 是否包含 `api_key`。**默认 False**
                 —— 出口（API/日志）一律脱敏，只有存储时才用 True。
         """
         d: dict[str, Any] = {
-            "id": self.id,
+            # AstrBot Persona 字段
+            "persona_id": self.name,
             "name": self.name,
-            "description": self.description,
-            "personality": self.personality,
-            "scenario": self.scenario,
-            "creator_notes": self.creator_notes,
-            "avatar_path": self.avatar_path,
+            "system_prompt": self.system_prompt,
+            "begin_dialogs": list(self.begin_dialogs),
+            "tools": None if self.tools is None else list(self.tools),
+            "skills": None if self.skills is None else list(self.skills),
+            "custom_error_message": self.custom_error_message,
+            "folder_id": self.folder_id,
+            "sort_order": self.sort_order,
+            # 我们的存储/元数据
+            "id": self.id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "prompt_sections": [s.to_dict() for s in self.prompt_sections],
+            "avatar_path": self.avatar_path,
             "api_url": self.api_url,
             "model": self.model,
             "api_key_configured": bool(self.api_key),
@@ -154,33 +183,98 @@ class Persona:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Persona:
+        """从 dict 还原。**兼容旧结构**（爱语 6 字段 / `prompt_sections`）。
+
+        🔴 为什么必须兼容：旧数据已经在 `emotion.db` 里了（莉莉丝、糯米茨）。
+           直接不认旧字段 = **用户的人设凭空消失**，那是不可接受的数据事故。
+
+        旧结构 → 新结构的映射（按信息量从大到小，拼接顺序固定）：
+          `prompt_sections[*].content`（按 order/title 稳定排序）
+          + `description` + `personality` + `scenario` + `creator_notes`
+        """
+        prompt = d.get("system_prompt")
+
+        if not isinstance(prompt, str) or not prompt.strip():
+            prompt = cls._migrate_legacy_prompt(d)
+
+        name = str(d.get("name") or d.get("persona_id") or "")
+        if not name.strip():
+            raise ValueError("Persona.name 不能为空（旧数据也没有 name）")
+
         return cls(
+            name=name,
+            system_prompt=prompt,
+            begin_dialogs=_as_str_list(d.get("begin_dialogs")),
+            # ⚠️ tools/skills **保留原始 None**（None≠[]，见模块 docstring）
+            tools=None if d.get("tools") is None else _as_str_list(d.get("tools")),
+            skills=None if d.get("skills") is None else _as_str_list(d.get("skills")),
+            custom_error_message=d.get("custom_error_message"),
+            folder_id=d.get("folder_id"),
+            sort_order=int(d.get("sort_order") or 0),
             id=d.get("id") or uuid.uuid4().hex,
-            name=d.get("name", ""),
-            description=d.get("description", ""),
-            personality=d.get("personality", ""),
-            scenario=d.get("scenario", ""),
-            creator_notes=d.get("creator_notes", ""),
+            created_at=float(d.get("created_at") or time.time()),
+            updated_at=float(d.get("updated_at") or time.time()),
             avatar_path=d.get("avatar_path", ""),
-            created_at=float(d.get("created_at", time.time())),
-            updated_at=float(d.get("updated_at", time.time())),
-            prompt_sections=[
-                PromptSection.from_dict(x) for x in d.get("prompt_sections", [])
-            ],
             api_url=d.get("api_url", ""),
             api_key=d.get("api_key", ""),
             model=d.get("model", ""),
             reference_image_path=d.get("reference_image_path", ""),
         )
 
-    # ---- 提示词组装 ----
+    @staticmethod
+    def _migrate_legacy_prompt(d: dict[str, Any]) -> str:
+        """把旧结构（6 字段 / prompt_sections）拼成 `system_prompt`。
 
-    def enabled_sections(self) -> list[PromptSection]:
-        """启用中的片段，**按 order 稳定排序**（同 order 按 title 保证确定性）。
-
-        ⭐ 稳定性是刻意的：顺序抖动会破坏上游的 prompt 缓存命中。
+        ⚠️ **顺序稳定**是刻意的：同 order 按 title 排，保证每次跑出来一字不差
+           （否则上游 prompt 缓存会一直失效）。
         """
-        return sorted(
-            (s for s in self.prompt_sections if s.enabled),
-            key=lambda s: (s.order, s.title),
-        )
+        parts: list[str] = []
+
+        sections = d.get("prompt_sections")
+        if isinstance(sections, list):
+            usable = []
+            for s in sections:
+                if not isinstance(s, dict):
+                    continue
+                if s.get("enabled") is False:
+                    continue
+                content = s.get("content")
+                if isinstance(content, str) and content.strip():
+                    usable.append(
+                        (int(s.get("order", 100) or 0), str(s.get("title") or ""), content)
+                    )
+            for _order, _title, content in sorted(usable, key=lambda x: (x[0], x[1])):
+                parts.append(content)
+
+        # 6 字段里剩下的部分（prompt_sections 里通常已有副本，这里去重）
+        joined = "\n".join(parts)
+        for key in ("description", "personality", "scenario", "creator_notes"):
+            value = d.get(key)
+            if isinstance(value, str) and value.strip() and value.strip() not in joined:
+                parts.append(value.strip())
+
+        return "\n\n".join(parts)
+
+    # ---- 与 AstrBot `Personality` 互转 ----
+
+    def to_personality(self) -> dict[str, Any]:
+        """转成 AstrBot v3 `Personality` 的形状（供兼容层喂给插件）。
+
+        🔴 `prompt` 用 `system_prompt`；`tools`/`skills` 的 **None 语义原样保留**
+           （`None`=全部，`[]`=一个都不给）。把它们归一成 `[]` 会让插件
+           以为"这个角色不许用任何工具" —— 那是**功能性故障**，不只是显示问题。
+        """
+        return {
+            "prompt": self.system_prompt,
+            "name": self.name,
+            "begin_dialogs": list(self.begin_dialogs),
+            "mood_imitation_dialogs": [],
+            "tools": None if self.tools is None else list(self.tools),
+            "skills": None if self.skills is None else list(self.skills),
+            "custom_error_message": self.custom_error_message,
+        }
+
+    @property
+    def persona_id(self) -> str:
+        """AstrBot 的 `persona_id`（= `name`）。"""
+        return self.name

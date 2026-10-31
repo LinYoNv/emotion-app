@@ -406,7 +406,10 @@ class Config:
         self.plugins.validate()
 
     def public_view(self) -> dict[str, Any]:
-        """脱敏全量视图（供 /health 与日志）。**不含任何密钥明文**。"""
+        """脱敏全量视图（供面板与**已鉴权**的诊断接口）。**不含任何密钥明文**。
+
+        ⚠️ **别再拿它喂 `/health`** —— 那个端点**免鉴权**（见 `liveness_view()`）。
+        """
         return {
             "server": {
                 "host": self.server.host,
@@ -420,6 +423,33 @@ class Config:
             "image": self.image.public_view(),
             "logging": {"level": self.logging.level, "json_output": self.logging.json_output},
             "plugins": self.plugins.public_view(),
+        }
+
+    def liveness_view(self) -> dict[str, Any]:
+        """**免鉴权**端点（`/health`）专用的极小视图。
+
+        🔴 为什么单独一个（2026-10-29，绑公网前审计出来的）：
+
+        `/health` **不需要令牌**（这是对的 —— 反代/监控要能探活）。
+        但它原来直接返回 `public_view()`，于是**任何能访问到端口的人**都能看到：
+
+          * 上游 `base_url`（中转站地址）与模型名
+          * 生图 `base_url`、模型、输出目录
+          * `token_length: 43` —— **密码长度是暴力破解的第一份情报**
+          * 插件目录结构、日志级别
+
+        这些不是密钥，但**是环境指纹**：拼起来足够让人判断
+        "这是谁的机器、上游在哪、值不值得打"。绑 `127.0.0.1` 无所谓，
+        绑 `0.0.0.0` 就是主动把底牌摊在公网上。
+
+        ✅ 探活真正需要的只有三件事：**活没活 / 存储通不通 / 聊得起来吗**。
+           （后两项仍由 `/health` 自己补 `storage` 与 `chat_ready`）
+        """
+        return {
+            "server": {"exposed": self.server.is_public()},
+            # 只报"配没配"，不报长度、不报任何地址
+            "auth": {"token_configured": bool(self.auth.access_token)},
+            "upstream": {"configured": bool(self.upstream.base_url)},
         }
 
 

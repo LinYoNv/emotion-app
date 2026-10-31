@@ -57,9 +57,15 @@ class Provider:
 
     # ---- 元信息（真实现有；插件可能读）----
 
-    @property
     def meta(self) -> Any:
-        """provider 元信息（真实现返回 `ProviderMeta`）。"""
+        """provider 元信息（真实现 `provider/provider.py:43`）。
+
+        🔴 **必须是方法，不是 property**（2026-10-29 修）：
+           真实现是 `def meta(self) -> ProviderMeta`，调用方写 `provider.meta()`。
+           我们原来写成了 `@property` ⇒ `provider.meta()` 抛
+           `TypeError: 'ProviderMeta' object is not callable`。
+           插件（及我们自己的 provider 端口）都按**方法**调，所以这里改回方法。
+        """
         from astrbot_host.compat.core.provider.entities import ProviderMeta
 
         cfg = self.provider_config
@@ -111,9 +117,127 @@ class ProviderGoogleGenAI(Provider):
 
 
 class ProviderOpenAIOfficial(Provider):
-    """OpenAI 官方 provider（真实现 `openai_source.py:51`）。"""
+    """OpenAI 官方 provider（真实现 `openai_source.py:51`）。
+
+    🔴 **2026-10-29：这个类从"纯类型标记"升级为"可实例化的真实现类"**。
+       原因是一条**精确类型校验**（不是 `isinstance`）：
+
+       ```python
+       # companion_v2/adapters/astrbot/provider.py:188
+       if type(self.native) is not provider_type:      # provider_type = ProviderOpenAIOfficial
+           raise ValueError("provider needs the verified native provider class")
+       ```
+
+       `type(x) is C` 要求 **`type(x)` 精确等于 `C`** ⇒ 任何子类都不通过。
+       所以宿主**必须直接实例化这个类本身**（与真 AstrBot 一致：真实现里
+       `ProviderOpenAIOfficial` 就是那个既有类型又有实现的类，
+       宿主的 provider 管理器装的就是它的实例）。
+
+    ⚠️ `get_model` / `client` / `default_params` / `_query_stream` 这四项
+       由宿主在 `register_provider_native()` 里注入（**不在这里写死**），
+       因为它们的值与上游配置（base_url / api_key / model）绑定，
+       而本模块属于"插件只依赖 AstrBot 契约"的边界，不该知道我们的配置结构。
+    """
 
     PROVIDER_TYPE = "openai_chat_completion"
+
+    #: 当前模型名（真实现 `provider.py:39` `get_model()` 读 `self.model_name`）。
+    #: 宿主装配时注入；未注入 ⇒ 空串（插件据此判"没配"，不是静默给假值）。
+    model_name: str = ""
+
+    #: OpenAI SDK 实例（真实现 `openai_source.py:384`）。
+    #: 宿主装配时注入；未注入 ⇒ None（插件在 `_current()` 里明确报
+    #: `host_provider_changed`，**不是**静默空回复）。
+    client: Any = None
+
+    #: `client.chat.completions.create` 的签名参数名集合
+    #: （真实现 `openai_source.py:392-394` `inspect.signature(...).parameters.keys()`）。
+    default_params: Any = frozenset()
+
+    def get_model(self) -> str:
+        """当前模型名（插件 `provider.py:192` 直接读它）。"""
+        return str(self.model_name or self.provider_config.get("model") or "")
+
+    def set_model(self, model: str) -> None:
+        self.model_name = str(model or "")
+        self.provider_config["model"] = self.model_name
+
+    async def _query_stream(self, *args: Any, **kwargs: Any) -> Any:
+        """流式传输入口（真实现 `openai_source.py` 的流式方法）。
+
+        ⚠️ 插件只在 `streaming=True` 时检查它是否存在
+           （`provider.py:197` `if streaming and not callable(...)`）。
+           存在但抛 NotImplementedError 是**如实**的：
+           比"检查能过、真调时静默返回空"好得多。
+        """
+        raise NotImplementedError(
+            "本宿主的 ProviderOpenAIOfficial 不支持流式传输（streaming=True）；"
+            "请在插件设置里把 model.streaming 关掉。"
+        )
+
+
+    async def _parse_openai_completion(self, completion: Any, tools: Any = None) -> Any:
+        """把原始 completion 解析成 `LLMResponse`（真实现 `openai_source.py:833`）。
+
+        🔴🔴 **2026-10-30 补的真缺口（生产实测）**：
+           陪伴 7.0 在模型回复处理阶段会**显式调用这个类方法**：
+
+               parsed = await self.provider_type._parse_openai_completion(
+                   native, completion, offered)
+
+           （`companion_v2/adapters/astrbot/provider.py:376`，
+             `provider_type` 就是我们这个 `ProviderOpenAIOfficial`）。
+
+           它替换的只是**实例属性**；类上若没有这个方法 ⇒ 插件回落到
+           类方法时抛 `AttributeError` ⇒ `native_response_parse_failed`
+           ⇒ `model_usage_unknown`（第 8 步「主动消息测试」的最后一环）。
+
+        实现取真实现的**核心语义**：从 `choices[0].message` 取文本与
+        reasoning，从 `tools_call_*` 取工具调用；厂商特有的 payload 改写
+        （`_finally_convert_payload`）**不做** —— 我们不在这一步猜测改写，
+        交给上游即可。
+        """
+        # 🔴 **不在这里手拼 `LLMResponse`**：本项目硬约束是「只有一个构造入口」
+        #    （`host/tests/test_response_bridge.py:391` 的源码级扫描判据）。
+        #    统一走 `response_bridge.to_llm_response`。
+        #    ⚠️ 它按**属性**读正文（`content` / `text` / `completion_text`），
+        #       所以这里先把 completion 的 `choices[0].message` **摊平**成
+        #       它认识的对象，再交出去 —— 不在本文件重复一份解析逻辑。
+        from types import SimpleNamespace
+
+        from astrbot_host.response_bridge import to_llm_response
+
+        def read(value: Any, name: str, default: Any = None) -> Any:
+            if isinstance(value, dict):
+                return value.get(name, default)
+            return getattr(value, name, default)
+
+        choices = read(completion, "choices", ()) or ()
+        if not choices:
+            raise ValueError("model completion has no choices")
+        choice = choices[0]
+        message = read(choice, "message")
+        content = read(message, "content")
+        if isinstance(content, list):
+            content = "".join(
+                str(read(part, "text", "") or "")
+                for part in content
+                if read(part, "type") == "text" or isinstance(part, str)
+            )
+        flat = SimpleNamespace(
+            content=None if content is None else str(content),
+            reasoning_content=read(message, "reasoning_content"),
+            tool_calls=read(message, "tool_calls"),
+            usage=read(completion, "usage"),
+            finish_reason=read(choice, "finish_reason"),
+            model=read(completion, "model"),
+        )
+        response = to_llm_response(flat, tools=tools)
+        try:
+            response.raw_completion = completion
+        except Exception:  # noqa: BLE001 — 原始体是附加信息
+            pass
+        return response
 
 
 class ProviderFishAudioTTSAPI(Provider):

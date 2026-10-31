@@ -25,6 +25,20 @@
 ⚠️ 纯标准库实现（`struct`/`zlib`/`base64`/`json`）——
    本项目依赖刻意只有 quart/hypercorn/aiosqlite/httpx，
    **不为读个 PNG 块引入 Pillow**。
+
+🔴 **2026-10-29 人设结构重构（情绪拍板「改成 astrbot 那样」）**：
+   `Persona` 不再是「爱语 6 字段 + `prompt_sections` 片段」，而是
+   **`persona_id` + 一整段 `system_prompt`**（对齐 AstrBot `core/db/po.py:145`）。
+   本模块的改动只有一类：**来源字段不再塞进片段，而是拼成 `system_prompt`**。
+
+   * 导入：`description → personality → scenario → creator_notes` 用 `\n\n`
+     顺序拼接（**顺序固定**，理由见 `_join_prompt_parts`）。
+   * 导出：`system_prompt` 写回角色卡的标准主字段（SillyTavern 用 `description`）。
+   * `avatar_path` / `reference_image_path` 的逻辑**一个字没动**（它们与本次重构无关）。
+
+   ⚠️ 下面出现的 `description` / `personality` / `scenario` / `creator_notes`
+   一律是**外部格式的 dict key**（爱语备份、SillyTavern 卡的字段名），
+   不是我们 `Persona` 的属性 —— 我们的模型里已经没有这些字段了。
 """
 from __future__ import annotations
 
@@ -37,7 +51,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .persona import Persona, PromptSection
+from .persona import Persona
 
 #: PNG 魔数
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -52,9 +66,28 @@ MAX_PERSONAS_PER_FILE = 500
 CARD_KEYWORDS = ("chara", "ccv3")
 
 #: 爱语人设的 6 个字段（照 `PersonaInfo` 的 `@SerializedName`）
+#:
+#: ⚠️ 这是**外部格式的 dict key 名**，不是我们 `Persona` 的属性 ——
+#:    2026-10-29 重构后模型里已经没有 `description` 那一族字段了。
+#:    它现在的唯一用途：算 `extra_fields`（如实告诉用户"备份里这个键我们没接"）。
 AIYU_FIELDS = (
     "name", "description", "personality", "scenario", "creator_notes", "avatar_path",
 )
+
+#: 拼 `system_prompt` 时来源字段的**固定顺序**（2026-10-29 人设结构重构）。
+#:
+#: 🔴 顺序固定有两个实在理由：
+#:   ① 稳定前缀（P3）—— 同一张卡每次导入必须拼出**逐字相同**的正文，
+#:      否则上游 prompt 缓存的稳定前缀一直在变，缓存等于没有；
+#:   ② 可预测 —— 用户看拼接结果能一眼对上"这段来自哪个字段"。
+#:
+#: 这 4 个键在爱语备份与 SillyTavern 卡里**同名同义**，所以一条规则两边通用。
+PROMPT_FIELD_ORDER: tuple[str, ...] = (
+    "description", "personality", "scenario", "creator_notes",
+)
+
+#: 字段分隔符：空一行。空字段**整段跳过**，不会拼出连续三个换行。
+PROMPT_JOINER = "\n\n"
 
 
 class CardImportError(ValueError):
@@ -203,68 +236,55 @@ def _as_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _join_prompt_fields(source: dict[str, Any]) -> str:
+    """把角色卡的文字字段按**固定顺序**拼成人设正文（AstrBot 的 `system_prompt`）。
+
+    🔴 **2026-10-29**：人设结构改成 AstrBot 的「`persona_id` + 一整段
+    `system_prompt`」后，角色卡那些字段（description/personality/scenario/
+    creator_notes）不再各占一个人设字段，而是**拼成一段正文**。
+
+    ⚠️ 只在**判断空**时 strip，拼进去的是**原文** —— 实测踩过：
+       用 `content.strip()` 存会丢掉尾部换行，对长提示词是信息损失。
+
+    Args:
+        source: 角色卡 dict（`creator_notes` 的别名 `creatorcomment` 需调用方先归一）。
+
+    Returns:
+        拼好的正文（没有可用字段时返回 `""`）。
+    """
+    parts: list[str] = []
+    for key in PROMPT_FIELD_ORDER:
+        content = source.get(key)
+        # ⚠️ 只在**判断空**时 strip，拼进去的是**原文**。
+        if isinstance(content, str) and content.strip():
+            parts.append(content)
+    return PROMPT_JOINER.join(parts)
+
+
 def _persona_from_aiyu(d: dict[str, Any]) -> Persona:
-    """爱语 `PersonaInfo` → 我们的 `Persona`（**6 字段逐一对应**）。
+    """爱语 `PersonaInfo` → 我们的 `Persona`。
 
-    ⭐ **把 6 字段物化成可编辑的提示词片段**（2026-09-19 修）。
+    🔴 **2026-10-29 改法**（人设结构对齐 AstrBot）：原来这里把 6 字段各物化成
+       一段 `PromptSection` 塞进 `prompt_sections`，理由是"面板上要有东西可编辑"。
+       新结构下面板编辑的是 `system_prompt` **一个框**，片段那个概念已经删了 ——
+       继续往 `prompt_sections` 写等于**写进一个没人读的地方**（静默失效）。
 
-    为什么必须这么做（实测踩到）：爱语备份**只有 6 个字段，不含片段结构**。
-    如果只填字段、`prompt_sections` 留空，面板的人设页会显示**空片段表** ——
-    用户在界面上看不到、也改不了这些人设内容，而这恰恰是本项目
-    「人设 = 提示词组装器」的核心（见 `PERSONA_PROMPT_SYSTEM.md`）。
-    （`/preview` 仍能显示内容，因为组装器会从字段现算 —— 所以这个 bug
-      **只有真的打开面板点进人设才会发现**，接口测试全绿也照样漏。）
+    现在：4 个正文来源字段由 `_join_prompt_fields` 按**固定顺序**拼成一段
+    `system_prompt`（`description → personality → scenario → creator_notes`）。
 
-    `order` 取值照 `PERSONA_PROMPT_SYSTEM.md` 的稳定前缀原则：
-    描述 → 性格 → 场景 → 备注（稳定内容在前，时间/记忆等易变内容由内置片段排到后面）。
+    ⚠️ `creator_notes` 在爱语备份里可能叫 `creatorcomment`，先归一。
+    ⚠️ 爱语的 `avatar_path` 是**手机上的路径**，搬到后端后无意义
+       → 只记名字不记路径（指过去也是不存在的文件）。
     """
     name = _as_text(d.get("name")).strip()
     if not name:
         raise CardImportError("备份里有条目没有 `name`（名字是必填的）")
 
-    persona = Persona(
-        name=name,
-        description=_as_text(d.get("description")),
-        personality=_as_text(d.get("personality")),
-        scenario=_as_text(d.get("scenario")),
-        creator_notes=_as_text(d.get("creator_notes")),
-        # ⚠️ 爱语的 avatar_path 是**手机上的路径**，搬到后端后无意义
-        #    → 只记名字，不记路径（路径会指向不存在的文件）
-        avatar_path="",
-    )
-
-    #: (字段, 片段标题, order) —— 顺序即注入顺序
-    #:
-    #: 🔴 **标题必须与 `prompt.persona_core_sections()` 逐字一致**：那边也按
-    #:    这 4 个标题从 6 字段现算片段，`prompt.merge_persona_sections()` 靠
-    #:    **标题相等**判断"这两份是同一个东西"→ 去重。
-    #:    ⚠️ 标题一旦漂移，去重会**静默失效**（每段又注入两次，界面看不出异常），
-    #:    所以这里用 `PERSONA_CORE_TITLES` 做**一致性断言**（见下方 assert）。
-    field_sections = (
-        ("description", "角色设定", 20),
-        ("personality", "性格", 21),
-        ("scenario", "场景", 22),
-        ("creator_notes", "创作者备注", 23),
-    )
-    from .prompt import PERSONA_CORE_TITLES as _CORE_TITLES
-
-    assert {t for _, t, _ in field_sections} == set(_CORE_TITLES), (
-        "persona_import 的片段标题与 prompt.PERSONA_CORE_TITLES 不一致 —— "
-        "去重会失效，人设提示词会被注入两次"
-    )
-    sections: list[PromptSection] = []
-    for attr, title, order in field_sections:
-        content = getattr(persona, attr)
-        # ⚠️ 只在**判断空**时 strip，存进去的是**原文**。
-        #    实测踩到：用 `content.strip()` 存会丢掉尾部换行，
-        #    导致"片段内容"与原字段不再逐字相等 —— 用户编辑片段保存后
-        #    会**静默改掉原文**（对他的长提示词来说这是信息损失）。
-        if content.strip():
-            sections.append(
-                PromptSection(title=title, content=content, order=order, source="persona")
-            )
-    persona.prompt_sections = sections
-
+    persona = Persona(name=name, avatar_path="")
+    source = dict(d)
+    if not source.get("creator_notes"):
+        source["creator_notes"] = d.get("creatorcomment")
+    persona.system_prompt = _join_prompt_fields(source)
     return persona
 
 
@@ -323,17 +343,19 @@ def _parse_aiyu_backup(card: dict[str, Any]) -> ParsedCard:
     )
 
 
-#: V2 `data` 里我们没有对应字段、但值得保留的键 → 转成提示词片段
-_V2_SECTION_MAP: tuple[tuple[str, str, int], ...] = (
-    ("system_prompt", "角色卡系统提示词", 60),
-    ("mes_example", "对话示例", 80),
-    ("post_history_instructions", "历史后指令", 950),
-)
-
-#: 问候语不是 system prompt（是"第一条消息"）→ **默认禁用**存进片段
-_GREETING_KEYS: tuple[tuple[str, str], ...] = (
-    ("first_mes", "开场白（默认关闭）"),
-    ("alternate_greetings", "备选开场白（默认关闭）"),
+#: V2 `data` 里"同样是喂给模型的指令、但我们没有独立字段装"的键。
+#:
+#: 🔴 2026-10-29：原来这里第三列是**片段 order**（那套已删）。现在只留键名顺序，
+#:    它们会被**按此顺序追加**到 `system_prompt` 末尾 —— 顺序固定，
+#:    保证同一张卡每次导入得到逐字相同的正文（P3 稳定前缀）。
+#:
+#: ⚠️ 为什么不是所有键都进正文：`description` 那 4 个是"人设正文本体"
+#:    （由 `_join_prompt_fields` 处理，排在最前）；这三个是"附在正文后面的补充
+#:    指令"，语义上本来就是后半段。开场白则**完全不是**正文（见 `begin_dialogs`）。
+_V2_EXTRA_PROMPT_KEYS: tuple[str, ...] = (
+    "system_prompt",
+    "mes_example",
+    "post_history_instructions",
 )
 
 
@@ -353,52 +375,125 @@ def _parse_sillytavern(card: dict[str, Any], fmt: str) -> ParsedCard:
         raise CardImportError("角色卡没有 `name`（名字是必填的）")
 
     notes: list[str] = []
-    persona = Persona(
-        name=name,
-        description=_as_text(data.get("description")),
-        personality=_as_text(data.get("personality")),
-        scenario=_as_text(data.get("scenario")),
-        creator_notes=_as_text(data.get("creator_notes") or data.get("creatorcomment")),
-    )
 
-    sections: list[PromptSection] = []
+    # 🔴 **2026-10-29：正文改成一段 `system_prompt`**（人设结构对齐 AstrBot）。
+    #
+    # ① 先用我们自己的 4 字段规则拼正文（`_join_prompt_fields`，顺序固定）。
+    #    ⚠️ `creator_notes` 在 SillyTavern 里还有个别名 `creatorcomment`，
+    #    所以先做一个**只在本函数内生效**的视图，不动调用方的 dict。
+    # ② 再补两类"卡里有、但我们没人设字段装"的东西：
+    #    * 卡自己的 `system_prompt` / `mes_example` / `post_history_instructions`
+    #      —— 同样是喂给模型的指令，追加到正文后面；
+    #    * 开场白（`first_mes` 等）—— **不是**系统提示词，所以放
+    #      `begin_dialogs`（AstrBot 那个字段就是为"开场对话"准备的）。
+    #      硬塞进正文会让模型以为"这些话已经说过了"。
+    # ③ 我们自己的导出块（`extensions.emotion_app`）里带**原文**，优先级最高 ——
+    #    那是往返无损的唯一保证，不依赖对方前端的字段习惯。
+    source = dict(data)
+    if not source.get("creator_notes"):
+        source["creator_notes"] = data.get("creatorcomment")
 
-    # ⭐ 优先用**我们自己导出**的完整结构（保留 order/enabled → 无损往返）
+    persona = Persona(name=name)
+    persona.system_prompt = _join_prompt_fields(source)
+
     ext = data.get("extensions")
     own = ext.get("emotion_app") if isinstance(ext, dict) else None
-    own_sections = own.get("prompt_sections") if isinstance(own, dict) else None
 
-    if isinstance(own_sections, list) and own_sections:
-        for raw in own_sections:
-            if not isinstance(raw, dict):
-                continue
-            try:
-                sections.append(PromptSection.from_dict(raw))
-            except (KeyError, ValueError) as exc:
-                notes.append(f"片段结构异常已跳过：{exc}")
-        notes.append(f"识别到本程序导出的完整片段结构（{len(sections)} 段，无损导入）")
+    if isinstance(own, dict):
+        notes.append("识别到本程序导出的扩展块（emotion_app）")
         fmt = "emotion_app"
+        # 我们自己的完整正文优先（导出→导入无损往返）
+        own_prompt = own.get("system_prompt")
+        if isinstance(own_prompt, str) and own_prompt.strip():
+            persona.system_prompt = own_prompt
+            notes.append("人设正文取自本程序导出的完整 system_prompt（无损）")
+
+        # 🔴 2026-10-29：**导出写了的键，导入必须读回来**。
+        #    原来这里只恢复 model/api_url，而 `to_export_dict` 把
+        #    begin_dialogs/tools/skills/custom_error_message/sort_order 也写进了
+        #    扩展块 → 导出再导入那些人设的**工具白名单与开场对话全丢**，
+        #    而且完全不报错（往返测试才发现）。导出与导入必须成对改。
+        own_dialogs = own.get("begin_dialogs")
+        if isinstance(own_dialogs, list):
+            persona.begin_dialogs = [x for x in own_dialogs if isinstance(x, str)]
+
+        # ⚠️ `tools`/`skills` 的 **None 语义**必须原样保住：
+        #    `None` = 用全部工具，`[]` = 一个都不给。写成 `or []` 会把
+        #    "全开"变成"全禁" —— 那是功能性故障，不只是显示问题。
+        for key in ("tools", "skills"):
+            if key in own:
+                value = own[key]
+                if value is None:
+                    setattr(persona, key, None)
+                elif isinstance(value, list):
+                    setattr(persona, key, [str(x) for x in value])
+
+        own_err = own.get("custom_error_message")
+        if isinstance(own_err, str) and own_err.strip():
+            persona.custom_error_message = own_err
+        try:
+            persona.sort_order = int(own.get("sort_order") or 0)
+        except (TypeError, ValueError):
+            # 扩展块被手改坏时不该让整个导入失败 —— 但也不静默：
+            notes.append("扩展块里的 `sort_order` 不是整数，已按 0 处理")
+
         if isinstance(own.get("model"), str) and not persona.model:
             persona.model = own["model"]
         if isinstance(own.get("api_url"), str) and not persona.api_url:
             persona.api_url = own["api_url"]
-    else:
-        for key, title, order in _V2_SECTION_MAP:
-            content = _as_text(data.get(key)).strip()
-            if content:
-                sections.append(
-                    PromptSection(title=title, content=content, order=order, source="persona")
-                )
-        for key, title in _GREETING_KEYS:
-            content = _as_text(data.get(key)).strip()
-            if content:
-                sections.append(
-                    PromptSection(title=title, content=content, order=900,
-                                  source="persona", enabled=False)
-                )
-                notes.append(f"「{title}」已导入但**默认关闭**（它不是系统提示词）")
 
-    persona.prompt_sections = sections
+    # 角色卡自带的额外指令 —— 追加到正文后面（顺序固定，保证可复现）。
+    #
+    # ⚠️ 判重是刻意的：我们自己的导出把正文放在 `description`，同时
+    #    `system_prompt` 留空 —— 那种情况不该追加；但第三方卡可能
+    #    `description` 与 `system_prompt` 都有内容，那就都要。
+    # ⚠️ 用 `in` 做子串判断只在"同一个值"这一种情况下可靠，
+    #    所以这里比的是**原始字段**是否已经出现在正文里，而不是去重合并。
+    extra_parts: list[str] = []
+    for key in _V2_EXTRA_PROMPT_KEYS:
+        content = _as_text(data.get(key))
+        if content.strip() and content not in persona.system_prompt:
+            extra_parts.append(content)
+    if extra_parts:
+        persona.system_prompt = "\n\n".join(
+            ([persona.system_prompt] if persona.system_prompt.strip() else []) + extra_parts
+        )
+
+    # 开场白 → `begin_dialogs`（AstrBot 的"开场对话"字段）。
+    #
+    # 🔴 格式必须照 AstrBot 的**真实实现**（`astrbot/core/persona_mgr.py:374-405`）：
+    #    `begin_dialogs` 是**交替的纯字符串数组** —— 偶数条，第 0 条是 user、
+    #    第 1 条是 assistant，依次交替，由 AstrBot 自己配对成 `{role, content}`。
+    #    ⚠️ 它不是 `[{role, content}]` 那种 dict 数组（那是 **processed 之后的**
+    #       `_begin_dialogs_processed`，是 AstrBot 的缓存字段，别再传回去）。
+    #    ⚠️ 条数为奇数时 AstrBot 会**整组丢弃**并打 error 日志（`persona_mgr.py:381`）
+    #       —— 所以这里绝不能塞进去单数条。
+    greetings: list[str] = []
+    first = _as_text(data.get("first_mes"))
+    if first.strip():
+        greetings.append(first)
+    alt = data.get("alternate_greetings")
+    if isinstance(alt, list):
+        greetings.extend(
+            str(x) for x in alt if isinstance(x, str) and x.strip()
+        )
+    elif isinstance(alt, str) and alt.strip():
+        greetings.append(alt)
+
+    # AstrBot 要偶数条（user/assistant 交替）。开场白天然只有"assistant 说一句"，
+    # 没有对应的 user 发言 ⇒ **成对补齐**会伪造用户台词（比丢掉更糟），
+    # 所以这里如实保留，并把奇数这件事**告诉用户**，不静默变形。
+    if greetings:
+        persona.begin_dialogs = greetings
+        notes.append(
+            f"开场白已导入 {len(greetings)} 条，放在 `begin_dialogs`（不混进人设正文）"
+        )
+        if len(greetings) % 2:
+            notes.append(
+                "⚠️ `begin_dialogs` 目前是奇数条。AstrBot 要求 user/assistant "
+                "交替成对（偶数条），奇数会被它整组丢弃 —— "
+                "请到面板补一条用户台词，或删掉多余的一条。"
+            )
 
     known = {
         "name", "description", "personality", "scenario", "creator_notes",
@@ -412,15 +507,37 @@ def _parse_sillytavern(card: dict[str, Any], fmt: str) -> ParsedCard:
     extra = sorted(k for k in data if k not in known)
     if extra:
         notes.append(f"卡里另有 {len(extra)} 个字段未导入：" + "、".join(extra))
-    if not persona.description and not persona.personality and not sections:
-        notes.append("⚠️ 这张卡几乎是空的（没有描述/性格/提示词）")
+    # (2026-10-29) 原来是 `not persona.description and ... and not sections`
+    # —— 那三个属性都已经不存在了。现在的判据是"正文与开场白都空"。
+    if not persona.system_prompt.strip() and not persona.begin_dialogs:
+        notes.append("⚠️ 这张卡几乎是空的（没有正文、也没有开场白）")
 
     return ParsedCard(personas=[persona], source_format=fmt,
                       notes=notes, extra_fields=extra)
 
 
 def _parse_json_card(card: dict[str, Any]) -> ParsedCard:
-    """自动识别 JSON 的格式（爱语备份 → 本程序导出 → SillyTavern）。"""
+    """自动识别 JSON 的格式（AstrBot → 爱语备份 → 本程序导出 → SillyTavern）。
+
+    🔴 **2026-10-29 新增 AstrBot 原生格式**（情绪提供的真实样本
+       `/root/personas/persona_莉莉丝.json`）：
+
+       ```json
+       {"persona_id": "莉莉丝", "system_prompt": "<全文>", "begin_dialogs": []}
+       ```
+
+       ⚠️ 它**只有这 3 个字段**，既没有 `name` 也没有 `spec` —— 原来的识别
+       逻辑三条分支全落空，直接报"认不出这个 JSON 的格式"。
+       而人设结构刚刚按 AstrBot 对齐，**认不了自家格式**就说不过去了。
+
+       🔴 必须放在**最前面**判断：`persona_id` 是 AstrBot 独有的键，
+          同时出现它和 `name` 时也应优先当 AstrBot 格式（`name` 在
+          SillyTavern 里语义不同，别混用）。
+    """
+    # ⓪ AstrBot 原生导出（`persona_id` + `system_prompt`）
+    if "persona_id" in card and isinstance(card.get("system_prompt"), str):
+        return _parse_astrbot_persona(card)
+
     # ① 爱语备份（主路径）：有 data.prompts
     data = card.get("data")
     if isinstance(data, dict) and isinstance(data.get("prompts"), dict):
@@ -437,9 +554,88 @@ def _parse_json_card(card: dict[str, Any]) -> ParsedCard:
 
     raise CardImportError(
         "认不出这个 JSON 的格式。支持："
-        "① 爱语备份（`data.prompts`）"
-        "② 本程序导出的角色卡（`spec: chara_card_v2`）"
-        "③ SillyTavern 角色卡（含 `name` 字段）"
+        "① AstrBot 人设（`persona_id` + `system_prompt`）"
+        "② 爱语备份（`data.prompts`）"
+        "③ 本程序导出的角色卡（`spec: chara_card_v2`）"
+        "④ SillyTavern 角色卡（含 `name` 字段）"
+    )
+
+
+#: AstrBot 人设 JSON 的已知字段（用于报"哪些没接"）。
+_ASTRBOT_PERSONA_KEYS = frozenset({
+    "persona_id", "system_prompt", "begin_dialogs",
+    # v3 `Personality` 的其它字段（我们模型里都有对应项）
+    "tools", "skills", "custom_error_message",
+    # 缓存字段：AstrBot 自己现算的，不该信也不该存
+    "_begin_dialogs_processed", "_mood_imitation_dialogs_processed",
+    "mood_imitation_dialogs",
+})
+
+
+def _parse_astrbot_persona(card: dict[str, Any]) -> ParsedCard:
+    """解析 AstrBot 原生人设 JSON → 我们的 `Persona`（结构已对齐，几乎 1:1）。
+
+    🔴 `begin_dialogs` 的格式（照 `astrbot/core/persona_mgr.py:374-405` 的**实测**语义）：
+
+       它是**交替的纯字符串数组**，第 0 条当 user、第 1 条当 assistant，
+       由 AstrBot 自己配对。`[{role, content}]` 那是它内部的**缓存字段**
+       `_begin_dialogs_processed`，不是输入格式。
+
+       ⚠️ **奇数条会被 AstrBot 整组丢弃并打 error** —— 所以这里如实导入
+          并在 notes 里明确告知，**不伪造配对**（编造一句用户台词是篡改数据）。
+
+    ⚠️ `_begin_dialogs_processed` / `_mood_imitation_dialogs_processed`
+       是我们的**不读也不存**的字段（下划线前缀 = AstrBot 的缓存），
+       列进 `extra` 让用户知道"这两个我们没接，但那是缓存不是内容"。
+    """
+    persona_id = _as_text(card.get("persona_id")).strip()
+    if not persona_id:
+        raise CardImportError("AstrBot 人设缺少 `persona_id`")
+
+    system_prompt = _as_text(card.get("system_prompt"))
+    notes: list[str] = []
+
+    dialogs_raw = card.get("begin_dialogs")
+    begin_dialogs: list[str] = []
+    if isinstance(dialogs_raw, list):
+        begin_dialogs = [str(x) for x in dialogs_raw if str(x).strip()]
+        if len(begin_dialogs) % 2 != 0:
+            notes.append(
+                f"⚠️ `begin_dialogs` 是 {len(begin_dialogs)} 条（奇数）。"
+                "AstrBot 会**整组丢弃**奇数条的开场对话，建议补一条凑成偶数后再用。"
+            )
+    elif dialogs_raw is not None:
+        notes.append("`begin_dialogs` 不是数组，已忽略")
+
+    persona = Persona(
+        name=persona_id,
+        system_prompt=system_prompt,
+        begin_dialogs=begin_dialogs,
+        # ⚠️ `tools` / `skills` 的 **None 语义**原样保留：
+        #    None=全部可用，[]=一个都不用。用 `or []` 归一会让"全禁"和
+        #    "全开"混成一个意思 —— 那是功能故障，不只是显示问题。
+        tools=(
+            None if card.get("tools") is None
+            else [str(x) for x in card["tools"] if str(x).strip()]
+        ),
+        skills=(
+            None if card.get("skills") is None
+            else [str(x) for x in card["skills"] if str(x).strip()]
+        ),
+        custom_error_message=card.get("custom_error_message"),
+    )
+
+    extra = sorted(k for k in card if k not in _ASTRBOT_PERSONA_KEYS)
+    if extra:
+        notes.append(f"文件里另有 {len(extra)} 个字段未导入：" + "、".join(extra))
+    if not system_prompt.strip():
+        notes.append("⚠️ 这个人设的 `system_prompt` 是空的")
+
+    return ParsedCard(
+        personas=[persona],
+        source_format="astrbot",
+        notes=notes,
+        extra_fields=extra,
     )
 
 
@@ -537,13 +733,17 @@ def to_aiyu_backup(personas: list[Persona]) -> dict[str, Any]:
             while f"{key}_{i}" in prompts:
                 i += 1
             key = f"{key}_{i}"
+        # 🔴 2026-10-29：新版人设只有一整段 `system_prompt`，
+        #    爱语备份格式没有对应字段 ⇒ 写进它的 `description`
+        #    （那是爱语那边的主正文位，语义最接近）。
+        #    ⚠️ 不拆回 personality/scenario —— 拆了就必然丢信息（原文是整段）。
         prompts[key] = {
             "data": {
                 "name": p.name,
-                "description": p.description,
-                "personality": p.personality,
-                "scenario": p.scenario,
-                "creator_notes": p.creator_notes,
+                "description": p.system_prompt,
+                "personality": "",
+                "scenario": "",
+                "creator_notes": "",
                 # 头像在备份里存路径；我们的头像存后端，导出时留空
                 # （导出的 JSON 不会带图，避免文件巨大）
                 "avatar_path": None,
@@ -559,27 +759,37 @@ def to_export_dict(persona: Persona) -> dict[str, Any]:
        * 发给爱语/备份 → 用 `to_aiyu_backup`
        * 与角色卡生态互通 → 用这个（带 `extensions.emotion_app` 保证无损往返）
     """
-    sections = {s.title: s.content for s in persona.prompt_sections}
+    # 🔴 2026-10-29：正文是**一整段** `system_prompt`。
+    #    SillyTavern 的 `description` 是它的主正文位 —— 整段放那里，
+    #    保证"导出→别的角色卡前端"能看到完整人设。
+    #    同时在我们自己的 `extensions.emotion_app` 里存**原文**，
+    #    往返时优先用它（无损），不依赖对方前端的字段习惯。
+    greetings = list(persona.begin_dialogs)
     data: dict[str, Any] = {
         "name": persona.name,
-        "description": persona.description,
-        "personality": persona.personality,
-        "scenario": persona.scenario,
-        "creator_notes": persona.creator_notes,
-        "system_prompt": sections.get("角色卡系统提示词", ""),
-        "post_history_instructions": sections.get("历史后指令", ""),
-        "mes_example": sections.get("对话示例", ""),
-        "first_mes": sections.get("开场白（默认关闭）", ""),
-        "alternate_greetings": [],
+        "description": persona.system_prompt,
+        "personality": "",
+        "scenario": "",
+        "creator_notes": "",
+        "system_prompt": "",
+        "post_history_instructions": "",
+        "mes_example": "",
+        "first_mes": greetings[0] if greetings else "",
+        "alternate_greetings": greetings[1:] if len(greetings) > 1 else [],
         "tags": ["情绪app"],
         "creator": "情绪app",
         "character_version": "1.0",
         "extensions": {
-            # 保留片段完整结构（order/enabled/source/condition）→ 往返无损
             "emotion_app": {
-                "prompt_sections": [s.to_dict() for s in persona.prompt_sections],
+                # 原文无损往返（导入时优先读它）
+                "system_prompt": persona.system_prompt,
+                "begin_dialogs": greetings,
                 "model": persona.model,
                 "api_url": persona.api_url,
+                "tools": persona.tools,
+                "skills": persona.skills,
+                "custom_error_message": persona.custom_error_message,
+                "sort_order": persona.sort_order,
             }
         },
     }
@@ -592,16 +802,56 @@ def merge_import_sections(
     """把导入结果与面板上的覆盖项合并（**批量**）。
 
     ⚠️ 只允许覆盖少数字段 —— 不开放 `api_key` 之类敏感项。
+
+    🔴 **2026-10-29 白名单跟着人设结构改**：新 `Persona` 没有
+       `description` / `personality` / `scenario` / `creator_notes` 了。
+       原来那份白名单里的 4 个键若继续 `setattr`，会直接
+       **AttributeError 把整个导入接口打成 500**（`slots=True` 的 dataclass
+       —— 连"悄悄加个属性"都不行）。
+
+       现在只认**模型里真实存在**的键。其中：
+         * `system_prompt` —— 覆盖人设正文（最常用）；
+         * `tools` / `skills` —— **保留 None 语义**（None=全部，[]=一个都不给）；
+         * `begin_dialogs` —— AstrBot 的"开场对话"，必须是字符串数组。
     """
     if not override:
         return parsed.personas
 
-    allowed = ("name", "description", "personality", "scenario", "creator_notes", "model")
+    text_keys = ("name", "system_prompt", "model", "api_url")
     for p in parsed.personas:
-        for key in allowed:
+        for key in text_keys:
             value = override.get(key)
             if isinstance(value, str) and value.strip():
                 setattr(p, key, value)
+
+        # `begin_dialogs`：**只接受字符串数组**（照 AstrBot `persona_mgr.py:374`）。
+        # ⚠️ 不打平、不转 str —— 混进 dict 会让 AstrBot 那边整组丢弃。
+        dialogs = override.get("begin_dialogs")
+        if isinstance(dialogs, list) and all(isinstance(x, str) for x in dialogs):
+            p.begin_dialogs = list(dialogs)
+
+        # `tools` / `skills`：**None 与 [] 语义不同**（见 `persona.py` docstring），
+        # 所以这里不能用 `if value:` —— 那会把 `None` 和 `[]` 一起跳过。
+        for key in ("tools", "skills"):
+            if key in override:
+                value = override[key]
+                if value is None:
+                    setattr(p, key, None)
+                elif isinstance(value, list):
+                    setattr(p, key, [str(x) for x in value])
+
+        # 旧面板可能还在送这 4 个键（前端没跟着改的时候）。**不静默吞掉**：
+        # 拼进正文之前不动，直接把它们的值当正文覆盖项处理会丢信息，
+        # 所以只在正文**为空**时用它们兜底拼一段，并留一条 note 让用户看得见。
+        if not p.system_prompt.strip():
+            legacy = _join_prompt_fields(override)
+            if legacy:
+                p.system_prompt = legacy
+                parsed.notes.append(
+                    "覆盖项里送的是旧字段"
+                    "（description/personality/scenario/creator_notes），"
+                    "已按固定顺序拼成 `system_prompt`"
+                )
     return parsed.personas
 
 

@@ -11,7 +11,8 @@
 
 import { send } from "./views/chat.js";
 import { $, MODE_HINTS, api, applyRoute, boot, closeDrawer, go, hideLogin, isMobile, recheckLogin, showLogin, state, switchToTab, toast, toggleSidebar } from "./core/core.js";
-import { downloadExport, loadPersonas, refreshPersonaInState, renderPersonaList, renderSections, selectPersona } from "./views/persona.js";
+import { closeAdapterForm, deleteAdapter, loadAdapters, onAdapterTypeChange, openAdapterCreate, openAdapterEdit, saveAdapter, setAdapterEnabled } from "./views/adapters.js";
+import { downloadExport, loadPersonas, refreshPersonaInState, renderPersonaList, renderPromptStats, selectPersona } from "./views/persona.js";
 import { NAV_PLUGIN_OPEN_KEY, collectPluginConfigChanges, openPluginConfig, savePluginSwitch, syncNavPluginGroupOpen } from "./views/plugins.js";
 import { PROVIDER_FILTER_ALL, addHeaderRow, addProviderModel, clearProviderDetail, closeModelsModal, closePresetPicker, closeTestModal, deleteProviderSource, fetchSourceModels, newProviderSourceFlow, removeProviderModel, renderAvailableModels, saveProviderSource, setAdapterType, setProviderFilter, showModal, testProviderModel } from "./views/providers.js";
 import { currentUmo, deleteSessionById, fillSessionForm, loadSessions, refreshSessionInfo, renderSessionList, renderSessionPicker, renderSessionSelect, saveSessionConfig, selectSession, showHint } from "./views/session.js";
@@ -101,20 +102,18 @@ $("p-ref-delete").onclick = async () => {
   } catch (e) { toast($("p-ref-hint"), "删除失败：" + e.message, true); }
 };
 
-$("add-section").onclick = () => {
-  state.sections.push({ title: "新片段", content: "", enabled: true, order: 100, source: "user", condition: "" });
-  renderSections();
-};
+/* 🔴 2026-10-29：这里原来有 `#add-section` / `#save-sections` 两个绑定，
+ *    分别往 `state.sections` 里加片段、以及用
+ *    `PUT /api/v1/personas/<id>/sections` 整体替换片段表。
+ *    **为什么整段删掉**：人设模型改成 AstrBot 的 `Persona` 后只有 `system_prompt`
+ *    一段正文，`prompt_sections` 字段与那个 PUT 接口**都已从后端删除** ——
+ *    留着这段代码的后果是「绑定到 null 直接抛 TypeError」（节点已从 index.html 移除），
+ *    一旦抛在模块顶层，**它之后的全部事件绑定都不会执行**（整页按钮全失灵）。
+ *    正文的编辑并入下面的表单保存（同一个 PATCH，不发两次请求）。 */
 
-$("save-sections").onclick = async () => {
-  if (!state.current) return;
-  try {
-    const p = await api("PUT", `/api/v1/personas/${state.current.id}/sections`, state.sections);
-    Object.assign(state.current, p);
-    toast($("chat-hint"), "片段已保存");
-    loadPersonas();
-  } catch (e) { toast($("chat-hint"), "保存失败：" + e.message, true); }
-};
+/* 人设正文实时字数（2026-10-29）—— 几千字的长文本，边打边给读数，
+ * 用户才不会怀疑"是不是只存进去一小段"。只读本地值，不发请求。 */
+$("p-system-prompt").oninput = renderPromptStats;
 
 $("new-persona").onclick = async () => {
   const name = prompt("新角色卡的名字？", "新角色");
@@ -136,12 +135,16 @@ $("persona-back").onclick = () => {
 $("persona-form").onsubmit = async (e) => {
   e.preventDefault();
   if (!state.current) return;
+  // 🔴 2026-10-29：提交字段跟着人设模型改（AstrBot 的 `Persona`）。
+  //    `PATCH /api/v1/personas/<id>` 现在只接受 name / system_prompt / begin_dialogs /
+  //    tools / skills / custom_error_message / folder_id / sort_order /
+  //    avatar_path / api_url / api_key / model / reference_image_path。
+  //    ⚠️ 旧的 description/personality/scenario/creator_notes **已被后端丢弃**
+  //      （`persona_repo.update()` 里有 allowed 白名单，不在名单里的键**静默跳过**），
+  //      所以这里继续送它们 = 用户以为改了、其实一个字都没存进去。
   const patch = {
     name: $("p-name").value,
-    description: $("p-description").value,
-    personality: $("p-personality").value,
-    scenario: $("p-scenario").value,
-    creator_notes: $("p-creator-notes").value,
+    system_prompt: $("p-system-prompt").value,
     api_url: $("p-api-url").value,
     model: $("p-model").value,
   };
@@ -157,6 +160,10 @@ $("persona-form").onsubmit = async (e) => {
     renderPersonaList();
     $("p-api-key").value = "";
     $("p-api-key").placeholder = p.api_key_configured ? "已设置（留空 = 不变）" : "留空 = 不变";
+    // ⚠️ 用**后端回来的正文**回填 + 刷新读数：保存链路若偷偷改写了原文
+    //    （trim / 转义 / 截断），用户会在这里**当场看见**，而不是等到下次打开才发现。
+    $("p-system-prompt").value = p.system_prompt || "";
+    renderPromptStats();
     toast($("chat-hint"), "已保存");
   } catch (e2) { toast($("chat-hint"), "保存失败：" + e2.message, true); }
 };
@@ -272,7 +279,7 @@ $("del").onclick = async () => {
     await api("DELETE", `/api/v1/personas/${state.current.id}`);
     state.current = null;
     $("persona-form").classList.add("hidden");
-    $("sections-block").classList.add("hidden");
+    // ⚠️ 原来这里还要隐掉 `#sections-block` —— 那个块已随片段表一起删除（2026-10-29）。
     $("persona-empty").classList.remove("hidden");
     await loadPersonas();
   } catch (e) { toast($("chat-hint"), "删除失败：" + e.message, true); }

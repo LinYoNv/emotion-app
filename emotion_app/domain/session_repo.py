@@ -17,7 +17,7 @@ from typing import Any
 
 from ..infra.logging_setup import get_logger
 from ..storage.base import StorageError, StoreBackend
-from .context import ContextPolicy
+from .context import ContextPolicy, MODE_ROLLING_SUMMARY, MODE_SEMANTIC
 from .message import Message
 
 log = get_logger(__name__)
@@ -31,6 +31,13 @@ MAX_MESSAGES_PER_SESSION = 5000
 
 class SessionNotFound(KeyError):
     """会话不存在。"""
+
+
+class NativeProjectionReadOnly(ValueError):
+    """原生对话投影的历史和人格由原生对话维护。"""
+
+    def __init__(self, message: str = "此聊天窗口的历史和人格由陪伴管理，请到陪伴页面修改，或在 QQ 中继续对话。") -> None:
+        super().__init__(message)
 
 
 @dataclass(slots=True)
@@ -101,9 +108,14 @@ class Session:
     #:
     #: 清零路径（唯一）：面板打开该会话时调 `mark_read()`。
     unread: int = 0
+    native_origin: str = ""
+    native_conversation_id: str = ""
+    history_revision: int = 0
+    native_history_revision: int = 0
+    native_reset_revision: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "id": self.id,
             "title": self.title,
             "persona_id": self.persona_id,
@@ -117,6 +129,16 @@ class Session:
             "message_count": self.message_count,
             "unread": self.unread,
         }
+        if self.history_revision:
+            out["history_revision"] = self.history_revision
+        if self.native_origin or self.native_conversation_id:
+            out.update(
+                native_origin=self.native_origin,
+                native_conversation_id=self.native_conversation_id,
+                native_history_revision=self.native_history_revision,
+                native_reset_revision=self.native_reset_revision,
+            )
+        return out
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Session:
@@ -138,6 +160,11 @@ class Session:
             #    存量会话本来就没有"用户没看过的主动消息"这个概念，
             #    给它们补一个非 0 的初值反而会在面板上凭空冒红点。
             unread=max(0, int(d.get("unread", 0) or 0)),
+            native_origin=str(d.get("native_origin") or ""),
+            native_conversation_id=str(d.get("native_conversation_id") or ""),
+            history_revision=max(0, int(d.get("history_revision", 0) or 0)),
+            native_history_revision=max(0, int(d.get("native_history_revision", 0) or 0)),
+            native_reset_revision=max(0, int(d.get("native_reset_revision", 0) or 0)),
         )
 
 
@@ -216,17 +243,34 @@ class SessionRepository:
 
     # ---- 会话 ----
 
+    @staticmethod
+    def _require_writable(session: Session) -> None:
+        if session.native_origin or session.native_conversation_id:
+            raise NativeProjectionReadOnly()
+
     async def _load_sessions(self) -> dict[str, Session]:
-        raw = await self._store.load_sections([SESSIONS_SECTION])
+        return self._decode_sessions(await self._store.load_sections([SESSIONS_SECTION]))
+
+    @staticmethod
+    def _decode_sessions(raw: dict[str, Any]) -> dict[str, Session]:
         section = raw.get(SESSIONS_SECTION) or {}
         if not isinstance(section, dict):
             raise StorageError(f"{SESSIONS_SECTION} section 格式错误")
         return {sid: Session.from_dict(d) for sid, d in section.items() if isinstance(d, dict)}
 
-    async def _save_sessions(self, sessions: dict[str, Session]) -> None:
-        await self._store.save_sections(
-            {SESSIONS_SECTION: {sid: s.to_dict() for sid, s in sessions.items()}}
-        )
+    async def _mutate(self, change: Any, *, with_messages: bool = False) -> Any:
+        keys = [SESSIONS_SECTION, MESSAGES_SECTION] if with_messages else [SESSIONS_SECTION]
+
+        def mutate(raw):
+            sessions = self._decode_sessions(raw)
+            messages = self._decode_messages(raw) if with_messages else {}
+            result = change(sessions, messages)
+            raw[SESSIONS_SECTION] = {sid: s.to_dict() for sid, s in sessions.items()}
+            if with_messages:
+                raw[MESSAGES_SECTION] = messages
+            return result
+
+        return await self._store.update_sections(keys, mutate)
 
     async def list(self) -> list[Session]:
         items = list((await self._load_sessions()).values())
@@ -265,11 +309,27 @@ class SessionRepository:
            记忆/关系**当场对不上**（等于静默换库）。存量会话要换标签，
            由用户在面板上显式点「生成专用 umo」——那是一个可见的动作。
         """
-        sessions = await self._load_sessions()
+        def change(sessions, messages):
+            return self._create_session(
+                sessions, title=title, persona_id=persona_id, user_id=user_id,
+                policy=policy, session_id=session_id,
+            )
+
+        s = await self._mutate(change)
+        log.info("会话已创建", extra={"data": {"id": s.id, "user_id": s.user_id}})
+        return s
+
+    @staticmethod
+    def _create_session(
+        sessions: dict[str, Session], *, title: str = "", persona_id: str = "",
+        user_id: str = "", policy: ContextPolicy | None = None, session_id: str = "",
+    ) -> Session:
+        if session_id and session_id in sessions:
+            raise StorageError(f"会话已存在：{session_id}")
         uid = _normalize_user_id(user_id, session_id=session_id)
         if not uid:
             # 走与 `new_umo_user_id()` **同一份**规则（唯一性检查也在那里）
-            uid = await self.new_umo_user_id()
+            uid = SessionRepository._available_user_id(sessions)
         s = Session(
             id=session_id or uuid.uuid4().hex,
             title=title or "新会话",
@@ -279,8 +339,6 @@ class SessionRepository:
         )
         s.policy.validate()
         sessions[s.id] = s
-        await self._save_sessions(sessions)
-        log.info("会话已创建", extra={"data": {"id": s.id, "user_id": s.user_id}})
         return s
 
     async def new_umo_user_id(self) -> str:
@@ -290,7 +348,10 @@ class SessionRepository:
            两处各写一套的话，将来约束一变就会漂移：面板生成的值可能违反
            某条约束，而插件那边**静默**按别的用户处理。
         """
-        sessions = await self._load_sessions()
+        return self._available_user_id(await self._load_sessions())
+
+    @staticmethod
+    def _available_user_id(sessions: dict[str, Session]) -> str:
         taken = {s.user_id for s in sessions.values()}
         for _ in range(8):
             candidate = _new_umo_user_id()
@@ -334,82 +395,92 @@ class SessionRepository:
 
     async def ensure(self, session_id: str, **kwargs: Any) -> Session:
         """取会话；不存在就建（聊天时用，省一次往返）。"""
-        if await self.exists(session_id):
-            return await self.get(session_id)
-        return await self.create(session_id=session_id, **kwargs)
+        def change(sessions, messages):
+            if session_id in sessions:
+                return sessions[session_id], False
+            return self._create_session(sessions, session_id=session_id, **kwargs), True
+
+        session, created = await self._mutate(change)
+        if created:
+            log.info("会话已创建", extra={"data": {"id": session.id, "user_id": session.user_id}})
+        return session
 
     async def update(self, session_id: str, patch: dict[str, Any]) -> Session:
-        sessions = await self._load_sessions()
-        if session_id not in sessions:
-            raise SessionNotFound(session_id)
+        def change(sessions, store):
+            if session_id not in sessions:
+                raise SessionNotFound(session_id)
 
-        s = sessions[session_id]
-        # 🔴 这是**白名单**：不在里面的键会被**静默忽略**（不报错、不落盘）。
-        #    所以加字段时**必须同时加到这里** —— 否则前端传了也没用，
-        #    而用户看到的是"保存成功"（本项目最忌的静默失败）。
-        #    `model` 于 2026-10-09 加入（按会话选模型）。
-        allowed = {"title", "persona_id", "user_id", "summary", "summarized_upto", "model"}
-        for k, v in patch.items():
-            if k == "policy":
-                if not isinstance(v, dict):
-                    raise ValueError("policy 必须是对象")
-                s.policy = ContextPolicy.from_dict(v)
-                s.policy.validate()
-            elif k in allowed:
-                if k == "user_id":
-                    v = _normalize_user_id(v, session_id=session_id)
-                if k == "model":
-                    v = str(v or "").strip()
-                setattr(s, k, v if not isinstance(v, str) else str(v))
+            s = sessions[session_id]
+            protected = {"native_origin", "native_conversation_id", "history_revision",
+                         "native_history_revision", "native_reset_revision"}
+            if protected.intersection(patch):
+                raise ValueError("会话来源与历史版本由服务端维护，不能手动修改")
+            if (s.native_origin or s.native_conversation_id) and {
+                "persona_id", "user_id", "summary", "summarized_upto",
+            }.intersection(patch):
+                raise NativeProjectionReadOnly()
+            if {"summary", "summarized_upto", "policy"}.intersection(patch):
+                s.history_revision += 1
+            # 🔴 这是**白名单**：不在里面的键会被**静默忽略**（不报错、不落盘）。
+            #    所以加字段时**必须同时加到这里** —— 否则前端传了也没用，
+            #    而用户看到的是"保存成功"（本项目最忌的静默失败）。
+            #    `model` 于 2026-10-09 加入（按会话选模型）。
+            allowed = {"title", "persona_id", "user_id", "summary", "summarized_upto", "model"}
+            for k, v in patch.items():
+                if k == "policy":
+                    if not isinstance(v, dict):
+                        raise ValueError("policy 必须是对象")
+                    s.policy = ContextPolicy.from_dict(v)
+                    s.policy.validate()
+                elif k in allowed:
+                    if k == "user_id":
+                        v = _normalize_user_id(v, session_id=session_id)
+                    if k == "model":
+                        v = str(v or "").strip()
+                    setattr(s, k, v if not isinstance(v, str) else str(v))
 
-        s.updated_at = time.time()
-        sessions[session_id] = s
-        await self._save_sessions(sessions)
-        return s
+            s.updated_at = time.time()
+            sessions[session_id] = s
+            return s
+
+        return await self._mutate(change, with_messages=False)
 
     async def delete(self, session_id: str) -> None:
-        sessions = await self._load_sessions()
-        if session_id not in sessions:
-            raise SessionNotFound(session_id)
-        sessions.pop(session_id)
+        def change(sessions, msgs):
+            if session_id not in sessions:
+                raise SessionNotFound(session_id)
+            self._require_writable(sessions[session_id])
+            sessions.pop(session_id)
 
-        msgs = await self._load_messages()
-        msgs.pop(session_id, None)
+            msgs.pop(session_id, None)
 
-        await self._store.save_sections(
-            {
-                SESSIONS_SECTION: {sid: s.to_dict() for sid, s in sessions.items()},
-                MESSAGES_SECTION: msgs,
-            }
-        )
+        await self._mutate(change, with_messages=True)
         log.info("会话已删除", extra={"data": {"id": session_id}})
 
     async def clear_messages(self, session_id: str) -> None:
         """清空某会话的消息，但保留会话本身（含策略与当前人设）。"""
-        sessions = await self._load_sessions()
-        if session_id not in sessions:
-            raise SessionNotFound(session_id)
+        def change(sessions, msgs):
+            if session_id not in sessions:
+                raise SessionNotFound(session_id)
 
-        msgs = await self._load_messages()
-        msgs[session_id] = []
+            s = sessions[session_id]
+            self._require_writable(s)
+            msgs[session_id] = []
+            s.history_revision += 1
+            s.message_count = 0
+            s.summary = ""
+            s.summarized_upto = 0
+            s.updated_at = time.time()
 
-        s = sessions[session_id]
-        s.message_count = 0
-        s.summary = ""
-        s.summarized_upto = 0
-        s.updated_at = time.time()
-
-        await self._store.save_sections(
-            {
-                SESSIONS_SECTION: {sid: x.to_dict() for sid, x in sessions.items()},
-                MESSAGES_SECTION: msgs,
-            }
-        )
+        return await self._mutate(change, with_messages=True)
 
     # ---- 消息 ----
 
     async def _load_messages(self) -> dict[str, list[dict[str, Any]]]:
-        raw = await self._store.load_sections([MESSAGES_SECTION])
+        return self._decode_messages(await self._store.load_sections([MESSAGES_SECTION]))
+
+    @staticmethod
+    def _decode_messages(raw: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         section = raw.get(MESSAGES_SECTION) or {}
         if not isinstance(section, dict):
             raise StorageError(f"{MESSAGES_SECTION} section 格式错误")
@@ -427,11 +498,58 @@ class SessionRepository:
            调用方无法区分"会话空"与"会话不存在"，会把 bug 藏起来。
            （判据：本项目铁律 —— 静默返回空数据比报错更贵。）
         """
-        sessions = await self._load_sessions()
+        raw = await self._store.load_sections([SESSIONS_SECTION, MESSAGES_SECTION])
+        if session_id not in self._decode_sessions(raw):
+            raise SessionNotFound(session_id)
+        store = self._decode_messages(raw)
+        return [Message.from_dict(d) for d in store.get(session_id, [])]
+
+    async def summary_snapshot(self, session_id: str) -> tuple[Session, list[Message]]:
+        raw = await self._store.load_sections([SESSIONS_SECTION, MESSAGES_SECTION])
+        sessions = self._decode_sessions(raw)
         if session_id not in sessions:
             raise SessionNotFound(session_id)
-        store = await self._load_messages()
-        return [Message.from_dict(d) for d in store.get(session_id, [])]
+        messages = self._decode_messages(raw).get(session_id, [])
+        return sessions[session_id], [Message.from_dict(message) for message in messages]
+
+    async def commit_summary(
+        self, session_id: str, *, expected_history_revision: int,
+        summary: str, summarized_upto: int,
+    ) -> bool:
+        def mutate(raw):
+            section = raw.get(SESSIONS_SECTION, {})
+            if not isinstance(section, dict):
+                raise StorageError("sessions section 格式错误")
+            metadata = section.get(session_id)
+            if not isinstance(metadata, dict):
+                return False
+            session = Session.from_dict(metadata)
+            if session.history_revision != expected_history_revision:
+                return False
+            if session.policy.mode not in (MODE_ROLLING_SUMMARY, MODE_SEMANTIC):
+                return False
+            if summarized_upto < session.summarized_upto or summarized_upto < 0:
+                return False
+            messages = self._decode_messages(raw).get(session_id, [])
+            if summarized_upto > sum(m.get("role") in ("user", "assistant") for m in messages):
+                return False
+            if session.native_origin or session.native_conversation_id:
+                native = raw.get("plugin_conversations", {})
+                if not isinstance(native, dict):
+                    raise StorageError("plugin_conversations section 格式错误")
+                record = native.get(session.native_conversation_id)
+                if not isinstance(record, dict) or record.get("user_id") != session.native_origin:
+                    return False
+                if int(record.get("history_revision", 0)) != session.native_history_revision:
+                    return False
+            metadata["summary"] = summary
+            metadata["summarized_upto"] = summarized_upto
+            metadata["updated_at"] = time.time()
+            return True
+
+        return await self._store.update_sections(
+            [SESSIONS_SECTION, MESSAGES_SECTION, "plugin_conversations"], mutate,
+        )
 
     async def append(
         self,
@@ -448,47 +566,44 @@ class SessionRepository:
                 ⚠️ 做一个**夹取**而不是原样加：传负数会把计数压成负数，
                 那是个"看着像 0、其实是坏的"状态。要清零走 `mark_read()`。
         """
-        sessions = await self._load_sessions()
-        if session_id not in sessions:
-            raise SessionNotFound(session_id)
+        def change(sessions, store):
+            if session_id not in sessions:
+                raise SessionNotFound(session_id)
 
-        store = await self._load_messages()
-        arr = store.setdefault(session_id, [])
-        arr.extend(m.to_dict() for m in new_messages)
+            self._require_writable(sessions[session_id])
+            arr = store.setdefault(session_id, [])
+            arr.extend(m.to_dict() for m in new_messages)
 
-        dropped = 0
-        if len(arr) > MAX_MESSAGES_PER_SESSION:
-            dropped = len(arr) - MAX_MESSAGES_PER_SESSION
-            del arr[:dropped]
-            log.warning(
-                "会话消息超上限，已丢弃最旧的",
-                extra={"data": {"session": session_id, "dropped": dropped}},
-            )
+            dropped = 0
+            if len(arr) > MAX_MESSAGES_PER_SESSION:
+                dropped = len(arr) - MAX_MESSAGES_PER_SESSION
+                del arr[:dropped]
+                log.warning(
+                    "会话消息超上限，已丢弃最旧的",
+                    extra={"data": {"session": session_id, "dropped": dropped}},
+                )
 
-        s = sessions[session_id]
-        s.message_count = len(arr)
-        s.updated_at = time.time()
-        # 首条用户消息自动做标题（省得用户手填）
-        if not s.title or s.title == "新会话":
-            for m in new_messages:
-                if m.role == "user" and m.content.strip():
-                    s.title = m.content.strip()[:30]
-                    break
+            s = sessions[session_id]
+            s.history_revision += 1
+            s.message_count = len(arr)
+            s.updated_at = time.time()
+            # 首条用户消息自动做标题（省得用户手填）
+            if not s.title or s.title == "新会话":
+                for m in new_messages:
+                    if m.role == "user" and m.content.strip():
+                        s.title = m.content.strip()[:30]
+                        break
 
-        # 游标要跟着丢弃量平移，否则总结会错位
-        if dropped:
-            s.summarized_upto = max(0, s.summarized_upto - dropped)
+            # 游标要跟着丢弃量平移，否则总结会错位
+            if dropped:
+                s.summarized_upto = max(0, s.summarized_upto - dropped)
 
-        if unread_delta > 0:
-            s.unread += int(unread_delta)
+            if unread_delta > 0:
+                s.unread += int(unread_delta)
 
-        await self._store.save_sections(
-            {
-                SESSIONS_SECTION: {sid: x.to_dict() for sid, x in sessions.items()},
-                MESSAGES_SECTION: store,
-            }
-        )
-        return s
+            return s
+
+        return await self._mutate(change, with_messages=True)
 
     async def mark_read(self, session_id: str) -> Session:
         """把某会话的未读数清零（面板真正**打开**这个会话时调）。
@@ -499,14 +614,15 @@ class SessionRepository:
            混进白名单就等于让前端可以随便把它设成任意值 —— 那时候
            `unread` 就不再是"有多少条没看"，而只是一个前端数字。
         """
-        sessions = await self._load_sessions()
-        if session_id not in sessions:
-            raise SessionNotFound(session_id)
-        s = sessions[session_id]
-        if s.unread:
-            s.unread = 0
-            await self._save_sessions(sessions)
-        return s
+        def change(sessions, store):
+            if session_id not in sessions:
+                raise SessionNotFound(session_id)
+            s = sessions[session_id]
+            if s.unread:
+                s.unread = 0
+            return s
+
+        return await self._mutate(change, with_messages=False)
 
     async def unread_total(self) -> int:
         """全部会话的未读总数（面板侧边栏那个圆圈的数字）。"""

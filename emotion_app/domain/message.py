@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -48,6 +49,7 @@ class Message:
     reasoning_duration: int = 0
     tool_calls: str = ""
     tool_call_id: str = ""
+    content_parts: list[dict[str, Any]] | None = None
 
     def validate(self) -> None:
         if self.role not in (
@@ -64,14 +66,14 @@ class Message:
         self,
         *,
         thinking_field: str = "reasoning_content",
-        inject_system_markers: bool = True,
+        inject_system_markers: bool = False,
     ) -> dict[str, Any] | None:
         """转成上游要的 `{role, content}`。
 
         Args:
             thinking_field: 思维链字段名（爱语可配置，默认 `reasoning_content`）。
             inject_system_markers: system 消息是否包
-                `<|SYSTEM_INJECT|>…<|END_INJECT|>`（爱语实测行为）。
+                `<|SYSTEM_INJECT|>…<|END_INJECT|>`。**默认 False**（见下）。
 
         Returns:
             None 表示**这条不该发给上游**（如内部 reasoning 角色）。
@@ -80,7 +82,26 @@ class Message:
             return None
 
         content = self.content
-        if self.role == ROLE_SYSTEM and inject_system_markers and content:
+        if self.content_parts is not None:
+            content = [
+                {key: deepcopy(value) for key, value in part.items() if key != "_no_save"}
+                for part in self.content_parts
+            ]
+        if self.role == ROLE_SYSTEM and inject_system_markers and isinstance(content, str) and content:
+            # 🔴🔴 **默认已关闭**（2026-10-29 实测，不要改回 True）
+            #
+            # `<|SYSTEM_INJECT|>…<|END_INJECT|>` 是**爱语私有的标记**，
+            # 不是 OpenAI 协议。标准中转站/官方模型不认识它，
+            # 会把它当成**用户数据**而不是系统指令 ⇒ **人设整个失效**。
+            #
+            # 实测（同一个 `gemini-3.8-flash-high`，只切这个开关）：
+            #   A 带标记 → 「不是，我是 Gemini，由 Google 训练的大语言模型。」
+            #   B 无标记 → 「（慢吞吞地睁开猩红的眼眸…）除了本小姐，这里
+            #               难道还会有第二只高贵又可爱的莉莉丝吗」
+            #
+            # 现象特征：**人设正文确实发出去了**（system 4169 字符），
+            #   模型也正常回话 —— 只是它不知道自己是谁。
+            #   光看"调用上游 200 + 有回复"**永远看不出**这个问题。
             content = f"<|SYSTEM_INJECT|>{content}<|END_INJECT|>"
 
         out: dict[str, Any] = {"role": self.role, "content": content}
@@ -126,6 +147,7 @@ class Message:
             "reasoning_duration": self.reasoning_duration,
             "tool_calls": self.tool_calls,
             "tool_call_id": self.tool_call_id,
+            **({"content_parts": deepcopy(self.content_parts)} if self.content_parts is not None else {}),
         }
 
     @classmethod
@@ -145,6 +167,7 @@ class Message:
             reasoning_duration=int(d.get("reasoning_duration", 0)),
             tool_calls=d.get("tool_calls", ""),
             tool_call_id=d.get("tool_call_id", ""),
+            content_parts=deepcopy(d.get("content_parts")),
         )
 
 
@@ -154,18 +177,15 @@ class Message:
 
 
 def from_upstream_message(d: dict[str, Any]) -> Message:
-    """把 OpenAI 形态的消息转成内部 Message。
-
-    只取 `role`/`content` —— 因为 OpenAI 形状本身就只有这些。
-    其余字段（图片/语音/思维链）在我们自己的 UI 里才有。
-    """
+    """把 OpenAI 消息转成内部 Message，媒体原文另存供上游和 JSON 往返。"""
     if not isinstance(d, dict):
         raise ValueError("消息必须是对象")
 
     role = d.get("role", ROLE_USER)
     content = d.get("content", "")
 
-    # content 可能是数组（多模态）：抽出纯文本，图片另存
+    # content 的文本视图用于现有 UI；原始内容段用于媒体传递。
+    content_parts = deepcopy(content) if isinstance(content, list) else None
     image_desc = ""
     if isinstance(content, list):
         texts: list[str] = []
@@ -183,7 +203,18 @@ def from_upstream_message(d: dict[str, Any]) -> Message:
                     image_desc = f"[图片: {url}]"
         content = "\n".join(t for t in texts if t)
 
-    msg = Message(role=str(role), content=str(content), image_desc=image_desc)
+    calls = d.get("tool_calls") if role == ROLE_ASSISTANT else None
+    msg = Message(
+        role=str(role), content=content if content is None else str(content),
+        image_desc=d.get("image_desc") or image_desc, content_parts=content_parts,
+        image_path=d.get("image_path") or "",
+        audio_path=d.get("audio_path") or "",
+        video_path=d.get("video_path") or "",
+        video_desc=d.get("video_desc") or "",
+        tool_calls=json.dumps(calls, ensure_ascii=False) if isinstance(calls, list) else "",
+        tool_call_id=str(d.get("tool_call_id") or "") if role == ROLE_TOOL else "",
+        reasoning_content=d.get("reasoning_content") or "",
+    )
     msg.validate()
     return msg
 
@@ -192,7 +223,7 @@ def build_upstream_messages(
     messages: list[Message],
     *,
     thinking_field: str = "reasoning_content",
-    inject_system_markers: bool = True,
+    inject_system_markers: bool = False,
 ) -> list[dict[str, Any]]:
     """把内部消息列表转成上游要的数组，**过滤掉不该发的**。"""
     out: list[dict[str, Any]] = []

@@ -26,6 +26,17 @@ APP_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_DIR))
 
 
+@pytest.fixture(autouse=True)
+def restore_logging_disable():
+    import logging
+
+    old_disable = logging.root.manager.disable
+    try:
+        yield
+    finally:
+        logging.disable(old_disable)
+
+
 class _Res:
     """模拟 DispatchResult（只带集成层关心的字段）。"""
 

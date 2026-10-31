@@ -142,7 +142,7 @@ def test_build_messages_prepends_system():
     svc = _svc(None)
     req = ChatRequest(
         messages=[Message(role="user", content="hi")],
-        persona=Persona(name="x", description="我是描述"),
+        persona=Persona(name="x", system_prompt="我是描述"),
     )
     msgs = svc.build_messages(req)
     assert msgs[0].role == "system"
@@ -229,8 +229,14 @@ async def test_chat_completions_shape(make_client):
     assert body["usage"]["total_tokens"] == 3
 
 
-async def test_chat_sends_system_prompt_with_markers(make_client):
-    """⭐ 端到端：system 内容带 `<|SYSTEM_INJECT|>…<|END_INJECT|>` 包裹（爱语实测行为）。"""
+async def test_chat_sends_plain_system_prompt(make_client):
+    """⭐ 端到端：system 是**裸文本**，不包 `<|SYSTEM_INJECT|>`（2026-10-29 改）。
+
+    端到端才抓得住：`Message.to_upstream()` 的默认值、`build_body()` 的透传、
+    路由的调用链，**三层任何一层把标记加回来**，这条就红。
+
+    实测依据见 `tests/test_domain.py::test_system_content_is_plain_by_default`。
+    """
     captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -246,8 +252,11 @@ async def test_chat_sends_system_prompt_with_markers(make_client):
 
     msgs = captured["messages"]
     assert msgs[0]["role"] == "system"
-    assert msgs[0]["content"].startswith("<|SYSTEM_INJECT|>")
-    assert msgs[0]["content"].endswith("<|END_INJECT|>")
+    content = msgs[0]["content"]
+    assert "<|SYSTEM_INJECT|>" not in content, (
+        "system 被包了爱语私有标记 —— 标准上游会把它当用户数据，人设失效"
+    )
+    assert "<|END_INJECT|>" not in content
     assert msgs[-1] == {"role": "user", "content": "hi"}
     assert captured["stream"] is False
 

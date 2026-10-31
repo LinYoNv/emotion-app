@@ -16,7 +16,7 @@ from typing import Any
 from quart import Blueprint, jsonify, request, send_from_directory
 
 from ..domain.context import VALID_MODES, ContextPolicy
-from ..domain.persona import Persona, PromptSection
+from ..domain.persona import Persona
 from ..domain.persona_import import (
     CONFLICT_MODES,
     CONFLICT_OVERWRITE,
@@ -32,7 +32,7 @@ from ..domain.persona_import import (
 )
 from ..domain.persona_repo import PersonaNotFound
 from ..domain import persona_ref as persona_ref_mod
-from ..domain.session_repo import SessionNotFound
+from ..domain.session_repo import NativeProjectionReadOnly, SessionNotFound
 from ..domain.settings import WRITABLE_FIELDS
 from ..infra.logging_setup import get_logger, scrub_text
 from ..storage.base import StorageError
@@ -1320,37 +1320,13 @@ def build_blueprint(require_auth: Any) -> Blueprint:
             {"ok": True, "file_removed": removed, "persona": updated.to_dict()}
         ), 200
 
-    # ==================================================================
-    # 提示词片段（人设内的 sections，单独管理便于面板编辑）
-    # ==================================================================
-
-    @bp.put("/personas/<persona_id>/sections")
-    async def replace_sections(persona_id: str):  # type: ignore[no-untyped-def]
-        """整体替换某人的提示词片段列表。"""
-        denied = require_auth()
-        if denied is not None:
-            return denied
-        repo, _, _ = _svc()
-
-        body = await request.get_json(silent=True)
-        if not isinstance(body, list):
-            return _err("请求体必须是片段数组", "invalid_request_error", 400)
-
-        try:
-            sections = [PromptSection.from_dict(x) for x in body]
-            for s in sections:
-                s.validate()
-        except (ValueError, KeyError, TypeError) as exc:
-            return _err(f"片段格式错误：{exc}", "invalid_request_error", 400)
-
-        try:
-            updated = await repo.update(
-                persona_id, {"prompt_sections": [s.to_dict() for s in sections]}
-            )
-        except PersonaNotFound:
-            return _err(f"人设不存在：{persona_id}", "not_found", 404)
-
-        return jsonify(updated.to_dict()), 200
+    # 🔴 2026-10-29：原 `PUT /personas/<id>/sections` 接口**已删除**。
+    #
+    # 人设结构改成 AstrBot 的 `Persona` 后，正文是**一整段 `system_prompt`**
+    # （`astrbot/core/db/po.py:145`），不存在"可开关的提示词片段"这个概念。
+    # 保留那个接口只会让人以为还能分段编辑，实际写进去也没人读 —— 静默失效。
+    #
+    # 现在改正文走 `PATCH /personas/<id> {"system_prompt": "..."}`。
 
     # ==================================================================
     # 会话（S3）
@@ -1462,6 +1438,8 @@ def build_blueprint(require_auth: Any) -> Blueprint:
 
         try:
             s = await repo.update(session_id, body)
+        except NativeProjectionReadOnly as exc:
+            return _err(str(exc), "native_projection_read_only", 409)
         except SessionNotFound:
             return _err(f"会话不存在：{session_id}", "not_found", 404)
         except (ValueError, Exception) as exc:  # noqa: BLE001
@@ -1477,6 +1455,8 @@ def build_blueprint(require_auth: Any) -> Blueprint:
         repo = _sessions()
         try:
             await repo.delete(session_id)
+        except NativeProjectionReadOnly as exc:
+            return _err(str(exc), "native_projection_read_only", 409)
         except SessionNotFound:
             return _err(f"会话不存在：{session_id}", "not_found", 404)
         return jsonify({"ok": True, "deleted": session_id}), 200
@@ -1490,6 +1470,8 @@ def build_blueprint(require_auth: Any) -> Blueprint:
         repo = _sessions()
         try:
             await repo.clear_messages(session_id)
+        except NativeProjectionReadOnly as exc:
+            return _err(str(exc), "native_projection_read_only", 409)
         except SessionNotFound:
             return _err(f"会话不存在：{session_id}", "not_found", 404)
         s = await repo.get(session_id)

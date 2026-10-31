@@ -340,14 +340,30 @@ def main() -> int:
             )
             return str(raw or "[]")
 
+        # ─────────────────────────────────────────────────────────────
+        # 🔴 2026-10-29 大改：人设结构已对齐 AstrBot
+        #
+        #  旧判据 ⑪⑫⑬ 全部建立在「提示词片段表」上（`#sections-block` /
+        #  `#sections-body` / `#add-section`）。那个表**已经不在了** ——
+        #  人设正文现在是**一整段 `system_prompt`**（`astrbot/core/db/po.py:145`），
+        #  一个 `<textarea id="p-system-prompt">` 承载，不再分段、不再可增删。
+        #
+        #  ⚠️ 所以这三条**不是"删掉了事"**：它们原来守的是一个**真痛点** ——
+        #     「用户在面板上看不见、也改不了人设正文」（2026-09-19 实测踩到：
+        #      爱语备份只有 6 个字段、如果只填字段不物化，面板就是空白，
+        #      而接口测试全绿照样漏）。
+        #  新结构下同一条痛点要用新形态重新守住，见下面 ⑪⑫⑬。
+        # ─────────────────────────────────────────────────────────────
+
+        # ---- ⑪-前置 人设详情**加载并静止** ----
         loaded = False
         for _ in range(40):      # 最多等 20s
             loaded = bool(
                 cdp.eval(
-                    "(function(){var b=document.getElementById('sections-block');"
+                    "(function(){var t=document.getElementById('p-system-prompt');"
                     " var n=document.getElementById('p-name');"
-                    " if(!b||!n) return false;"
-                    " return !b.classList.contains('hidden') && !!n.value;})()"
+                    " if(!t||!n) return false;"
+                    " return !t.closest('.hidden') && !!n.value;})()"
                 )
             )
             if loaded:
@@ -359,27 +375,18 @@ def main() -> int:
             loaded and settled,
             f"loaded={loaded} settled={settled} · {why} · 刷得最凶的 URL: {_top_urls()}",
         )
+
         # ---- ⑪-路由 **进人设详情后不许无限自刷**（真 bug，本工具撞见的）----
         #
         # 🔴 2026-09-21 实测抓到的**生产 bug**（不是判据问题）：
         #    `applyRoute` 的 persona 分支调 `selectPersona(id)` **没传
         #    `skipHash`** → `selectPersona` 里 `go("persona/<id>")` 又写 hash
         #    → `hashchange` → `applyRoute` → **无限循环**。
-        #
-        #    实测数字：进详情后**每 3 秒约 2000 次** `/api/v1/personas`
-        #    （4 秒内涨到 4130 次）；浏览器卡死、页面点不动，
-        #    而且**零报错**（每次都 HTTP 200）——
-        #    单测、`curl`、接口判据**全都看不见**它。
-        #
-        #    我是靠"页面永远不静止"（`__fetchSeq` 一直涨）才撞见的。
-        #    ✅ 现在把它变成**显式判据**：等 3 秒，请求数不许再涨。
-        seq_a = int(
-            cdp.eval("window.__fetchSeq||0") or 0
-        )
+        #    实测：进详情后每 3 秒约 2000 次 `/api/v1/personas`，浏览器卡死
+        #    而**零报错**（每次 HTTP 200）—— 单测/curl/接口判据全看不见。
+        seq_a = int(cdp.eval("window.__fetchSeq||0") or 0)
         time.sleep(3.0)
-        seq_b = int(
-            cdp.eval("window.__fetchSeq||0") or 0
-        )
+        seq_b = int(cdp.eval("window.__fetchSeq||0") or 0)
         check(
             "⑪-路由 进人设详情后**不自刷**（曾经每 3 秒 ~2000 次请求）",
             (seq_b - seq_a) <= 5,
@@ -387,70 +394,112 @@ def main() -> int:
             f" —— 路由自环；刷得最凶的: {_top_urls()}",
         )
         time.sleep(0.3)
-        row_titles = cdp.eval(
-            "(function(){var rs=document.querySelectorAll('#sections-body tr');"
-            " return JSON.stringify([].slice.call(rs).map(function(r){"
-            "   var i=r.querySelector('input[type=text]'); return i?i.value:''; }));})()"
-        ) or "[]"
-        try:
-            titles = json.loads(row_titles)
-        except Exception:
-            titles = []
-        core = {"角色设定", "性格", "场景", "创作者备注"}
-        dupes = [t for t in titles if t in core]
+
+        # ---- ⑪ 正文**真的显示在面板上**（旧痛点的新形态）----
+        #
+        # 守的是同一件事：「导入的人设必须让用户在界面上看得见」。
+        # 旧结构下这件事的失败形态是"片段表空白"，新结构下是"正文框空白"。
+        got_text = str(
+            cdp.eval("(function(){var t=document.getElementById('p-system-prompt');"
+                     " return t?t.value:'';})()") or ""
+        )
         check(
-            "⑪ 人设页「额外片段」表不再重复显示 4 个核心字段",
-            not dupes,
-            f"表里出现了核心字段 {dupes}（它们由上方输入框决定，改这儿不生效）",
+            "⑪ 人设正文**显示在面板上**（非空，且不是占位符）",
+            len(got_text.strip()) >= 20,
+            f"正文框只有 {len(got_text.strip())} 字符 —— "
+            f"导入的人设用户在界面上看不见（本项目真事故的形态）",
         )
 
-        # ---- ⑫ **真的加一个额外片段 → 它必须出现在表里** ----
+        # ---- ⑫ 旧的四字段输入框与片段表**必须已经消失** ----
         #
-        # 🔴 为什么必须做这一步（我的判据盲区，注入验证抓到的）：
-        #    上面 ⑪ 只断言"表里**没有**核心字段"。而糯米茨这个人设
-        #    **本来就没有额外片段** → 表格渲染逻辑即使**整个坏掉**
-        #    （一行都不渲染），⑪ 照样绿（**假通过**）。
-        #    实测：把 `renderSections` 的 `rows.forEach` 改成空数组后，
-        #    ⑪ 通过 —— 因为它只检查"有没有多"，不检查"该有的在不在"。
-        #
-        # ✅ 所以这里**真的点「+ 添加片段」**，断言新行出现。
-        #    ⚠️ 只改**前端内存**、**绝不保存**（不碰用户数据）：
-        #       不点「保存片段」就不会发 PUT。
-        # ⚠️ **`.empty-row` 也是一个 `tr`** —— 第一版判据数的是
-        #    `#sections-body tr`，于是"空态行"被当成了一条数据行：
-        #    before=1（空态行）→ after=1（真行替换了空态行）→
-        #    断言 `after == before + 1` **假红**（产品其实是对的）。
-        #    ✅ 只数**真数据行**（带文本框的那些）。
-        before_state = cdp.eval(
-            "(function(){var rs=document.querySelectorAll("
-            "'#sections-body tr:not(.empty-row)'); return rs.length;})()"
-        ) or 0
-        cdp.eval("document.getElementById('add-section').click()")
-        time.sleep(0.8)
-        after = cdp.eval(
-            "(function(){var rs=document.querySelectorAll("
-            "'#sections-body tr:not(.empty-row)'); return rs.length;})()"
-        ) or 0
-        new_titles = cdp.eval(
-            "(function(){var rs=document.querySelectorAll("
-            "'#sections-body tr:not(.empty-row)');"
-            " return JSON.stringify([].slice.call(rs).map(function(r){"
-            "   var i=r.querySelector('input[type=text]'); return i?i.value:''; }));})()"
-        ) or "[]"
-        try:
-            nt = json.loads(new_titles)
-        except Exception:
-            nt = []
-        check(
-            "⑫ 点「+ 添加片段」→ 新片段**真的出现在表里**",
-            after == before_state + 1 and "新片段" in nt,
-            f"before={before_state} after={after} titles={nt}",
+        # 🔴 这条是"反向判据"，很有必要：删了后端字段但前端还留着 4 个框，
+        #    用户填了会被**静默丢弃**（`update()` 的白名单里没有那些键）——
+        #    那是比"看不见"更糟的"改了不生效"。
+        legacy_ids = [
+            "p-description", "p-personality", "p-scenario", "p-creator-notes",
+            "sections-block", "sections-body", "add-section", "save-sections",
+        ]
+        still_there = json.loads(
+            cdp.eval(
+                "(function(){return JSON.stringify(%s.filter(function(id){"
+                " return !!document.getElementById(id);}));})()"
+                % json.dumps(legacy_ids)
+            ) or "[]"
         )
-        # ⑬ 它绝不能是核心字段名（新增的必须走"额外片段"那条路）
         check(
-            "⑬ 新增的片段不是核心字段（核心 4 段不由表格管理）",
-            not [t for t in nt if t in core],
-            f"titles={nt}",
+            "⑫ 旧的四字段框与片段表**已彻底移除**（留着会静默丢弃用户输入）",
+            not still_there,
+            f"仍然存在：{still_there} —— 用户在这上面改的东西不会生效",
+        )
+
+        # ---- ⑬ 改正文 → 保存 → **真的落到后端**（改得动）----
+        #
+        # 🔴 为什么必须做这一段（旧 ⑫ 的教训）：只断言"框里有内容"证明不了
+        #    "改得动"—— 保存按钮的 handler 断掉、或者 PATCH 发错字段，
+        #    正文照样显示得好好的。实测踩过：`bootstrap.js` 里删掉片段表那段
+        #    时，若 `$("add-section")` 返回 null 会在**模块顶层抛 TypeError**，
+        #    导致它之后**全部事件绑定不执行**——整页按钮失灵但页面"看起来正常"。
+        #
+        # ⚠️ 只改**一次**、且改完立刻还原（不污染用户数据）。
+        #    `__fetchSeq` 同时记录 PATCH 次数，用来确认没有额外发 /sections。
+        marker = "【判据自检-" + str(int(time.time())) + "】"
+        original = got_text
+        patched_seq0 = int(cdp.eval("window.__fetchSeq||0") or 0)
+        sections_before = int(
+            cdp.eval(
+                "(function(){var u=window.__urls||[];"
+                " return u.filter(function(x){return x.indexOf('/sections')>=0;}).length;})()"
+            ) or 0
+        )
+        cdp.eval(
+            "(function(){var t=document.getElementById('p-system-prompt');"
+            " t.value = t.value + %s;"
+            " t.dispatchEvent(new Event('input',{bubbles:true}));"
+            " var b=document.getElementById('save-persona');"
+            " if(b) b.click(); return 1;})()" % json.dumps(marker)
+        )
+        # 等保存往返完成（最多 15s）
+        saved_ok = False
+        for _ in range(30):
+            time.sleep(0.5)
+            body = cdp.eval(
+                "(function(){var t=document.getElementById('p-system-prompt');"
+                " return t?t.value:'';})()"
+            ) or ""
+            if marker in str(body):
+                saved_ok = True
+                break
+        sections_after = int(
+            cdp.eval(
+                "(function(){var u=window.__urls||[];"
+                " return u.filter(function(x){return x.indexOf('/sections')>=0;}).length;})()"
+            ) or 0
+        )
+        patched_seq1 = int(cdp.eval("window.__fetchSeq||0") or 0)
+        check(
+            "⑬ 改正文 → 保存**真的提交**（且不再调已删除的 /sections）",
+            saved_ok and sections_after == sections_before,
+            f"saved={saved_ok} · 请求数 {patched_seq0}→{patched_seq1} · "
+            f"/sections 调用 {sections_before}→{sections_after}（该接口已删除，必须为 0）",
+        )
+
+        # ---- ⑬-b 还原原正文（判据不许留下污染）----
+        cdp.eval(
+            "(function(){var t=document.getElementById('p-system-prompt');"
+            " t.value = %s;"
+            " t.dispatchEvent(new Event('input',{bubbles:true}));"
+            " var b=document.getElementById('save-persona');"
+            " if(b) b.click(); return 1;})()" % json.dumps(original)
+        )
+        time.sleep(1.5)
+        restored = str(
+            cdp.eval("(function(){var t=document.getElementById('p-system-prompt');"
+                     " return t?t.value:'';})()") or ""
+        )
+        check(
+            "⑬-b 判据跑完**已还原**原正文（不留污染）",
+            restored == original,
+            f"还原后长度 {len(restored)} vs 原 {len(original)}",
         )
 
         print()

@@ -53,6 +53,17 @@ class ContentPart(_DumpMixin):
     """内容段基类（照真实现）。"""
 
     type: str = ""
+    _no_save: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def mark_as_temp(self):
+        self._no_save = True
+        return self
+
+    def model_dump_for_context(self) -> dict[str, Any]:
+        data = self.model_dump()
+        if self._no_save:
+            data["_no_save"] = True
+        return data
 
 
 @dataclass

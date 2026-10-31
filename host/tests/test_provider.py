@@ -224,7 +224,21 @@ def test_manager_inst_map_is_dict_of_providers():
     pm.register(Provider(provider_id="a"))
     assert isinstance(pm.inst_map, dict), "inst_map 必须是 dict"
     assert list(pm.inst_map.keys()) == ["a"]
-    assert isinstance(pm.inst_map["a"], Provider)
+    # 🔴 2026-10-29 改：`Provider(...)` 现在返回的实例**类型精确是
+    #    `ProviderOpenAIOfficial`**（插件 `companion_v2/adapters/astrbot/provider.py:188`
+    #    用 `type(x) is ProviderOpenAIOfficial` 做精确比较，子类通不过）。
+    #    所以这条守的是"装的是真的 provider 对象、且带完整实现"，
+    #    而不是"类型恰好等于 Provider"——后者会把正确实现判成红的。
+    from astrbot_host.compat.core.provider.sources.providers import (
+        ProviderOpenAIOfficial,
+    )
+
+    inst = pm.inst_map["a"]
+    assert isinstance(inst, (Provider, ProviderOpenAIOfficial)), (
+        f"inst_map 里装的必须是 provider 对象，实际是 {type(inst).__name__}"
+    )
+    assert callable(getattr(inst, "text_chat", None)), "provider 必须能真发请求"
+    assert callable(getattr(inst, "get_model", None)), "provider 必须有 get_model"
 
 
 def test_manager_default_and_lookup():

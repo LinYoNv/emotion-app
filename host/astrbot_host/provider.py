@@ -55,6 +55,11 @@ ADAPTER_TYPE_OPENAI_CHAT = "openai_chat_completion"
 #:    其余（embedding / text_to_speech / …）**不假装支持**（作者判据③）。
 PROVIDER_TYPE_CHAT = "chat_completion"
 
+#: 🔴 插件的精确类型校验要的就是这个类（见文件末尾 `_mount_implementation` 的说明）。
+from astrbot_host.compat.core.provider.sources.providers import (  # noqa: E402
+    ProviderOpenAIOfficial,
+)
+
 
 class Provider:
     """一个模型供应商（照真实现的最小可用面）。
@@ -69,6 +74,30 @@ class Provider:
       2. `get_model()` 是**方法**（`:23020` 优先调它，失败才退回属性）；
       3. `provider_id` 属性存在（`:22931` 第二顺位）。
     """
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+        """构造一个 **类型精确为 `ProviderOpenAIOfficial`** 的实例。
+
+        🔴 **为什么要 `__new__` 偷换类型**（2026-10-29 实测）：
+           插件 `companion_v2/adapters/astrbot/provider.py:188` 是**精确类型比较**：
+
+           ```python
+           if type(self.native) is not provider_type:   # ProviderOpenAIOfficial
+               raise ValueError("provider needs the verified native provider class")
+           ```
+
+           `type(x) is C` ⇒ **任何子类都不通**。所以 `Provider(...)` 必须真的返回
+           一个 `ProviderOpenAIOfficial` 实例，而不是 `Provider` 实例。
+
+        ⚠️ **`__init__` 必须在这里手动调**：CPython 只在
+           `isinstance(返回值, cls)` 时才自动调用 `cls.__init__`。
+           我们返回的是**兄弟类**的实例（不是 `Provider` 的子类），
+           所以解释器**不会**再调 `__init__` —— 不手动调就会得到一个没初始化的空对象
+           （症状是后续属性访问全 AttributeError，极难查）。
+        """
+        obj = ProviderOpenAIOfficial.__new__(ProviderOpenAIOfficial)
+        Provider.__init__(obj, *args, **kwargs)
+        return obj
 
     def __init__(
         self,
@@ -100,8 +129,63 @@ class Provider:
         self.model_name = model
         self._llm = llm
         self._timeout = timeout
+        self._build_native_client(base_url=base_url, api_key=api_key)
 
-    # ---- 插件会读/调的方法 ----
+    # ---- 原生 client 面（插件 `AstrBotTextProvider` 直接依赖）----
+
+    def _build_native_client(self, *, base_url: str, api_key: str) -> None:
+        """照真实现建 `client` + `default_params`（`openai_source.py:372-395`）。
+
+        🔴 **为什么不复用 `_llm`（我们的 `UpstreamLLMPort`）**：
+           插件不是"调用宿主的发送函数"，而是**拿 client 自己拼 payload、自己解响应**
+           （`companion_v2/.../model_wire.py` 的 `build_wire` / `decode_response`），
+           还会 `with_options(max_retries=0)` 关掉 SDK 重试层。
+           所以必须给一个**真的 `AsyncOpenAI` 实例**，形状才与真实现一致。
+
+        ⚠️ 三个如实降级（不伪造 —— 本项目铁律）：
+          * `base_url` 为空 → `client=None`（插件在 `_current()` 里会明确报
+            `host_provider_changed`，不是静默空回复）；
+          * `openai` 包缺失 → `client=None` + 一条 ERROR；
+          * `default_params` 用**与真实现同一份算法**取
+            （`inspect.signature(client.chat.completions.create).parameters.keys()`），
+            不是我猜的固定列表。
+        """
+        self.client: Any = None
+        self.default_params: Any = frozenset()
+        if not base_url:
+            logger.warning(
+                "供应商 %s 没有 base_url —— 不建原生 client，"
+                "插件侧模型链路会明确报 host_provider_changed（不是静默降级）",
+                self.provider_id,
+            )
+            return
+        try:
+            import inspect
+
+            from openai import AsyncOpenAI
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "供应商 %s 无法建原生 client（openai 包不可用：%s）"
+                "—— 插件侧模型链路将不可用",
+                self.provider_id, exc,
+            )
+            return
+        try:
+            self.client = AsyncOpenAI(
+                api_key=api_key or "not-needed",
+                base_url=base_url,
+                timeout=float(self._timeout),
+            )
+            self.default_params = inspect.signature(
+                self.client.chat.completions.create
+            ).parameters.keys()
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "供应商 %s 建原生 client 失败：%s: %s",
+                self.provider_id, type(exc).__name__, exc,
+            )
+            self.client = None
+            self.default_params = frozenset()
 
     def get_model(self) -> str:
         """当前模型名（`page_api.py:23020` 会调它）。"""
@@ -168,33 +252,16 @@ class Provider:
                 f"供应商 {self.provider_id!r} 未接入模型调用端口（HostPorts.llm 为空）"
             )
 
-        # 组装消息：真实现语义是 prompt 追加到 contexts 之后
-        messages: list[dict[str, Any]] = []
-        if isinstance(contexts, list):
-            messages.extend(contexts)
-        # 🔴 **工具调用结果必须拼成消息喂回上游**（2026-09-22 修）。
-        #
-        #   原来 `tool_calls_result` 在 `_IGNORED_TEXT_CHAT_KWARGS` 里**刻意不转发**
-        #   （当时的理由："转发会让上游 400"）—— 但真因不是"不该转发"，
-        #   而是**转发的是裸对象**。真实现（`openai_source.py:983-990`）是：
-        #
-        #       context_query.extend(tool_calls_result.to_openai_messages())
-        #
-        #   即先转成 **1 条 role="assistant"（带 tool_calls）+ N 条 role="tool"**
-        #   再并入消息列表。不转就丢对象 → 上游 400；转了才是对的协议。
-        #   → 不转发的实际后果：**工具结果永远回不到模型**，
-        #     模型只能重复调同一个工具（或干脆不知道工具跑没跑）。
-        for block in _iter_tool_calls_results(tool_calls_result):
-            try:
-                messages.extend(block.to_openai_messages())
-            except Exception:  # noqa: BLE001
-                # ⚠️ 不静默：这是"工具闭环断掉"的关键节点
-                logger.error(
-                    "tool_calls_result 无法转成 OpenAI 消息（本轮工具结果将丢失）",
-                    exc_info=True,
-                )
-        if prompt:
-            messages.append({"role": "user", "content": prompt})
+        from astrbot_host.compat.api.provider import ProviderRequest
+        from astrbot_host.provider_content import provider_request_to_messages
+
+        request = ProviderRequest(
+            prompt=prompt, contexts=contexts if isinstance(contexts, list) else [],
+            image_urls=image_urls or [], audio_urls=audio_urls or [],
+            extra_user_content_parts=extra_user_content_parts or [],
+            tool_calls_result=tool_calls_result,
+        )
+        messages = provider_request_to_messages(request, include_system=False)
 
         try:
             # 🔴 `tools=` 必须**转成 OpenAI schema**再交给上游。
@@ -244,6 +311,200 @@ class Provider:
         #       tool_calls（`openai_source.py:881`），我们要照抄那个前提。
         return to_llm_response(out, tools=func_tool)
 
+    # ---- 原生 provider 契约：`_prepare_chat_payload` / `_query` ----
+    #
+    # 🔴🔴 **2026-10-30 补的真缺口（生产实测）**：陪伴 7.0.0 的主动联系/记忆等
+    #    后台任务**不走 `text_chat`**，而是直接调用 provider 的**原生私有方法**：
+    #
+    #        payload, _ = await native._prepare_chat_payload(
+    #            prompt=None, contexts=..., model=...)
+    #        response = await native._query(payload, tools)
+    #
+    #    （官方 `companion_v2/adapters/astrbot/provider.py:396` 与 `:444`；
+    #      真 AstrBot 实现在 `core/provider/sources/openai_source.py:949` / `:531`）
+    #
+    #    我们原来**两个都没有** ⇒ 插件抛 `AttributeError` ⇒ 被它归类成
+    #    `request_preparation_failed` / `not_started` ⇒ 第 8 步「主动消息测试」
+    #    的真实返回就是 `model_not_started`（日志原文：
+    #    `模型请求准备失败 provider=cpa/... failure=request_preparation_failed
+    #      error_type=AttributeError`），**且页面只显示"模型或投递链路失败"**。
+    #
+    #    ⚠️ 我们**不伪造**这两步：`_prepare_chat_payload` 只做官方那份"把
+    #       contexts/工具结果拼成 messages + 加 model"的纯组装（没有任何网络
+    #       动作，所以可以如实实现）；`_query` 则转调 `text_chat`，由它走真实
+    #       上游并复用已验证的 `to_llm_response` 解析。
+
+    async def _prepare_chat_payload(
+        self,
+        prompt: str | None = None,
+        image_urls: list[str] | None = None,
+        audio_urls: list[str] | None = None,
+        contexts: Any = None,
+        system_prompt: str | None = None,
+        tool_calls_result: Any = None,
+        model: str | None = None,
+        extra_user_content_parts: Any = None,
+        **kwargs: Any,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """组装聊天 payload（照真实现 `openai_source.py:949` 的语义）。
+
+        返回 `(payloads, context_query)`：
+          * `payloads` = `{"messages": [...], "model": ...}` —— 插件随后会往里塞
+            `max_tokens` / `response_format` 等字段，再交给 `_query`；
+          * `context_query` 是同一个 messages 列表（真实现也返回两份）。
+
+        ⚠️ 与真实现的**唯一差异**：我们不做 `_finally_convert_payload` 那些
+           针对特定厂商的字段改写（MiMo reasoning 回传、Gemini think part 等），
+           因为我们不掌握上游厂商分支 —— 与其猜错静默改写，不如原样交给上游。
+           插件在这里只依赖 `messages` 与 `model` 两个键。
+        """
+        from astrbot_host.compat.api.provider import ProviderRequest
+        from astrbot_host.provider_content import provider_request_to_messages
+
+        request = ProviderRequest(
+            prompt=prompt,
+            contexts=contexts if isinstance(contexts, list) else [],
+            image_urls=image_urls or [],
+            audio_urls=audio_urls or [],
+            extra_user_content_parts=extra_user_content_parts or [],
+            tool_calls_result=tool_calls_result,
+        )
+        messages = provider_request_to_messages(request, include_system=bool(system_prompt))
+        if system_prompt:
+            # `include_system=True` 时 provider_content 已把 system 放在最前；
+            # 这里再兜一次，避免不同实现路径下漏掉系统提示。
+            if not any(m.get("role") == "system" for m in messages):
+                messages.insert(0, {"role": "system", "content": system_prompt})
+
+        # 真实现会剔除内部标记键（`_no_save`）；插件可能带着它进来。
+        for part in messages:
+            part.pop("_no_save", None)
+
+        payloads: dict[str, Any] = {
+            "messages": messages,
+            "model": model or self.get_model(),
+        }
+        return payloads, messages
+
+    async def _query(
+        self,
+        payloads: dict[str, Any],
+        tools: Any = None,
+        *,
+        request_max_retries: int | None = None,
+    ) -> Any:
+        """执行一次原生模型请求（照真实现 `openai_source.py:531`）。
+
+        🔴 **必须返回 `LLMResponse`**（插件读 `.completion_text` /
+           `.tools_call_*`）；转调 `text_chat` 是为了复用**同一条已验证链路**，
+           而不是再写一套请求/解析。
+        """
+        if not isinstance(payloads, dict):
+            raise TypeError("payloads must be an object")
+        messages = payloads.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("payloads.messages must be a non-empty list")
+
+        # 🔴🔴 `LLMResponse` 必须挂上**真实原始 completion**。
+        #    陪伴 7.0 的 `model_wire.decode_response`（`model_wire.py:244`）
+        #    直接读 `response.raw_completion.choices[0].message/.finish_reason`：
+        #
+        #        completion = response.raw_completion
+        #        if len(completion.choices) != 1: raise ...
+        #        choice = completion.choices[0]
+        #
+        #    只返回 `LLMResponse`（raw 为空）⇒ `completion_present=False`、
+        #    `finish_reason=missing` ⇒ 判成 `response_contract_rejected` /
+        #    `model_usage_unknown`（生产实测，2026-10-30）。
+        #    真 AstrBot 的 `_query` 也是把 SDK 的 completion 交给 `LLMResponse`
+        #    解析后**保留在 `raw_completion`** 上，我们照此办理。
+        result = await self._llm.generate(
+            prompt=None,
+            messages=messages or None,
+            system_prompt=None,
+            model=payloads.get("model") or self.get_model() or None,
+            tools=normalize_tools(tools),
+        )
+        response = to_llm_response(result, tools=tools)
+        # 🔴 `raw_completion` **必须无条件构造**，不能等后端填 `raw`
+        #    （我们后端 `ChatResult.raw` 目前为空 ⇒ 只在 raw 非空时才构造
+        #      等于永远不构造，插件的 wire 校验就会一直 `completion_present=False`）。
+        #    字段取自**已经拿到的真实结果**：content / finish_reason / tool_calls。
+        try:
+            from types import SimpleNamespace
+
+            calls = []
+            for call in (getattr(result, "tool_calls", None) or []):
+                function = (call or {}).get("function") or {}
+                calls.append(SimpleNamespace(
+                    id=(call or {}).get("id"),
+                    type=(call or {}).get("type") or "function",
+                    function=SimpleNamespace(name=function.get("name"),
+                                             arguments=function.get("arguments", "{}")),
+                ))
+            # ⚠️ 必须补齐官方 `ChatCompletion.Choice.Message` 上**会被读到的**
+            #    字段：`refusal`（`explicit_refusal()` 会读它）与
+            #    `model_fields_set`（`_extract_reasoning_content` 会读它）。
+            #    缺了就是 `AttributeError` ⇒ `native_response_parse_failed`
+            #    （生产实测：`error_type=AttributeError`、`completion_present=true`）。
+            message = SimpleNamespace(
+                content=(getattr(result, "content", "") or None),
+                tool_calls=(calls or None),
+                refusal=None,
+                reasoning_content=(getattr(result, "reasoning_content", "") or None),
+            )
+            message.model_fields_set = set()
+            # ⚠️ 官方 `_parse_openai_completion` 还会读 `completion.usage` /
+            #    `completion.id` / `choice.refusal`；插件用的是**官方那个类方法**
+            #    （`provider_type._parse_openai_completion`），不是我们的实例方法，
+            #    所以这些字段一个都不能少（缺了就是 AttributeError）。
+            usage = getattr(result, "usage", None)
+            response.raw_completion = SimpleNamespace(
+                choices=[SimpleNamespace(
+                    finish_reason=(getattr(result, "finish_reason", "") or None),
+                    message=message,
+                    refusal=None,
+                )],
+                id="",
+                model=(getattr(result, "model", "") or None),
+                usage=SimpleNamespace(
+                    prompt_tokens=int((usage or {}).get("prompt_tokens", 0) or 0),
+                    completion_tokens=int((usage or {}).get("completion_tokens", 0) or 0),
+                    total_tokens=int((usage or {}).get("total_tokens", 0) or 0),
+                    prompt_tokens_details=None,
+                    completion_tokens_details=None,
+                ),
+            )
+        except Exception:  # noqa: BLE001 — 原始体属于附加信息，失败不该毁掉已拿到的回复
+            logger.warning("供应商 %s 无法构造原始 completion（插件将失去原生校验依据）",
+                           self.provider_id, exc_info=True)
+
+        # 🔴🔴 **必须回调 `_parse_openai_completion(completion, tools)`**。
+        #    真 AstrBot 的 `_query` 在拿到 SDK completion 后就是这一步
+        #    （`openai_source.py:585`）：
+        #
+        #        llm_response = await self._parse_openai_completion(completion, tools)
+        #
+        #    陪伴 7.0 会把这个方法**替换成它自己的 `parse()`**
+        #    （`companion_v2/adapters/astrbot/provider.py:388`），用来
+        #    校验 wire 协议、记录 `observed`、并产出最终文本。
+        #    漏掉它 ⇒ 它的 `observed` 永远为空 ⇒ `completion_present=False`
+        #    ⇒ `response_contract_rejected` / `model_usage_unknown`
+        #    （生产实测 2026-10-30；这是第 8 步模型阶段最后一个缺口）。
+        parser = getattr(self, "_parse_openai_completion", None)
+        if callable(parser):
+            try:
+                parsed = parser(response.raw_completion, tools)
+                if hasattr(parsed, "__await__"):
+                    parsed = await parsed
+                if parsed is not None:
+                    return parsed
+            except Exception:
+                # 插件自己的 parse 会做严格校验并抛出它要的错；
+                # 这里的异常**必须原样抛给插件**，否则它会误以为成功。
+                raise
+        return response
+
     async def text_chat_stream(self, *args: Any, **kwargs: Any) -> Any:
         """流式文本对话。
 
@@ -263,6 +524,87 @@ class Provider:
             f"<Provider id={self.provider_id!r} model={self.get_model()!r} "
             f"type={PROVIDER_TYPE_CHAT}>"
         )
+
+
+# ======================================================================
+# 🔴🔴 让 `ProviderOpenAIOfficial` 本身成为可实例化的真实现类
+# ======================================================================
+#
+# ## 为什么必须这么做（2026-10-29，实测踩过一次）
+#
+# 陪伴 7.0.0 的 `companion_v2/adapters/astrbot/provider.py:188` 用的是
+# **精确类型比较**，不是 `isinstance`：
+#
+# ```python
+# self.native = context.get_provider_by_id(provider_id)
+# if type(self.native) is not provider_type:      # provider_type = ProviderOpenAIOfficial
+#     raise ValueError("provider needs the verified native provider class")
+# ```
+#
+# `type(x) is C` 要求 **`type(x)` 精确等于 `C`** ⇒ 任何子类都通不过：
+#
+#   * ❌ `class Provider(ProviderOpenAIOfficial)` → `type()` 是 `Provider` → 失败
+#   * ✅ 直接实例化 `ProviderOpenAIOfficial` → `type()` 精确相等 → 通过
+#
+# 这与真 AstrBot 完全一致：真实现里 `ProviderOpenAIOfficial`（`openai_source.py:51`）
+# 就是"既有类型标记、又有完整 text_chat 实现"的类，ProviderManager 装的就是它的实例。
+#
+# ## 为什么是"注入方法"而不是"继承"
+#
+# `Provider` 这个类在本项目里有**自己的历史**：它的构造签名是 keyword-only
+# （`provider_id=` / `llm=` …），跟真实现 `(provider_config, provider_settings)`
+# 完全不同，而且 `host/tests/test_provider.py` 有 20+ 处按这个签名在构造。
+# 为了不推翻这些，做法是：**把 `Provider` 的实现方法整体拷贝到
+# `ProviderOpenAIOfficial` 上**，再让 ProviderManager 实例化后者。
+#
+# ⚠️ 副作用（有意为之）：`Provider` 与 `ProviderOpenAIOfficial` 现在共享同一批
+#    方法实现，但**类型不同**。插件只认后者（因为它做精确比较），
+#    我们自己的测试只认前者。这样两边都不用改。
+
+#: `compat` 里**特意重写**、不允许被 `Provider` 的实现覆盖的成员。
+#: 这三项在 `providers.py` 里都有更贴合插件契约的版本（含注释与如实降级）。
+_KEEP_TARGET_IMPLEMENTATION = frozenset({
+    "get_model",
+    "set_model",
+    "_query_stream",
+})
+
+
+def _mount_implementation(target: type) -> None:
+    """把 `Provider` 的实现方法挂到 `target` 上（不覆盖 target 已有的同名属性）。
+
+    Args:
+        target: 目的类（这里就是 `ProviderOpenAIOfficial`）。
+
+    ⚠️ **不覆盖已有的**：`ProviderOpenAIOfficial` 自己在 compat 里定义了
+       `get_model` / `set_model` / `_query_stream`（那三项是我们特意写的，
+       与 `Provider` 的实现等价但注释更贴合插件契约）。
+       覆盖会让"哪份实现生效"变得不可预测 —— 那是本项目最忌讳的隐式行为。
+    """
+    for name, member in vars(Provider).items():
+        if name.startswith("__") and name not in ("__init__", "__repr__"):
+            continue
+        if name in ("__dict__", "__weakref__", "__doc__", "__module__"):
+            continue
+        # 🔴 只跳过 compat 里**特意重写**的那三项（它们与 Provider 的实现在语义上
+        #    等价，但注释更贴合插件契约）。其余一律用 Provider 的实现覆盖 ——
+        #    compat 的 `Provider` 基类里有一份 "text_chat 抛 NotImplementedError"
+        #    的**占位实现**，不覆盖它 ⇒ 宿主的 provider 永远调不通
+        #    （实测症状：9 个 provider 测试全红，报 "这些类只是类型标记"）。
+        if name in _KEEP_TARGET_IMPLEMENTATION:
+            continue
+        try:
+            setattr(target, name, member)
+        except (AttributeError, TypeError) as exc:  # noqa: BLE001
+            logger.warning(
+                "把 Provider.%s 挂到 %s 上失败（%s）—— 该能力将不可用",
+                name, target.__name__, exc,
+            )
+    # 🔴 `__init__` 必须挂：它的 keyword-only 签名是这个项目的历史契约。
+    setattr(target, "__init__", Provider.__init__)
+
+
+_mount_implementation(ProviderOpenAIOfficial)
 
 
 #: `text_chat` 上真实现专有、我们**不转发给上游**的参数。

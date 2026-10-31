@@ -102,7 +102,9 @@ async def test_persona_crud_flow(ctx):
     client, _ = ctx
 
     # 建
-    r = await client.post("/api/v1/personas", json={"name": "小爱", "description": "描述"})
+    # 2026-10-29：人设正文只有 `system_prompt` 一个字段
+    # （旧的 description/personality/… 已从模型删除）
+    r = await client.post("/api/v1/personas", json={"name": "小爱", "system_prompt": "描述"})
     assert r.status_code == 201
     p = await r.get_json()
     pid = p["id"]
@@ -119,9 +121,9 @@ async def test_persona_crud_flow(ctx):
     assert (await r.get_json())["name"] == "小爱"
 
     # 改
-    r = await client.patch(f"/api/v1/personas/{pid}", json={"personality": "温柔"})
+    r = await client.patch(f"/api/v1/personas/{pid}", json={"system_prompt": "温柔"})
     assert r.status_code == 200
-    assert (await r.get_json())["personality"] == "温柔"
+    assert (await r.get_json())["system_prompt"] == "温柔"
 
     # 删
     r = await client.delete(f"/api/v1/personas/{pid}")
@@ -131,7 +133,7 @@ async def test_persona_crud_flow(ctx):
 
 async def test_create_persona_requires_name(ctx):
     client, _ = ctx
-    r = await client.post("/api/v1/personas", json={"description": "没有名字"})
+    r = await client.post("/api/v1/personas", json={"system_prompt": "没有名字"})
     assert r.status_code == 400
     assert (await r.get_json())["error"]["type"] == "invalid_request_error"
 
@@ -227,46 +229,72 @@ async def test_delete_active_persona_clears_selection(ctx):
 # ===========================================================================
 
 
-async def test_replace_sections(ctx):
+# ---------------------------------------------------------------------------
+# 人设正文编辑（`PUT /sections` → `PATCH /personas/<id>`）
+#
+# 🔴 2026-10-29：`PUT /api/v1/personas/<id>/sections` **已删除**
+#    （见 `api_admin.py:1321` 的说明：人设正文是一整段 `system_prompt`，
+#     不存在"可开关的提示词片段"；留着那个接口会让人以为还能分段编辑，
+#     实际写进去也没人读 —— 静默失效）。
+#
+#    这三条旧测试守的**真实风险**没消失，只是通道变了，所以我按下面的方式重守：
+#      ① 能改正文、且真落盘            → `test_update_system_prompt_persists`
+#      ② 非法输入明确报错、不静默忽略    → `test_update_persona_rejects_bad_body`
+#      ③ 删除的接口**真的不在了**        → `test_sections_route_is_gone`
+#        （这条是新增的：删接口最容易"以为删了其实还在"，必须实测）
+# ---------------------------------------------------------------------------
+
+
+async def test_update_system_prompt_persists(ctx):
+    """⭐ 改正文能落盘（这是 `/sections` 删除后**唯一**的正文编辑通道）。"""
     client, _ = ctx
     r = await client.post("/api/v1/personas", json={"name": "x"})
     pid = (await r.get_json())["id"]
 
-    r = await client.put(f"/api/v1/personas/{pid}/sections", json=[
-        {"title": "说话风格", "content": "简洁", "order": 30, "source": "user"},
-        {"title": "禁忌", "content": "别提某事", "order": 40, "source": "persona", "enabled": False},
-    ])
+    r = await client.patch(f"/api/v1/personas/{pid}", json={"system_prompt": "简洁\n\n别提某事"})
     assert r.status_code == 200
-    p = await r.get_json()
-    assert len(p["prompt_sections"]) == 2
+    assert (await r.get_json())["system_prompt"] == "简洁\n\n别提某事"
 
-    # 再取一次，确认落盘了
+    # 再取一次，确认真的落盘了（不是只在 patch 的返回值里改了）
     p2 = await (await client.get(f"/api/v1/personas/{pid}")).get_json()
-    assert p2["prompt_sections"][0]["title"] == "说话风格"
+    assert p2["system_prompt"] == "简洁\n\n别提某事"
 
 
-async def test_replace_sections_requires_array(ctx):
+async def test_update_persona_rejects_bad_body(ctx):
+    """非法请求体必须**明确 400**，不能静默接受。"""
     client, _ = ctx
     r = await client.post("/api/v1/personas", json={"name": "x"})
     pid = (await r.get_json())["id"]
-    r = await client.put(f"/api/v1/personas/{pid}/sections", json={"not": "array"})
+    r = await client.patch(f"/api/v1/personas/{pid}", json="not an object")
     assert r.status_code == 400
 
 
-async def test_replace_sections_rejects_bad_source(ctx):
+async def test_sections_route_is_gone(ctx):
+    """🔴 删掉的接口必须**真的不在了**（4xx），不能是"文档删了、路由还在"。
+
+    ⚠️ 为什么单独守：本项目踩过"以为删了其实还在"的坑 ——
+       旧接口留着会让面板/脚本继续调它，而写进去的数据没人读 = **静默失效**。
+    """
     client, _ = ctx
     r = await client.post("/api/v1/personas", json={"name": "x"})
     pid = (await r.get_json())["id"]
+
     r = await client.put(f"/api/v1/personas/{pid}/sections",
-                         json=[{"title": "t", "source": "hacker"}])
-    assert r.status_code == 400
+                         json=[{"title": "说话风格", "content": "简洁"}])
+    assert r.status_code in (404, 405), f"接口应已删除，实际 {r.status_code}"
 
 
 async def test_preview_shows_assembled_prompt(ctx):
-    """⭐ 预览必须体现"人设 → 提示词"的组装结果（情绪 A3 的核心）。"""
+    """⭐ 预览必须体现"人设 → 提示词"的组装结果（情绪 A3 的核心）。
+
+    2026-10-29：原来 6 字段各产一段（`【角色设定】`/`【性格】`/…），
+    现在人设正文是**一整段**，标题统一为 `【人设】`（`PERSONA_CORE_TITLE`）。
+    ⚠️ 守的意图**一点没变**：用户填的正文必须**看得见地**出现在预览里，
+       且能按标题追溯到来源（这正是 A3 要求的那件事）。
+    """
     client, _ = ctx
     r = await client.post("/api/v1/personas", json={
-        "name": "小爱", "description": "我是描述", "personality": "温柔",
+        "name": "小爱", "system_prompt": "我是描述\n\n温柔",
     })
     pid = (await r.get_json())["id"]
 
@@ -274,16 +302,17 @@ async def test_preview_shows_assembled_prompt(ctx):
     assert r.status_code == 200
     d = await r.get_json()
 
-    assert "【角色设定】" in d["text"]
+    assert "【人设】" in d["text"]
     assert "我是描述" in d["text"]
-    assert "【性格】" in d["text"]
+    assert "温柔" in d["text"]
+    # 人设正文 + 时间 = 2 段（旧结构下是 2 个字段段 + 时间）
     assert d["describe"]["section_count"] >= 2
-    assert any(s["title"] == "角色设定" for s in d["sections"])
+    assert any(s["title"] == "人设" for s in d["sections"])
 
 
 async def test_preview_time_section_is_last(ctx):
     client, _ = ctx
-    r = await client.post("/api/v1/personas", json={"name": "x", "description": "d"})
+    r = await client.post("/api/v1/personas", json={"name": "x", "system_prompt": "d"})
     pid = (await r.get_json())["id"]
     d = await (await client.get(f"/api/v1/personas/{pid}/preview")).get_json()
     assert d["sections"][-1]["title"] == "当前时间"
@@ -368,7 +397,7 @@ async def test_chat_uses_active_persona(tmp_path):
 
     # 建人设 + 激活
     r = await client.post("/api/v1/personas", json={
-        "name": "小爱", "description": "我是一个测试角色",
+        "name": "小爱", "system_prompt": "我是一个测试角色",
     })
     pid = (await r.get_json())["id"]
     await client.post(f"/api/v1/personas/{pid}/activate")

@@ -102,15 +102,25 @@ async def test_import_pasted_backup_creates_all(ctx):
     assert await personas.count() == 3
 
 
-async def test_import_persists_description(ctx):
+async def test_import_persists_persona_body(ctx):
+    """⭐ 导入后**人设正文必须落盘**。
+
+    2026-10-29：人设结构改成 AstrBot 的「一整段 `system_prompt`」，
+    爱语的 `description`/`personality` 在导入时按固定顺序拼进正文。
+    ⚠️ 守的意图**没变**：导入的内容必须**真的存下来**（不是只在响应里回显），
+       所以断言仍然落在"持久化之后从仓库读回来"这个动作上（`personas.list()`）。
+       用 `in` 而不是 `==`：正文是拼接的，整段相等会因拼接细节假红。
+    """
     client, personas, _ = ctx
     await client.post(
         "/api/v1/personas/import",
         json={"text": json.dumps(_backup("甲"), ensure_ascii=False)},
     )
     got = (await personas.list())[0]
-    assert got.description == "甲的描述"
-    assert got.personality == "甲的性格"
+    assert "甲的描述" in got.system_prompt
+    assert "甲的性格" in got.system_prompt
+    # 顺序固定（description → personality）：上游 prompt 缓存依赖这个
+    assert got.system_prompt.index("甲的描述") < got.system_prompt.index("甲的性格")
 
 
 async def test_import_invalid_json_is_400_with_reason(ctx):
@@ -370,8 +380,9 @@ async def test_export_then_import_roundtrip(ctx):
     assert d["count"] == 1
     p = d["personas"][0]
     assert p["name"] == "往返"
-    assert p["description"] == "往返的描述"
-    assert p["personality"] == "往返的性格"
+    # 2026-10-29：字段层已不存在，判据落到正文（用 `in`，因为正文是拼接的）
+    assert "往返的描述" in p["system_prompt"]
+    assert "往返的性格" in p["system_prompt"]
 
 
 # ===========================================================================

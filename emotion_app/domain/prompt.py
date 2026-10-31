@@ -18,7 +18,68 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .message import ROLE_SYSTEM, Message
-from .persona import Persona, PromptSection
+from .persona import Persona
+
+#: 提示词片段的来源 —— 决定"这段是谁加的"，便于调试与治理。
+SECTION_SOURCES = (
+    "builtin",   # 系统内置（如时间、硬格式约束）
+    "persona",   # 人设自带（来自 `Persona.system_prompt`）
+    "user",      # 用户手写
+    "memory",    # 记忆注入（S4）
+    "module",    # 模块注入（S5 预留）
+)
+
+
+@dataclass(slots=True)
+class PromptSection:
+    """一段提示词。片段化是刻意设计 —— 不是一坨大字符串（P1）。
+
+    🔴 **2026-10-29 从 `persona.py` 搬到这里**。
+
+    为什么搬：`PromptSection` 是**组装层的内部结构**，不是人设的存储结构。
+    `builtin_sections()` / `time_section()` / 记忆注入都在造它 ——
+    它们跟"人设长什么样"完全无关。
+
+    之前它放在 `persona.py` 里，导致重构人设模型（改成 AstrBot 的
+    `system_prompt` 单段结构）时差点把它一起删掉 —— 那会让整个组装器
+    起不来（`ImportError: cannot import name 'PromptSection'`）。
+    **两个概念分居两个模块，才不会一次改动牵连另一个。**
+    """
+
+    title: str                       # 小节名，如"当前时间"
+    content: str = ""
+    enabled: bool = True
+    order: int = 100                 # 越小越靠前；易变内容应放后面（P3）
+    source: str = "user"
+    condition: str = ""              # 条件表达式（S3+ 用，暂不解析）
+
+    def validate(self) -> None:
+        if not self.title or not self.title.strip():
+            raise ValueError("PromptSection.title 不能为空")
+        if self.source not in SECTION_SOURCES:
+            raise ValueError(f"未知 source：{self.source!r}，允许 {SECTION_SOURCES}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "title": self.title,
+            "content": self.content,
+            "enabled": self.enabled,
+            "order": self.order,
+            "source": self.source,
+            "condition": self.condition,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> PromptSection:
+        return cls(
+            title=d["title"],
+            content=d.get("content", ""),
+            enabled=bool(d.get("enabled", True)),
+            order=int(d.get("order", 100)),
+            source=d.get("source", "user"),
+            condition=d.get("condition", ""),
+        )
+
 
 #: 分节分隔符 —— 与爱语一致（实测用 `【】`）
 SECTION_OPEN = "【"
@@ -103,42 +164,38 @@ def time_section(now: float | None = None) -> PromptSection:
 
 
 def persona_core_sections(persona: Persona) -> list[PromptSection]:
-    """从人设 6 字段生成核心片段。
+    """从人设生成核心片段 —— **现在是 AstrBot 的单段 `system_prompt`**。
 
-    ⭐ 顺序稳定（固定 order）—— 这是 P3 原则的体现。
-    空字段**不产生片段**（不塞空标题，避免污染前缀）。
+    🔴 2026-10-29 重构（情绪拍板「改成 astrbot 那样」）：
+
+    原来这里从爱语 6 字段（description/personality/scenario/creator_notes）
+    各生成一段。问题有两个，都很实在：
+
+      ① **面板上看不全** —— 界面只画那 4 个框，人设正文若放在
+         `prompt_sections`（旧结构），四个框就是**空白**。
+         实测：莉莉丝 8621 字符全文躺在 `prompt_sections`，面板全空。
+      ② **陪伴插件不认** —— 它读 AstrBot 的 `Personality`（`prompt` 字段），
+         根本不看 `description` 那一族。
+
+    AstrBot 的人格就是 **`persona_id` + 一整段 `system_prompt`**
+    （`astrbot/core/db/po.py:145`），没有拆分。所以这里也收敛成一段。
+
+    ⭐ 仍然保持 P3（稳定前缀）：有正文就**恰好一段**，`order` 固定，
+       不会因为字段多少而抖动。
     """
-    out: list[PromptSection] = []
-
-    if persona.description.strip():
-        out.append(
-            PromptSection(
-                title="角色设定", content=persona.description.strip(),
-                order=ORDER_PERSONA_CORE, source="persona",
-            )
+    content = (persona.system_prompt or "").strip()
+    if not content:
+        # 空正文是合法的（= 纯默认人格），此时不产生片段，
+        # 让 `DEFAULT_PERSONA_PROMPT` 那条兜底生效（见 persona_manager）。
+        return []
+    return [
+        PromptSection(
+            title=PERSONA_CORE_TITLE,
+            content=content,
+            order=ORDER_PERSONA_CORE,
+            source="persona",
         )
-    if persona.personality.strip():
-        out.append(
-            PromptSection(
-                title="性格", content=persona.personality.strip(),
-                order=ORDER_PERSONA_CORE + 1, source="persona",
-            )
-        )
-    if persona.scenario.strip():
-        out.append(
-            PromptSection(
-                title="场景", content=persona.scenario.strip(),
-                order=ORDER_PERSONA_CORE + 2, source="persona",
-            )
-        )
-    if persona.creator_notes.strip():
-        out.append(
-            PromptSection(
-                title="创作者备注", content=persona.creator_notes.strip(),
-                order=ORDER_PERSONA_CORE + 3, source="persona",
-            )
-        )
-    return out
+    ]
 
 
 def assemble(
@@ -213,45 +270,34 @@ def assemble(
     return AssembledPrompt(sections=[s for s in sections if s.enabled])
 
 
-#: 6 字段派生片段的固定标题（`persona_core_sections` 与 `persona_import` **必须一致**）。
-#: ⚠️ 抽成常量而不是两处各写一份字面量：一旦漂移，去重就会**静默失效**
-#:    （标题对不上 → 又变回每段注入两次，而界面上看不出任何异常）。
+#: 人设正文片段的固定标题（2026-10-29 起只有一段，见 `persona_core_sections`）。
+PERSONA_CORE_TITLE: str = "人设"
+
+#: 兼容期保留：旧数据里可能有这 4 个标题的片段（爱语 6 字段派生）。
+#: ⚠️ 它们仍算"人设核心"，这样 `from_dict` 迁移时不会把它们当成
+#:    "用户手写的额外片段"而重复注入。
 PERSONA_CORE_TITLES: frozenset[str] = frozenset(
-    {"角色设定", "性格", "场景", "创作者备注"}
+    {"人设", "角色设定", "性格", "场景", "创作者备注"}
 )
 
 
 def merge_persona_sections(persona: Persona) -> list[PromptSection]:
-    """把"6 字段现算的片段"与"人设自带的片段"合**一份**（去重，见 `assemble` 的 docstring）。
+    """人设正文 → 片段列表。
 
-    ⚠️ 单独抽成函数是为了**能被判据直接测**（`assemble` 的输出还要过排序/过滤，
-       不好断言"到底注入了哪些"）。
+    🔴 **2026-10-29 大幅简化**（人设结构改成 AstrBot 的 `system_prompt` 单段后）：
+
+    原来这里要做四件事：① 6 字段各生成一段；② 尊重"用户在面板停用某段"；
+    ③ 优先用存储的原文（避免 strip 丢尾部空白）；④ 把非核心片段当"额外片段"加进来。
+
+    新结构下 **②③④ 全部消失**，因为：
+      * 人设只有**一段正文**（`system_prompt`），没有"多段可停用"的概念；
+      * 没有第二份副本，也就不存在"用哪份原文"的选择；
+      * 没有 `prompt_sections` 字段，也就没有"额外片段"。
+
+    ⚠️ 函数**保留**（不内联）是为了让判据能直接测"到底注入了哪些片段"，
+       而不用去解析 `assemble()` 排序后的整体输出。
     """
-    core = persona_core_sections(persona)
-    stored = list(persona.prompt_sections)          # ⚠️ 含**停用**的，才能尊重停用意图
-
-    # 被用户停用的 persona 片段标题（②：连 6 字段那份一起去掉）
-    disabled_titles = {
-        s.title for s in stored
-        if s.source == "persona" and not s.enabled and s.title in PERSONA_CORE_TITLES
-    }
-    # ③ 存储的原文（优先用它，避免 strip 造成的信息损失）
-    stored_core = {
-        s.title: s for s in stored
-        if s.source == "persona" and s.enabled and s.title in PERSONA_CORE_TITLES
-    }
-
-    out: list[PromptSection] = []
-    for sec in core:
-        if sec.title in disabled_titles:
-            continue                                  # ② 用户停用了 → 去掉
-        out.append(stored_core.get(sec.title, sec))   # ③ 有原文就用原文，否则用现算的
-    # ④ 真正的"额外片段"（标题不在 6 字段集合里）—— 照旧全部加进去
-    out.extend(
-        s for s in persona.enabled_sections()
-        if s.title not in PERSONA_CORE_TITLES
-    )
-    return out
+    return persona_core_sections(persona)
 
 
 def to_system_message(prompt: AssembledPrompt, *, inject_markers: bool = True) -> Message:

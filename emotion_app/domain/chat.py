@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+from functools import wraps
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from collections.abc import AsyncIterator
 from typing import Any
@@ -36,7 +38,7 @@ from .upstream import (
 log = get_logger(__name__)
 
 
-def _accepts_session_id(hook: Any) -> bool:
+def _accepts_session_id(hook: Any, keyword: str = "session_id") -> bool:
     """钩子能不能收 `session_id=` 这个关键字参数（**按签名判断**）。
 
     🔴 为什么不用 `except TypeError` 兜底（本项目踩过的坑）：
@@ -62,7 +64,7 @@ def _accepts_session_id(hook: Any) -> bool:
         if param.kind is param.VAR_KEYWORD:
             # `**kwargs` 确实收得下 `session_id=`
             return True
-        if name != "session_id":
+        if name != keyword:
             continue
         # 纯 POSITIONAL_ONLY 收不下关键字参数 —— 我们只按关键字调
         if param.kind is param.POSITIONAL_ONLY:
@@ -73,6 +75,22 @@ def _accepts_session_id(hook: Any) -> bool:
 
 class ChatError(Exception):
     """聊天编排层错误。"""
+
+
+class LLMRequestCancelled(ChatError):
+    """插件终止本轮请求，调用方不得继续调用模型或投递。"""
+
+
+@dataclass(slots=True)
+class _LifecycleRun:
+    result: ChatResult | None = None
+    completed: bool = False
+    #: 本轮是否**异常结束**（模型报错 / 请求被取消）。
+    #: 官方在中断场景传 `role="assistant"`、异常场景传 `role="err"`
+    #: （真 AstrBot `astr_agent_run_util.py:343`），我们两者都按 "err" 处理：
+    #: 取消意味着这轮没有产出可用回复，标成 assistant 会让官方把
+    #: **作废的回合**写成 completed（主动消息候选集就脏了）。
+    failed: bool = False
 
 
 @dataclass(slots=True)
@@ -101,6 +119,35 @@ class ChatRequest:
     #: 而两者在 `req.persona` 上**长得一模一样**，只能靠这个标记区分。
     #: ⚠️ 默认 `False`：旧调用方（没设过这个字段）走"不写回"这条更安全的路。
     persona_explicit: bool = False
+    llm_event: Any = field(default=None, repr=False, compare=False)
+    conversation_id: str = ""
+    history_override: list[Message] | None = field(default=None, repr=False, compare=False)
+    conversation_reset_revision: int | None = None
+    _lifecycle_run: _LifecycleRun | None = field(default=None, repr=False, compare=False, init=False)
+
+
+@dataclass(slots=True)
+class PreparedLLMRequest:
+    messages: list[Message]
+    tools: list[dict[str, Any]] | None = None
+    execute_tool: Any = None
+    response_hook: Any = None
+    model: str = ""
+    validate_context: Any = None
+
+
+def _complete_lifecycle(method: Any) -> Any:
+    @wraps(method)
+    async def complete(self: Any, req: ChatRequest) -> ChatResult:
+        async with self.lifecycle(req) as run:
+            try:
+                run.result = await method(self, req)
+            except BaseException:
+                run.failed = True
+                raise
+            return run.result
+
+    return complete
 
 
 class ChatService:
@@ -156,6 +203,34 @@ class ChatService:
         #:    保证既有测试与"没配模型供应商"的部署行为不变。
         self._model_resolver: Any = None
         self._bg_tasks: set[asyncio.Task] = set()   # 后台任务（防被 GC 回收）
+        self._lifecycle_begin: Any = None
+        self._lifecycle_done: Any = None
+
+    def bind_lifecycle_hooks(self, *, begin: Any = None, done: Any = None) -> None:
+        self._lifecycle_begin = begin
+        self._lifecycle_done = done
+
+    @asynccontextmanager
+    async def lifecycle(self, req: ChatRequest) -> AsyncIterator[_LifecycleRun]:
+        if req._lifecycle_run is not None:
+            yield req._lifecycle_run
+            return
+        run = _LifecycleRun()
+        req._lifecycle_run = run
+        begin = getattr(self, "_lifecycle_begin", None)
+        done = getattr(self, "_lifecycle_done", None)
+        try:
+            if begin is not None:
+                await begin(req)
+            yield run
+        finally:
+            try:
+                if not run.completed:
+                    run.completed = True
+                    if done is not None:
+                        await done(req, run.result, run.failed)
+            finally:
+                req._lifecycle_run = None
 
     def bind_model_resolver(self, resolver: Any) -> None:
         """注入"按模型 id 查 base_url/key"的端口（见 `_model_resolver` 注释）。
@@ -224,8 +299,8 @@ class ChatService:
         self._llm_hook_takes_session = _accepts_session_id(hook)
 
     async def _apply_llm_hook(
-        self, messages: list[Message], session_id: str = ""
-    ) -> list[Message]:
+        self, messages: list[Message], session_id: str = "", event: Any = None
+    ) -> list[Message] | PreparedLLMRequest:
         """跑 LLM 钩子（P0-4）。**未注入或出错都原样返回**，绝不影响聊天。
 
         Args:
@@ -254,16 +329,18 @@ class ChatService:
             takes_session = getattr(self, "_llm_hook_takes_session", None)
             if takes_session is None:
                 takes_session = _accepts_session_id(self._llm_hook)
-            if takes_session:
-                out = await self._llm_hook(messages, session_id=session_id)
-            else:
-                out = await self._llm_hook(messages)
+            kwargs = {"session_id": session_id} if takes_session else {}
+            if event is not None and _accepts_session_id(self._llm_hook, "event"):
+                kwargs["event"] = event
+            out = await self._llm_hook(messages, **kwargs)
+        except LLMRequestCancelled:
+            raise
         except Exception:  # noqa: BLE001
             log.error("LLM 钩子执行失败（本次按未注入处理）", exc_info=True)
             return messages
         if out is None:
             return messages
-        if not isinstance(out, list):
+        if not isinstance(out, (list, PreparedLLMRequest)):
             log.error(
                 "LLM 钩子返回了非列表（%s）→ 按未注入处理", type(out).__name__
             )
@@ -294,7 +371,7 @@ class ChatService:
             self._dispatch = FunctionCallDispatch()
         return self._dispatch
 
-    def _tool_payload_and_sections(self) -> tuple[dict[str, Any], list[Any]]:
+    def _tool_payload_and_sections(self, persona: Persona | None = None) -> tuple[dict[str, Any], list[Any]]:
         """统一的"工具怎么下发"入口。
 
         ⭐ 返回 `(请求体字段, 提示词片段)`：
@@ -305,6 +382,8 @@ class ChatService:
         if self._tools is None:
             return {}, []
         specs = self._tools.specs()
+        if persona is not None and persona.tools is not None:
+            specs = [spec for spec in specs if spec.name in persona.tools]
         if not specs:
             return {}, []
         d = self.dispatch
@@ -336,8 +415,7 @@ class ChatService:
     async def _summarize_bg(self, session_id: str) -> None:
         """后台总结：失败只记日志，**绝不影响用户**。"""
         try:
-            session = await self._sessions.get(session_id)
-            msgs = await self._sessions.messages(session_id)
+            session, msgs = await self._sessions.summary_snapshot(session_id)
             # 🔴 **总结该用哪个模型**（情绪 2026-10-09 的会话级字段）：
             #    ① 会话 policy 里显式指了 `summary_model` → 用它（**那是模型 id**，
             #       要经 `resolve_session_model` 解析成 base_url/key）；
@@ -364,10 +442,13 @@ class ChatService:
 
             if outcome.ran and outcome.ok:
                 # ⭐ 摘要与新游标**一次写入**（避免"游标动了但摘要没存"的中间态）
-                await self._sessions.update(session_id, {
-                    "summary": outcome.summary,
-                    "summarized_upto": outcome.cursor,
-                })
+                committed = await self._sessions.commit_summary(
+                    session_id, expected_history_revision=session.history_revision,
+                    summary=outcome.summary, summarized_upto=outcome.cursor,
+                )
+                if not committed:
+                    log.info("历史或策略已变化，未提交过期摘要", extra={"data": {"session": session_id}})
+                    return
                 log.info(
                     "会话摘要已更新",
                     extra={"data": {
@@ -617,12 +698,12 @@ class ChatService:
         """
         # ⭐ 工具相关提示词：使用规则（必注入）+ 下发方式要求的片段（function calling 为空）
         sections: list[Any] = []
-        _, dispatch_sections = self._tool_payload_and_sections()
+        _, dispatch_sections = self._tool_payload_and_sections(req.persona)
         if dispatch_sections:
             sections.extend(dispatch_sections)
         if self._tools is not None and self._tools.specs():
             from .image_tool import TOOL_USAGE_RULES
-            from .persona import PromptSection
+            from .prompt import PromptSection
 
             sections.append(
                 PromptSection(
@@ -647,6 +728,13 @@ class ChatService:
                 Message(role="system", content=f"【此前对话摘要】\n{summary.strip()}")
             )
 
+        examples = req.persona.begin_dialogs if req.persona is not None else []
+        if examples:
+            if len(examples) % 2:
+                log.warning("人格开场对话不是成对的user/assistant，未注入（persona=%s）", req.persona.id)
+            else:
+                out.extend(Message(role=ROLE_USER if i % 2 == 0 else ROLE_ASSISTANT, content=text)
+                           for i, text in enumerate(examples))
         if history:
             out.extend(history)
 
@@ -666,7 +754,7 @@ class ChatService:
             (会话, 历史消息, 摘要)。非会话模式返回 (None, [], "")。
         """
         if not req.session_id or self._sessions is None:
-            return None, [], ""
+            return None, list(req.history_override or []), ""
 
         persona_id = req.persona.id if req.persona else ""
         # 🔴🔴 **不要把全局人设"钉"进会话**（2026-09-20 实测修掉的次生 bug）。
@@ -694,7 +782,8 @@ class ChatService:
                     req.session_id, {"persona_id": persona_id}
                 )
 
-        all_msgs = await self._sessions.messages(req.session_id)
+        all_msgs = (list(req.history_override) if req.history_override is not None
+                    else await self._sessions.messages(req.session_id))
         # ⚠️ 只用**已被总结游标之前**之外的原文？不 —— 摘要与最近原文是叠加的，
         #    所以这里直接用全部历史，由策略决定保留哪些。
         ctx = context_mod.build_context(all_msgs, session.policy, summary=session.summary)
@@ -706,6 +795,7 @@ class ChatService:
         *,
         user_text: str,
         assistant_text: str,
+        user_message: Message | None = None,
     ) -> None:
         """把一轮对话写回会话。
 
@@ -718,7 +808,7 @@ class ChatService:
             await self._sessions.append(
                 session_id,
                 [
-                    Message(role=ROLE_USER, content=user_text),
+                    user_message if user_message is not None else Message(role=ROLE_USER, content=user_text),
                     Message(role=ROLE_ASSISTANT, content=assistant_text),
                 ],
             )
@@ -758,6 +848,7 @@ class ChatService:
         )
         raise ChatError(reason)
 
+    @_complete_lifecycle
     async def complete(self, req: ChatRequest) -> ChatResult:
         # 🔴 **顺序要紧**：先取会话，再解析目标 —— 因为"用哪个模型"是**会话**上的字段。
         #    早期版本把 `resolve_target` 写在 `prepare_session` 之前，
@@ -776,7 +867,11 @@ class ChatService:
         # 🔴 **必须传 `session_id`**：钩子要用它决定"这次是哪个插件用户"
         #    （umo 第三段 = 插件 `data["users"]` 的键）。不传的后果是
         #    **所有会话的记忆/关系/被动状态都按全局 `default` 算** → 串台。
-        messages = await self._apply_llm_hook(messages, req.session_id)
+        hooked = await self._apply_llm_hook(messages, req.session_id, req.llm_event)
+        prepared = hooked if isinstance(hooked, PreparedLLMRequest) else None
+        messages = prepared.messages if prepared is not None else hooked
+        if prepared is not None and prepared.model:
+            target.model = prepared.model
 
         body_extra = apply_nested_params({}, req.custom_params) if req.custom_params else None
 
@@ -793,24 +888,45 @@ class ChatService:
                 }
             },
         )
-        tool_payload, _ = self._tool_payload_and_sections()
+        tool_payload, _ = self._tool_payload_and_sections(req.persona)
+        if prepared is not None:
+            if req.persona is not None and req.persona.tools is not None:
+                prepared.tools = [item for item in prepared.tools or []
+                                  if item.get("function", {}).get("name") in req.persona.tools]
+                execute = prepared.execute_tool
+                allowed = set(req.persona.tools)
+
+                async def authorized_tool(call: ToolCall, history: list[Message]) -> ToolResult:
+                    if call.name not in allowed:
+                        return ToolResult(status="error", success=False, message="人格未授权此工具",
+                                          must_not_claim_sent=True)
+                    return await execute(call, history)
+
+                if execute is not None:
+                    prepared.execute_tool = authorized_tool
+            tool_payload = {"tools": prepared.tools}
 
         result = await self._chat_with_fallback(
-            target, messages, req.fallback_models, body_extra, tool_payload.get("tools")
+            target, messages, req.fallback_models, body_extra, tool_payload.get("tools"),
+            validate_context=prepared.validate_context if prepared is not None else None,
         )
 
-        # ⭐ 工具循环：模型要调工具 → 执行 → 把结果回填 → 再问一次
-        result = await self._run_tool_loop(
-            target, messages, result, body_extra, persona=req.persona
-        )
+        if prepared is not None and prepared.execute_tool is not None:
+            result = await self._run_native_tool_loop(target, messages, result, body_extra, prepared)
+        else:
+            result = await self._run_tool_loop(
+                target, messages, result, body_extra, persona=req.persona, prepared=prepared
+            )
+            if prepared is not None and prepared.response_hook is not None:
+                result = await prepared.response_hook(result)
 
         # 持久化（失败不影响已拿到的回复）
         if req.persist and session is not None:
-            last_user = next(
-                (m.content for m in reversed(req.messages) if m.role == ROLE_USER), ""
-            )
+            last_user = next((m for m in reversed(req.messages) if m.role == ROLE_USER), None)
+            media = {"user_message": last_user} if last_user is not None and last_user.content_parts is not None else {}
             await self.record(
-                session.id, user_text=last_user, assistant_text=result.content
+                session.id, user_text=last_user.content if last_user is not None else "",
+                assistant_text=result.content, **media,
             )
             # ⭐ **把总结丢到后台**（不阻塞本次回复）
             self.schedule_summarize(session.id)
@@ -824,6 +940,7 @@ class ChatService:
         fallback_models: tuple[str, ...],
         body_extra: dict[str, Any] | None,
         tools: list[dict[str, Any]] | None,
+        validate_context: Any = None,
     ) -> ChatResult:
         """按 Protocol 调后端，并在疑似拒答时**换模型重试**。
 
@@ -835,6 +952,8 @@ class ChatService:
 
         last: ChatResult | None = None
         for idx, model in enumerate(models):
+            if validate_context is not None:
+                await validate_context()
             result = await self._client.chat(
                 messages,
                 model=model,
@@ -844,6 +963,8 @@ class ChatService:
                 tools=tools,
                 extra=body_extra,
             )
+            if validate_context is not None:
+                await validate_context()
             if not looks_like_refusal(result.content, self._refusal_keywords):
                 return result
 
@@ -859,6 +980,44 @@ class ChatService:
 
     # ---- 工具循环 ----
 
+    async def _run_native_tool_loop(
+        self, target: UpstreamTarget, messages: list[Message], first: ChatResult,
+        body_extra: dict[str, Any] | None, prepared: PreparedLLMRequest,
+    ) -> ChatResult:
+        from .backends import FunctionCallDispatch
+
+        dispatch = FunctionCallDispatch()
+        history = list(messages)
+        result = first
+        for step in range(9):
+            if prepared.validate_context is not None:
+                await prepared.validate_context()
+            if prepared.response_hook is not None:
+                result = await prepared.response_hook(result)
+            calls = dispatch.extract_calls(result)
+            if not calls:
+                return result
+            if step == 8:
+                log.error("请求级工具达到步数上限，未继续执行")
+                return ChatResult(model=result.model, finish_reason="tool_step_limit")
+            history.append(Message(
+                role=ROLE_ASSISTANT, content=result.content,
+                tool_calls=json.dumps(result.tool_calls, ensure_ascii=False),
+            ))
+            for call in calls:
+                if prepared.validate_context is not None:
+                    await prepared.validate_context()
+                output = await prepared.execute_tool(call, history)
+                history.append(dispatch.render_result(output, call_id=call.id))
+            if prepared.validate_context is not None:
+                await prepared.validate_context()
+            result = await self._client.chat(
+                history, model=target.model, base_url=target.base_url,
+                api_key=target.api_key, timeout=target.timeout,
+                tools=prepared.tools if step < 7 else [], extra=body_extra,
+            )
+        raise AssertionError("unreachable native tool loop state")
+
     async def _run_tool_loop(
         self,
         target: UpstreamTarget,
@@ -867,6 +1026,7 @@ class ChatService:
         body_extra: dict[str, Any] | None,
         *,
         persona: Persona | None = None,
+        prepared: PreparedLLMRequest | None = None,
     ) -> ChatResult:
         """执行工具调用并把结果回填，再取一次模型回复。
 
@@ -881,7 +1041,10 @@ class ChatService:
         ⚠️ 只跑**一轮**（不是无限循环）——
            如果模型拿到工具结果后还想要更多，就按它的原文返回，由用户决定下一步。
         """
-        if self._tools is None or not first.wants_tools:
+        executor = prepared.execute_tool if prepared is not None else None
+        if prepared is not None and executor is None:
+            return first
+        if (self._tools is None and executor is None) or not first.wants_tools:
             return first
 
         counts: dict[str, int] = {}
@@ -898,7 +1061,15 @@ class ChatService:
         #    成员变量会被后一个请求改掉 → **画错脸**，而且单测看不出来（串行）。
         with tool_context.tool_scope(persona=persona):
             for call in dispatch.extract_calls(first):
-                result = await self._tools.execute(call, call_counts=counts)
+                if persona is not None and persona.tools is not None and call.name not in persona.tools:
+                    result = ToolResult(status="error", success=False, message="人格未授权此工具",
+                                        must_not_claim_sent=True)
+                elif executor is not None:
+                    assistant = Message(role=ROLE_ASSISTANT, content=first.content,
+                                        tool_calls=json.dumps(first.tool_calls, ensure_ascii=False))
+                    result = await executor(call, [*messages, assistant, *tool_msgs])
+                else:
+                    result = await self._tools.execute(call, call_counts=counts)
                 payloads.append({"tool": call.name, "status": result.status})
                 # 收集图片等附件（非流式返回必须带上，否则用户看不到图）
                 attachments.extend(_extract_attachments(result))
@@ -931,7 +1102,9 @@ class ChatService:
         )
         followup.extend(tool_msgs)
 
-        tool_payload2, _ = self._tool_payload_and_sections()
+        tool_payload2, _ = self._tool_payload_and_sections(persona)
+        if prepared is not None and prepared.tools is not None:
+            tool_payload2 = {"tools": prepared.tools}
         try:
             second = await self._client.chat(
                 followup,
@@ -970,6 +1143,19 @@ class ChatService:
     # ---- 流式 ----
 
     async def stream(self, req: ChatRequest) -> AsyncIterator[StreamChunk]:
+        async with self.lifecycle(req) as run:
+            iterator = self._stream(req)
+            acc: list[str] = []
+            try:
+                async for chunk in iterator:
+                    if req.llm_event is None:
+                        acc.append(chunk.delta or "")
+                        run.result = ChatResult(content="".join(acc), finish_reason=chunk.finish_reason)
+                    yield chunk
+            finally:
+                await iterator.aclose()
+
+    async def _stream(self, req: ChatRequest) -> AsyncIterator[StreamChunk]:
         """流式对话。
 
         ⚠️ 持久化**在流结束后**做（累积完整回复再写），
@@ -978,6 +1164,10 @@ class ChatService:
            面板**永远走流式**，所以漏了这里 = 会话级模型整个功能没生效
            —— 而且不报错，只是安静地用别的模型。
         """
+        if req.llm_event is not None:
+            result = await self.complete(req)
+            yield StreamChunk(delta=result.content, finish_reason=result.finish_reason, done=True)
+            return
         session, history, summary = await self.prepare_session(req)
         # ⚠️ `session` **可能是 `None`**（没有 session_id 的裸调用 / 会话不存在）。
         #    不去碰它的属性 —— 我第一版直接写 `session.model`，
@@ -989,7 +1179,8 @@ class ChatService:
         messages = self.build_messages(req, history=history, summary=summary)
         # ⭐ P0-4：与 `complete()` 同款（**流式也要注入**，否则"流式聊天没有记忆"）
         # 🔴 同样**必须传 `session_id`**（理由见 `complete()` 那处）
-        messages = await self._apply_llm_hook(messages, req.session_id)
+        hooked = await self._apply_llm_hook(messages, req.session_id, req.llm_event)
+        messages = hooked.messages if isinstance(hooked, PreparedLLMRequest) else hooked
         body_extra = apply_nested_params({}, req.custom_params) if req.custom_params else None
 
         log.info(
@@ -1006,7 +1197,7 @@ class ChatService:
             },
         )
 
-        tool_payload, _ = self._tool_payload_and_sections()
+        tool_payload, _ = self._tool_payload_and_sections(req.persona)
 
         acc: list[str] = []
         tc_fragments: list[dict[str, Any]] = []
@@ -1045,7 +1236,11 @@ class ChatService:
                     #    async generator 没有自己的 context 副本（PEP 567 只给 Task 发），
                     #    `yield` 期间把作用域挂着会让"当前人设"暴露在**调用方的上下文**里。
                     with tool_context.tool_scope(persona=req.persona):
-                        result = await self._tools.execute(call, call_counts=counts)
+                        if req.persona is not None and req.persona.tools is not None and call.name not in req.persona.tools:
+                            result = ToolResult(status="error", success=False, message="人格未授权此工具",
+                                                must_not_claim_sent=True)
+                        else:
+                            result = await self._tools.execute(call, call_counts=counts)
                     # 把结果带给上层（上层负责推图/渲染）
                     yield StreamChunk(
                         finish_reason="tool_executed",
@@ -1098,11 +1293,11 @@ class ChatService:
                         yield chunk
 
         if req.persist and session is not None and acc:
-            last_user = next(
-                (m.content for m in reversed(req.messages) if m.role == ROLE_USER), ""
-            )
+            last_user = next((m for m in reversed(req.messages) if m.role == ROLE_USER), None)
+            media = {"user_message": last_user} if last_user is not None and last_user.content_parts is not None else {}
             await self.record(
-                session.id, user_text=last_user, assistant_text="".join(acc)
+                session.id, user_text=last_user.content if last_user is not None else "",
+                assistant_text="".join(acc), **media,
             )
             self.schedule_summarize(session.id)
 

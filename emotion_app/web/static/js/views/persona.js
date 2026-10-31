@@ -107,22 +107,43 @@ export async function selectPersona(id, opts) {
 
   $("persona-empty").classList.add("hidden");
   $("persona-form").classList.remove("hidden");
-  $("sections-block").classList.remove("hidden");
 
   $("p-name").value = p.name || "";
-  $("p-description").value = p.description || "";
-  $("p-personality").value = p.personality || "";
-  $("p-scenario").value = p.scenario || "";
-  $("p-creator-notes").value = p.creator_notes || "";
+  // 🔴 2026-10-29：人设模型改成 AstrBot 的 `Persona` 后，**正文只有 `system_prompt`
+  //    一个字段**（description/personality/scenario/creator_notes/prompt_sections 全删）。
+  //    为什么改成直接读 `system_prompt`：
+  //      ① 那 4 个字段后端已经不返回 → 原来那 4 行 `$("p-xxx").value = p.xxx` 既拿不到值，
+  //         节点本身也已从 index.html 删掉（`$()` 返回 null → 直接抛 TypeError，
+  //         整段"选中人设"的渲染会中断，用户看到的是点不开详情的空白）；
+  //      ② 正文原来藏在 `prompt_sections` 里，界面上是空白的（实测莉莉丝 8621 字符全丢）。
+  $("p-system-prompt").value = p.system_prompt || "";
+  renderPromptStats();
   $("p-api-url").value = p.api_url || "";
   $("p-model").value = p.model || "";
   $("p-api-key").value = "";
   $("p-api-key").placeholder = p.api_key_configured ? "已设置（留空 = 不变）" : "留空 = 不变";
 
-  state.sections = (p.prompt_sections || []).map((s) => ({ ...s }));
-  renderSections();
   renderPersonaRef(p);
 }
+
+/** 人设正文的「当前字数 / 行数」提示（2026-10-29）。
+ *
+ * 🔴 为什么要它：正文常见几千字，**一个纯 textarea 看不出"到底存进去了多少"**。
+ *    用户在手机上看不到滚动条全长，很容易怀疑"是不是只存了一段"。
+ *    这里只读**框里的真实内容**（不读后端），所以它就是"你即将保存的东西"。
+ * ⚠️ 故意**不设上限**、不做字数校验：AstrBot 那边也没有上限，
+ *    前端硬拦一个数字只会让长人设存不进去（本项目最忌"静默改用户原文"）。
+ */
+export function renderPromptStats() {
+  const el = $("p-prompt-stats");
+  const ta = $("p-system-prompt");
+  if (!el || !ta) return;
+  const text = ta.value || "";
+  const chars = text.length;
+  const lines = text ? text.split("\n").length : 0;
+  el.textContent = chars ? `${chars} 字符 · ${lines} 行` : "空（聊天时不带人设正文）";
+}
+
 
 /* ================= 人设参考图（2026-09-25） =================
  *
@@ -176,115 +197,23 @@ export function refreshPersonaInState(p) {
 
 
 
-//: 🔴 与后端 `prompt.PERSONA_CORE_TITLES` **逐字一致**（4 个）。
-//:
-//: 为什么前端也要知道这 4 个标题（情绪 2026-09-21：
-//: 「图二的人设栏这个提示词片段可以不要了」）：
-//:   片段表里那 4 行（角色设定/性格/场景/创作者备注）**不是用户写的内容** ——
-//:   它们是从上面那 4 个输入框（描述/性格/场景/创作者备注）**现算**出来的，
-//:   后端的 `merge_persona_sections()` 每次都按字段重算。
-//:   → 表格里显示它们 = 同一份内容在同一个页面上出现**两遍**，
-//:     而且改表格那行**不会**改到字段（下次保存又被打回）→ 纯误导。
-//: ✅ 所以只渲染**真正的额外片段**（用户自己加的 / 非核心标题的）。
-//: ⚠️ 标题一旦与后端漂移，这里会**漏过滤**（那 4 行又冒出来）；
-//:    判据 `tools/chat_persona_check.py` 有一条守它。
-export const PERSONA_CORE_TITLES = ["角色设定", "性格", "场景", "创作者备注"];
-
-/** 判断一个片段是不是"从 6 字段现算的核心片段"（= 不该在表里重复展示）。 */
-export function isDerivedCoreSection(s) {
-  return (s.source || "") === "persona" && PERSONA_CORE_TITLES.includes(s.title || "");
-}
-
-export function renderSections() {
-  const tb = $("sections-body");
-  tb.innerHTML = "";
-  // 只显示**额外片段**（核心的 4 段由上方字段决定，见 PERSONA_CORE_TITLES 注释）
-  const rows = state.sections
-    .map((s, i) => ({ s, i }))
-    .filter(({ s }) => !isDerivedCoreSection(s));
-
-  // 空态：说清"为什么这里是空的"，别让人以为片段丢了
-  if (!rows.length) {
-    const tr = document.createElement("tr");
-    tr.className = "empty-row";
-    const td = document.createElement("td");
-    td.colSpan = 6;
-    // ⚠️ 手机端表头被 CSS 隐藏，字段名靠 `data-label` + `::before` 显示
-    //    （见 `app.css` 窄屏规则）。空态行也**必须给**，
-    //    否则手机上这格没有标签、看着像渲染坏了
-    //    （`tools/mobile_check.py` 有判据盯着"卡片有没有字段名"）。
-    td.dataset.label = "说明";
-    td.textContent =
-      "（没有额外片段）上面的描述/性格/场景/创作者备注就是人设的全部内容。" +
-      "需要追加额外规则时点下面的「+ 添加片段」。";
-    tr.appendChild(td);
-    tb.appendChild(tr);
-    return;
-  }
-
-  rows.forEach(({ s, i }) => {
-    const tr = document.createElement("tr");
-
-    // ⚠️ `data-label` 是给**手机端**用的：窄屏时表头被隐藏，
-    //    改用 CSS `::before { content: attr(data-label) }` 显示字段名。
-    const mkTd = (label, cls) => {
-      const td = document.createElement("td");
-      if (cls) td.className = cls;
-      td.dataset.label = label;
-      return td;
-    };
-
-    const tdOn = mkTd("启用", "narrow");
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.checked = s.enabled !== false;
-    cb.onchange = () => { state.sections[i].enabled = cb.checked; };
-    tdOn.appendChild(cb);
-
-    const tdTitle = mkTd("标题");
-    const ti = document.createElement("input");
-    ti.type = "text"; ti.value = s.title || "";
-    ti.oninput = () => { state.sections[i].title = ti.value; };
-    tdTitle.appendChild(ti);
-
-    const tdOrder = mkTd("order", "narrow");
-    const oi = document.createElement("input");
-    oi.type = "text"; oi.value = s.order ?? 100;
-    oi.oninput = () => { state.sections[i].order = parseInt(oi.value, 10) || 0; };
-    tdOrder.appendChild(oi);
-
-    const tdSrc = mkTd("来源", "narrow");
-    const sel = document.createElement("select");
-    for (const opt of ["user", "persona", "builtin", "memory", "module"]) {
-      const o = document.createElement("option");
-      o.value = opt; o.textContent = opt;
-      if ((s.source || "user") === opt) o.selected = true;
-      sel.appendChild(o);
-    }
-    sel.onchange = () => { state.sections[i].source = sel.value; };
-    tdSrc.appendChild(sel);
-
-    const tdContent = mkTd("内容");
-    const ta = document.createElement("textarea");
-    ta.rows = 2; ta.value = s.content || "";
-    ta.oninput = () => { state.sections[i].content = ta.value; };
-    tdContent.appendChild(ta);
-
-    const tdDel = mkTd("", "narrow");
-    const db = document.createElement("button");
-    db.textContent = "删除"; db.className = "danger";
-    db.title = "删除这个片段";
-    db.onclick = () => { state.sections.splice(i, 1); renderSections(); };
-    tdDel.appendChild(db);
-
-    tr.append(tdOn, tdTitle, tdOrder, tdSrc, tdContent, tdDel);
-    tb.appendChild(tr);
-  });
-}
-
-
-
-
+/* ================= 提示词片段（**2026-10-29 已整块移除**）=================
+ *
+ * 🔴 这里原来有 `PERSONA_CORE_TITLES` / `isDerivedCoreSection` / `renderSections()`
+ *    —— 也就是「额外片段」表格的全部读写逻辑。**为什么整块删掉（不是留着不用）**：
+ *
+ *    ① 后端 `domain/persona.py` 已把 `PromptSection` 从人设模型里搬走
+ *       （只留在组装层 `domain/prompt.py`），`Persona` 上**没有 `prompt_sections` 了**
+ *       → `p.prompt_sections || []` 恒为空数组，渲染出来永远是"没有额外片段"的假空态；
+ *    ② 写回用的 `PUT /api/v1/personas/<id>/sections` **接口已删**
+ *       → 留着「保存片段」按钮 = 一点就 404，属于"看起来能用、其实不能用"；
+ *    ③ 人设现在只有一段正文（`system_prompt`），"追加额外规则"直接写进正文即可，
+ *       不需要第二套结构 —— 留着两套入口只会让用户改了一处、另一处不生效。
+ *
+ *    ⚠️ **不要**因为判据（`tools/chat_persona_check.py` / `tools/mobile_check.py`）
+ *       里还有 `#sections-body` 的字样就把它加回来 —— 那两处是**旧判据**，
+ *       它们检查的性质（"导入的人设没有物化出片段"）已经随模型变更消失。
+ */
 /* 「← 返回列表」：手机端从详情退回列表 */
 
 

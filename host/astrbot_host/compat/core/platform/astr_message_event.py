@@ -20,6 +20,8 @@ get_messages 1
 """
 from __future__ import annotations
 
+import time
+
 import logging
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
@@ -118,6 +120,23 @@ def _normalize_message_type(message_obj: Any) -> Any:
             raw,
         )
         return MessageType.FRIEND_MESSAGE
+
+
+def _resolve_created_at(message_obj: Any) -> float:
+    """事件的创建时刻（unix 秒）。
+
+    真实现 `astr_message_event.py:80` 就是 `self.created_at = time()` ——
+    **纯当前时刻**，不看消息自带时间戳。我们照抄那个语义（保持可预测），
+    但**优先用消息自带的时间戳**（`AstrBotMessage.timestamp`，OneBot 事件里
+    有 `time` 字段）—— 重放/补发历史消息时那个值更准。
+
+    ⚠️ 类型必须真的是 `float`/`int`：插件会拿它喂
+       `datetime.fromtimestamp(...)`，给个字符串会变成另一个 `TypeError`。
+    """
+    raw = getattr(message_obj, "timestamp", None)
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+        return float(raw)
+    return time.time()
 
 
 class AstrMessageEvent:
@@ -250,6 +269,24 @@ class AstrMessageEvent:
         self._is_private = is_private
 
         # ---- 真实现 :51-58 / :94 / :99 的实例属性 ----
+
+        #: 🔴 **事件创建时刻**（真实现 `core/platform/astr_message_event.py:80`
+        #: `self.created_at = time()`）。
+        #:
+        #: 2026-10-29 补：陪伴 7.0.0 的
+        #: `astrbot_host/multi_session.py:159` 有一句
+        #: `at = datetime.fromtimestamp(event.created_at, timezone.utc)`
+        #: —— 我们原来**没有这个属性** ⇒ `AttributeError`
+        #: ⇒ 被它外层的 `except Exception` 吞成
+        #: `host_core_reply_capture_failed`（"private route or persona could not
+        #: be verified"）⇒ **QQ 私聊一律不回复**，且日志里看到的原因
+        #: 跟真因（少一个属性）毫无关系。
+        #:
+        #: ⚠️ 必须有默认值 `time()`：真实现也是"构造时取当前时间"。
+        #:    优先用消息自带的时间戳（跨平台重放/补发时更准），
+        #:    没有才退化成"现在"。
+        self.created_at = _resolve_created_at(message_obj)
+
         #: 用户角色（`admin` / `member`）—— `is_admin()` 读它（真 `:265`）
         self.role = "admin" if is_admin else "member"
         #: 是否唤醒（是否通过 WakingStage，真 `:53`）

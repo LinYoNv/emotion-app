@@ -195,14 +195,57 @@ class HostDbAdapter:
         finder = getattr(manager, "find_conversation", None)
         if callable(finder):
             return await finder(conversation_id)
-        # 没有专用方法 → 用宿主的"当前 umo"记录逐个试（见 conversation_manager）
-        umos = getattr(manager, "known_umos", None)
-        if callable(umos):
-            for umo in (await umos()) or ():
-                conv = await manager.get_conversation(umo, conversation_id)
-                if conv is not None:
-                    return conv
+        for umo in await self._known_umos():
+            conv = await manager.get_conversation(umo, conversation_id)
+            if conv is not None:
+                return conv
         return None
+
+    async def _known_umos(self) -> list[str]:
+        """枚举宿主里出现过的 umo（`_find_anywhere` 的输入）。
+
+        🔴 **为什么需要这一层（2026-10-30 第三轮续，实测缺口）**
+
+        真 AstrBot 的查询是**全局按 `conversation_id`**（`native.py:84` 的
+        `select(ConversationV2.persona_id).where(conversation_id == X)`，
+        **不带 umo**）—— 因为它的 `conversations` 表是扁平的。
+        而宿主的端口（`ConversationManagerPort`）是**按 umo 组织**的
+        （`get_conversation(umo, cid)`），所以要回答"这条 cid 属于谁"，
+        只能把 umo 列出来逐个试。
+
+        缺了这一步会怎样（实测，生产 `GET .../persona` 的真实返回）：
+
+            {"status":"error","code":"host_conversation_missing",
+             "reason":"selected AstrBot conversation is unavailable"}
+
+        即 `get_curr_conversation_id(umo)` 明明返回了 cid，但按 cid
+        反查不到 ⇒ 插件判"会话不存在"⇒「自我」页的「从当前人格整理档案」
+        与第 8 步主动消息测试双双失败。**且本层以前是静默返回空**。
+
+        ⚠️ 优先用宿主**显式提供**的枚举方法；只有它没有时，才回落到
+        读一次会话 section 并从**记录自身的 `user_id`** 取 umo ——
+        不猜键名、不猜 cid 形状（cid 是 uuid，umo 是 `平台:类型:id`，
+        两者混在同一个 dict 里，按形状猜必然出错）。
+        """
+        manager = self._manager
+        lister = getattr(manager, "known_umos", None)
+        if callable(lister):
+            found = await lister()
+            return [str(umo) for umo in (found or ())]
+        loader = getattr(manager, "_load", None)
+        if not callable(loader):
+            return []
+        section = await loader()
+        if not isinstance(section, dict):
+            return []
+        umos: list[str] = []
+        for record in section.values():
+            if not isinstance(record, dict):
+                continue
+            umo = record.get("user_id")
+            if isinstance(umo, str) and umo and umo not in umos:
+                umos.append(umo)
+        return umos
 
 
 def _parse_statement(statement: Any) -> tuple[tuple[str, ...], dict[str, Any]]:

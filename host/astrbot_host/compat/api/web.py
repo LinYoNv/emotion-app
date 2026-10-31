@@ -48,8 +48,29 @@ class PluginMultiDict(Generic[ValueT]):
                 return v
         return default
 
+    def __getitem__(self, key: str) -> ValueT:
+        """按 key 取**第一个**值（真 AstrBot 的 `PluginMultiDict` 就是这么用的）。
+
+        🔴🔴 **2026-10-30 补的真 bug**：原来没有 `__getitem__` ⇒ 官方插件里
+        所有 `query[key]` 形式（如 `acquaintance_api._route_query` 的
+        `{key: query[key] for key in PERSON_ROUTE_KEYS}`）都会抛
+        `TypeError: object is not subscriptable` ⇒ 被上层 catch 成 500/400，
+        页面看到的就是“权限读取失败/待读取”。
+
+        ⚠️ 缺键时**必须抛 KeyError**（不是返回 None）：官方代码用
+        `query.keys()` 先判断存在性，靠 KeyError 暴露被绕过的情况。
+        """
+        for k, v in self._pairs:
+            if k == key:
+                return v
+        raise KeyError(key)
+
     def getlist(self, key: str) -> list[ValueT]:
         return [v for k, v in self._pairs if k == key]
+
+    def __bool__(self) -> bool:
+        """空查询字典是 **falsy** —— 官方多处写 `if request.query:` 做“不允许带参”的校验。"""
+        return bool(self._pairs)
 
     def keys(self) -> list[str]:  # type: ignore[override]
         return [k for k, _ in self._pairs]
@@ -89,6 +110,64 @@ class _Headers:
         return self._raw[key.lower()]
 
 
+def _query_pairs(request_: Any) -> list[tuple[str, str]]:
+    """取出**保留重复键与顺序**的查询参数。
+
+    🔴🔴 **2026-10-30 修真 bug：原来永远返回空列表**。
+
+    原实现读的是 `request_.query_params`（Starlette/真 AstrBot 的形状），
+    而 Quart 的 `Request` **没有这个属性**，`getattr(..., None)` 得到 None
+    ⇒ `pairs` 恒为 `[]` ⇒ 插件收到的 `request.query` **永远是空的**。
+
+    后果不是报错而是**静默取不到参数**（本项目最贵的一类 bug）：
+    陪伴页 `acquaintance/authorization?subject_id=...` 被后端判成
+    「query 里没有 subject_id」→ 返回 `acquaintance_request_invalid`
+    → 页面「身份与权限」永远停在“待读取”、按钮永远禁用
+    （实测截图：无法设为核心用户、无法开放主动消息）。
+
+    ✅ 三种形状都收：Starlette 的 `query_params.multi_items()`、
+       Werkzeug/Quart 的 `args.items(multi=True)`、以及裸 dict。
+    ⚠️ **必须保序且保留重复键** —— 插件用 `len(query.getlist(k)) != 1`
+       来拒绝重复参数，合并去重会**静默放宽**它的校验。
+    """
+    qp = getattr(request_, "query_params", None)
+    multi = getattr(qp, "multi_items", None)
+    if callable(multi):
+        return [(str(key), str(value)) for key, value in multi()]
+
+    args = getattr(request_, "args", None)
+    items = getattr(args, "items", None)
+    if callable(items):
+        try:
+            return [(str(key), str(value)) for key, value in items(multi=True)]
+        except TypeError:  # 不是 multi 版本就退回单值
+            return [(str(key), str(value)) for key, value in items()]
+    if isinstance(args, dict):
+        return [(str(key), str(value)) for key, value in args.items()]
+    return []
+
+
+def _client_host(request_: Any) -> str | None:
+    """取发起方 IP（Starlette 用 `client.host`，Quart/ASGI 用 `remote_addr`）。
+
+    ⚠️ 拿不到时**返回 None**（不是空串）：官方 `_is_local_dashboard_request`
+       把 None 当"非本机"处理，这是它自己的既定语义，我们不改。
+    """
+    client = getattr(request_, "client", None)
+    host = getattr(client, "host", None) if client is not None else None
+    if host:
+        return str(host)
+    remote = getattr(request_, "remote_addr", None)
+    if remote:
+        return str(remote)
+    scope = getattr(request_, "scope", None)
+    if isinstance(scope, dict):
+        peer = scope.get("client")
+        if isinstance(peer, (tuple, list)) and peer:
+            return str(peer[0])
+    return None
+
+
 class PluginRequest:
     """暴露给插件 Web API 处理器的请求对象（照真实现字段）。"""
 
@@ -103,28 +182,103 @@ class PluginRequest:
         self._request = request_
         # 从底层请求对象提取（**属性名照真实现**）
         self.method: str = getattr(request_, "method", "GET")
-        url = getattr(request_, "url", None)
-        self.path: str = getattr(url, "path", "") if url else ""
+        # 🔴 `request.path`（不是 `request.url.path`）：Starlette 的 URL 有
+        #    `.path`，而 **Quart 的 `url` 是普通 `str`** ⇒ 取 `.path` 只会拿到
+        #    默认值，插件读 `request.path.startswith(...)` 的判断会恒为 False。
+        self.path: str = str(
+            getattr(request_, "path", None)
+            or getattr(getattr(request_, "url", None), "path", "")
+            or ""
+        )
         raw_headers = getattr(request_, "headers", {}) or {}
         self.headers = _Headers(
             {str(k).lower(): str(v) for k, v in dict(raw_headers).items()}
         )
         self.cookies: dict[str, str] = dict(getattr(request_, "cookies", {}) or {})
         self.content_type: str | None = self.headers.get("content-type")
-        client = getattr(request_, "client", None)
-        self.client_host: str | None = getattr(client, "host", None) if client else None
+        # 🔴 **2026-10-30 修第三个静默空值**：Quart（ASGI）请求**没有 `client`**
+        #    属性，只有 `remote_addr`（以及 `scope["client"]`）。原来只读
+        #    `request_.client.host` ⇒ `client_host` **恒为 None** ⇒ 官方
+        #    `together/common.py:_is_local_dashboard_request` 判定"不是本机"
+        #    ⇒ `browser_launch_available=False` ⇒ **本机浏览器唤起被静默降级**。
+        #    实测：`scope['client']==('127.0.0.1', 12345)`、`remote_addr=='127.0.0.1'`。
+        self.client_host: str | None = _client_host(request_)
         self.path_params: dict[str, Any] = path_params or {}
         self.plugin_name: str | None = plugin_name
         self.username: str | None = username
-        qp = getattr(request_, "query_params", None)
-        pairs = list(qp.multi_items()) if qp is not None and hasattr(qp, "multi_items") else []
-        self.query: PluginMultiDict[str] = PluginMultiDict[str](pairs)
+        self.query: PluginMultiDict[str] = PluginMultiDict[str](_query_pairs(request_))
 
     async def body(self) -> bytes:
-        """读原始请求体（照真实现）。"""
+        """读原始请求体（照真实现）。
+
+        🔴🔴 **2026-10-29 修真 bug：原来永远返回 `b""`**。
+
+        原实现是：
+
+        ```python
         body = getattr(self._request, "body", None)
         if callable(body):
-            return await body()
+            return await body()      # ← 在 Quart 上永远不会走到
+        return b""
+        ```
+
+        **两个错叠在一起**：
+
+        ① Quart 的 `Request` **没有** `body` 方法，走的是 `Request.data` /
+           `get_data()`；`getattr(request, "body")` 拿到的是
+           `quart.wrappers.request.Body`（一个**可 await 的容器**，
+           `quart/wrappers/request.py:35`）。
+        ② 那个 `Body` 类**只实现了 `__await__`，没有 `__call__`**
+           ⇒ `callable(body)` 是 **False** ⇒ 直接落到 `return b""`。
+
+        实测证据（2026-10-29，`confirm_binding` 打不开）：
+
+        ```
+        [DIAG] PluginRequest.body: inner_type=LocalProxy body_attr=Body callable=False
+        [DIAG] _body 收到 0 字节: b'' | Content-Length='2'
+        ```
+
+        上层看到的现象是 `setup_binding_confirmation_failed`
+        / "the pending private window could not be confirmed" ——
+        **和"没绑定"一模一样**，所以极难查（正是本项目最贵的静默 bug）。
+
+        ✅ 正确写法：先按 **`get_data()`**（Quart/Flask 通用、返回 bytes），
+           再兼容"可调用"和"可直接 await 的 Body 容器"两种形状。
+        """
+        req = self._request
+
+        # ① Quart / Flask 通用：get_data() 返回 bytes（首选，语义最明确）
+        get_data = getattr(req, "get_data", None)
+        if callable(get_data):
+            try:
+                data = get_data()
+                if hasattr(data, "__await__"):
+                    data = await data
+                if isinstance(data, (bytes, bytearray)):
+                    return bytes(data)
+            except Exception:  # noqa: BLE001 — 读不到就往下试别的形状
+                pass
+
+        # ② 有 body() 方法（Starlette/FastAPI 形状）
+        body = getattr(req, "body", None)
+        if callable(body):
+            out = body()
+            if hasattr(out, "__await__"):
+                out = await out
+            if isinstance(out, (bytes, bytearray)):
+                return bytes(out)
+
+        # ③ Quart 的 Body 容器：可 await（**不可调用**）
+        if body is not None and hasattr(body, "__await__"):
+            out = await body
+            if isinstance(out, (bytes, bytearray)):
+                return bytes(out)
+
+        # ④ 已缓存成属性的 data（Flask 形状）
+        data = getattr(req, "data", None)
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+
         return b""
 
     async def json(self, default: Any = None) -> Any:

@@ -36,6 +36,27 @@ dependencies = [
     "qrcode>=8",
     "requests>=2.34",
     "starlette>=1.9",
+    # ---- 2026-10-29：provider 端口的原生 client ----
+    # 🔴 不是"可选增强"：陪伴 7.0.0 的 `AstrBotTextProvider`
+    #    （`companion_v2/adapters/astrbot/provider.py:193`）直接读
+    #    `native.client` 并 `with_options(max_retries=0)`，
+    #    而 `client` 必须是**真的 OpenAI SDK 实例**（真实现
+    #    `openai_source.py:384` 建的就是 `AsyncOpenAI`）。
+    #    缺它 ⇒ 插件的后台任务/主动消息/日记/反思**全部起不来**，
+    #    且加载期完全不报错（典型"加载全绿但功能从没通"）。
+    "openai>=1.40",
+    # ---- 2026-10-29：插件在 import 期就硬要、但原来漏声明的两项 ----
+    # 🔴 实测（jp-vps 全新 venv，缺了就**整个插件加载失败**）：
+    #    Pillow  -> `companion_v2/conversation/media/screen.py:11` `from PIL import Image`
+    #               （顶层 import，陪伴主插件直接起不来）
+    #    aiohttp -> `astrbot_plugin_nai_image/main.py:13` 与 together 插件顶层 import
+    # ⚠️ 本机 venv 里早就有这两个（别的包带进来的），所以一直没发现
+    #    —— 典型的"依赖靠传递关系碰巧满足"，换机器就炸。
+    "Pillow>=12,<15",
+    "aiohttp>=3.9",
+    # pyyaml: 插件 metadata.yaml 的真实解析（缺了会退化到极简解析，
+    # 且 nai_image 的 `main.py:14 from yaml` 是顶层 import → 整个插件起不来）。
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

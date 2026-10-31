@@ -154,7 +154,7 @@ def build_body(
     model: str,
     stream: bool,
     thinking_field: str = "reasoning_content",
-    inject_system_markers: bool = True,
+    inject_system_markers: bool = False,
     extra: dict[str, Any] | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str = "",

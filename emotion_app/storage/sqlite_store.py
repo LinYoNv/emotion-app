@@ -12,13 +12,18 @@
 """
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
+from collections.abc import Callable
+from contextlib import asynccontextmanager
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
-from .base import StorageError, StoreBackend, validate_import_mode
+from .base import T, StorageError, StoreBackend, validate_import_mode
 
 #: 当前 schema 版本 —— 将来迁移用
 SCHEMA_VERSION = 1
@@ -49,6 +54,7 @@ class SqliteStore(StoreBackend):
         self._path = Path(path)
         self._default_factory = default_factory or (lambda: {})
         self._conn: aiosqlite.Connection | None = None
+        self._lock = asyncio.Lock()
 
     # ---- 生命周期 ----
 
@@ -72,9 +78,22 @@ class SqliteStore(StoreBackend):
         await self._conn.commit()
 
     async def close(self) -> None:
-        if self._conn is not None:
-            await self._conn.close()
-            self._conn = None
+        async with self._lock:
+            if self._conn is not None:
+                await self._conn.close()
+                self._conn = None
+
+    @asynccontextmanager
+    async def _transaction(self, *, write: bool = True):
+        async with self._lock:
+            conn = self._require_conn()
+            try:
+                await conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+                yield conn
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
 
     def _require_conn(self) -> aiosqlite.Connection:
         if self._conn is None:
@@ -89,7 +108,10 @@ class SqliteStore(StoreBackend):
     # ---- 读 ----
 
     async def load_store(self) -> dict[str, Any]:
-        conn = self._require_conn()
+        async with self._lock:
+            return await self._load_store(self._require_conn())
+
+    async def _load_store(self, conn: aiosqlite.Connection) -> dict[str, Any]:
         async with conn.execute("SELECT section, payload FROM store") as cur:
             rows = await cur.fetchall()
         if not rows:
@@ -105,7 +127,13 @@ class SqliteStore(StoreBackend):
     async def load_sections(self, keys: list[str]) -> dict[str, Any]:
         if not keys:
             return {}
-        conn = self._require_conn()
+        async with self._lock:
+            return await self._load_sections(self._require_conn(), keys)
+
+    @staticmethod
+    async def _load_sections(conn: aiosqlite.Connection, keys: list[str]) -> dict[str, Any]:
+        if not keys:
+            return {}
         placeholders = ",".join("?" * len(keys))
         out: dict[str, Any] = {}
         async with conn.execute(
@@ -119,47 +147,65 @@ class SqliteStore(StoreBackend):
         return out
 
     async def exists(self) -> bool:
-        conn = self._require_conn()
-        async with conn.execute("SELECT 1 FROM store LIMIT 1") as cur:
-            return await cur.fetchone() is not None
+        async with self._lock:
+            conn = self._require_conn()
+            async with conn.execute("SELECT 1 FROM store LIMIT 1") as cur:
+                return await cur.fetchone() is not None
 
     # ---- 写 ----
 
     async def save_store(self, data: dict[str, Any]) -> None:
-        conn = self._require_conn()
-        await conn.execute("DELETE FROM store")
-        await conn.executemany(
-            "INSERT INTO store(section, payload) VALUES(?, ?)",
-            [(k, json.dumps(v, ensure_ascii=False)) for k, v in data.items()],
-        )
-        await self._bump_revision(conn)
-        await conn.commit()
+        async with self._transaction() as conn:
+            payloads = [(k, json.dumps(v, ensure_ascii=False)) for k, v in data.items()]
+            await conn.execute("DELETE FROM store")
+            await conn.executemany(
+                "INSERT INTO store(section, payload) VALUES(?, ?)", payloads,
+            )
+            await self._bump_revision(conn)
 
     async def save_sections(self, sections: dict[str, Any]) -> None:
-        conn = self._require_conn()
+        async with self._transaction() as conn:
+            await self._save_sections(conn, sections)
+            await self._bump_revision(conn)
+
+    @staticmethod
+    async def _save_sections(conn: aiosqlite.Connection, sections: dict[str, Any]) -> None:
         await conn.executemany(
             "INSERT INTO store(section, payload, updated_at) VALUES(?, ?, datetime('now')) "
             "ON CONFLICT(section) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at",
             [(k, json.dumps(v, ensure_ascii=False)) for k, v in sections.items()],
         )
-        await self._bump_revision(conn)
-        await conn.commit()
+
+    async def update_sections(
+        self, keys: list[str], mutate: Callable[[dict[str, Any]], T]
+    ) -> T:
+        async with self._transaction() as conn:
+            sections = await self._load_sections(conn, keys)
+            before = deepcopy(sections)
+            result = mutate(sections)
+            if inspect.isawaitable(result):
+                if inspect.iscoroutine(result):
+                    result.close()
+                raise StorageError("section 更新回调必须同步执行，不能返回 awaitable")
+            if set(sections) - set(keys) or set(before) - set(sections):
+                raise StorageError("section 更新回调只能更新指定键，不能删除 section")
+            result = deepcopy(result)
+            changed = {k: v for k, v in sections.items() if k not in before or v != before[k]}
+            if changed:
+                await self._save_sections(conn, changed)
+                await self._bump_revision(conn)
+            return result
 
     # ---- 版本 ----
 
     async def next_revision(self) -> int:
-        conn = self._require_conn()
-        rev = await self._read_revision(conn) + 1
-        await conn.execute(
-            "INSERT INTO meta(key, value) VALUES('revision', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (str(rev),),
-        )
-        await conn.commit()
-        return rev
+        async with self._transaction() as conn:
+            await self._bump_revision(conn)
+            return await self._read_revision(conn)
 
     async def current_revision(self) -> int:
-        return await self._read_revision(self._require_conn())
+        async with self._lock:
+            return await self._read_revision(self._require_conn())
 
     @staticmethod
     async def _read_revision(conn: aiosqlite.Connection) -> int:
@@ -176,12 +222,13 @@ class SqliteStore(StoreBackend):
     # ---- 可移植性 ----
 
     async def export_store(self) -> dict[str, Any]:
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "revision": await self.current_revision(),
-            "backend": self.backend_name(),
-            "data": await self.load_store(),
-        }
+        async with self._transaction(write=False) as conn:
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "revision": await self._read_revision(conn),
+                "backend": self.backend_name(),
+                "data": await self._load_store(conn),
+            }
 
     async def import_store(self, data: dict[str, Any], *, mode: str = "replace") -> None:
         validate_import_mode(mode)
@@ -203,16 +250,17 @@ class SqliteStore(StoreBackend):
 
     async def health_check(self) -> dict[str, Any]:
         try:
-            conn = self._require_conn()
-            async with conn.execute("SELECT COUNT(*) FROM store") as cur:
-                (count,) = await cur.fetchone()
-            return {
-                "ok": True,
-                "backend": self.backend_name(),
-                "path": str(self._path),
-                "sections": count,
-                "revision": await self.current_revision(),
-                "schema_version": SCHEMA_VERSION,
-            }
+            async with self._lock:
+                conn = self._require_conn()
+                async with conn.execute("SELECT COUNT(*) FROM store") as cur:
+                    (count,) = await cur.fetchone()
+                return {
+                    "ok": True,
+                    "backend": self.backend_name(),
+                    "path": str(self._path),
+                    "sections": count,
+                    "revision": await self._read_revision(conn),
+                    "schema_version": SCHEMA_VERSION,
+                }
         except Exception as exc:  # noqa: BLE001 — 健康检查要把任何异常变成结构化结果
             return {"ok": False, "backend": self.backend_name(), "error": str(exc)}

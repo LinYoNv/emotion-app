@@ -67,6 +67,7 @@
 """
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any
 
@@ -480,6 +481,16 @@ def _persona_to_v3(persona: Any) -> dict[str, Any] | None:
 
     prompt = _persona_prompt_text(persona)
     pid = str(get("id") or "").strip()
+    begin_dialogs = copy.deepcopy(get("begin_dialogs", []) or [])
+    processed = []
+    if len(begin_dialogs) % 2:
+        logger.error("%s 人格情景预设对话格式不对，条数应该为偶数。", name)
+    else:
+        processed = [
+            {"role": "user" if index % 2 == 0 else "assistant",
+             "content": copy.deepcopy(dialog), "_no_save": True}
+            for index, dialog in enumerate(begin_dialogs)
+        ]
     return {
         # ⚠️ `name` 是插件的**主键**（真实现按 `["name"]` 匹配，
         #    插件 `_sanitize_persona_id` 也拿它当 persona_id）。
@@ -490,12 +501,12 @@ def _persona_to_v3(persona: Any) -> dict[str, Any] | None:
         "id": pid or name,
         # 照 `Personality` 补齐必需字段（缺了真实现 `Personality(**cfg)` 会 KeyError；
         # 插件只读 `name`/`prompt`，但形状对齐能少一类分叉）。
-        "begin_dialogs": [],
+        "begin_dialogs": begin_dialogs,
         "mood_imitation_dialogs": [],
-        "tools": None,
-        "skills": None,
-        "custom_error_message": None,
-        "_begin_dialogs_processed": [],
+        "tools": copy.deepcopy(get("tools", None)),
+        "skills": copy.deepcopy(get("skills", None)),
+        "custom_error_message": copy.deepcopy(get("custom_error_message", None)),
+        "_begin_dialogs_processed": processed,
         "_mood_imitation_dialogs_processed": "",
     }
 
@@ -506,6 +517,13 @@ def _persona_prompt_text(persona: Any) -> str:
     ⚠️ 组装失败**不静默**：记 ERROR 并退回"6 字段简单拼接"，
        绝不让插件拿到空串（空串 = 又变成那句误诊文案）。
     """
+    missing = object()
+    prompt = (persona.get("system_prompt", missing) if isinstance(persona, dict)
+              else getattr(persona, "system_prompt", missing))
+    if prompt is not missing:
+        if not isinstance(prompt, str):
+            raise TypeError("Persona.system_prompt must be a string")
+        return prompt
     try:
         from emotion_app.domain import prompt as prompt_mod
     except Exception:  # noqa: BLE001

@@ -165,12 +165,10 @@ class OpenAIChatBackend:
            本方法收 **OpenAI 风格的 dict** 列表（插件就是这么给的），在此转换。
            **不吞错**：上游错误原样抛。
         """
-        from .message import Message as _Msg
+        from .message import from_upstream_message
 
         domain_msgs = [
-            _Msg(role=str(m.get("role") or "user"), content=str(m.get("content") or ""))
-            for m in (messages or [])
-            if isinstance(m, dict)
+            from_upstream_message(m) for m in (messages or []) if isinstance(m, dict)
         ]
         target = model or kwargs.get("fallback_model") or ""
         return await self.chat(
@@ -435,7 +433,7 @@ class TextTagDispatch:
 
     def prompt_sections(self, tools: list[ToolSpec]) -> list[Any]:
         """把工具说明写成提示词片段（标签方式必须这样做）。"""
-        from .persona import PromptSection
+        from .prompt import PromptSection
 
         if not tools:
             return []

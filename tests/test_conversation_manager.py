@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -106,11 +107,17 @@ class _FakeStore:
         self.save_count = 0
 
     async def load_sections(self, keys: list[str]) -> dict:
-        return {k: self.sections.get(k) for k in keys}
+        return {k: deepcopy(self.sections[k]) for k in keys if k in self.sections}
 
     async def save_sections(self, sections: dict) -> None:
         self.save_count += 1
-        self.sections.update(sections)
+        self.sections.update(deepcopy(sections))
+
+    async def update_sections(self, keys, mutate):
+        snapshot = await self.load_sections(keys)
+        result = mutate(snapshot)
+        await self.save_sections(snapshot)
+        return deepcopy(result)
 
 
 @pytest.fixture

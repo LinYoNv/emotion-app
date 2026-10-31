@@ -113,27 +113,36 @@ class PersonaRepository:
         current = data[persona_id]
         current_dict = current.to_dict(include_secrets=True)
 
+        # 🔴 2026-10-29：允许改的字段**跟 AstrBot `Persona` 对齐**
+        #    （旧的 description/personality/scenario/creator_notes/prompt_sections
+        #     已从模型里删掉，再写会让 `from_dict` 把它们拼回 system_prompt
+        #     —— 那是"改一个字段却动了正文"的隐式副作用，必须挡住）。
         allowed = {
-            "name", "description", "personality", "scenario",
-            "creator_notes", "avatar_path",
-            "api_url", "api_key", "model", "prompt_sections",
+            "name", "system_prompt", "begin_dialogs", "tools", "skills",
+            "custom_error_message", "folder_id", "sort_order",
+            "avatar_path", "api_url", "api_key", "model",
             # 🆕 人设参考图（面板上传后写这个字段，2026-09-25）
             "reference_image_path",
         }
+        #: `tools` / `skills` 的 **None 语义**必须保留：
+        #: `None` = 用全部工具，`[]` = 一个都不给。归一成 `[]` 会让
+        #: 插件以为"这个角色不许用任何工具" —— 功能性故障，不只是显示问题。
         for key, value in patch.items():
             if key not in allowed:
                 continue
-            if key == "prompt_sections":
-                from .persona import PromptSection
-
+            if key == "begin_dialogs":
                 if not isinstance(value, list):
-                    raise ValueError("prompt_sections 必须是数组")
-                # 统一成 dict —— 调用方可能传 dict 也可能传 PromptSection
-                current_dict[key] = [
-                    x.to_dict() if isinstance(x, PromptSection)
-                    else PromptSection.from_dict(x).to_dict()
-                    for x in value
-                ]
+                    raise ValueError("begin_dialogs 必须是数组")
+                current_dict[key] = [str(x) for x in value]
+            elif key in ("tools", "skills"):
+                if value is None:
+                    current_dict[key] = None
+                elif isinstance(value, list):
+                    current_dict[key] = [str(x) for x in value]
+                else:
+                    raise ValueError(f"{key} 必须是数组或 null")
+            elif key == "sort_order":
+                current_dict[key] = int(value)
             else:
                 current_dict[key] = value
 

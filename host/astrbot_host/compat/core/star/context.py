@@ -332,7 +332,17 @@ class Context:
         #: 见 `get_db()` 的 docstring 与 `compat/core/db/adapter.py`。
         #: ⚠️ **惰性创建**：`HostDbAdapter` 要拿 `conversation_manager`，
         #:    而那个端口可能在 `HostPorts` 装配后才注入。
-        self._db: Any = None
+        #:
+        #: 🔴🔴 **2026-10-30 修真缺口：改成惰性 property（原来是裸 `None` 字段）**。
+        #:    真实现是 `context.py:132: self._db = BaseDatabase(...)` —— **构造即就绪**。
+        #:    我们原来写 `self._db: Any = None`，只在 `get_db()` 里才补建，
+        #:    而官方插件是**直接读 `context._db`**（`astrbot_host/native.py:76`
+        #:    `database = getattr(context, "_db", None)` → None → 抛
+        #:    `host_conversation_unavailable`），**根本不经过 `get_db()`**。
+        #:    后果（生产实测）：`/host/targets/<tid>/roles/<rid>/persona` 与
+        #:    「从当前人格整理档案」「第 8 步主动消息测试」全部失败。
+        #:    ⇒ 用 property 惰性构造，让 `_db` **读一次就就绪**，且与 `get_db()` 同一实例。
+        self._db_instance: Any = None
         #: 真实现里 `_db` 的同义公开名（部分插件写 `context.db`）
         self.db: Any = self._db
         #: 🔴 **照真实现的【属性】形态与【活列表】语义**（`context.py:126`）：
@@ -672,6 +682,30 @@ class Context:
             return inst_map.get(str(provider_id or "").strip())
         return None
 
+
+    @property
+    def _db(self) -> Any:
+        """数据库句柄（真实现 `context.py:132` 是构造即就绪的 `BaseDatabase`）。
+
+        ⚠️ **必须是 property**，不是普通字段：官方插件有两条读法 ——
+          * `context.get_db()`（我们原来只支持这条）；
+          * **`context._db`**（`astrbot_host/native.py:76` 直接 getattr）。
+        只做前者会让后者恒为 None → `host_conversation_unavailable`。
+        两条读法共用**同一个** `HostDbAdapter` 实例，避免出现两份状态。
+        """
+        if self._db_instance is None:
+            # ⚠️ 从 `_ports` 直接读，**不要** `self.conversation_manager` ——
+            #    那是会抛 NotImplementedError 的 property（未注入时）。
+            self._db_instance = HostDbAdapter(
+                conversation_manager=getattr(self._ports, "conversation_manager", None)
+            )
+        return self._db_instance
+
+    @_db.setter
+    def _db(self, value: Any) -> None:
+        """允许显式注入/清空（保留原字段语义，供测试与装配替换）。"""
+        self._db_instance = value
+
     def get_db(self) -> Any:
         """取会话数据库句柄（**最小暴露面**，2026-10-19 补）。
 
@@ -689,12 +723,7 @@ class Context:
         别的查询**显式抛 NotImplementedError**。这是有意的：
         假装能跑任意 SQL，会让插件误以为能读对话正文（越界）。
         """
-        if self._db is None:
-            # ⚠️ 从 `_ports` 直接读，**不要** `self.conversation_manager` ——
-            #    那是会抛 NotImplementedError 的 property（未注入时）。
-            self._db = HostDbAdapter(
-                conversation_manager=getattr(self._ports, "conversation_manager", None)
-            )
+        # 🔴 与 `context._db` 共用同一实例（见 `_db` property 的说明）
         return self._db.get_db()
 
     def register_web_api(

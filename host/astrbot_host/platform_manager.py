@@ -100,6 +100,8 @@ class OurPlatform(Platform):
         platform_name: str = "",
         delivery: Any = None,
         description: str = "",
+        sender: Any = None,
+        client_getter: Any = None,
     ) -> None:
         """造一个平台实例。
 
@@ -127,6 +129,24 @@ class OurPlatform(Platform):
         self._platform_name = spec.name
         #: 投递端口（未注入 = 不可用 → 如实失败，不伪造送达）
         self.delivery = delivery
+        #: 自定义发送器（外部适配器，如 OneBot）。
+        #:
+        #: 🔴 为什么需要它：`delivery` 是**我们内部会话存储**的端口（面板可见），
+        #:    而一个真实的外部平台（QQ）要把消息发到**那个平台自己**去。
+        #:    两者绝不能混：混了就会"以为发到 QQ 了，其实只写进了面板"——
+        #:    那是最贵的一类静默失败（用户以为对方收到了）。
+        #:
+        #:    签名：`async (session, message_chain) -> bool`
+        #:    语义：True=真的发出去了；False=失败（**如实**，不假装）。
+        #:    未注入（None）时走原来的 `delivery` 分支，行为与以前**逐字一致**。
+        self.sender: Any = sender
+        #: 🔴 协议端客户端提供者（2026-10-29 补）—— 签名 `() -> CQHttp | None`。
+        #: 真实现 `AiocqhttpPlatformAdapter.get_client()` 直接 `return self.bot`
+        #: （`aiocqhttp_platform_adapter.py:512`），陪伴 7.0.0 的
+        #: `multi_controller.startup_readiness()` 靠它读 `_wsr_api_clients`
+        #: 判断"这个 Bot 账号真的连上来了没"。
+        #: ⚠️ 不注入时 `get_client()` 返回 None → 插件如实判 `host_account_unavailable`。
+        self._client_getter: Any = client_getter
         # 🔴 元数据**唯一来源**：`umo.build_platform_metadata(spec=…)`。
         #    不在这里自己造 `PlatformMetadata(...)` —— 那样"平台三件套"
         #    就有了第二个定义处，`id` 与 umo 第一段漂移时表现为
@@ -144,6 +164,42 @@ class OurPlatform(Platform):
 
     def meta(self) -> PlatformMetadata:
         return self._metadata
+
+    def get_client(self) -> Any:
+        """取协议端客户端（照真实现 `platform.py:167` / aiocqhttp `:512`）。
+
+        🔴 **2026-10-29 补：原来这个类根本没有这个方法**，而陪伴 7.0.0 的
+           `astrbot_host/multi_controller.py:118` `startup_readiness()` 会调：
+
+           ```python
+           platform = self.context.get_platform_inst(account.platform_id)
+           if platform is None:
+               return "host_platform_unavailable"
+           client = platform.get_client()
+           if not getattr(client, "_wsr_api_clients", {}).get(account.self_id):
+               return "host_account_unavailable"
+           ```
+
+           缺方法 ⇒ `AttributeError` ⇒ 被上层吞成 `host_platform_unavailable`
+           ⇒ **「开始使用」第二步（选模型）永远失败**，而面板上显示的是
+           「共享宿主配置、原生路由或权限无法校验」—— 与真实原因完全无关。
+
+        Returns:
+            `CQHttp` 实例（真实现语义）；没有适配器时返回 `None`。
+            ⚠️ 返回 None **不是静默失败**：插件据此判 `host_account_unavailable`，
+               那是"账号还没连上来"的**准确**表述。
+        """
+        getter = self._client_getter
+        if not callable(getter):
+            return None
+        try:
+            return getter()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "取协议端客户端失败（平台 %s）——该平台的账号状态将如实报不可用",
+                self._platform_id,
+            )
+            return None
 
     async def send_by_session(self, session: Any, message_chain: Any) -> Any:
         """按会话投递消息链（插件主动消息的落点）。
@@ -164,7 +220,21 @@ class OurPlatform(Platform):
            返回 False 会走"回退核心发送"分支。
            两种都是**如实失败**，但返回 False 能触发它**再试一条路**
            （`context.send_message`），对我们更有利。
+
+        🔴 **外部适配器优先**：注入了 `sender`（如 OneBot）时**先走它** ——
+           消息必须真的发到 QQ，而不是只写进我们自己的面板存储。
+           只有 sender 未注入时，才退回 `delivery`（内置 Web 端就是这样）。
         """
+        if self.sender is not None:
+            try:
+                return await self.sender(session, message_chain)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "平台 %s 的外部发送失败：%s: %s",
+                    self._platform_id, type(exc).__name__, exc, exc_info=True,
+                )
+                return False
+
         if self.delivery is None:
             logger.warning(
                 "平台 %s 的投递端口未注入 → 无法发送（如实返回 False，不伪造送达）。"
@@ -265,6 +335,8 @@ def build_platform_manager(
     platform_id: str = "",
     platform_name: str = "",
     delivery: Any = None,
+    sender_for: Any = None,
+    client_for: Any = None,
 ) -> OurPlatformManager:
     """造一个已装配好的管理器（**含注册表里的每一个平台实例**）。
 
@@ -278,6 +350,10 @@ def build_platform_manager(
             ⚠️ 两个都留空且没给 registry 时 → 用默认平台。
         delivery: 投递端口（**所有**平台实例共用同一个端口 ——
             投递按 umo 分发，umo 第一段决定落到哪个平台的用户数据）。
+        sender_for: 按平台实例 id 取外部发送器的回调
+            `(platform_id: str) -> sender | None`。
+            ⚠️ **只给有真实外部连接的平台注入**（如 OneBot）；
+            内置 Web 端返回 None → 走 `delivery`，行为不变。
 
     Returns:
         含 N 个平台实例的管理器；`get_insts()` / `platform_insts` 都能拿到
@@ -295,9 +371,24 @@ def build_platform_manager(
         ]
     else:
         specs = [DEFAULT_PLATFORM]
-    return OurPlatformManager(
-        [OurPlatform(spec=spec, delivery=delivery) for spec in specs]
-    )
+    platforms = []
+    for spec in specs:
+        sender = sender_for(spec.id) if callable(sender_for) else None
+        # 🔴 `get_client()` 的来源：按平台 id 取协议端客户端。
+        #    未注入时 `OurPlatform.get_client()` 返回 None
+        #    → 插件如实判 `host_account_unavailable`（不静默给假对象）。
+        client_getter = (
+            (lambda sid=spec.id: client_for(sid)) if callable(client_for) else None
+        )
+        platforms.append(
+            OurPlatform(
+                spec=spec,
+                delivery=delivery,
+                sender=sender,
+                client_getter=client_getter,
+            )
+        )
+    return OurPlatformManager(platforms)
 
 
 __all__ = [

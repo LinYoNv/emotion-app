@@ -240,37 +240,53 @@ def main() -> int:
             #       所以**不能删**，要把它重新指向**同一个被测性质**：
             #       判据从"表里有几行"改成"**这个人设到底有没有片段**" ——
             #       数据里一段都没有才算失败（那才是当年那个 bug）。
-            rows = cdp.eval("document.querySelectorAll('#sections-body tr').length") or 0
-            has_empty_note = bool(
-                cdp.eval(
-                    "!!document.querySelector('#sections-body tr.empty-row')"
-                )
+            # 🔴 2026-10-29：人设结构对齐 AstrBot 后，正文是**一整段
+            #    `system_prompt`**（一个 `<textarea id="p-system-prompt">`），
+            #    不再有"片段表"。所以这里改成守**同一个被测性质**：
+            #    「导入的人设必须真的落到数据里、且在手机上看得见」。
+            #
+            #    ⚠️ 原判据当年抓的是真 bug（"导入的人设没有物化出片段 → 表是空的"）。
+            #       痛点没变，只是载体从"表里有几行"变成"正文框里有几字"。
+            box_len = cdp.eval(
+                "(function(){var t=document.getElementById('p-system-prompt');"
+                " return t? (t.value||'').length : -1;})()"
             )
-            real_sections = cdp.eval(
-                # 真 HTTP：直接问后端这个人设有几段（0 段 = 当年那个 bug）
+            real_body = cdp.eval(
+                # 真 HTTP：直接问后端这个人设的正文有多长（空 = 当年那个 bug）
                 "(async function(){var r=await fetch('/api/v1/personas/'+encodeURIComponent("
                 + json.dumps(str(bound_pid or ""))
                 + ")); if(!r.ok) return -1; var d=await r.json();"
-                " return ((d.prompt_sections)||[]).length;})()",
+                " return ((d.system_prompt)||'').length;})()",
                 await_promise=True,
             )
-            print(
-                f"   额外片段行数: {rows}（空态提示={has_empty_note}）"
-                f" 数据里的片段总数: {real_sections}"
+            legacy_left = cdp.eval(
+                "(function(){return ['sections-block','sections-body',"
+                "'p-description','p-personality','p-scenario','p-creator-notes']"
+                ".filter(function(id){return !!document.getElementById(id);}).join(',');})()"
             )
-            if rows == 0 and not has_empty_note:
-                # 0 行**且没有空态说明** = 表格渲染坏了（两种正常情况都不是）
+            print(
+                f"   正文框字符数: {box_len}"
+                f"  数据里的正文长度: {real_body}"
+                f"  遗留旧节点: {legacy_left or '无'}"
+            )
+            if box_len is not None and int(box_len) < 0:
+                fails.append("找不到 `#p-system-prompt` —— 人设正文框没渲染出来")
+            elif box_len is not None and int(box_len) < 20:
                 fails.append(
-                    "片段表 0 行且没有空态说明 —— 表格没渲染出来"
-                    "（不是『没有额外片段』那种正常空）"
+                    f"正文框只有 {box_len} 字符 —— 导入的人设在手机上**看不见**"
                 )
-            if real_sections == 0:
+            if real_body == 0:
                 fails.append(
-                    "这个人设在数据里**一段片段都没有**"
-                    "（导入的人设没有物化出片段 —— 这正是本判据当年抓到的 bug）"
+                    "这个在数据里**正文是空的**"
+                    "（导入的人设没有落到 system_prompt —— 这正是本判据当年抓到的 bug）"
                 )
-            elif real_sections < 0:
-                fails.append("读人设片段数失败（HTTP 非 2xx）—— 判据未验证，不算通过")
+            elif real_body is not None and int(real_body) < 0:
+                fails.append("读人设正文失败（HTTP 非 2xx）—— 判据未验证，不算通过")
+            if legacy_left:
+                fails.append(
+                    f"页面上还留着旧结构的节点：{legacy_left}"
+                    "（留着会静默丢弃用户输入）"
+                )
 
         # ---- 5) 输入框字号（iOS 聚焦不放大） ----
         fs = cdp.eval(

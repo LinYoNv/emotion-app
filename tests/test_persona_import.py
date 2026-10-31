@@ -20,7 +20,12 @@ import zlib
 
 import pytest
 
-from emotion_app.domain.persona import Persona, PromptSection
+from emotion_app.domain.persona import Persona
+from emotion_app.domain import prompt as prompt_mod
+
+#: 2026-10-29：`PromptSection` 是**组装层**结构，已从 `persona.py` 搬到 `prompt.py`
+#: （人设不再持有 `prompt_sections`；"人设怎么存"与"提示词怎么组装"分居两模块）。
+from emotion_app.domain.prompt import PromptSection
 from emotion_app.domain.persona_import import (
     CONFLICT_OVERWRITE,
     CONFLICT_RENAME,
@@ -82,10 +87,17 @@ def test_parse_aiyu_backup_single():
 
     p = parsed.persona
     assert p.name == "妹妹"
-    assert p.description == "你是我的妹妹，高中生"
-    assert p.personality == "活泼、爱撒娇"
-    assert p.scenario == "在家里"
-    assert p.creator_notes == "注意安全"
+    # 🔴 2026-10-29：人设结构改成 AstrBot 的「一整段 `system_prompt`」，
+    #    爱语那 4 个来源字段在导入时按**固定顺序**拼进正文
+    #    （description → personality → scenario → creator_notes）。
+    #    ⚠️ 守的意图**没变**：导入后"角色设定一点没丢"。
+    #    所以断言用 `in`（每段内容都在正文里），**不用** `==` 整段
+    #    —— 后者会因拼接加了别的字段而假红，且顺序一变就碎。
+    for piece in ("你是我的妹妹，高中生", "活泼、爱撒娇", "在家里", "注意安全"):
+        assert piece in p.system_prompt, piece
+    # 顺序固定是刻意的（P3 稳定前缀：同一张卡每次导入出逐字相同的正文，
+    # 上游 prompt 缓存才命中）
+    assert p.system_prompt.index("你是我的妹妹") < p.system_prompt.index("活泼")
 
 
 def test_parse_aiyu_backup_is_batch():
@@ -142,7 +154,12 @@ def test_aiyu_entry_without_name_is_error_for_that_entry():
 
 
 def test_aiyu_roundtrip_is_lossless():
-    """导出（爱语格式）→ 再导入 → 6 个字段全等。"""
+    """导出（爱语格式）→ 再导入 → **正文与名字全等**。
+
+    2026-10-29：人设只剩一整段 `system_prompt`，所以"6 个字段全等"
+    改成"正文全等"。意图不变（往返无损），还更严了 ——
+    以前是分字段比、现在是**逐字**比整段。
+    """
     original = parse_card(_b(AIYU_BACKUP)).personas
     exported = to_aiyu_backup(original)
     again = parse_card(_b(exported)).personas
@@ -150,10 +167,7 @@ def test_aiyu_roundtrip_is_lossless():
     assert len(again) == len(original)
     for a, b in zip(original, again):
         assert a.name == b.name
-        assert a.description == b.description
-        assert a.personality == b.personality
-        assert a.scenario == b.scenario
-        assert a.creator_notes == b.creator_notes
+        assert a.system_prompt == b.system_prompt
 
 
 def test_aiyu_export_never_includes_api_key():
@@ -216,17 +230,31 @@ ST_V2 = {
 
 
 def test_parse_sillytavern_v2():
+    """SillyTavern V2 卡 → 正文与开场白**各归各位**。
+
+    🔴 2026-10-29 概念迁移（意图不变）：
+      * 卡里的 `description`/`personality`/`scenario`/`creator_notes`
+        → 拼进 `system_prompt`（旧结构里它们是 4 个 `PromptSection`）。
+        守的仍是"**卡上的设定内容一条都没丢**"。
+      * 卡自己的 `system_prompt` 也是喂给模型的指令 → **追加进正文**
+        （旧结构里叫 `角色卡系统提示词` 片段）。
+      * 开场白**不是** system prompt → 进 `begin_dialogs`
+        （旧结构里是"默认关闭的片段"；新结构里 AstrBot 的 `begin_dialogs`
+        就是为这件事准备的字段，比"塞一段停用的提示词"更准确）。
+    """
     parsed = parse_card(_b(ST_V2))
     assert parsed.source_format == "sillytavern_v2"
     p = parsed.persona
     assert p.name == "Seraphina"
-    assert p.scenario == "castle"
 
-    titles = {s.title: s for s in p.prompt_sections}
-    assert titles["角色卡系统提示词"].content == "You are a knight."
-    # ⭐ 开场白导入但**默认关闭**（它不是 system prompt）
-    assert titles["开场白（默认关闭）"].enabled is False
-    assert any("默认关闭" in n for n in parsed.notes)
+    # 卡上的 4 段设定 + 卡自己的 system_prompt 都在正文里
+    for piece in ("a knight", "brave", "castle", "note", "You are a knight."):
+        assert piece in p.system_prompt, piece
+
+    # 开场白进 `begin_dialogs`，**不混进正文**（混进去模型会以为已经说过了）
+    assert p.begin_dialogs == ["Greetings!"]
+    assert "Greetings!" not in p.system_prompt
+    assert any("begin_dialogs" in n for n in parsed.notes), parsed.notes
 
 
 def test_parse_sillytavern_v1_flat():
@@ -235,24 +263,38 @@ def test_parse_sillytavern_v1_flat():
     assert parsed.persona.name == "扁平"
 
 
-def test_own_export_roundtrip_preserves_section_structure():
-    """⭐ 我们自己的导出带 `extensions.emotion_app` → 往返**无损**（order/enabled 都保住）。"""
+def test_own_export_roundtrip_preserves_persona_content():
+    """⭐ 我们自己的导出带 `extensions.emotion_app` → 往返**无损**。
+
+    2026-10-29：旧的 `extensions.emotion_app` 里存的是 `prompt_sections`
+    （带 order/enabled/source），现在存的是 `system_prompt` + `begin_dialogs`。
+    守的**意图完全不变**：只要我们自己的导出块在，往返就**不走对方前端的
+    字段习惯**，一个字都不许变。
+
+    ⚠️ 这里刻意覆盖 AstrBot 特有字段（`begin_dialogs` / `tools` / `skills` /
+       `custom_error_message` / `sort_order`）—— 它们**没有**对应的
+       SillyTavern 字段，只能靠自家扩展块保住。`tools` 的 `None` 语义尤其关键。
+    """
     p = Persona(
-        name="片段测试",
-        prompt_sections=[
-            PromptSection(title="甲", content="AAA", order=10, source="user"),
-            PromptSection(title="乙", content="BBB", order=200, source="persona", enabled=False),
-        ],
+        name="往返测试",
+        system_prompt="第一段\n\n第二段",
+        begin_dialogs=["你好", "你好呀"],
+        tools=["generate_image"],
+        skills=[],
+        custom_error_message="出错啦",
+        sort_order=7,
     )
     exported = to_export_dict(p)
     again = parse_card(_b(exported))
 
     assert again.source_format == "emotion_app"
-    got = {s.title: s for s in again.persona.prompt_sections}
-    assert got["甲"].order == 10
-    assert got["乙"].order == 200
-    assert got["乙"].enabled is False
-    assert got["乙"].source == "persona"
+    got = again.persona
+    assert got.system_prompt == p.system_prompt
+    assert got.begin_dialogs == p.begin_dialogs
+    assert got.tools == ["generate_image"]
+    assert got.skills == []
+    assert got.custom_error_message == "出错啦"
+    assert got.sort_order == 7
 
 
 def test_unknown_format_json_is_rejected():
@@ -432,8 +474,16 @@ def test_real_export_fields_are_byte_identical(real_raw):
     raw = next(iter(real_raw["data"]["prompts"].values()))["data"]
     p = parse_card(REAL_EXPORT.read_bytes()).persona
 
-    for field in ("name", "description", "personality", "scenario", "creator_notes"):
-        assert getattr(p, field) == (raw.get(field) or ""), f"{field} 不一致"
+    # 🔴 2026-10-29：我们的人设不再有 description/personality/… 这几个
+    #    **模型字段**（它们现在只是"外部格式的 dict key"，见
+    #    `persona_import.py` 模块 docstring）。守的意图不变：
+    #    **真机文件的每一段正文都必须落进 `system_prompt`**，一个字都不能丢。
+    assert p.name == (raw.get("name") or "")
+    for field in ("description", "personality", "scenario", "creator_notes"):
+        piece = raw.get(field) or ""
+        if not piece.strip():
+            continue          # 空字段本来就不该被拼进正文
+        assert piece in p.system_prompt, f"{field} 的原文没有进 system_prompt"
 
 
 def test_real_export_reports_no_lost_fields():
@@ -452,12 +502,17 @@ def test_real_export_drops_phone_avatar_path(real_raw):
 
 
 def test_real_export_roundtrip_is_lossless():
-    """真机文件 → 导出 → 再导入，5 字段仍逐字相同（**无损往返**）。"""
+    """真机文件 → 导出 → 再导入，正文仍**逐字相同**（无损往返）。
+
+    2026-10-29：字段层已不存在（人设只剩一整段 `system_prompt`），
+    往返判据落到**正文**上 —— 那才是用户真正的资产。
+    ⚠️ 这里刻意用 `==` 而不用 `in`：往返必须**无损**，多/少一个字都是回归。
+    """
     first = parse_card(REAL_EXPORT.read_bytes()).persona
     again = parse_card(_b(to_aiyu_backup([first]))).persona
 
-    for field in ("name", "description", "personality", "scenario", "creator_notes"):
-        assert getattr(first, field) == getattr(again, field), field
+    assert again.name == first.name
+    assert again.system_prompt == first.system_prompt
 
 
 def test_real_export_long_text_not_truncated():
@@ -467,64 +522,88 @@ def test_real_export_long_text_not_truncated():
     ))["data"]
     p = parse_card(REAL_EXPORT.read_bytes()).persona
 
-    # 用 fixture 自己的长度做判据，避免硬编码会随 fixture 更新而失效
-    assert len(p.description) == len(raw["description"])
-    assert len(p.creator_notes) == len(raw["creator_notes"])
-    assert len(p.description) > 1000, "fixture 应含长文本（否则这条测试没意义）"
+    # 2026-10-29：判据从"字段长度"改成"**正文包含这两段长文本的原文**"。
+    # 守的意图完全不变：**长文本不能被截断**（拼接/`strip()`/切片都可能截）。
+    assert raw["description"] in p.system_prompt
+    assert raw["creator_notes"] in p.system_prompt
+    # 用 fixture 自己的长度做下界，避免硬编码随 fixture 更新而失效
+    assert len(p.system_prompt) >= len(raw["description"])
+    assert len(raw["description"]) > 1000, "fixture 应含长文本（否则这条测试没意义）"
 
 
-def test_import_materializes_editable_sections():
-    """⭐ 导入必须**物化出可编辑的片段**（2026-09-19 修的真 bug）。
+# ---------------------------------------------------------------------------
+# 正文落位 + 组装层可见性
+#
+# 🔴 2026-10-29 这一组**整体重写**，原因如下（不是"迁就测试"）：
+#
+#   旧的三条测试守的是「导入必须物化出 4 个可编辑 `PromptSection`」
+#   （`角色设定/性格/场景/创作者备注`）。那次修 bug 的**真实痛点**是：
+#   「爱语备份只有字段、没有片段结构 ⇒ 面板人设页显示空片段表 ⇒
+#     用户在界面上看不到、也改不了人设内容」。
+#
+#   人设结构改成 AstrBot 的「一整段 `system_prompt`」后，
+#   `prompt_sections` 这个概念**不存在了**（`Persona` 上没有这个属性，
+#   `PUT /personas/<id>/sections` 路由也已删除 —— 见 `api_admin.py:1321`）。
+#   所以那三条断言**无法语义等价改写**，只能删掉概念、把痛点重新守住：
+#
+#     ① 导入后正文非空（= 面板上看得到内容）
+#     ② 正文能经 `/preview` 走完全程组装、且只产出一段 `【人设】`
+#        （= 用户看得见"我的人设变成了什么提示词"）
+#     ③ 改正文走 `PATCH /personas/<id> {"system_prompt": ...}`（= 改得动）
+# ---------------------------------------------------------------------------
 
-    起因：爱语备份只有 6 个字段、不含片段结构。若只填字段而让
-    `prompt_sections` 留空，**面板人设页会显示空片段表** ——
-    用户在界面上看不到也改不了人设内容，与"人设=提示词组装器"的设计冲突。
 
-    ⚠️ 这个 bug **接口测试全绿也照样漏**：`/preview` 会从字段现算，
-       所以只有真的打开面板点进人设才看得见。
+def test_import_fills_system_prompt_so_panel_has_content():
+    """⭐ 导入后 `system_prompt` 必须非空 —— 面板人设页才不是空白的。
+
+    这是「物化片段」那条测试要守的**真实痛点**在新结构下的等价判据。
     """
     p = parse_card(REAL_EXPORT.read_bytes()).persona
-    titles = [s.title for s in p.prompt_sections]
-
-    assert titles == ["角色设定", "性格", "场景", "创作者备注"], titles
-
-    by_title = {s.title: s for s in p.prompt_sections}
-    assert by_title["角色设定"].content == p.description
-    assert by_title["性格"].content == p.personality
-    assert by_title["场景"].content == p.scenario
-    assert by_title["创作者备注"].content == p.creator_notes
+    assert p.system_prompt.strip(), "正文为空 ⇒ 面板上人设就是一片空白"
+    # 真机文件 7000+ 字的 description 必须在里面（不是只塞了个名字）
+    assert len(p.system_prompt) > 1000
 
 
-def test_materialized_sections_are_ordered_stable_first():
-    """片段 order 必须**稳定内容在前**（时间等易变内容由内置片段排后面）。"""
+def test_imported_persona_assembles_into_single_core_section():
+    """导入的正文必须能被组装成**恰好一段** `【人设】`（来源可追溯）。
+
+    旧测试守的是"4 个片段的 order 递增、都 < 900、默认启用、source=persona"。
+    新结构只有一段，所以改成守：**这一段存在、标题对、source 对、order 在
+    易变内容（时间=990）之前** —— 意图（稳定前缀 + 来源可追溯）完全保留。
+    """
     p = parse_card(REAL_EXPORT.read_bytes()).persona
-    orders = [s.order for s in p.prompt_sections]
-    assert orders == sorted(orders), f"order 不是递增：{orders}"
-    assert all(o < 900 for o in orders), "人设片段应排在易变内容（时间=990）之前"
+    core = prompt_mod.persona_core_sections(p)
+
+    assert len(core) == 1, f"正文应恰好一段，实际 {len(core)} 段"
+    sec = core[0]
+    assert sec.title == prompt_mod.PERSONA_CORE_TITLE
+    assert sec.source == "persona"
+    assert sec.enabled is True
+    assert sec.order < prompt_mod.ORDER_TIME, "人设正文必须排在易变内容（时间）之前"
+    assert sec.content.strip(), "正文片段不该是空的"
 
 
-def test_materialized_sections_are_enabled_and_attributed():
-    """片段默认启用，且 `source=persona`（来源可追溯）。"""
-    p = parse_card(REAL_EXPORT.read_bytes()).persona
-    for s in p.prompt_sections:
-        assert s.enabled is True
-        assert s.source == "persona"
-
-
-def test_empty_fields_produce_no_empty_sections():
-    """空字段不该造出空片段（否则面板上一堆空行）。"""
+def test_empty_fields_produce_no_empty_prompt():
+    """空字段不该造出空正文（否则面板上是一段空白，或提示词被空标题污染）。"""
     card = {"data": {"prompts": {"a": {"data": {
         "name": "只有名字", "description": "", "personality": "  ",
         "scenario": "", "creator_notes": "",
     }}}}}
     p = parse_card(_b(card)).persona
-    assert p.prompt_sections == []
+    assert p.system_prompt == ""
+    # 空正文不产生片段（让 `DEFAULT_PERSONA_PROMPT` 那条兜底生效）
+    assert prompt_mod.persona_core_sections(p) == []
 
 
 def test_aiyu_roundtrip_preserves_fields_even_with_sections():
-    """物化片段后，爱语格式往返仍以 **6 字段**为准（片段不干扰）。"""
+    """爱语格式往返必须以**正文**为准（不受任何附加结构干扰）。
+
+    原判据是"物化片段后 6 字段往返仍逐字相同"。2026-10-29 结构变更后
+    既没有 6 字段、也没有物化片段 —— 但那两条**约束的本意**都还在：
+    ① 往返无损；② 附加结构（现在是 `begin_dialogs` 之类）不许污染正文。
+    """
     first = parse_card(REAL_EXPORT.read_bytes()).persona
     again = parse_card(_b(to_aiyu_backup([first]))).persona
 
-    for field in ("name", "description", "personality", "scenario", "creator_notes"):
-        assert getattr(first, field) == getattr(again, field), field
+    assert again.name == first.name
+    assert again.system_prompt == first.system_prompt

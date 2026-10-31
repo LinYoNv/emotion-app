@@ -60,7 +60,7 @@ async def _svc(tmp_path: Path):
 
 
 async def _mk_persona(personas: PersonaRepository, name: str) -> Persona:
-    return await personas.create(Persona(name=name, description=f"我是{name}"))
+    return await personas.create(Persona(name=name, system_prompt=f"我是{name}"))
 
 
 # ---------------------------------------------------------------------------

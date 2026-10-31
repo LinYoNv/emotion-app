@@ -214,12 +214,10 @@ class UpstreamLLMPort:
         chat = getattr(self._backend, "chat", None)
         if callable(chat):
             # `chat()` 收的是领域层 `Message`（不是 dict）→ 这里做一次转换。
-            from ..domain.message import Message as _Msg
+            from ..domain.message import from_upstream_message
 
             domain_msgs = [
-                _Msg(role=str(m.get("role") or "user"), content=str(m.get("content") or ""))
-                for m in msgs
-                if isinstance(m, dict)
+                from_upstream_message(m) for m in msgs if isinstance(m, dict)
             ]
             return await chat(
                 domain_msgs,

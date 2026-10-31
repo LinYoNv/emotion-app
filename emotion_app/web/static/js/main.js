@@ -24,7 +24,7 @@
  */
 import { refreshUnread, send } from "./views/chat.js";
 import { $, NAV_LOADERS, api, applyRoute, boot, go, isLoggedIn, recheckLogin, showLogin, state, syncSidebarAria, toast, toggleSidebar } from "./core/core.js";
-import { renderSections, selectPersona } from "./views/persona.js";
+import { renderPromptStats, selectPersona } from "./views/persona.js";
 import { openPluginConfig, renderNavPluginPages } from "./views/plugins.js";
 import { loadProviderSources, selectProviderSource } from "./views/providers.js";
 import { loadSessions, saveSessionConfig, selectSession } from "./views/session.js";
@@ -36,7 +36,7 @@ import "./bootstrap.js";
 /* 🔴 **这份清单是外部契约** —— 对应 `tools/*.py` 里判据直接调用的名字。
  *    改动它等于改动判据契约，必须同时跑全套浏览器判据。 */
 const GLOBALS = {
-  $, state, api, toast, NAV_LOADERS, applyRoute, go, syncSidebarAria, toggleSidebar, send, selectPersona, renderSections, loadSessions, refreshUnread, selectSession, saveSessionConfig, loadLogs, loadConfigProfile, resetConfigProfile, loadProviderSources, selectProviderSource, renderNavPluginPages, openPluginConfig, boot, recheckLogin, isLoggedIn, showLogin,
+  $, state, api, toast, NAV_LOADERS, applyRoute, go, syncSidebarAria, toggleSidebar, send, selectPersona, renderPromptStats, loadSessions, refreshUnread, selectSession, saveSessionConfig, loadLogs, loadConfigProfile, resetConfigProfile, loadProviderSources, selectProviderSource, renderNavPluginPages, openPluginConfig, boot, recheckLogin, isLoggedIn, showLogin,
 };
 
 const missing = [];

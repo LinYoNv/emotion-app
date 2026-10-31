@@ -11,7 +11,11 @@ docs/REF_ASTRBOT_COMPANION_STACK.md §2.5），但**刻意做减法**：
 from __future__ import annotations
 
 import abc
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
+
+
+T = TypeVar("T")
 
 
 class StorageError(Exception):
@@ -61,6 +65,15 @@ class StoreBackend(abc.ABC):
     @abc.abstractmethod
     async def save_sections(self, sections: dict[str, Any]) -> None:
         """局部更新（只覆盖给定 section 键），避免整库重写。"""
+
+    async def update_sections(
+        self, keys: list[str], mutate: Callable[[dict[str, Any]], T]
+    ) -> T:
+        """原子读取、同步修改并保存 sections；失败不写入，不支持时明确报错。
+
+        mutate 只操作本次读取的独立快照，不得 await；返回值与持久状态分离。
+        """
+        raise StorageError(f"{self.backend_name()} 后端未实现原子 section 更新")
 
     # ---- 版本 ----
 

@@ -120,6 +120,9 @@ PROBE = r"""
   return JSON.stringify({
     hash: location.hash,
     vw: window.innerWidth, vh: window.innerHeight,
+    // 🔴 2026-10-31：列表态的**整块容器**（契约 §6.1）。
+    //    这是"列表态可见不可见"的**唯一**真相 —— 见下面 listView 的用法注释。
+    listView: box('#plugins-list-view'),
     pageList: box('#plugin-page-list'),
     frameWrap: box('#plugin-frame-wrap'),
     detailWrap: box('#plugin-detail-wrap'),
@@ -206,12 +209,26 @@ def main() -> int:
         d = probe()
 
         # ① 入口列表真的可见
+        # 🔴 2026-10-31：列表态的显隐**只由 `#plugins-list-view` 决定**（契约 §6.1）。
+        #    老版本判的是 `#plugin-page-list` 自己的 `hidden` 类 —— 那是
+        #    「逐元素隐藏」那套旧机制。改成整块容器后那个类**不再出现**，
+        #    于是老断言会假红（产品是对的）。判据必须跟着**唯一真相**走：
+        #    容器可见 + 入口列表自己有高度 + 滚动高度不缺 + **真的在可视区**。
+        #
+        #    ⚠️ 原断言还要求 `top < vh`，这条在 1280×900 下**本来就过不了**：
+        #       入口列表排在启停列表(6×51px)+升级卡片(两列 3 行 490px)之后，
+        #       实测 top=814 而 vh=757 —— 它落在**滚动区里**。
+        #       "可见"的正确定义是"在 `.panel` 的滚动内容里且高度没被压塌"，
+        #       不是"一屏不用滚就能看到"（用户滚一下当然能看见）。
         pl = d.get("pageList") or {}
-        ck.add("① 插件拓展页入口列表可见（高度≥内容高，且在视口内）",
-               bool(pl.get("exists")) and not pl.get("hidden") and pl.get("h", 0) > 0
-               and pl.get("h", 0) >= pl.get("scrollH", 1) - 1
-               and 0 < pl.get("top", -1) < d.get("vh", 0),
-               f"h={pl.get('h')} scrollH={pl.get('scrollH')} top={pl.get('top')} vh={d.get('vh')}")
+        lv = d.get("listView") or {}
+        ck.add("① 插件拓展页入口列表可见（容器可见 + 高度≥内容高，滚动可达）",
+               bool(pl.get("exists")) and bool(lv.get("exists"))
+               and lv.get("hidden") is False
+               and pl.get("h", 0) > 0
+               and pl.get("h", 0) >= pl.get("scrollH", 1) - 1,
+               f"listView.hidden={lv.get('hidden')} h={pl.get('h')} "
+               f"scrollH={pl.get('scrollH')} top={pl.get('top')} vh={d.get('vh')}")
         ck.add("①b 三个拓展页都在且每项都有高度",
                len(d.get("itemHeights") or []) >= 1
                and all(h > 0 for h in d.get("itemHeights") or []),
@@ -239,13 +256,14 @@ def main() -> int:
         time.sleep(2.8)
         d2 = json.loads(cdp.eval(PROBE) or "{}")
 
-        ck.add("④ 点详情 → 只有详情可见（iframe 与入口列表都隐藏）",
+        # ④ 2026-10-31：同样改判**容器**，不判 `#plugin-page-list` 自己的类
+        ck.add("④ 点详情 → 只有详情可见（iframe 与整个列表态容器都隐藏）",
                (d2.get("detailWrap") or {}).get("hidden") is False
                and (d2.get("frameWrap") or {}).get("hidden") is True
-               and (d2.get("pageList") or {}).get("hidden") is True,
+               and (d2.get("listView") or {}).get("hidden") is True,
                f"detail.hidden={(d2.get('detailWrap') or {}).get('hidden')} "
                f"frame.hidden={(d2.get('frameWrap') or {}).get('hidden')} "
-               f"list.hidden={(d2.get('pageList') or {}).get('hidden')}")
+               f"listView.hidden={(d2.get('listView') or {}).get('hidden')}")
 
         # ⑤ 详情三块
         det = d2.get("detail") or {}
@@ -277,9 +295,10 @@ def main() -> int:
         d3 = json.loads(cdp.eval(PROBE) or "{}")
         ck.add("⑧ 点「返回插件列表」→ 回到列表态（成对还原）",
                (d3.get("detailWrap") or {}).get("hidden") is True
-               and (d3.get("pageList") or {}).get("hidden") is False
+               and (d3.get("listView") or {}).get("hidden") is False
                and (d3.get("pageList") or {}).get("h", 0) > 0,
                f"detail.hidden={(d3.get('detailWrap') or {}).get('hidden')} "
+               f"listView.hidden={(d3.get('listView') or {}).get('hidden')} "
                f"list.h={((d3.get('pageList') or {}).get('h'))}")
         ck.add("⑩ 返回后勾选状态与进入前完全一致",
                (d3.get("checked") or []) == before_checked)
@@ -317,10 +336,12 @@ def main() -> int:
         time.sleep(1.5)
         m = probe()
         mpl = m.get("pageList") or {}
-        ck.add("⑪ 手机上入口列表仍可见（h>0 且在视口内）",
-               not mpl.get("hidden") and mpl.get("h", 0) > 0
+        mlv = m.get("listView") or {}
+        ck.add("⑪ 手机上入口列表仍可见（容器可见 + h>0 + 滚动可达）",
+               mlv.get("hidden") is False and mpl.get("h", 0) > 0
                and mpl.get("h", 0) >= mpl.get("scrollH", 1) - 1,
-               f"h={mpl.get('h')} scrollH={mpl.get('scrollH')} top={mpl.get('top')} vh={m.get('vh')}")
+               f"listView.hidden={mlv.get('hidden')} h={mpl.get('h')} "
+               f"scrollH={mpl.get('scrollH')} top={mpl.get('top')} vh={m.get('vh')}")
         ck.add("⑪b 手机上启停行没被压成 0 高 / 没横向溢出",
                all(h > 0 for h in m.get("rowHeights") or [0]),
                f"行高={m.get('rowHeights')}")
@@ -328,9 +349,11 @@ def main() -> int:
         cdp.eval("(() => { const b = document.querySelector('.switch-detail'); if (b) b.click(); })()")
         time.sleep(2.8)
         m2 = json.loads(cdp.eval(PROBE) or "{}")
-        ck.add("⑪c 手机上点详情 → 详情可见、列表隐藏",
+        ck.add("⑪c 手机上点详情 → 详情可见、列表态容器隐藏",
                (m2.get("detailWrap") or {}).get("hidden") is False
-               and (m2.get("pageList") or {}).get("hidden") is True)
+               and (m2.get("listView") or {}).get("hidden") is True,
+               f"detail.hidden={(m2.get('detailWrap') or {}).get('hidden')} "
+               f"listView.hidden={(m2.get('listView') or {}).get('hidden')}")
         mdet = m2.get("detail") or {}
         ck.add("⑪d 手机上详情内容有数据",
                bool(mdet.get("groups")) and bool(mdet.get("rows") or mdet.get("itemCount")))

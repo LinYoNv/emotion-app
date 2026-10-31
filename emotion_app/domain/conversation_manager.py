@@ -40,9 +40,8 @@
 
 ## 存储落点
 
-新开一个 section `plugin_conversations`（**不动** `sessions`/`messages`：
-那是我们自己的会话，与插件的"对话"是两个概念 —— 真 AstrBot 里
-`conversations` 与 `platform_message_history` 也是分开的表）。
+原生对话保存在 `plugin_conversations`；内部投影接口将指定 cid 的历史
+单向同步到已存在的 `sessions`/`messages` 行，三个 section 同事务提交。
 
     {
       "<umo>":  {"sel": "<cid>"},                 # 该 umo 当前选中的对话
@@ -62,6 +61,9 @@ import uuid
 from typing import Any
 
 from ..infra.logging_setup import get_logger
+from ..storage.base import StorageError
+from .message import Message, from_upstream_message
+from .session_repo import MESSAGES_SECTION, SESSIONS_SECTION, NativeProjectionReadOnly, SessionNotFound
 
 log = get_logger(__name__)
 
@@ -78,6 +80,17 @@ _SEL = "sel"
 MAX_MESSAGES = 400
 
 
+def conversation_messages(history: str | list[dict[str, Any]]) -> list[Message]:
+    """从权威原生历史生成模型消息；checkpoint 仅在出口过滤。"""
+    parsed = json.loads(history) if isinstance(history, str) else history
+    if not isinstance(parsed, list):
+        raise ValueError("原生对话 history 必须是消息列表")
+    if any(not isinstance(message, dict) for message in parsed):
+        raise ValueError("原生对话 history 的每条消息必须是对象")
+    return [from_upstream_message(message) for message in parsed
+            if message.get("role") != "_checkpoint"]
+
+
 class Conversation:
     """对话对象（**照真实现 `astrbot.core.db.po.Conversation` 的字段**）。
 
@@ -86,7 +99,7 @@ class Conversation:
 
     __slots__ = (
         "platform_id", "user_id", "cid", "history", "title",
-        "persona_id", "created_at", "updated_at", "token_usage",
+        "persona_id", "created_at", "updated_at", "token_usage", "reset_revision",
     )
 
     def __init__(
@@ -101,6 +114,7 @@ class Conversation:
         created_at: int = 0,
         updated_at: int = 0,
         token_usage: int = 0,
+        reset_revision: int = 0,
     ) -> None:
         self.platform_id = platform_id
         self.user_id = user_id
@@ -111,6 +125,7 @@ class Conversation:
         self.created_at = created_at
         self.updated_at = updated_at
         self.token_usage = token_usage
+        self.reset_revision = reset_revision
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
         return f"<Conversation cid={self.cid!r} umo={self.user_id!r} title={self.title!r}>"
@@ -132,8 +147,13 @@ class StoreConversationManager:
     # ---- 内部：读写整个 section ----
 
     async def _load(self) -> dict[str, Any]:
-        raw = await self._store.load_sections([CONVERSATIONS_SECTION])
-        section = raw.get(CONVERSATIONS_SECTION) or {}
+        return self._section(await self._store.load_sections([CONVERSATIONS_SECTION]))
+
+    @staticmethod
+    def _section(raw: dict[str, Any]) -> dict[str, Any]:
+        section = raw.get(CONVERSATIONS_SECTION)
+        if section is None:
+            section = {}
         if not isinstance(section, dict):
             # ⚠️ 格式坏掉时**报错**而不是当空 —— 当空会静默丢光用户历史
             raise RuntimeError(
@@ -142,18 +162,76 @@ class StoreConversationManager:
             )
         return section
 
-    async def _save(self, section: dict[str, Any]) -> None:
-        await self._store.save_sections({CONVERSATIONS_SECTION: section})
+    async def _mutate(self, change: Any, *, projection: bool = False) -> Any:
+        keys = [CONVERSATIONS_SECTION]
+        if projection:
+            keys.extend([SESSIONS_SECTION, MESSAGES_SECTION])
+
+        def mutate(raw):
+            section = self._section(raw)
+            result = change(section, raw)
+            if section or CONVERSATIONS_SECTION in raw:
+                raw[CONVERSATIONS_SECTION] = section
+            return result
+
+        return await self._store.update_sections(keys, mutate)
+
+    @staticmethod
+    def _selected(section: dict[str, Any], umo: str) -> dict[str, Any] | None:
+        entry = section.get(umo)
+        cid = entry.get(_SEL) if isinstance(entry, dict) else None
+        rec = section.get(str(cid)) if cid else None
+        if isinstance(rec, dict) and rec.get("user_id") == umo:
+            return rec
+        return None
+
+    @staticmethod
+    def _owned(section: dict[str, Any], umo: str, cid: str) -> dict[str, Any]:
+        rec = section.get(str(cid))
+        if not isinstance(rec, dict):
+            raise RuntimeError(f"Conversation with id {cid} not found")
+        if rec.get("user_id") != umo:
+            raise RuntimeError(f"Conversation with id {cid} does not belong to {umo}")
+        return rec
+
+    @staticmethod
+    def _create(
+        section: dict[str, Any], umo: str, platform_id: str | None = None,
+        content: list[dict[str, Any]] | None = None, title: str | None = None,
+        persona_id: str | None = None,
+    ) -> dict[str, Any]:
+        parts = umo.split(":", 2)
+        now = int(time.time())
+        cid = str(uuid.uuid4())
+        rec = {
+            "cid": cid, "platform_id": platform_id or (parts[0] if len(parts) >= 3 else "unknown"),
+            "user_id": umo, "content": list(content or []), "title": title,
+            "persona_id": persona_id, "token_usage": 0, "created_at": now, "updated_at": now,
+            "history_revision": 0, "reset_revision": 0,
+        }
+        section[cid] = rec
+        entry = section.get(umo)
+        if not isinstance(entry, dict):
+            entry = {}
+            section[umo] = entry
+        entry[_SEL] = cid
+        return rec
 
     @staticmethod
     def _trim(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if len(content) <= MAX_MESSAGES:
             return content
+        start = len(content) - MAX_MESSAGES
+        boundary = start
+        while start < len(content) and content[start].get("role") in ("tool", "_checkpoint"):
+            start += 1
         log.warning(
             "对话历史超过上限，丢弃最早的 %d 条（上限 %d）",
-            len(content) - MAX_MESSAGES, MAX_MESSAGES,
+            boundary, MAX_MESSAGES,
         )
-        return content[-MAX_MESSAGES:]
+        if start > boundary:
+            log.warning("为保持工具协议完整，额外丢弃截断块残余的 %d 条", start - boundary)
+        return content[start:]
 
     @staticmethod
     def _to_conv(rec: dict[str, Any]) -> Conversation:
@@ -169,23 +247,15 @@ class StoreConversationManager:
             created_at=int(rec.get("created_at") or 0),
             updated_at=int(rec.get("updated_at") or 0),
             token_usage=int(rec.get("token_usage") or 0),
+            reset_revision=int(rec.get("reset_revision") or 0),
         )
 
     # ---- 真契约的 5 个方法（与 `ConversationManagerPort` 一一对应）----
 
     async def get_curr_conversation_id(self, unified_msg_origin: str) -> str | None:
-        """该 umo 当前选中的对话 id；没有则 `None`（**不自动创建**，照真实现）。"""
-        section = await self._load()
-        entry = section.get(str(unified_msg_origin))
-        if not isinstance(entry, dict):
-            return None
-        cid = entry.get(_SEL)
-        # 只有这个 cid 的对话记录**真的还在**才算数 ——
-        # 否则返回一个悬空 id，插件 `get_conversation` 会拿到 None，
-        # 而它会以为"有对话但取不到"（比直接说"没有"更难排查）。
-        if cid and isinstance(section.get(str(cid)), dict):
-            return str(cid)
-        return None
+        """该 umo 当前选中的有效对话 id；没有则 None，不自动创建。"""
+        rec = self._selected(await self._load(), str(unified_msg_origin))
+        return str(rec["cid"]) if rec is not None else None
 
     async def get_conversation(
         self,
@@ -193,17 +263,20 @@ class StoreConversationManager:
         conversation_id: str,
         create_if_not_exists: bool = False,
     ) -> Conversation | None:
-        """取对话对象；不存在时按 `create_if_not_exists` 决定是否新建（照真实现）。"""
+        """取该来源的对话；不存在时按 create_if_not_exists 决定是否新建。"""
+        umo = str(unified_msg_origin)
+        if create_if_not_exists:
+            def change(section, raw):
+                rec = section.get(str(conversation_id))
+                if not isinstance(rec, dict):
+                    rec = self._create(section, umo)
+                return self._to_conv(self._owned(section, umo, rec["cid"]))
+
+            return await self._mutate(change)
         section = await self._load()
         rec = section.get(str(conversation_id))
-        if not isinstance(rec, dict):
-            if not create_if_not_exists:
-                return None
-            cid = await self.new_conversation(str(unified_msg_origin))
-            section = await self._load()
-            rec = section.get(cid)
-            if not isinstance(rec, dict):
-                return None
+        if not isinstance(rec, dict) or rec.get("user_id") != umo:
+            return None
         return self._to_conv(rec)
 
     async def new_conversation(
@@ -214,36 +287,11 @@ class StoreConversationManager:
         title: str | None = None,
         persona_id: str | None = None,
     ) -> str:
-        """新建对话并把该 umo 的"当前对话"切到它；返回新 cid（照真实现）。
+        """新建对话并原子切换当前 cid；位置参数顺序与原生契约一致。"""
+        def change(section, raw):
+            return self._create(section, str(unified_msg_origin), platform_id, content, title, persona_id)["cid"]
 
-        ⚠️ **第一个位置参数是 `platform_id`**（模块说明②）。没给时从 umo
-           里解析（`platform:type:id` 的第一段）—— 真实现也是这么做的。
-        """
-        umo = str(unified_msg_origin)
-        if not platform_id:
-            parts = umo.split(":")
-            platform_id = parts[0] if len(parts) >= 3 else "unknown"
-        now = int(time.time())
-        cid = str(uuid.uuid4())
-        section = await self._load()
-        section[cid] = {
-            "cid": cid,
-            "platform_id": platform_id,
-            "user_id": umo,
-            "content": list(content or []),
-            "title": title,
-            "persona_id": persona_id,
-            "token_usage": 0,
-            "created_at": now,
-            "updated_at": now,
-        }
-        section.setdefault(umo, {})
-        if isinstance(section[umo], dict):
-            section[umo][_SEL] = cid
-        else:
-            section[umo] = {_SEL: cid}
-        await self._save(section)
-        return cid
+        return await self._mutate(change)
 
     async def update_conversation(
         self,
@@ -254,31 +302,31 @@ class StoreConversationManager:
         persona_id: str | None = None,
         token_usage: int | None = None,
     ) -> None:
-        """更新对话（cid 为空时取该 umo 当前的；照真实现）。"""
+        """在同一事务里解析当前 cid 并更新对话。"""
         umo = str(unified_msg_origin)
-        cid = conversation_id or await self.get_curr_conversation_id(umo)
-        if not cid:
-            # 真实现这里是 `if conversation_id:` 静默跳过。我们**不改语义**
-            # （插件依赖"传空就不更新"），但留一行 debug 便于排查。
-            log.debug("update_conversation 跳过：umo=%s 没有当前对话", umo)
-            return
-        section = await self._load()
-        rec = section.get(str(cid))
-        if not isinstance(rec, dict):
-            # 真实现此时也是静默无操作（`db.update_conversation` 找不到就返回）
-            log.debug("update_conversation 跳过：cid=%s 不存在", cid)
-            return
-        if history is not None:
-            rec["content"] = self._trim(list(history))
-        if title is not None:
-            rec["title"] = title
-        if persona_id is not None:
-            rec["persona_id"] = persona_id
-        if token_usage is not None:
-            rec["token_usage"] = int(token_usage)
-        rec["updated_at"] = int(time.time())
-        section[str(cid)] = rec
-        await self._save(section)
+
+        def change(section, raw):
+            if conversation_id:
+                rec = section.get(str(conversation_id))
+            else:
+                rec = self._selected(section, umo)
+            if not isinstance(rec, dict):
+                log.debug("update_conversation 跳过：umo=%s cid=%s 不存在", umo, conversation_id)
+                return
+            self._owned(section, umo, rec["cid"])
+            if history is not None:
+                rec["content"] = self._trim(list(history))
+                rec["history_revision"] = int(rec.get("history_revision", 0)) + 1
+                rec["reset_revision"] = rec["history_revision"]
+            if title is not None:
+                rec["title"] = title
+            if persona_id is not None:
+                rec["persona_id"] = persona_id
+            if token_usage is not None:
+                rec["token_usage"] = int(token_usage)
+            rec["updated_at"] = int(time.time())
+
+        await self._mutate(change)
 
     async def add_message_pair(
         self,
@@ -286,20 +334,113 @@ class StoreConversationManager:
         user_message: Any,
         assistant_message: Any,
     ) -> None:
-        """往 `cid` 追加一对消息（照真实现；**对话不存在要抛异常**）。"""
-        section = await self._load()
-        rec = section.get(str(cid))
-        if not isinstance(rec, dict):
-            # 照真实现抛 —— 静默会让插件的"存档成功"变成假象
-            raise RuntimeError(f"Conversation with id {cid} not found")
+        """往 cid 原子追加一对消息；对话不存在要抛异常。"""
+        def change(section, raw):
+            rec = section.get(str(cid))
+            if not isinstance(rec, dict):
+                raise RuntimeError(f"Conversation with id {cid} not found")
+            self._append_pair(rec, user_message, assistant_message)
+
+        await self._mutate(change)
+
+    def _append_pair(self, rec: dict[str, Any], user_message: Any, assistant_message: Any) -> None:
         content = rec.get("content")
-        content = list(content) if isinstance(content, list) else []
-        content.append(_as_dict(user_message))
-        content.append(_as_dict(assistant_message))
+        if content is None:
+            content = []
+        if not isinstance(content, list):
+            raise StorageError("原生对话 content 格式错误")
+        content = list(content)
+        content.extend([_as_dict(user_message), _as_dict(assistant_message)])
         rec["content"] = self._trim(content)
+        rec["history_revision"] = int(rec.get("history_revision", 0)) + 1
         rec["updated_at"] = int(time.time())
-        section[str(cid)] = rec
-        await self._save(section)
+
+    async def get_or_create_conversation(
+        self, umo: str, platform_id: str | None = None, persona_id: str | None = None,
+    ) -> Conversation:
+        def change(section, raw):
+            rec = self._selected(section, str(umo))
+            if rec is None:
+                rec = self._create(section, str(umo), platform_id=platform_id, persona_id=persona_id)
+            return self._to_conv(rec)
+
+        return await self._mutate(change)
+
+    @staticmethod
+    def _project(raw: dict[str, Any], rec: dict[str, Any], session_id: str) -> None:
+        sessions = raw.get(SESSIONS_SECTION, {})
+        messages = raw.get(MESSAGES_SECTION, {})
+        if not isinstance(sessions, dict) or not isinstance(messages, dict):
+            raise StorageError("会话投影 section 格式错误")
+        metadata = sessions.get(session_id)
+        if not isinstance(metadata, dict):
+            raise SessionNotFound(session_id)
+        content = rec.get("content", [])
+        if not isinstance(content, list):
+            raise StorageError("原生对话 content 格式错误")
+        projected = conversation_messages(content)
+        previous = messages.get(session_id, [])
+        if not isinstance(previous, list):
+            raise StorageError("会话投影 messages 格式错误")
+        common = 0
+        for old, new in zip(previous, projected):
+            if not isinstance(old, dict):
+                raise StorageError("会话投影消息必须是对象")
+            stored = Message.from_dict(old)
+            if stored.to_upstream() != new.to_upstream():
+                break
+            new.timestamp = stored.timestamp
+            common += 1
+        origin, cid = str(rec["user_id"]), str(rec["cid"])
+        old_origin = str(metadata.get("native_origin") or "")
+        old_cid = str(metadata.get("native_conversation_id") or "")
+        linked = bool(old_origin or old_cid)
+        if linked and (old_origin != origin or old_cid != cid):
+            raise NativeProjectionReadOnly()
+        native_revision = int(rec.get("history_revision", 0))
+        reset_revision = int(rec.get("reset_revision", 0))
+        reset_changed = reset_revision != int(metadata.get("native_reset_revision", 0))
+        content_changed = common != len(previous) or len(previous) != len(projected)
+        if not linked or content_changed or native_revision != int(metadata.get("native_history_revision", 0)):
+            metadata["history_revision"] = int(metadata.get("history_revision", 0)) + 1
+        if not linked or common != len(previous) or reset_changed:
+            metadata["summary"] = ""
+            metadata["summarized_upto"] = 0
+        metadata["native_origin"] = origin
+        metadata["native_conversation_id"] = cid
+        metadata["native_history_revision"] = native_revision
+        metadata["native_reset_revision"] = reset_revision
+        metadata["message_count"] = len(projected)
+        metadata["updated_at"] = time.time()
+        messages[session_id] = [message.to_dict() for message in projected]
+        raw[SESSIONS_SECTION] = sessions
+        raw[MESSAGES_SECTION] = messages
+
+    async def project_conversation(self, umo: str, cid: str, session_id: str) -> Conversation:
+        def change(section, raw):
+            rec = self._owned(section, str(umo), str(cid))
+            selected = self._selected(section, str(umo))
+            if selected is None or selected["cid"] != str(cid):
+                raise RuntimeError(f"Selected conversation changed for {umo}")
+            self._project(raw, rec, str(session_id))
+            return self._to_conv(rec)
+
+        return await self._mutate(change, projection=True)
+
+    async def record_reply(
+        self, umo: str, cid: str, session_id: str, user_message: Any, assistant_message: Any,
+        *, expected_reset_revision: int | None = None,
+    ) -> bool:
+        def change(section, raw):
+            rec = self._owned(section, str(umo), str(cid))
+            if (expected_reset_revision is not None
+                    and int(rec.get("reset_revision") or 0) != expected_reset_revision):
+                return False
+            self._append_pair(rec, user_message, assistant_message)
+            self._project(raw, rec, str(session_id))
+            return True
+
+        return await self._mutate(change, projection=True)
 
 
 def _as_dict(msg: Any) -> dict[str, Any]:

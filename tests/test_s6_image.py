@@ -27,7 +27,8 @@ from emotion_app.domain.image_tool import (
     build_spec,
     register_image_tool,
 )
-from emotion_app.domain.persona import PromptSection
+# 2026-10-29：此处原本 `from emotion_app.domain.persona import PromptSection`，
+# 现已删除 —— 本文件从未真正用到它（死导入），且人设已无 `prompt_sections`。
 from emotion_app.domain.tools import ToolRegistry, ToolResult, ToolSpec
 
 PNG_1PX = (
