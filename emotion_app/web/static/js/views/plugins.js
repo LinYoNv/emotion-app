@@ -557,6 +557,13 @@ export function renderPluginUpdate() {
     };
     actions.appendChild(btn);
 
+    // 「⋯」动作菜单（照 AstrBot 真卡片的 actions 弹出层，契约 §6.2）。
+    // ⚠️ 必须放在 `btn` **声明之后** —— 「重新安装」那条复用的是同一个升级按钮
+    //    （要让它的"升级中…"状态也管住菜单项）。第一版放在前面，是 `const`
+    //    的 TDZ 错误：渲染到第 N 张卡片时整个函数抛错，**后面的卡片全不出来**，
+    //    而控制台只有一行 ReferenceError。
+    actions.appendChild(buildPluginActionMenu(p, btn));
+
     card.appendChild(actions);
     host.appendChild(card);
   });
@@ -681,9 +688,15 @@ export function openPluginPage(pluginId, pageName, opts) {
   //    少了斜杠会打到上一级去（后端对无斜杠的请求做了 308 重定向兜底）。
   const url = `/api/v1/plugins/${encodeURIComponent(pluginId)}/pages/${encodeURIComponent(pageName)}/`;
 
-  $("plugin-frame-title").textContent = meta ? (meta.title || pageName) : pageName;
-  $("plugin-frame-open").href = url;
-  $("plugin-frame").src = url;
+  // 🔴 三处都**先判空**：本项目真事故是"删了一块之后 `null.onclick` 让
+  //    后面所有接线静默不执行"。这里任何一处拿到 null 就整条路由炸掉，
+  //    而炸在 `applyRoute` 里 = 用户点侧边栏**毫无反应**且零报错。
+  const titleEl = $("plugin-frame-title");
+  if (titleEl) titleEl.textContent = meta ? (meta.title || pageName) : pageName;
+  const openEl = $("plugin-frame-open");
+  if (openEl) openEl.href = url;
+  const frameEl = $("plugin-frame");
+  if (frameEl) frameEl.src = url;
   state.pluginCurrentId = pluginId;
   showPluginsView("frame");
   // 🔴 **必须补这两句**：点侧边栏子项是**直接调**这个函数的（不经过 `applyRoute`），
@@ -731,33 +744,61 @@ export async function openPluginDetail(pluginId, opts) {
   const wrap = $("plugin-detail-wrap");
   const body = $("plugin-detail-body");
   const hint = $("plugin-detail-hint");
-  $("plugin-detail-title").textContent = pluginId;
+  const titleEl = $("plugin-detail-title");
+  if (titleEl) titleEl.textContent = pluginId;
   state.pluginCurrentId = pluginId;
   showPluginsView("detail");
 
   // 🔴 每次进入都**清空并说明正在读** —— 绝不保留上一个插件的残留内容
   //    （否则用户以为看到的是当前插件的，其实还没加载完）。
-  body.innerHTML = "";
-  hint.textContent = "正在读取…";
-  hint.style.color = "";
+  // ⚠️ `body` / `hint` 判空后才动：整块被删过之后这里抛 TypeError，
+  //    而那是在 `applyRoute` 的调用链里 ⇒ "回列表/进详情"整条路径白屏。
+  if (body) body.innerHTML = "";
+  if (hint) { hint.textContent = "正在读取…"; hint.style.color = ""; }
 
   try {
     const d = await api("GET", `/api/v1/plugins/${encodeURIComponent(pluginId)}`);
     // ⚠️ 异步回来时用户可能已经切走/返回了 —— 迟到的响应**不许**改写当前视图
     if (state.pluginCurrentId !== pluginId) return;
     state.pluginDetail = d;
-    $("plugin-detail-title").textContent = d.name || d.id || pluginId;
+    if (titleEl) titleEl.textContent = d.name || d.id || pluginId;
     renderPluginDetail(d);
-    hint.textContent = "";
+    if (hint) hint.textContent = "";
+    // 🔴 从「⋯ → README」进来时**滚到 README 区块**。
+    //    ⚠️ 必须放在 `renderPluginDetail` **之后** —— 渲染前那个节点还不存在，
+    //       `querySelector` 会拿到 null，滚动作废且**不报错**。
+    if (opts && opts.scrollTo === "readme") scrollToPluginSection("README");
   } catch (e) {
     if (state.pluginCurrentId !== pluginId) return;
-    hint.textContent = `读取失败：${e.message}`;
-    hint.style.color = "var(--danger)";
-    body.innerHTML = "";
+    if (hint) { hint.textContent = `读取失败：${e.message}`; hint.style.color = "var(--danger)"; }
+    if (body) body.innerHTML = "";
   }
 
   if (!(opts && opts.updateHash === false)) {
-    go(`plugins/${encodeURIComponent(pluginId)}`);
+    // ⚠️ 带锚点时**保留锚点在 hash 里**，否则刷新后位置丢了
+    const suffix = opts && opts.scrollTo === "readme" ? "/readme" : "";
+    go(`plugins/${encodeURIComponent(pluginId)}${suffix}`);
+  }
+}
+
+/**
+ * 在插件详情页里滚到某个 `<h4>` 开头的分组（按标题前缀匹配）。
+ *
+ * ⚠️ 用 `scrollIntoView({block:"nearest"})` 而不是 `block:"start"`：
+ *    详情页本来就短，`start` 会让整页跳到顶部空白，看着像"没定位"。
+ */
+export function scrollToPluginSection(titlePrefix) {
+  const body = $("plugin-detail-body");
+  if (!body) return;
+  const heads = body.querySelectorAll(".detail-group h4");
+  for (const h of heads) {
+    if ((h.textContent || "").startsWith(titlePrefix)) {
+      h.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      // 高亮一下，否则用户不知道"为什么滚到这"
+      h.classList.add("detail-flash");
+      setTimeout(() => h.classList.remove("detail-flash"), 1200);
+      return;
+    }
   }
 }
 
@@ -847,6 +888,8 @@ export function renderComponentGroup(title, items) {
 /** 按 `GET /api/v1/plugins/<id>` 的响应画详情。 */
 export function renderPluginDetail(d) {
   const body = $("plugin-detail-body");
+  // 判空：没有容器就没什么可画的。抛 TypeError 会一路炸回 `applyRoute`。
+  if (!body) return;
   body.innerHTML = "";
 
   // ---- ① 概览 ----
@@ -933,27 +976,29 @@ export function renderPluginDetail(d) {
     }
   }
 
-  // ---- ⑤ README（有才画） ----
+  // ---- ⑤ README ----
+  // 🔴 现在**恒定画这一块**（2026-10-31 契约 §4 加了独立的 `…/readme` 接口）。
+  //    原来写的是 `if (d.readme)` —— 没有 README 的插件**整块消失**，
+  //    于是「⋯ → README」点进去之后：页面滚了、高亮了、**什么也没有**，
+  //    用户分不清"它没写文档"和"面板坏了"。契约 §4 也明确要求
+  //    "没 README 时详情页显示'暂无文档'"。
+  const rd = document.createElement("section");
+  rd.className = "detail-group";
+  const rh = document.createElement("h4");
+  rh.textContent = "README" + (d.readme_truncated ? "（已截断）" : "");
+  rd.appendChild(rh);
   if (d.readme) {
-    const rd = document.createElement("section");
-    rd.className = "detail-group";
-    const rh = document.createElement("h4");
-    rh.textContent = "README" + (d.readme_truncated ? "（已截断）" : "");
-    rd.appendChild(rh);
     const pre = document.createElement("pre");
     pre.className = "detail-pre readme";
     pre.textContent = d.readme;
     rd.appendChild(pre);
-    body.appendChild(rd);
+  } else {
+    const none = document.createElement("p");
+    none.className = "hint";
+    none.textContent = "暂无文档 —— 这个插件的目录里没有 README.md。";
+    rd.appendChild(none);
   }
-}
-
-/** 显示/隐藏「插件启停」那块（打开插件页/详情时让位）。 */
-export function setPluginSwitchVisible(visible) {
-  for (const id of ["plugin-switch-hint", "plugin-switch-list"]) {
-    const el = $(id);
-    if (el) el.classList.toggle("hidden", !visible);
-  }
+  body.appendChild(rd);
 }
 
 /**
@@ -973,19 +1018,33 @@ export function setPluginSwitchVisible(visible) {
  * @param {"list"|"frame"|"detail"|"config"} which
  */
 export function showPluginsView(which) {
-  // 🔴 四块主体：**互斥**。新增了 "config"（插件配置，情绪 2026-10-09）——
-  //    正如这里的注释所说，新增视图**只改这一处**就够。
-  $("plugin-frame-wrap").classList.toggle("hidden", which !== "frame");
-  $("plugin-detail-wrap").classList.toggle("hidden", which !== "detail");
-  $("plugin-config-wrap").classList.toggle("hidden", which !== "config");
-  $("plugin-page-list").classList.toggle("hidden", which !== "list");
-  $("plugins-hint").classList.toggle("hidden", which !== "list");
-  // 启停那块只在**列表态**显示（其余状态整个面板让给主体）
-  setPluginSwitchVisible(which === "list");
+  // 🔴 **五块主体互斥**，每块**只由这里**决定显隐。
+  //
+  // 2026-10-31（情绪报的 bug）：`plugins-list-view` 是**整块**容器，
+  // 取代了原来逐个 toggle `#plugin-switch-hint` / `#plugin-switch-list` 的写法。
+  // 那次事故的根因就是"逐元素"：后来新增的「插件升级」整块（标题/提示/
+  // 代理行/卡片列表/结果）**没人负责隐藏** ⇒ 在插件独立页里照样显示，
+  // 而且**没有任何报错**。改成整块容器后，新增内容放进那个 div 就天然跟随。
+  //   ⚠️ 别再把某块从容器里拿出来单独 toggle —— 那就退回事故形态了。
+  //
+  // 🔴 四块**必须判空**：`$()` 拿到 null 时 `.classList` 直接抛 TypeError。
+  //    这个函数是 `applyRoute` 的**必经**调用点（每次进插件页都过），
+  //    抛出去 = 整个插件页白屏 + 零报错。本项目真事故就是"删了块之后
+  //    `null.onclick` 让后半段接线全死" —— 同一个坑换了个形状。
+  //    `hidden` 是 `.panel` 的互斥标记，缺一块就少一个视图，但**不能崩**。
+  const toggle = (id, show) => {
+    const el = $(id);
+    if (el) el.classList.toggle("hidden", !show);
+  };
+  toggle("plugins-list-view", which === "list");
+  toggle("plugin-frame-wrap", which === "frame");
+  toggle("plugin-detail-wrap", which === "detail");
+  toggle("plugin-config-wrap", which === "config");
 
   if (which !== "frame") {
     // 清 src：否则插件页的定时器/连接继续在后台跑
-    $("plugin-frame").src = "about:blank";
+    const frameEl = $("plugin-frame");
+    if (frameEl) frameEl.src = "about:blank";
   }
   if (which !== "detail") {
     // 离开详情就丢掉缓存，并清 id —— 迟到的详情响应靠它判断"用户已经走了"
@@ -1537,4 +1596,484 @@ export function collectPluginConfigChanges() {
     }
   }
   return changes;
+}
+
+
+/* ================================================================================
+ * 插件卡片的「⋯」动作菜单（情绪 2026-10-31：「插件的删除键没了」）
+ *
+ * ## 照的是什么
+ *
+ * 真 AstrBot 的卡片右下角有一个 `⋯` 图标，点开是弹出层
+ * （`dashboard/dist/assets/InstalledPluginsTab-DSnl1LUd.js` 的 `ExtensionCard`，
+ *  在 `emits` 里逐条列出：`configure / update / reload / uninstall /
+ *  toggle-activation / view-handlers / view-readme / toggle-pin / open-webui /
+ *  change-source`）。文案取自 `index-BiTHkcB1.js` 的 `features/extension`：
+ *
+ *     actions: { uninstall:"删除", reload:"重载", viewInfo:"行为",
+ *                viewDocs:"文档", configure:"配置", update:"更新" }
+ *     tooltips: { uninstall:"删除插件", reload:"重载", ... }
+ *
+ * 我们取其中**有真实后端**的那几条（契约 §6.2）。**没有的就不画** ——
+ * 画一个点了不生效的条目就是假能力（本项目铁律：写了不调用 = 没有）。
+ *
+ * ## 三条纪律
+ * ① 菜单**同一时刻只开一个**：全局面板共用一个 `_openPluginMenu`。
+ * ② 点外部 / 按 Esc / 滚动 都要关 —— 否则菜单会飘在别的卡片上面。
+ * ③ **不可用的条目要灰掉并说明原因**：只给一个灰按钮，用户会以为功能坏了，
+ *    而不是"这个插件不支持"。
+ * ================================================================================ */
+
+/**
+ * 关掉**所有**动作菜单（幂等）。
+ *
+ * 🔴🔴 **必须按 DOM 实况关，不能只关"我记着的那个"**（2026-10-31 真机判据抓到的 bug）：
+ *
+ * 第一版只维护一个 `_openPluginMenu` 指针，`closePluginActionMenu()` 只隐藏它指向的
+ * 那一个菜单。真浏览器判据 `plugin_actions_ui_check.py` 的 B3/B4 当场变红：
+ *
+ *     连续点两个卡片的「⋯」→ DOM 里**两个菜单同时可见**（`overlap=2`），
+ *     且按 Esc 只关掉其中一个，另一个**永久留在页面上**（`open=2`）。
+ *
+ * 原因是那个指针**只是一个副本**：卡片列表一旦被 `loadPluginSwitch()` 重绘，
+ * 旧 DOM 节点仍在（要等浏览器回收），指针却指向了已脱离文档的节点 ——
+ * 于是"关掉了"这句话对屏幕上那个菜单**不成立**，而且**零报错**。
+ *
+ * ⇒ 判据改成"DOM 里还有没有 `.plugin-menu` 没 hidden"，
+ *   指针降级为**纯优化**（这次有没有东西要关）。这样即使指针失准，
+ *   也不会留下一个关不掉的浮层。
+ */
+let _openPluginMenu = null;
+
+/** 关掉当前打开的所有动作菜单（幂等、自愈）。 */
+export function closePluginActionMenu() {
+  const menus = document.querySelectorAll(".plugin-menu:not(.hidden)");
+  for (const menu of menus) menu.classList.add("hidden");
+  for (const trigger of document.querySelectorAll('.plugin-menu-trigger[aria-expanded="true"]')) {
+    trigger.setAttribute("aria-expanded", "false");
+  }
+  _openPluginMenu = null;
+}
+
+/* 全局监听：**只注册一次**（模块级副作用在本文件是被禁止的，见文件头注释）。
+ * 所以由 `renderPluginUpdate()` 在第一次画卡片时调一次 `_ensureMenuDismissers()`。 */
+let _menuDismissersReady = false;
+
+function _ensureMenuDismissers() {
+  if (_menuDismissersReady) return;
+  _menuDismissersReady = true;
+  // 点外部关闭：用**捕获**阶段，这样卡片内部的点击也会先经过这里，
+  // 但菜单自己的点击要放行（`wrap.contains` 判定）。
+  document.addEventListener(
+    "click",
+    (ev) => {
+      if (!_openPluginMenu) return;
+      if (_openPluginMenu.wrap.contains(ev.target)) return;
+      closePluginActionMenu();
+    },
+    true,
+  );
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && _openPluginMenu) {
+      const trigger = _openPluginMenu.trigger;
+      closePluginActionMenu();
+      // 焦点还给触发按钮 —— 键盘用户不该被丢在原地
+      trigger.focus();
+    }
+  });
+  // 滚动就关：菜单是 `position:absolute`，容器一滚它就对不上卡片了
+  document.addEventListener("scroll", closePluginActionMenu, true);
+  window.addEventListener("resize", closePluginActionMenu);
+}
+
+/**
+ * 建一个卡的「⋯」按钮 + 它的弹出菜单。
+ *
+ * @param {object} p           `GET /api/v1/plugins` 的单项
+ * @param {HTMLElement} updateBtn 该卡的「升级」按钮（「重新安装」复用它）
+ */
+export function buildPluginActionMenu(p, updateBtn) {
+  _ensureMenuDismissers();
+
+  const wrap = document.createElement("div");
+  wrap.className = "plugin-menu-wrap";
+
+  const trigger = document.createElement("button");
+  trigger.type = "button";
+  trigger.className = "plugin-act-btn plugin-menu-trigger";
+  trigger.textContent = "⋯";
+  trigger.title = "更多操作";
+  trigger.setAttribute("aria-haspopup", "menu");
+  trigger.setAttribute("aria-expanded", "false");
+  wrap.appendChild(trigger);
+
+  const menu = document.createElement("div");
+  menu.className = "plugin-menu hidden";
+  menu.setAttribute("role", "menu");
+  wrap.appendChild(menu);
+
+  trigger.onclick = (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    // ⚠️ "再点一次收起"的判据看**这个菜单自己**的可见状态，
+    //    不看指针 —— 指针会因重绘失准（见 `closePluginActionMenu` 的说明）。
+    const wasOpen = !menu.classList.contains("hidden");
+    closePluginActionMenu();
+    if (wasOpen) return;                    // 再点一次 = 收起
+    menu.classList.remove("hidden");
+    trigger.setAttribute("aria-expanded", "true");
+    _openPluginMenu = { wrap, trigger };
+    // 打开后把焦点移到第一条**可用**项（键盘可达）
+    const first = menu.querySelector(".plugin-menu-item:not(:disabled)");
+    if (first) first.focus();
+  };
+
+  /** 加一条菜单项。`opts.disabled` + `opts.reason` 决定灰不灰、为什么。 */
+  const item = (text, opts = {}) => {
+    const el = document.createElement("button");
+    el.type = "button";
+    el.className = "plugin-menu-item" + (opts.danger ? " plugin-menu-item--danger" : "");
+    el.setAttribute("role", "menuitem");
+    el.textContent = text;
+    if (opts.disabled) {
+      el.disabled = true;
+      // 🔴 不可用时**必须**说明原因（title 悬停可见）—— 灰按钮不说话等于没做
+      el.title = opts.reason || "当前不可用";
+    }
+    if (opts.onSelect) {
+      el.onclick = (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        closePluginActionMenu();
+        opts.onSelect();
+      };
+    }
+    menu.appendChild(el);
+    return el;
+  };
+
+  const id = encodeURIComponent(p.id);
+  const name = p.display_name || p.name || p.id;
+
+  // ---- ① 行为（详情页，契约 §6.2 第一条）----
+  item("行为", {
+    onSelect: () => go(`plugins/${id}`),
+  });
+
+  // ---- ② README（进详情页并滚到 README 区块）----
+  item("README", {
+    onSelect: () => go(`plugins/${id}/readme`),
+  });
+
+  // ---- ③ 插件设置 ----
+  item("插件设置", {
+    onSelect: () => go(`plugins/${id}/config`),
+  });
+
+  // ---- ④ 重载（契约 §2）----
+  // 🔴 `can_reload` 由**后端**算（它才知道停用状态与源码目录），前端只显示。
+  item("重载", {
+    disabled: p.can_reload === false,
+    reason: p.reloadable_reason,
+    onSelect: () => reloadPlugin(p),
+  });
+
+  // ---- ⑤ 重新安装（与「升级」同一接口，官方也是复用它）----
+  item("重新安装", {
+    disabled: p.state === "failed",
+    reason: "加载失败的插件无法重新安装 —— 先看「行为」页里的堆栈",
+    onSelect: () => upgradePlugin(p, updateBtn),
+  });
+
+  // ---- ⑥ 更换插件源… ----
+  // 契约 §5：**不新增接口**，复用 `POST .../update` 的 `repo` 字段。
+  // 官方那套 `plugin-sources` 依赖"安装源"持久化，我们没有 —— 硬造一套
+  // 就是"写进去不生效"的假能力。
+  item("更换插件源…", {
+    disabled: p.state === "failed",
+    reason: "加载失败的插件请先修好再换源",
+    onSelect: () => reinstallFromRepo(p, updateBtn),
+  });
+
+  // ---- 分隔线 + ⑦ 删除（危险，红色）----
+  const sep = document.createElement("div");
+  sep.className = "plugin-menu-sep";
+  menu.appendChild(sep);
+
+  item("删除插件", {
+    danger: true,
+    disabled: p.can_uninstall === false,
+    reason: p.uninstallable_reason,
+    onSelect: () => uninstallPlugin(p),
+  });
+
+  return wrap;
+}
+
+/** 重载一个插件（契约 §2）。**不需要重启服务** —— 文案必须说清。 */
+export async function reloadPlugin(p) {
+  const hint = $("plugin-update-hint");
+  const out = $("plugin-update-result");
+  const name = p.display_name || p.name || p.id;
+  if (out) {
+    out.style.color = "";
+    out.textContent = `正在重载「${name}」…`;
+  }
+  try {
+    const r = await api("POST", `/api/v1/plugins/${encodeURIComponent(p.id)}/reload`, {});
+    const res = (r && r.result) || {};
+    if (out) {
+      out.style.color = "";
+      // ⚠️ 与「升级」的关键区别必须让用户看见：重载**不用重启**
+      out.textContent =
+        `已重载「${name}」：handlers=${res.handler_count}，` +
+        `工具=${res.llm_tool_bind_count}，Web API=${res.web_api_count}。` +
+        `新代码已经在跑（不需要重启）。` +
+        // 🔴 **「部分生效」必须如实说**（jp-vps 上 Hermes 因为这句错了两次：
+        //    commit 2109290ce0 / da898da6a6 / 01337cd1d0）。
+        //    重载换的是"从现在起新拿到的 handler/工具/hook"；
+        //    已经在跑的那一轮对话手里还攥着旧引用，它跑完才会用新代码。
+        `注意：正在进行中的那一轮对话仍会用旧代码，下一轮起才是新代码。`;
+    }
+    // 🔴 重取清单，不自己改 DOM —— 否则面板与实际状态会漂
+    //    （本项目踩过"同源数据各取一份"）
+    await loadPluginSwitch();
+  } catch (e) {
+    if (out) {
+      out.style.color = "var(--danger)";
+      // 后端把插件自己的错误原样带回来了（`reload_failed` 是 400）——
+      // 必须透出，否则用户只知道"失败了"、不知道改哪一行
+      out.textContent = `重载「${name}」失败：${e.message}`;
+    }
+    if (hint) hint.style.color = "";
+  }
+}
+
+/** 换一个仓库地址重新拉取（契约 §5：复用 update 的 `repo` 字段）。 */
+export async function reinstallFromRepo(p, updateBtn) {
+  const name = p.display_name || p.name || p.id;
+  const repo = (window.prompt(
+    `「${name}」要换成哪个仓库？\n\n` +
+      `会从该地址拉取并覆盖插件源码（不会删除数据与 files/ 等用户文件）。`,
+    (p.repo || "").trim(),
+  ) || "").trim();
+  if (!repo) return;                       // 用户取消 → 什么都不做
+
+  const proxyEl = $("plugin-update-proxy");
+  const proxy = proxyEl ? proxyEl.value.trim() : "";
+  const out = $("plugin-update-result");
+  const btn = updateBtn;
+  const old = btn ? btn.textContent : "";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "拉取中…";
+  }
+  if (out) {
+    out.style.color = "";
+    out.textContent = `正在从 ${repo} 拉取「${name}」…（可能要几十秒，勿关页面）`;
+  }
+  try {
+    const res = await api("POST", `/api/v1/plugins/${encodeURIComponent(p.id)}/update`, {
+      proxy,
+      repo,
+    });
+    if (out) {
+      out.style.color = "var(--warn)";
+      out.textContent =
+        `${(res && res.message) || "已拉取"}。` +
+        `⚠️ 换源后请点「⋯ → 重载」，或重启服务，新代码才会加载。`;
+    }
+    await loadPluginSwitch();
+  } catch (e) {
+    if (out) {
+      out.style.color = "var(--danger)";
+      out.textContent = `换源失败：${e.message}`;
+    }
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = old;
+    }
+  }
+}
+
+/**
+ * 卸载一个插件（契约 §3）—— **删掉源码目录**，配置与数据按勾选项。
+ *
+ * 🔴 二次确认必须让用户看清四件事：
+ *   ① 会被删掉的**真实目录**（`source_path`，由后端解析源码根得到）；
+ *   ② 两个**可勾选**的附加删除项，各自显示**具体路径**；
+ *   ③ 两者**默认都不删** ⇒ 卸载后重新安装，配置与记忆仍在；
+ *   ④ 勾选后**不可恢复**。
+ *   少任何一条，用户都无法判断"我这一下到底动了什么"。
+ *
+ * 🔴 **为什么不备份、不做回收站**（情绪 2026-10-31 定）：
+ *    「备份什么啊，什么都要备份那不就慢了。回收站也不要了，astrbot 卸载插件的时候
+ *     有二次选择，如果插件的配置文件没有删除重新安装就可以继续使用。」
+ *   插件代码是**可再生的**（`metadata.yaml` 有 `repo:`，「重新安装」一条命令拉回来）；
+ *   真正不可再生的是配置与持久化数据，而那两样由勾选项显式决定。
+ *   给可再生资源做回收站 = 解决错了对象，还多造一个用户不知道怎么清理的目录。
+ */
+export async function uninstallPlugin(p) {
+  const name = p.display_name || p.name || p.id;
+  const source = (p.source_path || "").trim();
+  const cfgPath = (p.config_path || "").trim();
+  const dataPath = (p.data_path || "").trim();
+
+  // 🔴 二次确认照 AstrBot 的「删除插件」弹窗（情绪 2026-10-31 指定的形态）：
+  //     标题 + "你确定要删除当前插件吗？" + 两个**可勾选**的附加删除项 + 取消/确认。
+  //
+  //    ⚠️ 两个勾选项**默认都不勾**：这是官方语义，也是"卸载后重新安装配置还在"
+  //       的前提。删配置/删数据是**不可逆**的，绝不能默认选上。
+  //    ⚠️ 用 `confirm()` 只够放一段文字、做不出两个勾选框，所以这里用
+  //       `prompt()` 也不行 —— 我们要一个真弹窗。用 `window.confirm` 两段式
+  //       会问两次（体验差且容易误点），因此走**页面内模态**。
+  const pick = await askDeletePluginOptions({ name, source, cfgPath, dataPath });
+  if (!pick) return;                        // 取消 → **一个请求都不发**
+
+  const out = $("plugin-update-result");
+  if (out) {
+    out.style.color = "";
+    out.textContent = `正在卸载「${name}」…`;
+  }
+  try {
+    const r = await api("DELETE", `/api/v1/plugins/${encodeURIComponent(p.id)}`, {
+      delete_config: !!pick.deleteConfig,
+      delete_data: !!pick.deleteData,
+    });
+    const removed = (r && r.removed) || {};
+    if (out) {
+      out.style.color = "";
+      out.textContent =
+        `${r.message || `已卸载「${name}」`}。` +
+        `摘掉 handlers=${removed.handlers || 0}、工具=${removed.llm_tools || 0}、` +
+        `Web API=${removed.web_apis || 0}。` +
+        (pick.deleteConfig || pick.deleteData
+          ? ""
+          : "配置与数据仍在，重新安装后可以继续使用。");
+    }
+    await loadPluginSwitch();
+    const raw = (location.hash || "").replace(/^#\/?/, "").split("/").filter(Boolean);
+    if (raw[0] === "plugins" && raw.length > 1 && decodeURIComponent(raw[1]) === p.id) {
+      go("plugins");
+    }
+  } catch (e) {
+    if (out) {
+      out.style.color = "var(--danger)";
+      out.textContent = `卸载「${name}」失败：${e.message}`;
+    }
+  }
+}
+
+/**
+ * 「删除插件」确认弹窗 —— 照 AstrBot 的二次选择。
+ *
+ * @returns {Promise<null | {deleteConfig: boolean, deleteData: boolean}>}
+ *          `null` = 用户取消（调用方**不许**发任何请求）。
+ *
+ * 🔴 为什么不用 `window.confirm`：它只能放一段文字。而这个弹窗必须
+ *    让用户**看见并分别勾选**"删配置""删数据"——两个都不可逆，
+ *    合并成一句话去问"要不要一起删"就是在制造误删。
+ * 🔴 为什么不用 `prompt`：同上，且它还得输入文本。
+ * 🔴 为什么每个勾选项都显示**具体路径**：用户需要判断"我要删的到底是哪个文件"。
+ *    只写"配置文件"，他没法确认那是不是他在意的那份。
+ */
+export function askDeletePluginOptions({ name, source, cfgPath, dataPath }) {
+  return new Promise((resolve) => {
+    const modal = document.createElement("div");
+    modal.className = "modal delete-plugin-modal";
+
+    const box = document.createElement("div");
+    box.className = "modal-box";
+    modal.appendChild(box);
+
+    const h = document.createElement("h3");
+    h.textContent = "删除插件";
+    box.appendChild(h);
+
+    const q = document.createElement("p");
+    q.className = "hint";
+    q.textContent = `你确定要删除当前插件「${name}」吗？`;
+    box.appendChild(q);
+
+    const pathLine = document.createElement("p");
+    pathLine.className = "hint mono delete-plugin-path";
+    pathLine.textContent = source || "（未能解析出源码目录）";
+    box.appendChild(pathLine);
+
+    const ops = document.createElement("div");
+    ops.className = "delete-plugin-ops";
+    const opsTitle = document.createElement("h4");
+    opsTitle.textContent = "操作：";
+    ops.appendChild(opsTitle);
+
+    /** 一个带说明的勾选项。`detailBy` 拿到 `{el, input}` 便于外部读值。 */
+    const makeOption = (label, detail, onToggle) => {
+      const row = document.createElement("label");
+      row.className = "delete-plugin-opt";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = false;                    // 🔴 默认不勾
+      row.appendChild(cb);
+      const txt = document.createElement("span");
+      txt.className = "delete-plugin-opt-text";
+      const strong = document.createElement("span");
+      strong.textContent = label;
+      txt.appendChild(strong);
+      if (detail) {
+        const small = document.createElement("small");
+        small.className = "delete-plugin-opt-detail mono";
+        small.textContent = detail;
+        txt.appendChild(small);
+      }
+      row.appendChild(txt);
+      cb.onchange = () => onToggle && onToggle(cb.checked);
+      ops.appendChild(row);
+      return { row, input: cb };
+    };
+
+    const cfgOpt = makeOption("同时删除插件配置文件", cfgPath, null);
+    const dataOpt = makeOption("同时删除插件持久化数据", dataPath, null);
+    box.appendChild(ops);
+
+    const warn = document.createElement("p");
+    warn.className = "hint";
+    warn.textContent =
+      "两个选项默认都不删除 —— 卸载后重新安装，配置与记忆仍在。勾选后不可恢复。";
+    box.appendChild(warn);
+
+    const actions = document.createElement("div");
+    actions.className = "row delete-plugin-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.textContent = "取消";
+    const ok = document.createElement("button");
+    ok.type = "button";
+    ok.className = "danger";
+    ok.textContent = "确认";
+    actions.append(cancel, ok);
+    box.appendChild(actions);
+
+    const cleanup = (result) => {
+      document.removeEventListener("keydown", onKey, true);
+      modal.remove();
+      resolve(result);
+    };
+    const onKey = (ev) => {
+      if (ev.key === "Escape") { ev.preventDefault(); cleanup(null); }
+    };
+
+    cancel.onclick = () => cleanup(null);
+    // 点遮罩空白处 = 取消（与其它模态一致）
+    modal.onclick = (ev) => { if (ev.target === modal) cleanup(null); };
+    ok.onclick = () => cleanup({
+      deleteConfig: cfgOpt.input.checked,
+      deleteData: dataOpt.input.checked,
+    });
+
+    document.addEventListener("keydown", onKey, true);
+    document.body.appendChild(modal);
+    // 焦点给"取消"——误按回车不该删东西
+    cancel.focus();
+  });
 }

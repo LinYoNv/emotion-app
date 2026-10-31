@@ -19,7 +19,9 @@
      只预载 latin 那一条：中文字形本来就走系统字体，预载它没意义。
      ⚠️ `crossorigin` 不能省 —— 字体请求是 CORS 模式，少了它会**重复下载**。 -->
 <link rel="preload" href="/static/fonts/geist-latin.woff2" as="font" type="font/woff2" crossorigin />
-<link rel="stylesheet" href="/static/app.css" />
+<!-- ⚠️ `?v=` 必须与文件末尾 `<script src="js/main.js?v=…">` 的版本号**一起改** ——
+     改 CSS 不改版本号 = 用户看不到新样式（本项目 2026-09-26 真事故）。 -->
+<link rel="stylesheet" href="/static/app.css?v=20261031a" />
 </head>
 <body>
 <!--
@@ -82,6 +84,12 @@
         </button>
         <div id="nav-plugin-items" class="nav-group-items"></div>
       </div>
+      <!-- ⚠️ 适配器（消息平台接入：OneBot v11 / 内置 Web 端）。
+           图标用 🔗（不是 🔌/🧩）—— 侧边栏收起态只剩图标，重复就分不出来。
+           结构（class/层级/nav-ico/nav-label）与其它 nav-item 逐字一致。 -->
+      <a class="nav-item" href="#/adapters" data-nav="adapters" data-nav-title="适配器">
+        <span class="nav-ico" aria-hidden="true">🔗</span><span class="nav-label">适配器</span>
+      </a>
       <!-- ⚠️ 与契约 §4 的唯一差异：**图标用 🔌 而不是 🧩**。
            原因：上面「插件」已经用了 🧩，而侧边栏**收起态只剩图标**
            （`.app.collapsed .nav-label { display: none }`）→ 两个 🧩 在图标条里
@@ -205,7 +213,8 @@
         <div id="persona-empty" class="empty">
           <span class="empty-ico" aria-hidden="true">🎭</span>
           <strong>还没选人设</strong>
-          <span>左边点一个人设来编辑片段与参考图；<br />或者「+ 新建」「导入」一个。</span>
+          <!-- 2026-10-29：文案跟着结构调整 —— 人设模型里已经没有「片段」这个概念了。 -->
+          <span>左边点一个人设来编辑人设正文与参考图；<br />或者「+ 新建」「导入」一个。</span>
         </div>
         <form id="persona-form" class="hidden">
           <div class="row">
@@ -215,10 +224,23 @@
             <button type="button" id="export-persona">导出</button>
             <button type="button" id="del" class="danger">删除</button>
           </div>
-          <label>描述 <textarea id="p-description" rows="3"></textarea></label>
-          <label>性格 <textarea id="p-personality" rows="3"></textarea></label>
-          <label>场景 <textarea id="p-scenario" rows="2"></textarea></label>
-          <label>创作者备注 <textarea id="p-creator-notes" rows="2"></textarea></label>
+          <!-- 🔴 2026-10-29：人设模型改成 AstrBot 的 `Persona` —— **正文只有一段**
+               （`system_prompt`），所以这里是**一个**大文本框，不再是 4 个小框。
+               为什么必须改掉那 4 个框：
+                 ① 后端 `domain/persona.py` 已删掉 description/personality/scenario/
+                    creator_notes，`PATCH /personas/<id>` 也不再接受它们 ——
+                    留着的输入框**存进去也读不回来**（保存了却像没生效）；
+                 ② 实测「莉莉丝」8621 字符的正文原本躺在 `prompt_sections` 里，
+                    而界面只画那 4 个小框 → 面板上看到的是**一片空白**。
+               ⚠️ 正文常见几千字，所以给足行数 + `class="prompt-body"`
+                  （等宽字体 + 可纵向拉伸，见 app.css）；不加 spellcheck 红线。 -->
+          <label>人设正文（完整系统提示词）
+            <textarea id="p-system-prompt" class="prompt-body" rows="20" spellcheck="false"
+              placeholder="这个角色的完整系统提示词（可以直接粘贴整份 .txt）。留空 = 不带人设。"></textarea>
+          </label>
+          <!-- 字数/行数读数：几千字的长正文，光看 textarea 判断不出"存进去了多少"。
+               由 `persona.js:renderPromptStats()` 在载入和输入时刷新。 -->
+          <p class="hint prompt-stats" id="p-prompt-stats">—</p>
 
           <details>
             <summary>上游覆盖（留空 = 用全局设置）</summary>
@@ -232,7 +254,7 @@
             <button type="button" id="preview">预览提示词</button>
           </div>
           <p class="hint">
-            上面 4 个字段就是人设的全部内容，保存时会自动变成提示词。
+            这个框里的正文就是人设的全部内容（预览时前面会补上「当前时间」等系统片段）。
           </p>
 
           <!-- 🆕 人设参考图（2026-09-25）—— 情绪「用户能填的就让用户改」。
@@ -268,20 +290,10 @@
       </div>
     </div>
 
-    <div id="sections-block" class="hidden">
-      <h3>额外片段 <small>（顺序 = order，小的在前；易变内容应靠后）</small></h3>
-      <p class="hint">
-        只有<strong>需要追加额外规则</strong>时才用这里。
-        描述 / 性格 / 场景 / 创作者备注<strong>不在这里重复显示</strong>
-        —— 它们由上面那 4 个字段决定，在这儿改也不会生效。
-      </p>
-      <table class="sections">
-        <thead><tr><th>启用</th><th>标题</th><th>order</th><th>来源</th><th>内容</th><th></th></tr></thead>
-        <tbody id="sections-body"></tbody>
-      </table>
-      <button id="add-section" type="button">+ 添加片段</button>
-      <button id="save-sections" type="button">保存片段</button>
-    </div>
+    <!-- 🔴 2026-10-29：**整块删除**「额外片段」表格（`#sections-block` / `#sections-body`）。
+         `prompt_sections` 已从 `Persona` 模型里消失，`PUT /personas/<id>/sections`
+         接口也一并删了 —— 留着这块 UI 只会点出一个 404，属于「看起来能用、其实不能用」。
+         需要"追加额外规则"时，直接写进上面那个人设正文里即可。 -->
   </section>
 
   <!-- ============ 模型供应商 ============
@@ -496,6 +508,97 @@
             <button type="button" id="provider-delete" class="danger">删除该提供商源</button>
           </div>
         </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 适配器（消息平台接入）============
+       OneBot v11（QQ）/ 内置 Web 端。后端契约见 `emotion_app/web/api_adapters.py`。
+
+       🔴 三条本页的设计硬要求：
+       ① **运行状态三态**（`running` × `connected`）：
+              running && connected   → 已连接（绿）
+              running && !connected  → 等待协议端连接（黄）—— OneBot 是**反向** WS，
+                                       我们起服务等协议端连过来，这是正常待连，不是错误
+              !running               → 未运行（灰）+ 有 last_error 就显示它
+              builtin:true           → 内置（不受启停开关影响）
+          把"启动了"和"连上了"合成一个绿点，用户会盯着它发呆（静默失败）。
+       ② **表单字段由后端 `fields[]` 驱动**（string/int/bool/secret/string_list），
+          这里**一个字段名都不写死** —— 写死就会与后端漂移，且"漏渲染"会
+          伪装成"这个类型没有这项配置"。
+       ③ **secret 只写不回显**：接口给的是打码值（`•` 开头），
+          用户不动它就**原样回传**，后端识别打码值并保持原值。
+
+       ⚠️ 「添加/编辑」是页内表单，不占子路由：它不是"可分享的某一条适配器"，
+          而写 hash 会多一次 hashchange → applyRoute → 重复拉一次列表。
+       ⚠️ 空态 `#adapters-empty` 的文案由 JS 写（三种"空"要说清是哪一种）：
+          "还没读到" / "读到 0 个" / "读取失败"。 -->
+  <section id="tab-adapters" class="panel hidden">
+    <div class="adapters-head">
+      <h3>适配器 <small>（把消息平台接进来：OneBot v11 / 内置 Web 端）</small></h3>
+      <div class="row">
+        <button type="button" id="adapter-new" class="primary">+ 添加适配器</button>
+        <button type="button" id="adapter-refresh">刷新状态</button>
+      </div>
+    </div>
+    <p class="hint" id="adapters-hint"></p>
+
+    <ul id="adapter-list" class="adapter-list"></ul>
+    <div id="adapters-empty" class="empty">
+      <span class="empty-ico" aria-hidden="true">🔗</span>
+      <strong>正在读取适配器…</strong>
+      <span id="adapters-empty-text">正在读取适配器…</span>
+    </div>
+
+    <!-- ---------- 添加 / 编辑表单（同构：新增时类型可切，编辑时类型锁定） ---------- -->
+    <div id="adapter-form-card" class="providers-card adapter-form hidden">
+      <header class="providers-card-head">
+        <div>
+          <h3 id="adapter-form-title">添加适配器</h3>
+          <p class="hint">配好后点「保存」；协议端（NapCat / LLOneBot / go-cqhttp）要指向这里显示的监听地址。</p>
+        </div>
+        <button type="button" id="adapter-save" class="primary">保存</button>
+      </header>
+
+      <p class="hint" id="adapter-form-hint"></p>
+
+      <section class="providers-block">
+        <div class="field-labeled" id="adapter-type-row">
+          <div class="fl-text">
+            <label for="adapter-type">类型</label>
+            <span class="hint">决定这个适配器怎么接、有哪些配置项（选项来自后端，内置类型不会出现在这里）。</span>
+          </div>
+          <div class="fl-ctl">
+            <select id="adapter-type"></select>
+            <span class="hint" id="adapter-type-desc"></span>
+          </div>
+        </div>
+
+        <div class="field-labeled">
+          <div class="fl-text">
+            <label for="adapter-name">名字</label>
+            <span class="hint">给人看的名字，例如「我的QQ」。留空 = 用类型名。</span>
+          </div>
+          <div class="fl-ctl"><input id="adapter-name" type="text" placeholder="例如：我的QQ" /></div>
+        </div>
+
+        <div class="field-labeled">
+          <div class="fl-text">
+            <label for="adapter-enabled">启用</label>
+            <span class="hint">停用后不会启动、不监听端口、不收消息；配置保留。内置适配器不能停用。</span>
+          </div>
+          <div class="fl-ctl">
+            <label class="adapter-check"><input id="adapter-enabled" type="checkbox" checked /><span>启用</span></label>
+          </div>
+        </div>
+
+        <!-- 🔴 字段区**只有空容器** —— 全部由 JS 按后端 `fields[]` 渲染，见 adapters.js -->
+        <div id="adapter-fields"></div>
+      </section>
+
+      <div class="providers-card-foot">
+        <button type="button" id="adapter-delete" class="danger hidden">删除该适配器</button>
+        <button type="button" id="adapter-cancel">取消</button>
       </div>
     </div>
   </section>
@@ -731,6 +834,25 @@
 
   <!-- ============ 插件（情绪报的"没有配置入口"补在这） ============ -->
   <section id="tab-plugins" class="panel hidden">
+    <!-- ==================================================================
+         🔴🔴 **列表态整体容器**（情绪 2026-10-31 报的 bug 的根因修法）
+
+         症状（他附的第三张截图）：点左侧「插件页面」里某个插件的独立 web 页后，
+         右侧「插件启停 / 插件升级 / 插件卡片」那一整块**仍然可见**。
+
+         根因不是"某一块忘了隐藏"，而是**隐藏方式是逐元素的**：
+         以前 `showPluginsView()` 里靠 `setPluginSwitchVisible()` 逐个 toggle
+         `#plugin-switch-hint` / `#plugin-switch-list`，而后来新增的「插件升级」
+         整块（标题/提示/代理行/卡片列表/结果）**没人管** ——
+         所以每加一块就漏一块，而且漏了**没有任何报错**。
+
+         正解：列表态的全部内容收进**一个**容器，由 `showPluginsView()` 一处
+         决定它显不显示。新增内容只要放进这个 div，就天然跟着走。
+         ⚠️ 这个 div 必须**自己**是 flex 列容器：`#plugin-switch-list` /
+            `#plugin-page-list` 的 flex 规则依赖父级是 flex 列（见 app.css 里
+            2026-09-27 那次"入口列表被压成 0 高"的完整取证）。
+         ================================================================== -->
+    <div id="plugins-list-view" class="plugins-list-view">
     <!-- 🔴 插件**启停**（照真 AstrBot 的 inactivated_plugins）。
          判据必须真浏览器验："有没有这个元素" 与 "值对不对" 是两件事，
          `curl` 验不了 JS。 -->
@@ -788,6 +910,7 @@
     <h3>插件拓展页 <small>（AstrBot 插件自带的面板）</small></h3>
     <p class="hint" id="plugins-hint">正在读取…</p>
     <ul id="plugin-page-list" class="list"></ul>
+    </div><!-- /#plugins-list-view（列表态到此为止；下面三块是互斥的其它视图） -->
 
     <!-- ==================== 插件详情 ====================
          照真 AstrBot 的「插件详情页」：点插件行上的「详情」进来，
@@ -977,7 +1100,18 @@
 
 <!-- 面板脚本：**原生 ES 模块，零构建**（见 js/main.js 顶部注释）。
      拆自原单文件 app.js（5418 行）；模块间用 window 全局桥接，
-     保证 tools/*.py 里 24 个直接调用的名字仍然可见。 -->
-<script type="module" src="/static/js/main.js"></script>
+     保证 tools/*.py 里 24 个直接调用的名字仍然可见。
+
+     ⚠️ `?v=` 只加在**入口的两个静态引用**上（这里 + 上面的 app.css）。
+     为什么在 `Cache-Control: no-cache, must-revalidate` 之外还要它：
+       ① 本项目**没有构建器给文件名加指纹**，`/static/js/main.js` 这个 URL 一辈子不变；
+       ② `no-cache` 保证"回源校验"，但**同一会话内的内存缓存**（bfcache /
+          前进后退 / 软导航）仍可能复用已解析的模块图 —— 改完前端、用户切一下
+          页面再切回来就可能跑旧代码；升级 HTTP 缓存头救不了这一层；
+       ③ 踩过的现场：2026-09-26 "改完前端、手机上还是旧的"。
+     ⇒ 改 `js/` 或 `app.css` **必须**同时改这里的版本号，两边一起走。
+     ⚠️ 子模块（`js/views/*.js`）**不加** `?v=`：它们由 `main.js` 的静态 `import`
+        决定 URL，加不了参数，改了子模块就靠 bump 这里来打破整张模块图的缓存。 -->
+<script type="module" src="/static/js/main.js?v=20261031a"></script>
 </body>
 </html>

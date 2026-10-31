@@ -24,11 +24,23 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("astrbot")
+
+
+def _plugins_data_root() -> Path:
+    """插件数据根（`data/plugins`）—— 与 `star_tools._data_root` 同一个来源。
+
+    ⚠️ 走 `get_data_root()` 而不是重新拼路径：插件自己也是从那里拿目录的，
+       另拼一份必然在某次配置变更后与插件手里的那份漂移。
+    """
+    from .compat.core.star.star_tools import get_data_root
+
+    return Path(get_data_root())
 
 #: 插件「配置文件」上传的单文件上限（真实现用 `MAX_FILE_BYTES`；这里 12 MiB，
 #: 够放参考图这类用途，又不至于让面板卡住）。
@@ -144,6 +156,7 @@ class PluginHost:
         initialize_timeout: float = 20.0,
         mirror_root: str | Path | None = None,
         inactivated: list[str] | None = None,
+        inactivated_writer: Any = None,
     ) -> None:
         self.plugin_dirs = [Path(d) for d in plugin_dirs]
         #: 传给加载器的镜像目录（`None` = 不镜像，直接在源目录加载）
@@ -152,6 +165,17 @@ class PluginHost:
         #: `PluginLoader.normalize_module_path`）。由装配层从配置读出来再传进来：
         #: 单向依赖铁律 —— `host/` 不许反过来 import `emotion_app`。
         self.inactivated = list(inactivated or ())
+        #: 🔴 **停用名单的写端口**（`Callable[[str], str]`：传入要剔除的插件目录名，
+        #: 返回被剔除的 module_path）。
+        #:
+        #: 为什么是回调而不是让宿主直接写配置：`host/` 不许反向 import
+        #: `emotion_app`（单向依赖铁律，见上一段的注释）。而**卸载插件时
+        #: 必须**把它从停用名单里剔掉 —— 否则下次启动会报
+        #: `停用名单里有 N 项对不上任何插件目录`，用户会追一条**指向已删插件**的
+        #: 假警告。
+        #: ⚠️ 没注入时 `forget_inactivated()` **如实 warning 并返回空串**，
+        #:    不假装清理成功（本项目铁律：能力缺失必须显式暴露）。
+        self.inactivated_writer = inactivated_writer
         #: 加载器的镜像结果（启动后才有值）
         self.mirror_report: Any = None
         self.auto_initialize = auto_initialize
@@ -204,33 +228,7 @@ class PluginHost:
         load_report = await self.loader.load_all(ports=ports or HostPorts())
         self.context = self.loader._context  # noqa: SLF001（同一包内，故意的）
 
-        self.report.loaded = len(load_report.loaded)
-        self.report.loaded_plugins = [r.dir_name for r in load_report.loaded]
-        self.report.failed = [
-            (r.dir_name, (r.error or "").strip().splitlines()[-1] if r.error else "")
-            for r in load_report.failed
-        ]
-        # 🔴 停用的插件**单独一列**（不进 `loaded`、也不进 `failed`）——
-        #    状态报告里必须能区分"没跑"是因为停用，还是因为坏了。
-        self.report.inactivated = [r.module_path for r in load_report.inactivated]
-        self.report.unmatched_inactivated = list(load_report.unmatched_inactivated)
-        self.report.mounted = self._collect_apis(load_report)
-
-        # 🔴 **拓展页发现**：只收集"入口 HTML 真的存在"的页。
-        #    情绪报的「插件没有配置入口」根因就在这 —— 上一轮只挂了 API，
-        #    没有把插件声明的 `pages:` 变成可访问的页面路由。
-        from .plugin_pages import discover_pages
-
-        self.report.pages = discover_pages(
-            load_report.loaded,
-            plugin_root_of=lambda rec: rec.path,
-        )
-        if self.report.pages:
-            logger.info(
-                "发现 %d 个插件拓展页：%s",
-                len(self.report.pages),
-                ", ".join(f"{p.plugin_id}/{p.page_name}" for p in self.report.pages),
-            )
+        await self._rebuild_report(load_report=load_report)
 
         if self.auto_initialize:
             self.report.initialized, self.report.init_failed = await self._initialize_all(
@@ -244,6 +242,133 @@ class PluginHost:
         self._started = True
         logger.info("插件宿主已启动\n%s", self.report.summary())
         return self.report
+
+    async def _rebuild_report(self, *, load_report: Any = None) -> None:
+        """按 `loader.records` **重算** `self.report`（启动 / 重载 / 卸载共用）。
+
+        🔴 为什么必须收敛成一处（2026-10-31）：
+
+        重载与卸载都会改 `loader.records`。如果它们各自去改 `report` 的几个字段，
+        就会出现"面板说 6 个插件、实际 5 个"这种**没有任何报错**的漂移
+        —— 而这正是本项目最忌的静默不一致。现在三条路径都只调这一个方法，
+        `report` 永远等于 `records` 的投影。
+
+        Args:
+            load_report: 启动时传入（含 `unmatched_inactivated` 这类**只能由
+                 加载过程算出**的信息 —— records 推不出来）。重载/卸载时传
+                 `None`：那种情况下停用名单的 unmatched 由
+                 `HostPorts` 侧重新判（见 `PluginHost.forget_inactivated`）。
+        """
+        records = list(self.loader.records.values()) if self.loader else []
+
+        loaded = [r for r in records if r.ok]
+        failed = [r for r in records if r.state == "failed"]
+        inactivated = [r for r in records if r.state == "inactivated"]
+
+        self.report.loaded = len(loaded)
+        self.report.loaded_plugins = [r.dir_name for r in loaded]
+        self.report.failed = [
+            (r.dir_name, (r.error or "").strip().splitlines()[-1] if r.error else "")
+            for r in failed
+        ]
+        # 🔴 停用的插件**单独一列**（不进 `loaded`、也不进 `failed`）——
+        #    状态报告里必须能区分"没跑"是因为停用，还是因为坏了。
+        self.report.inactivated = [r.module_path for r in inactivated]
+
+        if load_report is not None:
+            self.report.unmatched_inactivated = list(
+                getattr(load_report, "unmatched_inactivated", []) or []
+            )
+        else:
+            # 重载/卸载后：重新判"名单里有没有对不上任何插件的项"。
+            # ⚠️ 不重新判就会留着一个已经删掉的插件名，而加载器下次启动才报 ——
+            #    "删掉一条记录 ≠ 它不会再出现"（本项目已记）。
+            known = {r.module_path for r in records}
+            self.report.unmatched_inactivated = sorted(
+                p for p in (self.loader.inactivated if self.loader else set())
+                if p not in known
+            )
+
+        # 归档已装载的 API —— `_collect_apis` 直接读 `context.registered_web_apis`，
+        # 而 detach 已经把该插件的条目摘掉了，所以这里天然是"剩下那些"。
+        self.report.mounted = self._collect_apis(load_report)
+
+        # 🔴 **拓展页发现**：只收集"入口 HTML 真的存在"的页。
+        #    情绪报的「插件没有配置入口」根因就在这 —— 上一轮只挂了 API，
+        #    没有把插件声明的 `pages:` 变成可访问的页面路由。
+        from .plugin_pages import discover_pages
+
+        self.report.pages = discover_pages(
+            loaded,
+            plugin_root_of=lambda rec: rec.path,
+        )
+        if self.report.pages and load_report is not None:
+            # ⚠️ 只在**启动**那条路径打这一行：重载/卸载每次都打会把日志淹掉，
+            #    而"发现 N 个拓展页"只在启动时有诊断价值。
+            logger.info(
+                "发现 %d 个插件拓展页：%s",
+                len(self.report.pages),
+                ", ".join(f"{p.plugin_id}/{p.page_name}" for p in self.report.pages),
+            )
+
+    async def _initialize_reloaded(self, rec: Any, *, timeout: float) -> None:
+        """给**重载后**的插件补一次 `initialize()`（与启动路径同一套隔离 + 超时）。
+
+        ⚠️ 不直接复用 `_initialize_all()`：那个收的是 records 列表、并且把结果
+           append 到 `report.initialized`。重载是**单个**插件，语义不同
+           （而且重载失败必须能告诉用户是哪一步失败的）。
+        """
+        import asyncio
+        import time
+
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(rec.instance.initialize(), timeout=timeout)
+        except asyncio.TimeoutError:
+            msg = f"TimeoutError: initialize() 超过 {timeout:.0f}s 未返回"
+            rec.error = msg
+            logger.error("插件 initialize() 超时（重载）：%s → %s", rec.dir_name, msg)
+            return
+        except Exception as exc:  # noqa: BLE001
+            rec.error = f"{type(exc).__name__}: {exc}"
+            rec.traceback = traceback.format_exc()
+            logger.error(
+                "插件 initialize() 失败（重载）：%s\n%s", rec.dir_name, rec.traceback
+            )
+            return
+        elapsed = time.monotonic() - started
+        if elapsed >= timeout * 0.5:
+            logger.warning(
+                "插件 initialize() 偏慢（重载）：%s 用了 %.1fs（上限 %.0fs）",
+                rec.dir_name,
+                elapsed,
+                timeout,
+            )
+        if rec.dir_name not in self.report.initialized:
+            self.report.initialized.append(rec.dir_name)
+
+    def forget_inactivated(self, plugin_id: str) -> str:
+        """把一个插件的 module_path 从**已保存的停用名单**里剔除，返回被剔除的值。
+
+        🔴 为什么卸载时必须做：停用名单里的元素是 module_path。插件目录被移走后，
+        那条元素就"对不上任何插件"了 —— 下次启动会报
+        `停用名单里有 N 项对不上任何插件目录（拼写错误？）`。
+        用户看到的是一条**指向已删插件**的警告，而它其实是正常的。
+
+        ⚠️ 写配置这件事**必须走宿主的注入口**（`inactivated_writer`），
+           不许在这里直接 import `emotion_app` 去写盘 —— `host/` 单向依赖
+           `emotion_app` 是不允许的（见 `PluginHost` 的 `config_profile_path` 注释）。
+        """
+        writer = getattr(self, "inactivated_writer", None)
+        if not callable(writer):
+            # 如实：没注入口就说明"没能清理名单"，而不是假装清理了
+            logger.warning(
+                "没有注入 inactivated_writer —— 停用名单里 %s 的残留项未被清理"
+                "（下次启动会报 unmatched）",
+                plugin_id,
+            )
+            return ""
+        return str(writer(plugin_id) or "")
 
     async def stop(self) -> None:
         """调用所有插件的 `terminate()`（**逐个隔离异常**，一个失败不影响其它）。"""
@@ -353,8 +478,14 @@ class PluginHost:
         """
         if self.loader is None:
             return []
+        #: 源码目录解析**每轮只做一次前缀判断**就够（`resolve_source_dir` 内部
+        #: 只 stat 几个 `<root>/<dir>/main.py`），但六个插件 × 两个根 = 12 次
+        #: stat 也在同一个请求里跑 —— 所以提到循环外，一次算好。
+        from .plugin_lifecycle import resolve_source_dir
+
         out: list[dict[str, Any]] = []
         for rec in self.loader.records.values():
+            source_path = resolve_source_dir(self.loader, rec.dir_name)
             out.append(
                 {
                     "id": rec.dir_name,
@@ -379,9 +510,118 @@ class PluginHost:
                     "error": (rec.error or "").strip().splitlines()[-1]
                     if rec.error
                     else "",
+                    # ---- 2026-10-31：卡片动作菜单的**可用性判据** ----
+                    #
+                    # 🔴 为什么由后端算而不是前端自己判：
+                    #    前端只有面板看到的那点信息（`state`/`module_path`），
+                    #    判"能不能重载"还要知道①它是不是被停用（停用了重载没意义）
+                    #    ②源码目录能不能解析出来（开了镜像时 `plugin_dirs` 指向副本）；
+                    #    判"能不能删"更是必须解析**真实源码目录**。
+                    #    前端自己猜 = 又一处"两边各算一份、迟早漂移"。
+                    #    ⚠️ 而且**不可用时必须给出原因**：只给一个灰按钮，
+                    #    用户会以为"这功能坏了"，而不是"这个插件不支持"。
+                    "can_reload": self._can_reload(rec),
+                    "reloadable_reason": self._reload_blocker(rec),
+                    "can_uninstall": source_path is not None,
+                    "uninstallable_reason": ""
+                    if source_path is not None
+                    else "解析不到源码目录（可能开了源码镜像），为避免删错目录已禁用",
+                    #: 会被移动/删除的那个目录 —— 二次确认弹窗**必须**显示它，
+                    #: 否则用户无法判断"我要删的到底是哪一份"。
+                    "source_path": str(source_path) if source_path else "",
+                    #: 卸载时会**连带删除**的可选产物路径（面板二次确认要逐条列出来）。
+                    #:
+                    #: 🔴 这是给"勾了才会删"的两项用的：用户在确认框里必须看到
+                    #: **具体会删掉哪个文件/目录**，而不是一句"配置和数据"。
+                    #: 默认勾选为 false ⇒ 这两项不删 ⇒ 卸载后重新安装，
+                    #: 配置与记忆还在（官方同此语义）。
+                    "config_path": str(self._plugin_config_file(rec.dir_name)),
+                    "data_path": str(self._plugin_data_dir(rec.dir_name)),
                 }
             )
         return out
+
+    def _plugin_config_file(self, plugin_id: str) -> Path:
+        """插件的配置文件路径（**可能不存在** —— 只是"如果要删，会是这个"）。
+
+        照官方命名：`<plugin_config_path>/<root_dir_name>_config.json`
+        （`star_manager.py:1538-1541`）。我们的数据根是 `data/plugins`，
+        所以是 `data/plugins/config/<id>_config.json`。
+        """
+        return _plugins_data_root() / "config" / f"{plugin_id}_config.json"
+
+    def _plugin_data_dir(self, plugin_id: str) -> Path:
+        """插件的持久化数据目录（**可能不存在**）。
+
+        ⚠️ 与 `StarTools.get_data_dir()` **同一口径**（它建的就是
+           `<data_root>/<plugin_name>`）—— 两边不一致会让"删除持久化数据"
+           删不到用户真正的数据（官方就有这个毛病，见契约 §0）。
+        """
+        return _plugins_data_root() / plugin_id
+
+    def _reload_blocker(self, rec: Any) -> str:
+        """重载不了时**说明原因**（空串 = 可以重载）。
+
+        ⚠️ 判据是契约 §1 那两条，**从数据推出来**，不是拍板名单：
+        `can_reload = 有 main.py + 不是 inactivated`。
+        """
+        if rec.inactivated:
+            return "插件处于停用状态，重载不会让它跑起来 —— 请先启用并重启服务"
+        if self.loader is None:
+            return "插件宿主尚未完成加载"
+        # 🔴 「有 main.py」这一条必须查**记录指向的那个目录**（`rec.path`），
+        #    不是源码根：加载器可能正从镜像副本里加载，而那份才是"正在跑的代码"。
+        #    删掉 `main.py` 的插件重载只会得到一个"没有 Star 子类"的失败，
+        #    而原因和按钮状态都会指错地方。
+        if not (Path(str(rec.path)) / "main.py").is_file():
+            return "插件目录里没有 main.py（入口文件缺失），重载不可能会成功"
+        return ""
+
+    def _can_reload(self, rec: Any) -> bool:
+        return not self._reload_blocker(rec)
+
+    # ---- 生命周期薄方法（委托给 `plugin_lifecycle`，Web 层直接用这三个） ----
+    #
+    # 🔴 为什么还要包一层"薄方法"（路由明明可以直接 import 那个模块）：
+    #    ① 装配测试可以只依赖 `PluginHost` 这一个对象，不必知道实现住在哪个模块；
+    #    ② 将来若换实现（比如改成子进程重载），只改这三行里的转发；
+    #    ③ 这三个名字与 `plugins_view()` 的字段、契约里的路由**一一对应**，
+    #       读代码时"面板那个按钮调的是什么"不用跨文件拼。
+    #    ⚠️ 它们**不含任何逻辑**：判断、错误分类、磁盘操作全在 `plugin_lifecycle`
+    #       —— 那样"同一概念两条实现路径"就不会从这两行开始长出来。
+
+    async def reload_plugin(self, plugin_id: str) -> Any:
+        """就地重载一个插件（**不需要重启服务**）。返回 `ReloadResult`。
+
+        Raises:
+            `plugin_lifecycle.PluginLifecycleError`（带 `code`）——
+            `inactivated` / `not_loaded` / `unsupported` / `reload_failed`。
+        """
+        from .plugin_lifecycle import reload_plugin as _reload_plugin
+
+        return await _reload_plugin(self, plugin_id)
+
+    async def uninstall_plugin(
+        self,
+        plugin_id: str,
+        *,
+        delete_config: bool = False,
+        delete_data: bool = False,
+    ) -> Any:
+        """把插件源码目录**移入回收站**并从宿主摘干净。返回 `UninstallResult`。
+
+        Raises:
+            `plugin_lifecycle.PluginLifecycleError`（带 `code`）——
+            `not_loaded` / `unsupported` / `uninstall_failed`。
+        """
+        from .plugin_lifecycle import uninstall_plugin as _uninstall_plugin
+
+        return await _uninstall_plugin(
+            self,
+            plugin_id,
+            delete_config=delete_config,
+            delete_data=delete_data,
+        )
 
     # ---- 调用（Web 层用它派发） ----
 

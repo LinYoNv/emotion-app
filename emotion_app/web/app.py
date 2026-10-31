@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import asyncio
 import inspect
 import json as _json
 import time
@@ -56,6 +57,10 @@ def create_app(
     app.config["EMOTION_STORE"] = store
     app.config["EMOTION_AUTH"] = auth
     app.config["EMOTION_CHAT"] = chat
+    if chat is not None and hasattr(chat, "bind_lifecycle_hooks"):
+        from .default_llm_reply import begin_agent_lifecycle, done_agent_lifecycle
+
+        chat.bind_lifecycle_hooks(begin=begin_agent_lifecycle, done=done_agent_lifecycle)
     app.config["EMOTION_PERSONAS"] = personas
     app.config["EMOTION_SETTINGS"] = settings
     app.config["EMOTION_SESSIONS"] = sessions
@@ -63,6 +68,45 @@ def create_app(
     #: 所以把它挂上来，由 `plugin_host` 装配供应商时取用。
     #: ⚠️ 没传时为 None → 供应商照建但调不通（会**如实抛错**，不是静默空回复）。
     app.config["EMOTION_CHAT_BACKEND"] = chat_backend
+
+    #: 消息平台适配器（`data/adapters.json` + 运行中的适配器实例）。
+    #:
+    #: ⚠️ 路径可被 `app.config["EMOTION_ADAPTERS_PATH"]` 覆盖（测试用）——
+    #: 照 providers 的同款做法：直接取默认值会让**测试碰项目真实的**
+    #: `data/adapters.json`（那会污染用户的适配器配置）。
+    #:
+    #: ⚠️ 存储与运行时**都允许为 None**：`api_adapters` 会如实返回 503，
+    #: 而不是假装"保存成功"（静默失败比报错贵）。
+    from emotion_app.infra.adapters_store import AdapterStore
+
+    _adapters_path = app.config.get("EMOTION_ADAPTERS_PATH")
+    _adapters_store = AdapterStore(_adapters_path) if _adapters_path else AdapterStore()
+    _adapters_store.load()
+    app.config["EMOTION_ADAPTERS_STORE"] = _adapters_store
+
+    try:
+        # 🔴 **必须先 `ensure_host_on_path()`** —— `astrbot_host` 是并列交付物
+        #    （不在 `emotion_app` 包内），而它只由 `plugin_host` 在
+        #    `start()` 时才加进 `sys.path`。`create_app` 比 `start()` **更早**，
+        #    不先加路径就会 `ModuleNotFoundError: No module named 'astrbot_host'`
+        #    → 被下面的 except 吞成一条 warning → 适配器"能存但永远不连"。
+        #    ⚠️ 这是同一类坑的**第二次**（第一次在 `plugin_pages_web` 挂路由阶段）。
+        from .plugin_host import ensure_host_on_path
+
+        ensure_host_on_path()
+
+        from astrbot_host.adapters import AdapterRuntime
+
+        app.config["EMOTION_ADAPTERS_RUNTIME"] = AdapterRuntime()
+    except Exception as exc:  # noqa: BLE001
+        # 宿主包不可用（例如未安装插件依赖的部署）→ 适配器照存不照跑。
+        # 🔴 **如实记 warning**，不要静默变成"配置能存但永远不生效"。
+        log.warning(
+            "适配器运行时不可用（宿主包未就绪）：%s —— 适配器配置可保存，"
+            "但不会真正连上消息平台",
+            exc,
+        )
+        app.config["EMOTION_ADAPTERS_RUNTIME"] = None
 
     # ------------------------------------------------------------------
     # 辅助
@@ -120,9 +164,19 @@ def create_app(
 
     @app.get("/health")
     async def health():  # type: ignore[no-untyped-def]
-        """存活 + 配置自检。
+        """存活 + 配置自检（**免鉴权**，反代/监控要靠它探活）。
 
-        ⚠️ **脱敏**：只回显"是否配置了"，绝不回显密钥本身。
+        ⚠️ **脱敏**：只回显"是否配置了"，绝不回显密钥本身 ——
+           也**不再回显环境指纹**（2026-10-29 绑公网前审计修）：
+
+           原来这里返回 `config.public_view()`，于是任何能访问端口的人都能看到
+           上游 `base_url`/模型名、生图 `base_url`、**令牌长度**（= 暴力破解的
+           第一份情报）、插件目录结构、日志级别。绑 `127.0.0.1` 时无所谓，
+           绑 `0.0.0.0` 就是主动把底牌摊在公网。
+
+           ⇒ 改用 `config.liveness_view()`：只报"活没活 / 存储通不通 /
+             令牌配没配 / 聊得起来吗"这四件事。
+           要完整配置请看 `/api/v1/status`（**已鉴权**）。
         """
         store_health = await store.health_check()
         ok = bool(store_health.get("ok"))
@@ -132,7 +186,7 @@ def create_app(
                     "status": "ok" if ok else "degraded",
                     "service": "emotion-app",
                     "storage": store_health,
-                    "config": config.public_view(),
+                    "config": config.liveness_view(),
                     "auth": auth.stats(),
                     "chat_ready": _chat_or_none() is not None,
                 }
@@ -200,7 +254,14 @@ def create_app(
 
     @app.get("/api/v1/status")
     async def status():  # type: ignore[no-untyped-def]
-        denied = _require_auth()
+        # 🔴 2026-10-29 修：原来用 `_require_auth()`（**只认会话 cookie**），
+        #    于是「用 Bearer 令牌直接调」会 401 —— 而绑公网后，自用场景
+        #    恰恰就是拿令牌调（脚本/App 没有 cookie）。
+        #    实测：`curl -H "Authorization: Bearer <正确令牌>" /api/v1/status`
+        #    → 401，而同令牌调 `/v1/models`、`/api/v1/plugins` 都是 200。
+        #    这与 `_authenticated()` 上那句「现在两条路径都接受访问令牌当 Bearer，
+        #    行为一致」自相矛盾 —— 这里就是那个漏网点。
+        denied = _require_auth_or_api_key()
         if denied is not None:
             return denied
 
@@ -509,6 +570,17 @@ def create_app(
         except ChatError as exc:
             return _openai_error(str(exc), "invalid_request_error", 400)
 
+        session_repo = getattr(svc, "sessions", None)
+        if req.session_id and session_repo is not None:
+            from emotion_app.domain.session_repo import NativeProjectionReadOnly, SessionNotFound
+
+            try:
+                session = await session_repo.get(req.session_id)
+            except SessionNotFound:
+                session = None
+            if session is not None and getattr(session, "native_conversation_id", ""):
+                return _openai_error(str(NativeProjectionReadOnly()), "native_projection_read_only", 409)
+
         # 🔴 **人设解析优先级：显式 > 会话绑定 > 当前人设**（2026-09-20 修）。
         #
         # ⚠️ **必须把 `session_id` 传进去** —— 原来这里调 `resolve_persona()`
@@ -799,6 +871,11 @@ def create_app(
 
     app.register_blueprint(build_providers_blueprint(_require_auth_or_api_key))
 
+    # 适配器管理 API（`/api/v1/adapters`）—— 消息平台（OneBot v11 / 内置 Web 端）
+    from .api_adapters import build_blueprint as build_adapters_blueprint
+
+    app.register_blueprint(build_adapters_blueprint(_require_auth_or_api_key))
+
     # ------------------------------------------------------------------
     # 插件 Web API（把 266 条插件路由挂上路）
     # ------------------------------------------------------------------
@@ -907,8 +984,215 @@ def create_app(
                     },
                 )
 
+        # 🔴 **消息平台适配器**（OneBot 等）—— 必须在插件宿主启动**之后**：
+        #    适配器的派发回调依赖 `EMOTION_PLUGIN_HOST`，而平台注册也要
+        #    在宿主的注册表建好之后才能补进去。
+        await _start_adapters()
+
+    async def _start_adapters() -> None:
+        """起已启用的适配器，并把入站消息接到派发链路。
+
+        ⚠️ 顺序很关键：`plugin_host.start()` 里建平台注册表 → 我们补注册
+        → 适配器才可能被插件"看见"。反过来做，插件会以为只有 Web 端。
+        """
+        runtime = app.config.get("EMOTION_ADAPTERS_RUNTIME")
+        store_obj = app.config.get("EMOTION_ADAPTERS_STORE")
+        if runtime is None or store_obj is None:
+            return
+
+        svc = app.config.get("EMOTION_PLUGIN_HOST")
+
+        external_locks: dict[str, asyncio.Lock] = {}
+
+        async def _dispatch_external_event(event: Any) -> None:
+            """适配器收到消息 → 派发给插件 → 插件不说话就由核心 LLM 回。"""
+            if svc is None:
+                log.warning(
+                    "收到外部消息但插件宿主未启动，消息无法处理（已丢弃）：%s",
+                    str(getattr(event, "message_str", ""))[:40],
+                )
+                return
+            from emotion_app.web.default_llm_reply import bind_event_sender
+
+            bind_event_sender(event, svc.platform_manager)
+            result = await svc.dispatch_event(event)
+            if result is None:
+                return
+            # 🔴 把本轮产出的回复**发回来源平台**。
+            #    ⚠️ 只发 `emitted`（yield 点收集的），不要再用 `result.result`
+            #    —— 后者在洋葱模型里已被消费，重复发 = 用户收到两条一样的消息。
+            await _deliver_event_results(event, result)
+
+            # 🔴🔴 **插件没接话 → 由核心 LLM 管线回复**（2026-10-29 补的真断点）
+            #
+            # 实测症状：QQ 私聊日志走到
+            #   `[CompanionV2] 交由 AstrBot 核心回复管线` 就**断了**
+            #   —— 没模型调用、没发出消息（`sent=0`）、也没有报错。
+            #
+            # 根因：陪伴 7.0.0 对普通私聊的策略就是「**交出**这一轮」
+            #   （`action=reply reason=private_default_reply`），它自己不产出；
+            #   而宿主在 `dispatch_event()` 之后只投递 `emitted` ⇒ 什么都不发。
+            #   `DispatchResult.allow_default_llm` 虽然被算出来了，
+            #   但**没有任何生产代码消费它** —— 这一步从来没实现过。
+            #
+            # ⚠️ 三个条件缺一不可，见 `default_llm_reply.should_use_default_llm`
+            #    的 docstring（重复回复 / 群里插嘴都是用户可见事故）。
+            from emotion_app.web.default_llm_reply import should_use_default_llm
+
+            if should_use_default_llm(result, event):
+                await _reply_via_default_llm(event)
+
+        async def _on_dispatch(event: Any) -> None:
+            key = str(event.unified_msg_origin)
+            lock = external_locks.setdefault(key, asyncio.Lock())
+            async with lock:
+                await _dispatch_external_event(event)
+
+        async def _reply_via_default_llm(event: Any) -> None:
+            """默认管线始终以平台确认送达的组件记录捕获的原生会话。"""
+            chat_svc = app.config.get("EMOTION_CHAT")
+            if chat_svc is None:
+                log.error("插件交出本轮回复，但宿主没有聊天服务（umo=%s）", event.unified_msg_origin)
+                return
+            from emotion_app.domain.chat import LLMRequestCancelled
+            from emotion_app.web.default_llm_reply import (
+                build_external_chat_request, external_message_parts,
+                deliver_default_llm_reply, record_external_chat_reply,
+            )
+
+            umo = str(getattr(event, "unified_msg_origin", "") or "")
+            req = None
+            try:
+                parts = external_message_parts(event)
+                if not parts:
+                    log.info("本轮没有可处理的文本或媒体，未请求默认模型（umo=%s）", umo)
+                    return
+                req = await build_external_chat_request(chat_svc, svc, event, content_parts=parts)
+                log.info(
+                    "核心管线人设: %s | 正文 %d 字符 | 会话=%s",
+                    getattr(req.persona, "name", None),
+                    len(req.persona.system_prompt) if req.persona else 0,
+                    req.session_id,
+                )
+                req.persist = False
+                async with chat_svc.lifecycle(req) as run:
+                    result = await chat_svc.complete(req)
+                    run.result = result
+                if await deliver_default_llm_reply(event, result):
+                    log.info("核心 LLM 已回复并投递（umo=%s）", umo)
+            except LLMRequestCancelled:
+                log.info("核心 LLM 请求或投递已取消（umo=%s）", umo)
+            except Exception as exc:
+                log.error("核心 LLM 回复或投递失败：%s: %s", type(exc).__name__, exc, exc_info=True)
+            finally:
+                if req is not None:
+                    try:
+                        await record_external_chat_reply(chat_svc, svc, event, req)
+                    except Exception:
+                        log.exception("已送达内容的原生会话历史保存失败（umo=%s）", umo)
+
+        async def _deliver_event_results(event: Any, result: Any) -> None:
+            chains = list(getattr(result, "emitted", None) or [])
+            if not chains:
+                # 插件没产出 = 正常（它可能只做了记忆/关系更新，不该回话）
+                return
+            platform_manager = getattr(svc, "platform_manager", None)
+            umo = str(getattr(event, "unified_msg_origin", "") or "")
+            if not umo:
+                log.error("派发结果没有 umo，无法投递（本条回复丢失）")
+                return
+            try:
+                from astrbot_host.compat.core.platform.message_session import (
+                    MessageSession,
+                )
+
+                session = MessageSession.from_str(umo)
+            except Exception as exc:  # noqa: BLE001
+                log.error("umo 解析失败（%s）：%s", umo, exc)
+                return
+            platform = None
+            if platform_manager is not None:
+                for inst in platform_manager.get_insts():
+                    if str(getattr(inst.meta(), "id", "")) == session.platform_id:
+                        platform = inst
+                        break
+            if platform is None:
+                log.error(
+                    "找不到平台 %s，回复无法投递（本条回复丢失）", session.platform_id
+                )
+                return
+            for chain in chains:
+                try:
+                    ok = await platform.send_by_session(session, chain)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("投递回复失败：%s: %s", type(exc).__name__, exc)
+                    continue
+                if ok is False:
+                    log.error(
+                        "平台 %s 如实报告投递失败（消息未送达）", session.platform_id
+                    )
+
+        runtime.on_dispatch = _on_dispatch
+        if svc is not None:
+            svc.adapters = runtime
+
+        # 🔴🔴 **顺序必须是：先起适配器，再把平台补进注册表和平台管理器**
+        #    （2026-10-29 修真 bug）。
+        #
+        #    原来这里是"先补注册，再 reload"：
+        #      * 补注册时 `runtime.specs()` **还是空的**（适配器没起）；
+        #      * 而 `platform_manager` 早在 `PluginHost.start()` 里就用
+        #        **当时那份（只有 Web 端的）注册表**建好了，之后永不更新。
+        #    ⇒ `context.get_platform_inst("onebot-napcat1")` 恒为 None。
+        #    ⇒ 陪伴 7.0.0 的 `startup_readiness()` 恒返回
+        #       `host_platform_unavailable`，「开始使用」第二步（选模型）
+        #       **永远失败**，而面板显示「共享宿主配置、原生路由或权限无法校验」
+        #       —— 跟真实原因毫无关系。
+        #
+        #    实测证据（2026-10-29 15:02）：
+        #      `[DIAG] readiness pid='onebot-napcat1' platform=None`
+        #      日志只有一行 `平台实例已装载：情绪app Web 端[11/webchat]`
+        await runtime.reload(store_obj.all())
+
+        if svc is not None:
+            # 适配器已起 → specs() 现在才有内容
+            specs = runtime.specs()
+            try:
+                registry = svc.platform_registry
+                if registry is not None:
+                    for spec in specs:
+                        try:
+                            registry.register(spec)
+                        except Exception:  # noqa: BLE001 — 重复注册不算错误
+                            pass
+            except Exception:  # noqa: BLE001
+                log.exception("平台注册表补注册失败（外部平台的主动消息将不可用）")
+
+            # 🔴 关键：把新平台**装进已存在的 platform_manager**，
+            #    否则上面那些注册对它无效（它是启动时就固定的一份列表）。
+            added = svc.attach_platforms(specs)
+            if added:
+                log.info("外部平台已接入管理器：%s", ", ".join(added))
+
+        live = runtime.status()
+        if live:
+            log.info(
+                "消息平台适配器已启动",
+                extra={"data": {"adapters": live}},
+            )
+        else:
+            log.info("消息平台适配器：没有已启用的外部适配器（仅内置 Web 端）")
+
     @app.after_serving
     async def _shutdown() -> None:
+        # 🔴 先停适配器：它们持有监听端口，晚停会让"服务已停止"变成假话
+        #    （端口还在监听，下一次启动会撞 address already in use）。
+        adapter_runtime = app.config.get("EMOTION_ADAPTERS_RUNTIME")
+        if adapter_runtime is not None:
+            try:
+                await adapter_runtime.stop_all()
+            except Exception as exc:  # noqa: BLE001
+                log.error("停止适配器失败：%s: %s", type(exc).__name__, exc)
         svc = app.config.get("EMOTION_PLUGIN_HOST")
         if svc is not None:
             await svc.stop()
@@ -1734,6 +2018,267 @@ def _mount_plugin_routes(
                     "result": out.as_dict(),
                     "message": msg + "。**需要重启服务**才生效",
                     "note": "宿主没有热重载 —— 必须重启服务，新版本才会真正加载",
+                }
+            ),
+            200,
+        )
+
+    # ==================================================================
+    # 插件**生命周期动作**（情绪 2026-10-31：「插件的删除键没了」）
+    #
+    # 契约逐字在 `docs/PLUGIN_ACTIONS_CONTRACT.md` §2/§3/§4 —— 改任何字段
+    # 都要同时改那份文档（后端与前端共用它）。
+    #
+    # 🔴 官方实现（**只读源码**，`/root/.local/share/uv/tools/astrbot/...`）：
+    #   `core/star/star_manager.py:1010  reload()`
+    #   `core/star/star_manager.py:1753 uninstall_plugin()`
+    #   `dashboard/api/plugins.py:1104 /plugins/<id>/reload`
+    #   `dashboard/api/plugins.py:930  DELETE /plugins/<id>`
+    #   `dashboard/services/plugin_service.py:1737 uninstall_plugin()`
+    #
+    # 🔴 **三处刻意不同**（都在契约 §0 里写了理由）：
+    #   ① 官方 `remove_dir()` **直接删**；我们**移入回收站**（可恢复）。
+    #   ② 官方有 `reserved` 概念；我们**没有**（插件全是用户自己放的）。
+    #   ③ 官方 reload 走它自己的 load()；我们走 `PluginLoader.load_one()`
+    #      —— 我们的加载器多了整树清 `sys.modules` / 别名安装 /
+    #      `companion_v2` 归零这些官方没有的硬约束。
+    #
+    # ⚠️ 三条都必须**先走 `_plugin_guard()`**（含 `require_auth()`）：
+    #    本项目真事故 —— 漏了鉴权，未登录也能读/写，而服务绑 0.0.0.0。
+    #    而且这三条是**写操作**（重载会重建注册表、卸载会移动磁盘目录）。
+    # ==================================================================
+
+    def _lifecycle_error(exc: Any) -> tuple[Any, int]:
+        """把 `PluginLifecycleError.code` 映射成 HTTP 状态码（**唯一映射处**）。
+
+        🔴 为什么映射写在一处：三条约路由都要用；各写一份必然漂。
+        🔴 为什么按 `code` 而不是按文案匹配：改一句文案就会让状态码**静默变 500**
+           （本项目踩过"否定式断言的字面串"那类坑）。
+        """
+        status = {
+            # 插件自己的问题 → 400（不是我们服务坏了，重试也一样）
+            "reload_failed": 400,
+            # 前置不满足 → 409（用户改一下设置就能继续）
+            "inactivated": 409,
+            "unsupported": 409,
+            # 宿主没起来 / 没有这个插件
+            "not_loaded": 404,
+            "uninstall_failed": 500,
+        }.get(str(getattr(exc, "code", "")), 500)
+        payload: dict[str, Any] = {
+            "message": str(getattr(exc, "message", exc)),
+            "type": str(getattr(exc, "code", "internal_error")),
+        }
+        extra = getattr(exc, "extra", None)
+        if isinstance(extra, dict):
+            payload.update({k: v for k, v in extra.items() if k != "message"})
+        return jsonify({"error": payload}), status
+
+    @app.get("/api/v1/plugins/<plugin_id>/readme")
+    async def plugin_readme_route(plugin_id: str):  # type: ignore[no-untyped-def]
+        """读插件的 README 正文（契约 §4）。
+
+        ⚠️ **没有 README 返回 200 + `readme: null`**，不是 404：
+           插件存在、只是没写文档 —— 404 会让前端显示"这个插件不存在"。
+        """
+        guard = _plugin_guard(plugin_id)
+        if guard is not None:
+            return guard
+
+        out = service.host.plugin_readme(plugin_id)
+        if out is None:
+            return jsonify({"readme": None, "truncated": False}), 200
+        text, truncated = out
+        return jsonify({"readme": text, "truncated": truncated}), 200
+
+    @app.post("/api/v1/plugins/<plugin_id>/reload")
+    async def plugin_reload(plugin_id: str):  # type: ignore[no-untyped-def]
+        """就地重载一个插件（契约 §2）。**不需要重启服务。**
+
+        ⚠️ 与「升级」的区别必须让用户看得见：升级换了磁盘上的代码但要重启，
+           重载是同一个目录重新 import。响应里 `restart_required` 恒为 `false`。
+        """
+        guard = _plugin_guard(plugin_id)
+        if guard is not None:
+            return guard
+
+        from .plugin_host import ensure_host_on_path
+
+        ensure_host_on_path()
+        from astrbot_host.plugin_lifecycle import (
+            PluginLifecycleError,
+            reload_plugin as do_reload,
+        )
+
+        try:
+            result = await do_reload(service.host, plugin_id)
+        except PluginLifecycleError as exc:
+            log.warning(
+                "插件重载失败：%s（plugin=%s，code=%s）",
+                exc.message,
+                plugin_id,
+                exc.code,
+                extra={"data": {"plugin": plugin_id, "code": exc.code}},
+            )
+            return _lifecycle_error(exc)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("插件重载异常（plugin=%s）", plugin_id)
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": f"重载失败：{type(exc).__name__}: {exc}",
+                            "type": "internal_error",
+                        }
+                    }
+                ),
+                500,
+            )
+
+        return (
+            jsonify(
+                {
+                    "ok": True,
+                    "message": f"插件「{plugin_id}」已重载（handlers={result.handler_count}）",
+                    "result": {
+                        "plugin_id": result.plugin_id,
+                        "state": result.state,
+                        "handler_count": result.handler_count,
+                        "llm_tool_bind_count": result.llm_tool_bind_count,
+                        "web_api_count": result.web_api_count,
+                        "detached": result.detached.as_dict(),
+                    },
+                    "restart_required": False,
+                    # 🔴 **「部分生效」如实说**（2026-10-31，来自 Hermes 的教训：
+                    #    commit 2109290ce0 / da898da6a6 / 01337cd1d0 ——
+                    #    它那句"下个会话生效"**错了两次**才改对）。
+                    #    重载换的是"从现在起新取到的 handler/工具/hook"；
+                    #    **已经在跑**的那一轮手里还攥着旧引用，它跑完才用新代码。
+                    "note": (
+                        "热重载已完成 —— 新代码已经在跑，不需要重启服务；"
+                        "但正在进行中的那一轮对话仍用旧代码，下一轮起生效"
+                    ),
+                }
+            ),
+            200,
+        )
+
+    @app.delete("/api/v1/plugins/<plugin_id>")
+    async def plugin_uninstall(plugin_id: str):  # type: ignore[no-untyped-def]
+        """把插件移入**回收站**并从宿主摘干净（契约 §3）。
+
+        Body（都可选，默认 `false`）：
+            `{"delete_config": bool, "delete_data": bool}` —— 字段名照官方
+            `star_manager.uninstall_plugin()` 的签名。
+
+        🔴 **绝不会渲染成"已永久删除"**：源码目录是**移动**到
+           `data/plugin_trash/<id>-<UTC 时间戳>/`，响应里带 `trash_path`。
+           面板没有"清空回收站"入口 —— 文案必须写明要用户自己去删。
+        """
+        guard = _plugin_guard(plugin_id)
+        if guard is not None:
+            return guard
+
+        body = await request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": "请求体必须是 JSON 对象",
+                            "type": "invalid_request_error",
+                        }
+                    }
+                ),
+                400,
+            )
+        # ⚠️ 严格布尔：传 `"false"` 字符串时**不能**当成 True
+        #    （`bool("false") is True`，这是经典坑；面板传的是真布尔，但 API 是公开面）
+        def _flag(name: str) -> bool:
+            raw = body.get(name, False)
+            if isinstance(raw, bool):
+                return raw
+            raise ValueError(name)
+
+        try:
+            delete_config = _flag("delete_config")
+            delete_data = _flag("delete_data")
+        except ValueError as exc:
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": f"{exc.args[0]} 必须是布尔值（true/false）",
+                            "type": "invalid_request_error",
+                        }
+                    }
+                ),
+                400,
+            )
+
+        from .plugin_host import ensure_host_on_path
+
+        ensure_host_on_path()
+        from astrbot_host.plugin_lifecycle import (
+            PluginLifecycleError,
+            uninstall_plugin as do_uninstall,
+        )
+
+        try:
+            result = await do_uninstall(
+                service.host,
+                plugin_id,
+                delete_config=delete_config,
+                delete_data=delete_data,
+            )
+        except PluginLifecycleError as exc:
+            log.warning(
+                "插件卸载失败：%s（plugin=%s，code=%s）",
+                exc.message,
+                plugin_id,
+                exc.code,
+                extra={"data": {"plugin": plugin_id, "code": exc.code}},
+            )
+            return _lifecycle_error(exc)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("插件卸载异常（plugin=%s）", plugin_id)
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": f"卸载失败：{type(exc).__name__}: {exc}",
+                            "type": "internal_error",
+                        }
+                    }
+                ),
+                500,
+            )
+
+        bits = [f"插件「{plugin_id}」已卸载"]
+        if result.config_file is None and result.data_dir is None:
+            # 🔴 这是**最常见的路径**（两个勾选项默认都不勾），必须说清楚
+            #    它意味着什么 —— 否则用户会以为"卸载 = 全没了"而不敢重装。
+            bits.append("配置与数据**已保留**，重新安装后可以继续使用")
+        else:
+            if result.config_file:
+                bits.append(f"已删除配置文件 {result.config_file}")
+            if result.data_dir:
+                bits.append(f"已删除数据目录 {result.data_dir}")
+        if result.removed_from_inactivated:
+            bits.append("已从停用名单里剔除")
+        return (
+            jsonify(
+                {
+                    "ok": True,
+                    "message": "；".join(bits),
+                    "source_path": result.source_path,
+                    "removed": {
+                        **result.detached.as_dict(),
+                        "config_file": result.config_file,
+                        "data_dir": result.data_dir,
+                        "inactivated_entry": result.removed_from_inactivated or None,
+                    },
+                    "note": "源码目录已删除。要恢复请用「⋯ → 重新安装」从仓库重新拉取",
                 }
             ),
             200,

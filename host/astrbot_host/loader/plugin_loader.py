@@ -42,6 +42,11 @@ from astrbot_host.compat.core.star.base import (
     star_registry,
 )
 from astrbot_host.compat.core.star.context import Context, HostPorts
+from astrbot_host.plugin_imports import (
+    PluginAliasInstallation,
+    install_plugin_aliases,
+    retire_plugin_aliases,
+)
 from astrbot_host.registry import star_handlers_registry
 
 logger = logging.getLogger("astrbot.host.loader")
@@ -329,6 +334,32 @@ class PluginLoader:
         """找出所有插件目录（含 `main.py` 或 metadata）。
 
         ⚠️ 判据用"有没有 `main.py`"——真 AstrBot 要求插件入口是 `main.py`。
+
+        🔴🔴 **排序规则（2026-10-29 修的真 bug）**：
+           把"**自带共享顶层包**"（`companion_v2` / `astrbot_host`）的插件
+           **排到最后加载**。
+
+           为什么（实测灾难现场）：`_purge_plugin_modules` 会按
+           `(插件名, "companion_v2", "astrbot_host")` 三个前缀清 `sys.modules`，
+           判据是"**不属于本次新根**就算旧根残留"。于是加载
+           `astrbot_plugin_together_companion`（字母序在 private_companion 之后）
+           时，`companion_v2.*` 的 `__file__` 全在 **陪伴目录**下 ⇒ 不属于
+           together 的 root ⇒ **582 个陪伴模块被清掉**。
+
+           后果不是报错，而是**类身份被换掉**：已创建的对象（`ScopeRef.kind`
+           等枚举成员）持有旧类，新导入的代码用新类做 `is` 比较 → 恒 False：
+
+           ```
+           [DIAG] scene=<ScopeKind.PRIVATE> isPRIV=False
+           本模块 ScopeKind id=844574304 / scope.kind 所属类 id=135521387880
+           → group route requires a group and must not retain its speaker as owner
+           → 「开始使用」第二步（选模型）永远失败
+           ```
+
+           ✅ 排在最后 ⇒ 它加载之后**没有任何插件再触发清理** ⇒ 类身份稳定。
+           ⚠️ 这是**排序规避**，不是根治（根治要改 `_purge_plugin_modules`
+           的归属判据，但那会牵动 reimport 用例，风险更大 —— 见项目记忆）。
+           判据：`shared_package_owner` 那条测试 + 「开始使用」能走通。
         """
         found: list[Path] = []
         for root in self.plugin_dirs:
@@ -340,7 +371,18 @@ class PluginLoader:
                     continue
                 if (child / "main.py").is_file():
                     found.append(child)
-        return found
+
+        # 🔴 自带共享顶层包的插件排到最后（稳定排序，其余保持字母序）
+        shared = tuple(self._SHARED_TOP_PACKAGES)
+
+        def _owns_shared(path: Path) -> bool:
+            return any((path / name).is_dir() for name in shared)
+
+        return sorted(found, key=lambda p: (_owns_shared(p), str(p)))
+
+    #: 会被多个插件共用的顶层包（插件自己 `sys.path.insert` 进来的）。
+    #: 见 `discover()` 的 docstring 与 `_purge_plugin_modules` 的说明。
+    _SHARED_TOP_PACKAGES = ("companion_v2", "astrbot_host")
 
     # ---- 加载 ----
 
@@ -389,9 +431,19 @@ class PluginLoader:
 
         return report
 
-    async def load_one(self, path: Path) -> PluginRecord:
-        """加载单个插件目录。**失败不抛异常**（记录进 `PluginRecord.error`）。"""
+    async def load_one(self, path: Path, *, force: bool = False) -> PluginRecord:
+        """加载单个插件目录。**失败不抛异常**（记录进 `PluginRecord.error`）。
+
+        Args:
+            force: 🔴 **热重载/卸载传 `True`**。它只影响"清理范围"：
+                 `force=False`（首次/换目录）时按老规矩把共用顶层包
+                 `companion_v2`/`astrbot_host` 一起清；
+                 `force=True` 时**只清本插件自己的包** —— 因为此时**别的插件正持有
+                 旧类对象**，清掉共用包会让它们 `isinstance` 恒 False（生产事故，
+                 见 `_purge_plugin_modules` 的 docstring）。
+        """
         rec = PluginRecord(name=path.name, dir_name=path.name, path=path)
+        alias_installations: list[PluginAliasInstallation] = []
         try:
             self._ensure_on_sys_path(path.parent)
 
@@ -464,7 +516,9 @@ class PluginLoader:
             #    插件模块已 import 过时，`importlib` 不会重新执行装饰器
             #    → 差值为 0，看起来"没注册任何 handler"（假象）。
             #    正确做法：**按模块路径统计该插件自己的 handler**。
-            module = self._import_plugin(path)
+            module = self._import_plugin(
+                path, alias_installations=alias_installations, force=force
+            )
             rec.module = module
 
             star_cls = self._find_star_class(module)
@@ -473,6 +527,8 @@ class PluginLoader:
                     "模块里没有 `Star` 子类 —— 插件必须定义一个继承 "
                     "`astrbot.api.star.Star` 的类（真 AstrBot 同此要求）。"
                 )
+                for installation in reversed(alias_installations):
+                    installation.rollback()
                 return rec
             rec.star_cls = star_cls
 
@@ -552,6 +608,8 @@ class PluginLoader:
                 rec.name, rec.version, rec.handler_count,
             )
         except Exception as exc:  # noqa: BLE001
+            for installation in reversed(alias_installations):
+                installation.rollback()
             # 🔴 关键：**保留完整堆栈**（不只消息）—— 插件加载失败时
             #    用户需要知道是哪一行，光有 "ImportError" 没法排查。
             rec.error = f"{type(exc).__name__}: {exc}"
@@ -630,6 +688,12 @@ class PluginLoader:
         还是旧的那条。所以必须在**导入之前**判断。
         """
         target = Path(path).resolve()
+        for name, module in tuple(sys.modules.items()):
+            if not name.startswith(dir_name + "."):
+                continue
+            source = getattr(module, "__file__", None)
+            if isinstance(source, str) and source and not Path(source).resolve().is_relative_to(target):
+                return False
 
         # 🔴 **`companion_v2` 必须一起判断**（2026-10-19 实测）
         #
@@ -677,8 +741,30 @@ class PluginLoader:
         return False
 
     @staticmethod
-    def _purge_plugin_modules(dir_name: str, path: Path | None = None) -> int:
+    def _purge_plugin_modules(
+        dir_name: str, path: Path | None = None, *, force: bool = False
+    ) -> int:
         """把某插件的**整个导入图**从 `sys.modules` 里清掉。返回清掉的数量。
+
+        Args:
+            force: 🔴 **热重载必须传 `True`**（2026-10-31 修的真 bug）。
+
+                默认语义是"**来源目录变了**才清"（`_belongs_to_root` 为真 =
+                已经指向本次新根 = 同源 = 不清，避免把刚导入的同源模块删掉）。
+                这对 `load_all` 的重复加载是对的，但对**重载同一个目录**恰好是
+                反的：`__file__` **本来就已经**指向这个根 ⇒ 一个都不清 ⇒
+                `load_one` 里 `_same_source` 判为同源 ⇒ 走 `importlib.reload`
+                分支 ⇒ **子模块根本不会重新执行**（官方文档：reload 不递归重载
+                子模块），重载后插件跑的还是旧代码。
+
+                实测现场（同一进程，改 `helper.py` 的常量后调重载）：
+                    helper.py 从 `VERSION_TAG='OLD'` 改成 `'NEW'`
+                    重载前 instance.tag = OLD
+                    重载后 instance.tag = **OLD**   ← 重载是假成功
+                清掉整棵树之后同一探针得到 `NEW`。
+
+                ⇒ 重载/卸载要的是"**无条件重来**"，所以给显式的 `force`，
+                  而不是把默认判据改掉（那会让 `load_all` 重复加载出问题）。
 
         ## 🔴 为什么必须整树清，而不是 `importlib.reload`
 
@@ -718,7 +804,31 @@ class PluginLoader:
                 不给则清该前缀下的全部条目（兼容旧调用）。
         """
         #: 7.0.0 自己认定的三个前缀，见 `import_lifecycle.py:44`
-        prefixes = (dir_name, "companion_v2", "astrbot_host")
+        # 🔴🔴 `force=True`（热重载）时**只清这个插件自己的包**，
+        #    绝不碰**共用顶层包** `companion_v2` / `astrbot_host`。
+        #
+        #    实测事故（2026-10-31，生产 12:59:16）：重载 `content_companion` 时
+        #    无条件清了 **653 个模块**，其中包含 `companion_v2.*`。而陪伴 7.0.0
+        #    正在跑（`state=running`），它的 `TaskError` / `ScopeKind` 等类对象
+        #    属于**旧的** `companion_v2` 模块；重载后新导入的代码是**新的**类对象
+        #    ⇒ 插件里 `isinstance(error, TaskError)` 恒 False
+        #    （`application.py:516`）⇒ `failure_code` 从具体码退化成
+        #    `host_dispatch_failed` ⇒ 整个 host 进 `faulted`、`accepting=false`，
+        #    面板上表现为「消息测试 · 卡在管理员身份」。
+        #
+        #    ⚠️ 这与 `load_all` 分支"必须清共用包"的要求**不冲突**：
+        #       那条路径是"来源目录变了"（首次加载/换目录），此时**没人**在跑旧对象；
+        #       而 `force` 是"同一目录重来"，**别的插件正持有旧类对象**。
+        #       两种场景的正确答案不同 ⇒ 必须分开判。
+        #    ⚠️ 但**重载陪伴插件自己**时，`companion_v2` / `astrbot_host`
+        #       就是它自己的包，**必须**一起清（否则它的子模块不重新执行，
+        #       重载还是假成功）。判据是"这两个包是否物理位于本次 path 之内" ——
+        #       那是**外部依据**（目录事实），不是拍板名单。
+        shared = tuple(
+            name for name in ("companion_v2", "astrbot_host")
+            if path is not None and (Path(path) / name).is_dir()
+        )
+        prefixes = (dir_name, *shared) if force else (dir_name, "companion_v2", "astrbot_host")
         if path is not None:
             try:
                 root = Path(path).resolve()
@@ -813,8 +923,9 @@ class PluginLoader:
                 continue
             if name.split(".")[0] == "astrbot_host" and not _is_plugin_owned(module):
                 continue  # 宿主自己的那个包，别动
-            if root is not None and _belongs_to_root(module):
+            if not force and root is not None and _belongs_to_root(module):
                 # 已经指向本次新根 → 不必清（避免把刚导入的同源模块删掉）
+                # ⚠️ `force=True`（热重载）时**跳过这个跳过** —— 理由见 docstring。
                 continue
             owned.append((name, module))
 
@@ -834,10 +945,16 @@ class PluginLoader:
             removed += 1
 
         if removed:
-            logger.info(
-                "插件 %s 的来源目录变了 → 已清理 %d 个旧模块后重新导入",
-                dir_name, removed,
-            )
+            if force:
+                logger.info(
+                    "插件 %s 热重载 → 已无条件清理 %d 个模块后重新导入",
+                    dir_name, removed,
+                )
+            else:
+                logger.info(
+                    "插件 %s 的来源目录变了 → 已清理 %d 个旧模块后重新导入",
+                    dir_name, removed,
+                )
         return removed
 
     @staticmethod
@@ -881,7 +998,10 @@ class PluginLoader:
         return {}
 
     @staticmethod
-    def _import_plugin(path: Path) -> Any:
+    def _import_plugin(
+        path: Path, *, alias_installations: list[PluginAliasInstallation] | None = None,
+        force: bool = False,
+    ) -> Any:
         """import 插件包与它的 `main` 子模块。
 
         🔴 **必须显式 import `<包>.main`**（实测踩到）：
@@ -918,6 +1038,7 @@ class PluginLoader:
         #    **仍然是旧路径**（它改的是模块的内容，不是它的身份）。
         #    这正是下面那句 `was_loaded` 判断会走错分支的根因。
         same_source = PluginLoader._same_source(name, path)
+        retire_plugin_aliases(name, keep_root=path)
         if not same_source:
             # ⚠️ 清完缓存还不够：**旧目录还留在 `sys.path` 里**，而
             #    `import_module` 是按 `sys.path` 顺序解析的。更麻烦的是
@@ -926,7 +1047,7 @@ class PluginLoader:
             #    于是即便把新目录插到最前，解析仍可能落到旧目录（实测）。
             #    ⇒ 清缓存后把**旧目录从 `sys.path` 里摘掉**（只摘同名插件的
             #    那个父目录，不动别的）。
-            PluginLoader._purge_plugin_modules(name, path)
+            PluginLoader._purge_plugin_modules(name, path, force=force)
             PluginLoader._ensure_on_sys_path(Path(path).parent)  # ⚠️ 清理后重新确认顺序
             was_loaded = False
             pkg = importlib.import_module(name)
@@ -949,6 +1070,9 @@ class PluginLoader:
         else:
             # 包不 import main（少见）→ 这时才需要我们主动 import
             main_mod = importlib.import_module(main_name)
+        installation = install_plugin_aliases(path, name)
+        if alias_installations is not None:
+            alias_installations.append(installation)
         setattr(pkg, "main", main_mod)
         # 把 main 里的公开名字提升到包命名空间（便于 _find_star_class 扫描）
         for attr in dir(main_mod):

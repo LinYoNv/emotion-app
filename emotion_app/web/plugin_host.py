@@ -197,92 +197,62 @@ async def resolve_user_id(config: Any, sessions: Any, session_id: str) -> str:
 
 
 def _messages_to_provider_request(messages: Any, req_cls: Any) -> tuple[Any, list]:
-    """我们的 `list[Message]` → AstrBot `ProviderRequest`。
-
-    映射规则（照真实现语义）：
-      * `role == "system"` 的消息 **合并进 `req.system_prompt`**
-        （真实现的 system_prompt 就是系统提示词那一段）；
-      * 其它消息进 `req.contexts`（OpenAI 格式，原样保留 role/content）。
-
-    ⚠️ 多个 system 消息也合并（我们组装时会产出"人设"+"摘要"两条 system，
-       见 `domain/chat.py` 的 `build_messages`）—— 用 `\n\n` 连接，
-       保持它们在真实现里"同一段系统提示"的语义。
-
-    Returns:
-        `(req, contexts)` —— contexts 原样返回，便于转回时复用结构。
-    """
+    """保留系统提示、结构化历史与本轮 multipart，prompt 只提供文本视图。"""
     system_parts: list[str] = []
     contexts: list[dict] = []
-    for m in messages or []:
-        role = getattr(m, "role", None) or (m.get("role") if isinstance(m, dict) else "")
-        content = getattr(m, "content", None)
-        if content is None and isinstance(m, dict):
-            content = m.get("content")
-        if role == "system":
-            if content:
-                system_parts.append(str(content))
+    for message in messages or []:
+        if isinstance(message, dict):
+            from copy import deepcopy
+
+            item = deepcopy(message)
         else:
-            contexts.append({"role": role, "content": content})
+            convert = getattr(message, "to_upstream", None)
+            if callable(convert):
+                item = convert()
+                if item is None:
+                    continue
+            else:
+                item = {"role": message.role, "content": message.content}
+        if item.get("role") == "system":
+            if item.get("content"):
+                system_parts.append(str(item["content"]))
+        else:
+            contexts.append(item)
     req = req_cls(prompt=_last_user_text_from(contexts), contexts=contexts)
     req.system_prompt = "\n\n".join(system_parts)
+    ensure_host_on_path()
+    from astrbot_host.provider_content import content_media_locators
+
+    current = next((item for item in reversed(contexts) if item.get("role") == "user"), None)
+    if current is not None:
+        req.image_urls, req.audio_urls = content_media_locators(current.get("content"))
     return req, contexts
 
 
 def _last_user_text_from(contexts: list[dict]) -> str:
-    """取最后一条 user 消息的纯文本（插件的指令/上下文判断要用）。"""
-    for c in reversed(contexts or []):
-        if c.get("role") != "user":
-            continue
-        content = c.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = [
-                str(x.get("text", ""))
-                for x in content
-                if isinstance(x, dict) and x.get("type") == "text"
-            ]
-            if parts:
-                return "".join(parts)
+    """取最后一条 user 的文本视图，纯媒体本轮不能回退到历史文本。"""
+    ensure_host_on_path()
+    from astrbot_host.provider_content import content_text
+
+    for context in reversed(contexts or []):
+        if context.get("role") == "user":
+            return content_text(context.get("content"))
     return ""
 
 
 def _provider_request_to_messages(req: Any, contexts: list[dict]) -> list:
-    """AstrBot `ProviderRequest` → 我们的 `list[Message]`（**带回插件注入的内容**）。
+    """复用宿主媒体组装，回写当前 user 一次并保留真实协议字段。"""
+    ensure_host_on_path()
+    from astrbot_host.provider_content import provider_request_to_messages
+    from emotion_app.domain.message import from_upstream_message
 
-    🔴 **这个函数是"注入是否生效"的关键**：
-       * `req.system_prompt` 被插件改过 → 作为**第一条 system 消息**放回去；
-       * `req.contexts` 被插件改过（增删改）→ 用**插件版**（不是原来的）；
-       * `req.extra_user_content_parts` 非空 → **追加为一条 system 消息**
-         （真实现语义是"在用户消息之后追加的内容块"，我们宿主用 system 承载，
-          因为它对模型的效果等价、且不污染 user 角色）。
-
-    ⚠️ 我们自己构造 Message，不 import 领域层的类 ——
-       这样插件宿主与领域层**零耦合**（只要对象有 `.role`/`.content` 就行，
-       而 `Message` 正好是 dataclass，可直接构造）。
-    """
-    from emotion_app.domain.message import Message
-
-    out: list[Any] = []
-    system_prompt = getattr(req, "system_prompt", "") or ""
-    if system_prompt.strip():
-        out.append(Message(role="system", content=system_prompt))
-    for c in getattr(req, "contexts", None) or []:
-        if not isinstance(c, dict):
-            continue
-        out.append(Message(role=c.get("role", "user"), content=c.get("content")))
-    extra = getattr(req, "extra_user_content_parts", None) or []
-    if extra:
-        texts = []
-        for part in extra:
-            if isinstance(part, dict):
-                texts.append(str(part.get("text", "")))
-            else:
-                texts.append(str(getattr(part, "text", "") or ""))
-        joined = "".join(t for t in texts if t)
-        if joined.strip():
-            out.append(Message(role="system", content=joined))
-    return out
+    request_contexts = getattr(req, "contexts", None) or []
+    current_user = next((i for i in range(len(request_contexts) - 1, -1, -1)
+                         if isinstance(request_contexts[i], dict)
+                         and request_contexts[i].get("role") == "user"), None)
+    return [from_upstream_message(item) for item in provider_request_to_messages(
+        req, current_user_index=current_user,
+    )]
 
 
 def _load_provider_config() -> dict:
@@ -364,6 +334,14 @@ class PluginHostService:
         #:    静态事实，重建既浪费又会让"启动时的那个"与"派发时的那个"
         #:    有机会不一致（两个对象 != 同源）。
         self.platform_registry: Any = None
+        #: 平台管理器（`OurPlatformManager`）。**外部适配器晚于它启动**，
+        #: 所以这里要留引用，供 `attach_platforms()` 补装新平台。
+        self.platform_manager: Any = None
+        #: 🔴 **消息平台适配器运行时**（OneBot 等）—— 由装配层注入。
+        #:
+        #: ⚠️ `None` = 没有外部平台（只有内置 Web 端），行为与加这个能力**之前
+        #:    逐字一致**。这是刻意的：不装插件的部署不该被迫依赖 `host/`。
+        self.adapters: Any = None
         #: 🔴 **配置文件（`data/config_profile.json`）路径解析器** —— 由装配层注入。
         #: 与 `_backend_getter` 同款：路由装配那一刻 `app.config` 可能还没被测试
         #: 覆盖（`create_app` 之后才设 `EMOTION_CONFIG_PROFILE_PATH`），
@@ -444,6 +422,11 @@ class PluginHostService:
             # 🔴 **停用名单从配置读出来传进去**（宿主侧不反向依赖本模块）。
             #    读不到 = 空名单（全部启用），那时行为与加这个能力**之前逐字一致**。
             inactivated=self.saved_inactivated(),
+            # 🔴 **停用名单的写端口**（2026-10-31，卸载插件要用）：
+            #    插件目录被移走后，名单里那条 module_path 就成了"对不上任何插件"
+            #    的残留 —— 下次启动会报一条**指向已删插件**的假警告。
+            #    宿主不许反过来 import 本模块（单向依赖铁律），所以从这里注入。
+            inactivated_writer=self._forget_inactivated,
         )
         try:
             # 🔴 **投递端口**：让插件的主动消息真的能落到用户看得见的地方。
@@ -461,6 +444,9 @@ class PluginHostService:
             # ⚠️ 会话仓库没注入时**如实降级**：端口为 None →
             #    `send_by_session` 返回 False（不伪造送达，插件的降级路径本来就有）。
             delivery = self._build_delivery()
+            # 留引用：后到的外部平台也要用**同一份**投递端口
+            # （否则新装的平台能查到、却发不出消息 —— 又一类静默失败）
+            self.delivery = delivery
 
             # 🔴 **平台管理器**：让插件能按 umo 找到我们的平台并投递
             #    （主动消息链的前提，见 `host/astrbot_host/platform_manager.py`）。
@@ -471,8 +457,36 @@ class PluginHostService:
             #    ⚠️ 三项硬约束在 `PlatformSpec` 构造时就校验（配错 = 起不来），
             #       理由见 `host/astrbot_host/platforms.py` 的模块 docstring。
             registry = self._build_platform_registry()
+            # 🔴 **把外部适配器的平台注册进注册表**（OneBot 等）。
+            #    不注册的话：插件能收到 QQ 的消息（派发时靠事件自带的
+            #    platform_meta），但**主动消息发不出去** ——
+            #    `context.send_message` 按 `meta().id` 查表，查不到就静默失败。
+            #    这是"三条链路通了两条"的典型，必须在这里补上。
+            if self.adapters is not None:
+                for spec in self.adapters.specs():
+                    try:
+                        registry.register(spec)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(
+                            "适配器平台 %s 注册失败：%s", getattr(spec, "id", "?"), exc
+                        )
+
             platform_manager = build_platform_manager(
-                registry=registry, delivery=delivery
+                registry=registry,
+                delivery=delivery,
+                # 🔴 按平台 id 注入外部发送器：有真实外部连接的平台
+                #    （OneBot）走它，内置 Web 端返回 None → 走 delivery。
+                sender_for=(
+                    self.adapters.sender_for if self.adapters is not None else None
+                ),
+                # 🔴 协议端客户端（`Platform.get_client()` 的来源）。
+                #    陪伴 7.0.0 的 `startup_readiness()` 靠它读 `_wsr_api_clients`
+                #    判断"Bot 账号真的连上来了没"。不注入 ⇒ 插件的
+                #    「开始使用」第二步（选模型）永远失败，且报的是
+                #    `host_platform_unavailable`（与真实原因无关）。
+                client_for=(
+                    self.adapters.client_for if self.adapters is not None else None
+                ),
             )
             logger.info(
                 "平台实例已装载：%s",
@@ -480,6 +494,12 @@ class PluginHostService:
                     f"{s.display}[{s.id}/{s.kind}]" for s in registry.all()
                 ),
             )
+            # 🔴 保存引用：外部适配器（OneBot）是在**这之后**才启动的，
+            #    它们的平台要能补进这份管理器 —— 否则
+            #    `context.get_platform_inst("onebot-napcat1")` 恒为 None
+            #    （陪伴 7.0.0 的 `startup_readiness()` 因此恒失败）。
+            #    见 `attach_platforms()`。
+            self.platform_manager = platform_manager
 
             # 🔴 **供应商管理器**：让插件能按 ID 选模型（陪伴有 20+ 个 `*_PROVIDER_ID`）。
             #    没有它 → `get_using_provider` 拿不到 → 记忆抽取/日程/关系分析
@@ -697,6 +717,89 @@ class PluginHostService:
         except Exception:  # noqa: BLE001
             logger.error("获取聊天后端失败（模型能力将不可用）", exc_info=True)
             return None
+
+    def attach_platforms(self, specs: list[Any]) -> list[str]:
+        """把**后到的**平台补进已存在的 `platform_manager`（返回新装上的 id）。
+
+        🔴🔴 **为什么必须有这个**（2026-10-29 修的真 bug）：
+
+        时序是这样的：
+
+        ```
+        PluginHost.start()
+          └─ build_platform_manager(registry=当时的注册表)   # ← 只有 Web 端
+          └─ 交给 HostPorts(platform_manager=...)            # ← 之后不再更新
+        app._start_adapters()
+          └─ await runtime.reload()        # ← 适配器这时才启动
+          └─ runtime.specs()               # ← 现在才有 onebot-napcat1/2
+        ```
+
+        `platform_manager.__init__` 里 `self.platform_insts = list(insts or [])`
+        —— 是**一份固定列表**。所以补注册到 `registry` 对它**毫无影响**。
+
+        实测后果（2026-10-29 15:02）：
+
+        ```
+        平台实例已装载：情绪app Web 端[11/webchat]          ← 只有 1 个
+        [DIAG] readiness pid='onebot-napcat1' platform=None  ← 插件查不到
+        ```
+
+        ⇒ 陪伴 7.0.0 的 `startup_readiness()` 恒返回
+        `host_platform_unavailable` ⇒ 「开始使用」第二步（选模型）**永远失败**，
+        而面板上显示的是「共享宿主配置、原生路由或权限无法校验」
+        —— 和真实原因**毫无关系**，是本项目最贵的那类静默 bug。
+
+        Args:
+            specs: 新出现的平台规格（来自 `AdapterRuntime.specs()`）。
+
+        Returns:
+            本次真正新装上的平台 id 列表（**已存在的不重复装**）。
+            幂等：重复调用不会产生重复实例。
+        """
+        pm = self.platform_manager
+        if pm is None or not specs:
+            return []
+
+        from astrbot_host.platform_manager import OurPlatform
+
+        insts = getattr(pm, "platform_insts", None)
+        if not isinstance(insts, list):
+            logger.error(
+                "platform_manager 没有 platform_insts 列表，外部平台无法接入"
+                "（插件将看不到这些平台）"
+            )
+            return []
+
+        existing: set[str] = set()
+        for inst in insts:
+            try:
+                existing.add(str(getattr(inst.meta(), "id", "") or ""))
+            except Exception:  # noqa: BLE001
+                continue
+
+        adapters = getattr(self, "adapters", None)
+        added: list[str] = []
+        for spec in specs:
+            sid = str(getattr(spec, "id", "") or "")
+            if not sid or sid in existing:
+                continue
+            # 🔑 关键：这两个 getter 必须与 `build_platform_manager` 里
+            #    用的是**同一份**，否则新装的平台能"被查到"但发不出消息。
+            sender = adapters.sender_for(sid) if adapters is not None else None
+            client_getter = (
+                (lambda s=sid: adapters.client_for(s)) if adapters is not None else None
+            )
+            insts.append(
+                OurPlatform(
+                    spec=spec,
+                    delivery=self.delivery,
+                    sender=sender,
+                    client_getter=client_getter,
+                )
+            )
+            existing.add(sid)
+            added.append(sid)
+        return added
 
     def _build_platform_registry(self) -> Any:
         """造平台注册表（**默认平台永远在**，配置可追加额外平台）。
@@ -919,7 +1022,9 @@ class PluginHostService:
 
     # ---- LLM 钩子（P0-4：让插件改"发给模型的提示词"） ----
 
-    async def apply_llm_hooks(self, messages: Any, *, session_id: str = "") -> Any:
+    async def apply_llm_hooks(
+        self, messages: Any, *, session_id: str = "", event: Any = None
+    ) -> Any:
         """把**已组装好的消息列表**交给插件钩子，返回可能被改过的列表。
 
         适配层职责（把宿主的两套表示对接起来）：
@@ -954,14 +1059,44 @@ class PluginHostService:
             logger.error("LLM 钩子模块导入失败（跳过注入）", exc_info=True)
             return None
 
+        from emotion_app.domain.chat import LLMRequestCancelled
+
+        original_event = event
         try:
             req, contexts = _messages_to_provider_request(messages, ProviderRequest)
             # 🔴 与消息派发**同一个判据**：会话绑了就用会话的，没绑才回落全局
-            uid = await resolve_user_id(self.config, self.sessions, session_id)
-            event = build_inbound_event(_last_user_text_from(contexts), uid)
-            await run_llm_request_hooks(event, req)
+            if event is None:
+                uid = await resolve_user_id(self.config, self.sessions, session_id)
+                event = build_inbound_event(_last_user_text_from(contexts), uid)
+            req.session_id = str(getattr(event, "unified_msg_origin", "") or session_id)
+            conversations = getattr(self, "conversation_manager", None)
+            if original_event is not None and conversations is not None:
+                captured = event.get_extra("_emotion_native_conversation_id")
+                guard = event.get_extra("_emotion_native_history_guard")
+                if callable(guard):
+                    await guard()
+                cid = captured or await conversations.get_curr_conversation_id(req.session_id)
+                if cid:
+                    req.conversation = await conversations.get_conversation(req.session_id, cid)
+                    if captured and req.conversation is None:
+                        raise LLMRequestCancelled("本轮原生会话已不可用")
+            if original_event is not None:
+                context = getattr(self.host, "context", None)
+                if context is not None:
+                    from astrbot_host.compat.core.astr_main_agent import _merge_plugin_tools
+
+                    _merge_plugin_tools(req, context)
+            req, cancelled = await run_llm_request_hooks(event, req)
+            if cancelled:
+                raise LLMRequestCancelled("LLM 请求已由插件终止")
             out = _provider_request_to_messages(req, contexts)
+            if original_event is not None:
+                from emotion_app.web.llm_turn import prepare_llm_turn
+
+                return prepare_llm_turn(out, req, event, context=getattr(self.host, "context", None))
             return out
+        except LLMRequestCancelled:
+            raise
         except Exception:  # noqa: BLE001
             logger.error("LLM 钩子执行异常（本条按未注入处理）", exc_info=True)
             return None
@@ -1061,6 +1196,43 @@ class PluginHostService:
             )
         return result
 
+    async def dispatch_event(self, event: Any) -> Any:
+        """把一条**已经构造好的**事件派发给插件 handler。
+
+        与 `dispatch_message()` 的分工：
+        * `dispatch_message()` 从**纯文本**重建事件（面板聊天走它）；
+        * 本方法接受**现成事件**（外部平台走它）。
+
+        🔴 为什么外部平台必须用本方法：OneBot 的消息带**图片、引用、@**
+           —— 那些是 `message_obj.message` 里的消息段。若走
+           `dispatch_message(text)`，这些段会被丢掉，插件只看到一个纯字符串
+           ⇒ 「引用回复」失效、图片看不见。**那是静默降级**，最难查。
+
+        Returns:
+            `DispatchResult`；宿主没起来时返回 `None`。
+        """
+        if self.host is None:
+            return None
+        try:
+            from astrbot_host.dispatch import dispatch
+        except Exception:  # noqa: BLE001
+            logger.error("派发模块导入失败（外部消息无法派发给插件）", exc_info=True)
+            return None
+
+        try:
+            result = await dispatch(event)
+        except Exception:  # noqa: BLE001
+            logger.error("插件事件派发失败（本条消息按【无插件】处理）", exc_info=True)
+            return None
+
+        if result.errors:
+            logger.warning(
+                "插件派发中有 %d 个 handler 抛错：%s",
+                len(result.errors),
+                "; ".join(f"{n}: {e}" for n, e in result.errors[:3]),
+            )
+        return result
+
     # ---- 插件启停（照真实现的 `inactivated_plugins`）----
 
     def _config_profile_store(self) -> Any:
@@ -1129,6 +1301,45 @@ class PluginHostService:
         )
         self._config_profile_store().patch({SECTION_PLUGINS: validated})
         return self.plugin_activation_view()
+
+    def _forget_inactivated(self, plugin_id: str) -> str:
+        """把某个插件从**已保存的停用名单**里剔掉，返回被剔掉的 module_path。
+
+        这是注入给 `PluginHost` 的 `inactivated_writer` 端口
+        （见 `PluginHost.__init__` 的说明：宿主不许反向 import 本模块）。
+
+        ⚠️ 为什么卸载插件必须调它：名单元素是 module_path。目录被移走后那条
+           就成了"对不上任何插件"的残留 —— 下次启动加载器会报
+           `停用名单里有 N 项对不上任何插件目录（拼写错误？）`，
+           用户看到一条**指向已删插件**的警告，还得自己去翻配置文件。
+
+        ⚠️ 走 `save_inactivated()` 而不是自己写盘：那是**面板唯一的写入口**，
+           校验（`validate_patch`）只在那一处。另开一条写路径 = 本项目
+           最忌的"同一概念两条写入路径"。
+
+        Returns:
+            被剔掉的 module_path（**空串** = 它本来就不在名单里）。
+        """
+        from astrbot_host.loader.plugin_loader import normalize_module_path
+
+        target = normalize_module_path(plugin_id)
+        saved = self.saved_inactivated()
+        hits = [x for x in saved if normalize_module_path(x) == target]
+        if not hits:
+            return ""
+        remaining = [x for x in saved if normalize_module_path(x) != target]
+        try:
+            self.save_inactivated(remaining)
+        except Exception:  # noqa: BLE001
+            # 🔴 写配置失败**不许静默**：名单没清掉是"下次启动会看到假警告"，
+            #    而不是"操作失败" —— 必须让用户在日志里能看到。
+            logger.error(
+                "从停用名单里剔除 %s 失败（名单已保留原样，下次启动可能报 unmatched）",
+                target,
+                exc_info=True,
+            )
+            return ""
+        return hits[0]
 
     def plugin_activation_ids(self) -> list[str]:
         """当前宿主认识的**全部**插件 id（目录名）。

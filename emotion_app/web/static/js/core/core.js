@@ -5,6 +5,7 @@
  *    这是为了消除循环依赖在"模块顶层立即求值"时拿到未初始化绑定的风险。
  */
 
+import { loadAdapters } from "../views/adapters.js";
 import { loadChat, loadHistory, refreshUnread } from "../views/chat.js";
 import { loadPersonas, renderPersonaList, selectPersona } from "../views/persona.js";
 import { closePluginPage, loadPluginPages, loadPluginSwitch, openPluginConfig, openPluginDetail, openPluginPage, syncNavPluginActive } from "../views/plugins.js";
@@ -17,7 +18,10 @@ import { loadConfigProfile, loadLogs, loadSettings, stopLogsAutoRefresh } from "
 
 export const $ = (id) => document.getElementById(id);
 export let state = {
-  personas: [], activeId: "", current: null, sections: [],
+  // ⚠️ 2026-10-29：`state.sections`（提示词片段表的编辑缓冲）已删除 ——
+  //    人设模型里没有 `prompt_sections` 了，正文只有 `system_prompt` 一个字段，
+  //    编辑状态直接读/写 `#p-system-prompt` 的 value，不再需要影子副本。
+  personas: [], activeId: "", current: null,
   sessions: [], currentSessionId: "", currentSession: null,
   // 未读：`unread` = {会话id: 条数}（后端 `GET /api/v1/unread`），
   // `unreadTotal` = 侧边栏「聊天」那个圆圈显示的数字。
@@ -73,6 +77,19 @@ export let state = {
   pluginDetail: null,
   // 当前选中的插件 id（详情/拓展页用；空 = 在列表态）
   pluginCurrentId: "",
+  // ---- 适配器（消息平台接入：OneBot v11 / 内置 Web 端）----
+  // 🔴 `null` 与 `[]` **必须分开**：`null` = **还没读到**（或读失败），
+  //    `[]` = 真读到了、后端就是没有适配器。混成一种，"读失败"会被显示成
+  //    "你还没有适配器" → 用户会去建一个重复的（本项目最贵的静默失败类型）。
+  adapters: null,
+  // 类型目录（`GET /api/v1/adapters` 的 types / `GET /api/v1/adapters/types`）；
+  // null = 还没读到 —— 打开"添加"时会补拉一次。
+  adapterTypes: null,
+  adaptersError: "",        // 非空 = 列表读取失败的原因（hint 正在显示它）
+  adapterCreating: false,   // 表单是"新增"态（true）还是"编辑"态（false）
+  adapterEditingId: "",     // 正在编辑的适配器 id（空 = 没有在编辑）
+  adapterEditingType: "",   // 表单对应的类型（新增=下拉选中的那个；编辑=它自己的类型）
+  adapterFormFields: [],    // 当前表单的字段定义（来自后端 fields[]，**不硬编码**）
 };
 
 export const MODE_HINTS = {
@@ -97,6 +114,11 @@ export async function api(method, path, body) {
     const e = new Error(msg);
     e.status = r.status;
     e.type = data?.error?.type || "";
+    // 🔴 把信封里的 `reason` 也带出来（`{status:"error",message,reason,error:{...}}`）：
+    //    适配器页要把 message **和** reason 一起显示（只有 message 时，
+    //    `adapter_protected` / `adapter_invalid` 这类可行动的线索就丢了）。
+    //    ⚠️ 加字段是**纯增量**：其它调用方读不到它时行为完全不变。
+    e.reason = data?.reason || "";
     // 🔴 把**出错字段名**也带出来（后端 400 会带 `error.field`）：
     //    配置文件页要把红框标在**对应的那个控件**上；只给一句"值不合法"，
     //    用户在几十个字段里根本找不到是哪一个。
@@ -152,6 +174,10 @@ export async function refreshStatus() {
  *     #/plugins/<id>/<page>  打开某个插件拓展页
  *     #/providers           模型供应商（提供商源列表）
  *     #/providers/<源id>     某个提供商源的详情 ← 同人设页的"点开路由到详情"
+ *     #/adapters        消息平台适配器（OneBot v11 / 内置 Web 端）
+ *                       ⚠️ 本页的"添加/编辑"是**页内表单**，不占子路由：
+ *                          它没有"可分享的某一条适配器"这种语义，
+ *                          而写 hash 会多一次 hashchange → applyRoute → 重复拉列表。
  *     #/settings        设置
  */
 
@@ -164,6 +190,11 @@ export const NAV_LOADERS = {
   session: () => loadSessions(),
   persona: () => loadPersonas(),
   plugins: () => Promise.all([loadPluginSwitch(), loadPluginPages()]),
+  // ⚠️ 适配器页的 loader 直接调 `loadAdapters()`：它会**自己**把失败原因写进
+  //    `#adapters-hint` 并返回 false（不抛），所以这里不需要再包 try。
+  //    ⚠️ 别在这里顺手把 `state.adapters` 预置成 `[]` —— 那是"读到 0 个"的语义，
+  //    而"还没读到/读失败"必须是 `null`（见 state 里的注释）。
+  adapters: () => loadAdapters(),
   // ⚠️ 供应商页的 loader 走 `loadProviderSourcesOnce()` 而不是直接调：
   //    `saveProviderSource()` 保存成功后**自己已经 load 过一次**了，
   //    紧接着它调 `selectProviderSource()` 改 hash → 触发 hashchange → applyRoute()
@@ -175,12 +206,59 @@ export const NAV_LOADERS = {
   providers: () => loadProviderSourcesOnce(),
   // ⚠️ 设置页要拉**两样**：上游连接（本服务自己用）+ 配置文件（会话/上下文）。
   //    两个都失败也各自提示（`loadConfigProfile` 内部自己处理错误，不会互相吞）。
-  settings: () => Promise.all([loadSettings(), loadConfigProfile()]),
+  // 🔴 设置页还要**确保有一个会话被选中**（2026-10-31 修的真 bug）。
+  //
+  //    现场（情绪截图）：直接进「设置」页时，「绑定人设」下拉**只有占位项**
+  //    「（当前人设）」，人设全都不见了。
+  //
+  //    根因**不是**人设没加载 —— 实测 `state.personas` 有 1 条、后端接口也正常。
+  //    真因是：那个 `<select id="s-persona">` **只由 `fillSessionForm()` 填充**，
+  //    而 `fillSessionForm()` 只在 `selectSession()` 里被调。直接进设置页时
+  //    `state.currentSessionId` 是 null ⇒ 一次都没填过 ⇒ 下拉停在那一个占位项。
+  //    （"先过人设页再回来"也救不了，因为那条路径同样不选会话。）
+  //
+  //    ⇒ 进设置页时补一次"选会话"。**只做一次**（已有 currentSessionId 就不动），
+  //      否则会抢用户手动选的那条。
+  settings: () =>
+    Promise.all([loadSettings(), loadConfigProfile(), ensureSessionSelected()]),
   // ⚠️ 日志页的 loader **顺便管自动刷新的开关**：进来开、离开必须关 ——
   //    否则用户切走后定时器还在跑（白刷 + 用户看不到却仍在发请求）。
   //    停表在 `applyRoute`（见那里的 `stopLogsAutoRefresh`）。
   logs: () => loadLogs({ startAuto: true }),
 };
+
+/**
+ * 确保**有一个会话被选中**（设置页要用它填「绑定人设」「对话模型」等字段）。
+ *
+ * 🔴 为什么必须单独有这个（2026-10-31 修的真 bug）：设置页那些控件
+ *    （`#s-persona` / 模型下拉 / 上下文模式…）**全部由 `fillSessionForm()` 填**，
+ *    而它只从 `selectSession()` 进来。直接深链接到 `#/settings` 时
+ *    `state.currentSessionId` 是 `null` ⇒ 一次都没填 ⇒ 用户看到
+ *    「绑定人设」只剩一个「（当前人设）」占位项（情绪报障的原话：
+ *    「这里的人设多选也没了」）。
+ *    ⚠️ 现象像"人设没加载"，实际人设早就在 `state.personas` 里了 ——
+ *       这就是为什么"先过人设页再回来"也修不好。
+ *
+ * ⚠️ **已有选中会话时什么都不做**：用户手动选的那条不能被抢走。
+ * ⚠️ 没有会话时也什么都不做（空态是正常的，不能凭空造一条）。
+ */
+export async function ensureSessionSelected() {
+  if (state.currentSessionId) return;
+  if (!Array.isArray(state.sessions)) return;
+  if (!state.sessions.length) {
+    // 会话列表可能还没加载（并行 Promise.all 里它可能后到）→ 补一次
+    try { await loadSessions(); } catch (e) { return; }
+  }
+  if (state.currentSessionId) return;
+  const first = (state.sessions || [])[0];
+  if (!first) return;
+  try {
+    await selectSession(first.id);
+  } catch (e) {
+    // 选会话失败不该让整个设置页打不开 —— 如实记日志即可
+    console.error("[settings] 自动选中会话失败：", e);
+  }
+}
 
 /** 上一轮 `loadSettings()` 的 promise（供"只等一次"的调用方复用；见 loadSettings 注释）。 */
 export let settingsLoadPromise = null;
@@ -270,7 +348,10 @@ export async function applyRoute() {
       // 回到列表：手机端退出"详情态"
       $("tab-persona").classList.remove("is-detail");
       $("persona-form").classList.add("hidden");
-      $("sections-block").classList.add("hidden");
+      // ⚠️ 2026-10-29：原来还要隐掉 `#sections-block`（额外片段表）。
+      //    人设结构改成 AstrBot 的 `Persona` 后那个块**已从 index.html 删除**，
+      //    继续 `$("sections-block").classList` 会拿到 null → TypeError，
+      //    而这段在 `applyRoute` 里，抛出去就是"回列表"整条路径白屏。
       $("persona-empty").classList.remove("hidden");
       state.current = null;
       renderPersonaList();
@@ -297,6 +378,13 @@ export async function applyRoute() {
     //       目前**没有**插件把页面起名叫 `config`（实测 7 个页面名都对不上），
     //       但**不能靠这个巧合** —— 插件是第三方代码，明天就可能有人这么起名。
     if (pid && page === "config") openPluginConfig(pid);
+    // 🔴 `readme` 是**详情页的一个定位锚**，不是拓展页 —— 必须排在
+    //    `openPluginPage` 之前，否则会被当成"一个叫 readme 的插件页面"去打开
+    //    （然后 404）。与 `config` 那条同一类判据：插件是第三方代码，
+    //    明天就可能有人真把页面起名叫 readme —— 但那时它自己的页面路由
+    //    仍然可达（`#/plugins/<id>/readme` 会优先当锚点，这点我们接受，
+    //    因为"从菜单点 README"比"猜某插件有同名页面"更常发生）。
+    else if (pid && page === "readme") openPluginDetail(pid, { updateHash: false, scrollTo: "readme" });
     else if (pid && page) openPluginPage(pid, page, { updateHash: false });
     else if (pid) openPluginDetail(pid, { updateHash: false });
     else closePluginPage();

@@ -700,14 +700,28 @@ input:disabled, textarea:disabled, select:disabled { opacity: .5; cursor: not-al
 details { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; }
 summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 
-/* 片段表 */
-table.sections { width: 100%; border-collapse: collapse; font-size: 13px; }
-table.sections th, table.sections td { border: 1px solid var(--border); padding: 5px 7px; text-align: left; }
-table.sections th { color: var(--muted); font-weight: 500; }
-table.sections input[type=text], table.sections textarea { width: 100%; }
-table.sections td.narrow { width: 70px; }
-/* 空态行：没有"额外片段"时说明原因（别让表格看起来像加载失败） */
-table.sections tr.empty-row td { color: var(--muted); text-align: center; font-size: 12px; }
+/* 人设正文（`#p-system-prompt`）—— 2026-10-29 起人设只有 `system_prompt` 一段正文，
+   取代了原来的「片段表」（`table.sections` 那套已随模型变更删除）。
+   🔴 为什么要单独给它一套样式：
+     ① 正文常见**几千字**，默认 input 样式（padding 8px、行高跟随）读起来非常挤
+        → 用等宽字体 + 1.7 行高，段落边界才看得清（长提示词里换行是有语义的）；
+     ② 必须**可拉伸**（`resize: vertical`）：20 行的框对 8000 字仍要滚动，
+        用户想一次看更多内容时只能靠拖 —— 但**只能纵向**，
+        横向拉伸会把这页的左右分栏撑破。
+     ③ `white-space: pre-wrap` 让原文里的缩进/换行**原样显示**，
+        否则长提示词的结构（编号列表、缩进段）在框里全糊成一片。 */
+textarea.prompt-body {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 320px;          /* 约 20 行；再小就看不出正文结构了 */
+  max-height: 70vh;           /* 别把「保存」「参考图」挤出屏幕 */
+  resize: vertical;
+  font: 13px/1.7 var(--font-mono);
+  white-space: pre-wrap;
+  tab-size: 2;
+}
+/* 字数读数：贴着正文框下面的一行小字（不抢注意力，但要看得到） */
+.prompt-stats { margin-top: -4px; font-variant-numeric: tabular-nums; }
 
 .preview {
   background: var(--sunken); border: 1px solid var(--border); border-radius: var(--radius-sm);
@@ -908,36 +922,14 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   .composer textarea { font-size: 16px; }
   .composer button { flex: 0 0 auto; padding: 8px 16px; }
 
-  /* --- 提示词片段表 → 卡片（手机上看宽表必然溢出）--- */
-  #sections-block { overflow-x: visible; }
-  table.sections, table.sections thead, table.sections tbody,
-  table.sections tr, table.sections td { display: block; width: 100%; }
-  table.sections thead { display: none; }         /* 表头靠 data-label 替代 */
-  table.sections tr {
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    padding: var(--sp-2);
-    margin-bottom: var(--sp-2);
-    background: var(--panel-2);
+  /* --- 人设正文框（原「提示词片段表 → 卡片」那段已随片段表删除）---
+     🔴 手机上把 min-height 调大：窄屏每行容纳的字少，320px 只能看到十来行，
+        而长提示词必须能看到段落结构才能改（这是这一页最主要的操作）。 */
+  textarea.prompt-body {
+    min-height: 420px;
+    max-height: none;         /* 手机上整页本来就在滚，不需要框内再限高 */
+    font-size: 16px;          /* ⚠️ iOS：<16px 聚焦会自动放大整页（与上面统一）*/
   }
-  table.sections td {
-    border: none;
-    padding: var(--sp-1) 0;
-    display: flex;
-    align-items: flex-start;
-    gap: var(--sp-2);
-  }
-  table.sections td::before {
-    /* 用 CSS 造"字段名"，无需改 JS */
-    content: attr(data-label);
-    flex: 0 0 64px;
-    color: var(--muted);
-    font-size: 12px;
-    padding-top: var(--sp-2);
-  }
-  table.sections td input, table.sections td textarea { flex: 1 1 auto; }
-  table.sections td.narrow { width: auto; }
-  table.sections td:last-child:empty { display: none; }
 
   /* --- 弹层：手机上留足边距，内容可滚 --- */
   .modal { align-items: flex-start; padding: 12px; overflow-y: auto; }
@@ -952,7 +944,7 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 @media (max-width: 380px) {
   .nav-item { font-size: 14px; }
   .split aside { max-height: 28vh; }
-  table.sections td::before { flex-basis: 54px; }
+  textarea.prompt-body { min-height: 360px; }
 }
 
 /* ---------- 横屏手机：竖向空间紧张，收紧一点 ---------- */
@@ -1047,6 +1039,31 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
    这里要把它留在状态标签**右边**且不换行（手机端会 wrap，是预期）。 */
 .switch-detail { flex: 0 0 auto; font-size: 11.5px; padding: 2px 8px; }
 
+/* ==================== 插件列表态整体容器 ====================
+   🔴 2026-10-31（情绪报的 bug）：原来「插件启停 / 插件升级 / 插件拓展页」是
+   `#tab-plugins` 的直接子节点，靠**逐元素** toggle 隐藏 —— 新增的升级块
+   没人负责，于是在插件独立页里照样可见。
+
+   现在收进 `#plugins-list-view` 一个容器，由 `showPluginsView()` 一处决定显隐。
+
+   ⚠️🔴 **这个容器必须自己复刻 `.panel` 的"flex 列容器"身份**，
+      而不是写 `display:block`。理由是本项目 2026-09-27 的真实事故：
+      `.panel` 是 `display:flex; flex-direction:column`，子项 `#plugin-switch-list`
+      带 `flex:0 1 auto; min-height:0`、`#plugin-page-list` 带 `flex:0 0 auto`。
+      一旦中间插进一个 `display:block` 的 div，那两个列表的**父级就不再是
+      flex 容器** ⇒ `flex` 属性全部失效 ⇒ 高度由内容决定、不再可压缩，
+      矮窗口下整块被推出可视区（当时的表现是"插件页入口列表高度 0"）。
+
+      写成 flex 列 + `min-height:0` + `flex:1`，语义与原来**逐字等价**：
+      容器自己占据 `.panel` 给的高度，内部子项照旧参与 flex 布局。 */
+.plugins-list-view {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);          /* 与 `.panel` 的 gap 一致，间距观感不变 */
+  flex: 1 1 auto;
+  min-height: 0;             /* 允许被压缩（否则矮窗口下会把面板撑爆） */
+}
+
 /* ==================== 插件升级：卡片式（两列网格）====================
    结构照 AstrBot 的「已安装插件」卡片（`InstalledPluginsTab-Djk2B9wl.css`），
    但**排成两列、整体缩小**（情绪 2026-10-17：「把卡片缩小一下并排一行排两个卡片」）。
@@ -1088,8 +1105,16 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   background: var(--panel-2);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  overflow: hidden;
-  min-width: 0;           /* 同上：允许网格项收窄，否则长内容撑破 */
+  /* 🔴 **绝不能写 `overflow:hidden`**（2026-10-31 真浏览器实测抓到）。
+     卡片的 `⋯` 菜单是 `position:absolute` + `bottom:100%`（**向上**弹），
+     父级一裁切，整个菜单就被切掉 —— 实测 1280×900 下菜单顶沿比卡片上沿
+     高 **160px**，7 个条目 `elementFromPoint` **全部**命中到别的元素
+     （`itemHittable=[false×7]`）= 用户根本点不到。
+     ⚠️ 而 `b.click()` 这类**程序化点击绕过命中测试**，所以老版判据全绿
+        ——那是假绿。判据必须用几何 + `elementFromPoint` 验，不能只看"点了有没有反应"。
+     这行本来就没用：卡片里的块级子元素宽度已由 `min-width:0` 收住，
+     菜单自己的描边/圆角/投影在 `.plugin-menu` 上单独声明。 */
+  min-width: 0;           /* 允许网格项收窄，否则长内容撑破列宽 */
   transition: border-color var(--ease), background var(--ease);
 }
 .plugin-card:hover { border-color: var(--border-strong); }
@@ -1952,3 +1977,283 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
    前者不可恢复。⚠️ 只改颜色、**不隐藏** —— 隐藏按钮会让用户以为没这功能。 */
 .plugin-file-del { color: var(--danger); }
 .plugin-file-hint { display: block; }
+
+/* ==================== 适配器页（消息平台接入：OneBot v11 / 内置 Web 端）====================
+ * 设计约束与「模型供应商」页一致：**复用既有设计语言** ——
+ *   卡片 = `.providers-card`、字段两列 = `.field-labeled/.fl-text/.fl-ctl`、
+ *   空态 = `.empty`、颜色只用已有令牌。
+ * 下面**只加确实缺的**：列表行（三态状态徽标 + 启停开关 + 操作）、
+ * 表单卡片的头部与底部排版、以及"必填"小标。
+ *
+ * 🔴 三态颜色语义（与后端 `AdapterRuntime` 的判定对齐）：
+ *    .ok     已连接          ← --ok（绿）
+ *    .warn   等待协议端连接  ← --warn（黄）**这是正常待连，不是错误**
+ *    （无）  未运行          ← --muted（灰）
+ *    .builtin 内置           ← --accent（强调色，表示"平台自带、始终可用"）
+ *    ⚠️ 不要给"等待协议端连接"用 --danger：它每天都会出现（协议端没开时），
+ *       用红色会让用户以为坏了，然后去改一堆本来正确的配置。
+ * ========================================================================== */
+
+.adapters-head {
+  display: flex; align-items: flex-start; gap: var(--sp-3);
+  justify-content: space-between; flex-wrap: wrap;
+}
+.adapters-head h3 { margin: 0; }
+.adapters-head .row { flex: 0 0 auto; }
+
+/* 列表：一行一个适配器（左=信息，右=开关与操作）。
+   ⚠️ 不复用 `.list`（那是"点开进详情"的卡片列表，整行可点）；
+      本页整行**不可点**，只有明确的按钮/开关可操作 —— 语义不同，样式也不该共用。 */
+.adapter-list {
+  list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: var(--sp-2);
+}
+.adapter-row {
+  display: flex; flex-direction: row; align-items: center; gap: var(--sp-3);
+  flex-wrap: wrap;
+  padding: var(--sp-3); border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--panel);
+  transition: border-color var(--ease), background var(--ease);
+}
+.adapter-row:hover { border-color: var(--border-strong); }
+.adapter-row-main { flex: 1 1 260px; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.adapter-row-title {
+  display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap;
+  min-width: 0;
+}
+.adapter-name {
+  font-size: 13.5px; font-weight: 600; color: var(--fg);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
+}
+/* 类型徽标：中性底（它不是状态，不该抢注意力） */
+.adapter-type {
+  padding: 0 6px; border-radius: var(--radius-sm);
+  font-size: 10.5px; font-weight: 500; vertical-align: 1px;
+  background: var(--border-strong); color: var(--muted); border: 1px solid var(--border);
+  white-space: nowrap;
+}
+/* 运行状态徽标：**三态一眼分得开**（这是本页最重要的信息） */
+.adapter-status {
+  padding: 0 7px; border-radius: 999px;
+  font-size: 11px; font-weight: 600; white-space: nowrap;
+  color: var(--muted); border: 1px solid var(--border);
+}
+.adapter-status.ok {
+  color: var(--ok); border-color: rgba(121, 201, 158, .34);
+  background: var(--ok-soft);
+}
+.adapter-status.warn {
+  color: var(--warn); border-color: rgba(224, 184, 119, .34);
+  background: var(--warn-soft);
+}
+.adapter-status.builtin {
+  color: var(--accent); border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+.adapter-sub { color: var(--muted); font-size: 11.5px; line-height: 1.6; word-break: break-word; }
+/* 未运行时的 last_error：**必须显眼**（它是"为什么没跑"的唯一线索） */
+.adapter-err {
+  color: var(--danger); font-size: 11.5px; line-height: 1.6;
+  word-break: break-word; padding-left: var(--sp-2);
+  border-left: 2px solid var(--danger);
+}
+
+/* 右侧操作区：启停开关 + 编辑 + 删除 */
+.adapter-ops { flex: 0 0 auto; display: flex; flex-direction: row; align-items: center; gap: var(--sp-2); }
+/* ⚠️ 显式 `flex-direction: row`：本文件有一条**全局** `label{flex-direction:column}`
+   规则（约 :187），插件启停那次就是被它排成竖排（每行 126px，实测）。
+   这里不写方向会继承到竖排 —— 又一个"同一概念多条写入路径"的坑。 */
+.adapter-switch {
+  display: flex; flex-direction: row; align-items: center; gap: 5px;
+  font-size: 12px; color: var(--muted); cursor: pointer; user-select: none;
+}
+.adapter-switch input[type=checkbox] {
+  width: 16px; height: 16px; flex: 0 0 auto;
+  accent-color: var(--accent); cursor: pointer;
+}
+.adapter-switch input[type=checkbox]:disabled { cursor: not-allowed; opacity: .55; }
+.adapter-ops button { padding: 4px 10px; font-size: 12px; }
+
+/* 表单卡片：复用 `.providers-card` 的皮，这里只补头部/底部排版 */
+.adapter-form { margin-top: var(--sp-3); }
+.adapter-form .providers-card-foot {
+  justify-content: space-between; gap: var(--sp-2);
+}
+/* bool 字段的控件：勾选框 + 一行"开启/关闭"（不用浏览器默认的裸勾选框） */
+.adapter-check {
+  display: flex; flex-direction: row; align-items: center; gap: 6px;
+  font-size: 13px; color: var(--fg); cursor: pointer;
+}
+.adapter-check input[type=checkbox] {
+  width: 16px; height: 16px; flex: 0 0 auto;
+  accent-color: var(--accent); cursor: pointer;
+}
+/* 「必填」小标：跟在 label 后面，低调但看得见（红色会太吵，那不是错误） */
+.adapter-required {
+  margin-left: 6px; padding: 0 5px; border-radius: var(--radius-xs);
+  font-size: 10px; font-weight: 500; color: var(--warn);
+  background: var(--warn-soft); border: 1px solid rgba(224, 184, 119, .28);
+}
+/* secret 字段的输入框用等宽字体：打码值是 `••••` 与末 4 位，等宽下更好核对 */
+#adapter-fields .field-labeled[data-field-type="secret"] input { font-family: var(--font-mono); font-size: 12.5px; }
+
+/* 手机端：行变竖排，操作区占满一整行（否则 300px 宽里按钮会被挤成方块） */
+@media (max-width: 640px) {
+  .adapters-head { flex-direction: column; align-items: stretch; }
+  .adapters-head .row button { flex: 1 1 auto; }
+  .adapter-row { flex-direction: column; align-items: stretch; }
+  .adapter-ops { justify-content: space-between; }
+  .adapter-form .providers-card-foot { flex-direction: column; align-items: stretch; }
+}
+
+/* ==================== 插件卡片的「⋯」动作菜单 ====================
+   照 AstrBot 真卡片的 actions 弹出层（`InstalledPluginsTab-DSnl1LUd.js`
+   的 `ExtensionCard`，`emits` 里列了 configure / update / reload / uninstall /
+   view-handlers / view-readme / change-source）。
+
+   🔴 **只放我们真有后端的那几条**（契约 §6.2）—— 画一条点了不生效的
+      就是假能力。 */
+
+.plugin-menu-wrap { position: relative; display: inline-flex; }
+
+.plugin-menu-trigger {
+  /* `⋯` 是个符号不是文字，用等宽 + 略大字号让它居中好看 */
+  font-size: 13px; line-height: 1; padding: 4px 8px; letter-spacing: 1px;
+}
+.plugin-menu-trigger[aria-expanded="true"] {
+  background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent);
+}
+
+.plugin-menu {
+  position: absolute;
+  /* 向上弹：卡片在列表里靠下时，向下弹会被视口切掉。
+     `bottom:100%` + 小间距，让菜单贴着触发器上沿。 */
+  bottom: calc(100% + 4px);
+  right: 0;
+  z-index: 40;                       /* 高于卡片，低于模态框（100+） */
+  min-width: 132px;
+  padding: 4px;
+  display: flex; flex-direction: column; gap: 1px;
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  /* 卡片是圆角+边框的，菜单必须自己投影，否则和背后卡片糊在一起 */
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+}
+
+.plugin-menu-item {
+  /* 🔴 必须 `text-align:left`：按钮默认居中，菜单项居中看着像标题不像条目 */
+  text-align: left;
+  font-size: 12.5px;
+  padding: 6px 10px;
+  border: none; border-radius: 6px;
+  background: transparent; color: var(--fg);
+  cursor: pointer; white-space: nowrap;
+  transition: background var(--ease);
+}
+.plugin-menu-item:hover:not(:disabled) { background: var(--hover); }
+.plugin-menu-item:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: -2px;
+}
+/* 不可用：灰掉但**仍然可悬停**（title 要能显示原因）——
+   所以用 `opacity` 而不是 `display:none`，也不改 `pointer-events`。 */
+.plugin-menu-item:disabled {
+  opacity: 0.42; cursor: not-allowed;
+}
+.plugin-menu-item--danger { color: var(--danger); }
+.plugin-menu-item--danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+
+.plugin-menu-sep {
+  height: 1px; margin: 3px 4px;
+  background: var(--border);
+}
+
+/* 从「⋯ → README」跳过来时高亮一下那个分组标题 ——
+   否则用户只看到"页面滚了一下"，不知道滚到了哪。
+   ⚠️ 用 `outline` 而不是 `background`：标题行没有自己的背景，
+      加背景会盖住 `.detail-group` 的边框感。 */
+.detail-flash {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
+  transition: outline-color 0.4s var(--ease);
+}
+
+/* ==================== 「删除插件」二次确认弹窗 ====================
+   照 AstrBot 的删除弹窗（情绪 2026-10-31 给的截图）：
+     标题「删除插件」+「你确定要删除当前插件吗？」+「操作：」两个勾选项 + 取消/确认。
+
+   🔴 复用 `.modal / .modal-box`（登录框同一套），不另写一套遮罩 ——
+      两套遮罩会各自记 `display`，退出路径一多必然有一条漏关。 */
+
+.delete-plugin-modal .modal-box {
+  /* 比登录框宽一点：两行勾选项各带一段等宽路径，太窄会折成三行 */
+  max-width: 540px;
+  width: min(92vw, 540px);
+}
+
+.delete-plugin-modal h3 {
+  margin: 0 0 var(--sp-2);
+  font-size: 17px;
+}
+
+/* 源码目录那一行：等宽 + 可折行 + 弱化（它是"将要被删掉的东西"，要看得清但不喧宾夺主） */
+.delete-plugin-path {
+  font-size: 11.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;      /* 长路径要能断开，否则撑破弹窗 */
+  margin: 0 0 var(--sp-3);
+  color: var(--muted);
+}
+
+.delete-plugin-ops { margin: var(--sp-3) 0; }
+.delete-plugin-ops h4 {
+  margin: 0 0 var(--sp-2);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+/* 一行勾选项：checkbox 在左，标签+路径在右，纵向排 */
+.delete-plugin-opt {
+  /* ⚠️ 必须显式 row：本文件有条全局 `label{flex-direction:column}`（约 :187），
+     不写就变成"勾选框在上、文字在下"的竖排（2026-09-27 插件启停踩过同一个坑）。 */
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 10px;
+  padding: var(--sp-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background var(--ease), border-color var(--ease);
+}
+.delete-plugin-opt + .delete-plugin-opt { margin-top: 6px; }
+.delete-plugin-opt:hover { background: var(--hover); border-color: var(--border-strong); }
+.delete-plugin-opt input[type="checkbox"] {
+  width: 16px; height: 16px;
+  flex: 0 0 auto;
+  margin-top: 2px;              /* 与首行文字基线对齐 */
+  cursor: pointer;
+}
+.delete-plugin-opt-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;                 /* 允许内部长路径收缩，否则撑破 */
+  font-size: 13px;
+}
+.delete-plugin-opt-detail {
+  font-size: 11px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.delete-plugin-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+}
