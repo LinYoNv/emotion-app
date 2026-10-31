@@ -23,3 +23,20 @@ tools/.inject_*_baseline.json
 # Wiki 审读报告：情绪 2026-09-25「wiki 审读就不用上传了，给你看是为了更好理解陪伴插件」
 # → 留在本地当参考，**不进仓库**。
 docs/WIKI_REVIEW_*.md
+
+# 🔴 一次性运维/排查脚本（2026-10-31）：它们带**本机/本服务器的具体路径与现场上下文**
+#    （根因、踩过的坑），是当时的排障记录，**不是可复用工具**。
+#    留在工作区供查阅，但不进仓库 —— 否则 clone 到别的机器上跑会打空，
+#    而且它们的能力（改白名单、重绑适配器）本身就是危险的，不该被随手复跑。
+tools/fix_*.py
+tools/rebind_*.py
+tools/confirm_binding*.py
+tools/finish_setup.py
+tools/show_setup.py
+tools/import_personas.py
+tools/import_astrbot_persona.py
+tools/sync_manifest_persona.py
+tools/purge_assistant_identity.py
+tools/remove_dsh_onebot.py
+tools/run_proactive_test.py
+tools/verify_provider_live.py
