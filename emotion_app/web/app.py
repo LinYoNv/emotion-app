@@ -971,7 +971,8 @@ def create_app(
             },
         )
         if config.plugins.enabled:
-            report = await app.config["EMOTION_PLUGIN_HOST"].start()
+            plugin_service = app.config["EMOTION_PLUGIN_HOST"]
+            report = await plugin_service.start()
             if report is not None:
                 log.info(
                     "插件已挂载",
@@ -983,6 +984,36 @@ def create_app(
                         }
                     },
                 )
+                # 🔴 **把「原生会话的人设」交给陪伴插件自己写**（2026-10-31）。
+                #
+                #   为什么必须走插件的接口而不是直接改它的表：
+                #   它把会话人设存在 `sp` 的
+                #   `(umo, "session_service_config")` 里，优先级比我们改的那张表**更高**，
+                #   直接改表**不报错、只是不生效**（我第一版就是这么翻的）。
+                #   插件的 `POST .../accounts/session` 会校验 persona 是否已加载、
+                #   是否在 Bot 绑定里，并刷新它自己的缓存 —— 语义全归它。
+                #
+                #   ⚠️ 绑定失败**不阻止服务启动**：那只是"面板改人设会报错"，
+                #      不该让整个面板打不开。如实记一条 warning。
+                sessions_repo = app.config.get("EMOTION_SESSIONS")
+                if sessions_repo is not None and hasattr(sessions_repo, "bind_persona_sync"):
+                    # ⚠️ `astrbot_host` 不在 `emotion_app` 包内（并列交付物），
+                    #    必须先补 `sys.path` —— 这正是 `plugin_host` 文档里
+                    #    那条硬约束（漏了就 ModuleNotFoundError）。
+                    from .plugin_host import ensure_host_on_path
+
+                    ensure_host_on_path()
+                    from astrbot_host.host_app import (
+                        set_session_persona_via_plugin,
+                    )
+
+                    async def _sync_persona(umo: str, persona_id: str) -> None:
+                        await set_session_persona_via_plugin(
+                            plugin_service.host, umo=umo, persona_id=persona_id
+                        )
+
+                    sessions_repo.bind_persona_sync(_sync_persona)
+                    log.info("原生会话的人设已交给陪伴插件管理（面板改人设会同步到插件）")
 
         # 🔴 **消息平台适配器**（OneBot 等）—— 必须在插件宿主启动**之后**：
         #    适配器的派发回调依赖 `EMOTION_PLUGIN_HOST`，而平台注册也要

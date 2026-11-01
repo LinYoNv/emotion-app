@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import traceback
@@ -1398,3 +1399,123 @@ class PluginHost:
             if hasattr(result, "__await__"):
                 result = await result
             return result
+
+
+# ---------------------------------------------------------------------------
+# 会话人设 → **委托给插件自己写**（2026-10-31，仿 AstrBot 的单一数据源）
+# ---------------------------------------------------------------------------
+
+#: 陪伴插件的账号/会话接口前缀（它自己登记的路由，见
+#: `astrbot_host/account_session_api.py:19` 的 `PREFIX`）。
+_COMPANION_PREFIX = "astrbot_plugin_private_companion/accounts"
+
+
+class _InternalRequest:
+    """给 `call_api` 用的**最小请求桩**（内部调用没有真实 HTTP 请求）。
+
+    ⚠️ 只需要 `method` / `path` / `headers` / `cookies` / `body()`：
+       插件那几个 handler 读的就是这几项（`PluginRequest` 其余字段给默认值即可）。
+    ⚠️ **不带 query**：插件的 `_admin()` 会 `if request.query: raise`，
+       造一个带 query 的桩会被它当场拒掉（`account_config_invalid`）。
+    """
+
+    def __init__(self, path: str, payload: dict[str, Any] | None = None) -> None:
+        self.method = "POST"
+        self.path = path
+        self.headers: dict[str, str] = {"content-type": "application/json"}
+        self.cookies: dict[str, str] = {}
+        self._raw = b"" if payload is None else json.dumps(payload).encode("utf-8")
+
+    async def body(self) -> bytes:
+        return self._raw
+
+
+async def set_session_persona_via_plugin(
+    host: Any, *, umo: str, persona_id: str
+) -> dict[str, Any]:
+    """把「某个 umo 的会话人设」**交给陪伴插件自己写**。
+
+    ## 为什么不直接改它的存储
+
+    陪伴插件把会话人设存在 `sp` 的
+    `(scope="umo", scope_id=<umo>, key="session_service_config")` 里
+    （`astrbot_host/native.py:174`），字段名 `persona_id`。
+    我第一版是**直接往 `plugin_conversations` 写** `persona_id` —— 那是错的：
+
+      * 那是**插件的私有表**，字段语义（`persona_id` vs `persona_override`）
+        由插件定义，写错了**不报错、只是不生效**；
+      * 插件还有一层 `session_service_config` 优先级更高，
+        直接改表根本压不过它。
+
+    ✅ 正确做法：调**插件自己的接口** `POST .../accounts/session`
+       （`account_session_api.py:98` 的 `save_session`）。它内部会：
+         ① 校验 persona 是否在**已加载的人设**里；
+         ② 若该会话受管（managed），还要求该 persona 已在 Bot 绑定里
+            （否则 `account_session_persona_unmapped`）；
+         ③ 写 `session_service_config["persona_id"]` 并刷新它的内存缓存。
+       ⇒ 语义、校验、缓存失效全由插件负责，**我们只传意图**。
+       这也正是 AstrBot 的做法（面板写、插件读，同一套接口）。
+
+    Args:
+        host: `PluginHost`。
+        umo: 会话的 unified_msg_origin（插件按它认会话）。
+        persona_id: 人设**名字**（AstrBot 规范就是 name，不是 UUID）。
+            传空串 = 解绑（插件会 `pop("persona_id")`）。
+
+    Returns:
+        插件原样返回的 dict（`{"status": "ok", "data": {"saved": True, ...}}`）。
+
+    Raises:
+        LookupError: 插件没登记该路由（宿主没起 / 插件版本不对）。
+        RuntimeError: 插件返回了 `status != ok`（**带上它的 code**，
+            绝不静默当成功 —— 那会让用户以为改好了、其实没改）。
+    """
+    if host is None or getattr(host, "context", None) is None:
+        raise RuntimeError("插件宿主尚未启动，无法把会话人设交给陪伴插件")
+
+    # 先按 umo 找到这个会话的 `session_key`（**不自己拼**：那是插件的内部格式，
+    # 它随时可能改；`GET /accounts` 会把它算好给我们）。
+    listed = await host.call_api(
+        _COMPANION_PREFIX,
+        request_obj=_InternalRequest(f"/{_COMPANION_PREFIX}"),
+        method="GET",
+        username="owner",
+    )
+    data = listed.get("data") if isinstance(listed, dict) else None
+    discovered = (data or {}).get("discovered") or {}
+    candidates: list[dict[str, Any]] = []
+    for group in discovered.values():
+        if isinstance(group, list):
+            candidates.extend(row for row in group if isinstance(row, dict))
+        elif isinstance(group, dict):
+            candidates.extend(row for row in group.values() if isinstance(row, dict))
+    target = next(
+        (row for row in candidates
+         if str(row.get("unified_msg_origin") or "") == str(umo)
+         and row.get("session_key")),
+        None,
+    )
+    if target is None:
+        raise RuntimeError(
+            f"陪伴插件里找不到 umo={umo!r} 对应的会话（它还没见过这条会话？"
+            f"先在 QQ 里说一句话，或到陪伴面板的「账号与会话」里确认）"
+        )
+
+    saved = await host.call_api(
+        f"{_COMPANION_PREFIX}/session",
+        request_obj=_InternalRequest(
+            f"/{_COMPANION_PREFIX}/session",
+            {"session_key": target["session_key"], "persona_id": str(persona_id or "")},
+        ),
+        method="POST",
+        username="owner",
+    )
+    if isinstance(saved, dict) and str(saved.get("status")) != "ok":
+        # 🔴 插件的具体原因**原样透出**（`account_session_persona_unmapped` 之类
+        #    都指向一个明确的下一步动作），不要笼统说"保存失败"。
+        err = saved.get("data") if isinstance(saved.get("data"), dict) else {}
+        raise RuntimeError(
+            f"陪伴插件拒绝了这次人设修改：{err.get('code') or saved.get('status')}"
+            f"（{err.get('message') or err.get('reason') or ''}）"
+        )
+    return saved

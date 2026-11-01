@@ -24,11 +24,6 @@ log = get_logger(__name__)
 
 SESSIONS_SECTION = "sessions"
 MESSAGES_SECTION = "messages"
-#: 🔴 插件侧的原生对话节（与 `conversation_manager.CONVERSATIONS_SECTION` **同一个值**）。
-#:    这里显式写一份是因为 `session_repo` 不该 import `conversation_manager`
-#:    （那会引入领域层内部循环依赖）。判据 `test_section_names_match` 守两处一致。
-CONVERSATION_SECTION = "plugin_conversations"
-
 #: 单会话消息上限（防御性；超出时保留最近 N 条并记 dropped）
 MAX_MESSAGES_PER_SESSION = 5000
 
@@ -268,6 +263,11 @@ class SessionRepository:
         """
         self._store = store
         self._persona_name_of = persona_name_of if callable(persona_name_of) else None
+        #: 「把会话人设交给陪伴插件写」的端口（`async (umo, persona_id) -> None`）。
+        #: 原生会话必须走它；普通会话不需要（人设只存在我们自己库里）。
+        #: ⚠️ 没注入时如实跳过 —— 面板上会显示"已保存"，但**插件侧没变**，
+        #:    所以装配层必须注入它（见 `emotion_app/__main__.py`）。
+        self._persona_sync: Any = None
 
     # ---- 会话 ----
 
@@ -433,7 +433,29 @@ class SessionRepository:
             log.info("会话已创建", extra={"data": {"id": session.id, "user_id": session.user_id}})
         return session
 
+    def bind_persona_sync(self, sync: Any) -> None:
+        """注入「把会话人设交给陪伴插件写」的端口（见 `__init__` 的说明）。"""
+        self._persona_sync = sync if callable(sync) else None
+
     async def update(self, session_id: str, patch: dict[str, Any]) -> Session:
+        # 🔴 **先让插件落定，再写我们自己的库**（顺序不能反）。
+        #    插件可能拒绝（比如该 persona 不在 Bot 绑定里 →
+        #    `account_session_persona_unmapped`）。若先写本地再调插件，
+        #    拒绝时本地已经改了 ⇒ 面板显示新值、插件仍是旧值，
+        #    正是本项目最忌的"假成功"。
+        if "persona_id" in patch and self._persona_sync is not None:
+            current = await self.get(session_id)
+            umo = str(getattr(current, "native_origin", "") or "")
+            if umo:
+                wanted = str(patch.get("persona_id") or "").strip()
+                # 🔴 **必须翻译成 name**：插件会用 `available_personas()`
+                #    （人设**名字**列表）校验，传 UUID 直接被拒
+                #    `host_persona_unavailable`。控件里存的是我们的 UUID。
+                name = ""
+                if wanted and self._persona_name_of is not None:
+                    name = str(self._persona_name_of(wanted) or "")
+                await self._persona_sync(umo, name)
+
         def change(sessions, store):
             if session_id not in sessions:
                 raise SessionNotFound(session_id)
@@ -507,6 +529,20 @@ class SessionRepository:
             sessions[session_id] = s
             return s
 
+        # 🔴 **原生会话的人设要交给陪伴插件自己写**（2026-10-31，仿 AstrBot）。
+        #
+        #   我第一版是直接往插件的 `plugin_conversations` 写 `persona_id` ——
+        #   那是错的：插件真正的会话人设存在 `sp` 的
+        #   `(scope="umo", scope_id=<umo>, key="session_service_config")` 里，
+        #   优先级**更高**，直接改表压不过它，而且**不报错、只是不生效**。
+        #
+        #   ✅ 正确做法：调插件自己的 `POST .../accounts/session`
+        #      （`account_session_api.py:98`），由它校验 + 写入 + 失效缓存。
+        #      语义、校验、缓存全归插件 —— 这正是 AstrBot 的模型：
+        #      **面板写同一套数据，插件读同一套数据**。
+        #
+        #   ⚠️ 这件事**不归本类管**（要 async 调别人），所以由装配层注入一个
+        #      `persona_sync` 端口；没注入时如实跳过（不假装同步成功）。
         # 🔴 **改了人设要就地同步到插件那侧**（2026-10-31，方案 A）。
         #
         #   为什么不能"等下一次聊天再同步"：`project_conversation()` 只在
@@ -517,53 +553,7 @@ class SessionRepository:
         #
         #   ⇒ 在**同一次 `update_sections` 事务**里把 `plugin_conversations`
         #     的 `persona_id` 一起改掉。两者要么都成功、要么都不写。
-        if "persona_id" in patch:
-            return await self._mutate_with_persona_sync(change, session_id)
-
         return await self._mutate(change, with_messages=False)
-
-    async def _mutate_with_persona_sync(self, change: Any, session_id: str) -> Any:
-        """原子地更新会话，并把 `persona_id` 同步进 `plugin_conversations`。
-
-        🔴 同步规则（与 `conversation_manager._project()` **同一口径**，别写第二套）：
-           * 面板存 UUID/AstrBot 存 name ⇒ 必须**翻译成 name**
-             （`multi_controller.py:244` 校验 `native["name"] == persona_id`）；
-           * 查不到就写空串，**不猜**（写 UUID 会让插件抛
-             `host_persona_unavailable`，一个看起来与本操作无关的错误）。
-
-        ⚠️ 只动**已存在**的原生会话记录（`native_conversation_id` 有值）：
-           没有原生侧记录时无从同步，如实跳过（不是失败）。
-        """
-        keys = [SESSIONS_SECTION, MESSAGES_SECTION, CONVERSATION_SECTION]
-
-        def mutate(raw):
-            sessions = self._decode_sessions(raw)
-            messages = self._decode_messages(raw)
-            result = change(sessions, messages)
-            raw[SESSIONS_SECTION] = {sid: s.to_dict() for sid, s in sessions.items()}
-            raw[MESSAGES_SECTION] = messages
-
-            node = raw.get(CONVERSATION_SECTION)
-            if not isinstance(node, dict):
-                node = {}
-            session = sessions.get(session_id)
-            cid = str(getattr(session, "native_conversation_id", "") or "") if session else ""
-            if cid and isinstance(node.get(cid), dict):
-                wanted = str(getattr(session, "persona_id", "") or "").strip()
-                name = ""
-                if wanted and self._persona_name_of is not None:
-                    try:
-                        name = str(self._persona_name_of(wanted) or "")
-                    except Exception:  # noqa: BLE001
-                        log.warning(
-                            "人设 id → name 翻译失败（%s），本轮不同步", wanted, exc_info=True
-                        )
-                        name = ""
-                node[cid]["persona_id"] = name
-                raw[CONVERSATION_SECTION] = node
-            return result
-
-        return await self._store.update_sections(keys, mutate)
 
     async def delete(self, session_id: str) -> None:
         def change(sessions, msgs):
