@@ -23,6 +23,13 @@ export let state = {
   //    编辑状态直接读/写 `#p-system-prompt` 的 value，不再需要影子副本。
   personas: [], activeId: "", current: null,
   sessions: [], currentSessionId: "", currentSession: null,
+  // 🔴 会话表单**刚填好时的快照**（键 = PATCH 收的字段名）。
+  //    保存时拿它做**增量对比**，只提交改动过的字段。
+  //    为什么必须这样：原生会话有只读字段（`user_id` / `summary`），
+  //    全量提交会把它们一起发出去 ⇒ 后端按设计 409 ⇒ 用户只是改个标题
+  //    也保存不了（情绪原话「设置面板什么改动都不行」）。
+  //    ⚠️ 由 `fillSessionForm()` 写入、保存成功后更新；**别让它长期是旧值**。
+  sessionFormBaseline: null,
   // 未读：`unread` = {会话id: 条数}（后端 `GET /api/v1/unread`），
   // `unreadTotal` = 侧边栏「聊天」那个圆圈显示的数字。
   // ⚠️ 只有**插件主动消息**会让它涨（见 `refreshUnread` 的注释）；

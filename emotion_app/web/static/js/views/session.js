@@ -329,6 +329,31 @@ export function fillSessionForm(s) {
   renderSessionModelField(s);
   // 总结模型下拉（同一套控件，独立的一个 select）
   renderSessionSummaryModelField(s);
+
+  // 🔴 **记下"表单刚填好时的样子"**，供保存时做**增量对比**（见 saveSessionConfig）。
+  //    见那里说明：全量提交会把"这个会话不让改的字段"一起发出去，整条被 409 拒掉。
+  state.sessionFormBaseline = sessionFormSnapshot();
+}
+
+/**
+ * 读出当前会话表单的**可提交快照**（键名 = `PATCH /sessions/<id>` 收的键）。
+ *
+ * ⚠️ 只收**真的会被 PATCH 接的**那些；`umo` 是服务端算的，不在里面。
+ * ⚠️ `user_id` 必须 `trim`（它是插件 `data["users"]` 的键，尾随空格会造出一个
+ *    看着一样、实际匹配不上的键）；`summary_instruction` **不 trim**（用户原文）。
+ */
+export function sessionFormSnapshot() {
+  const val = (id) => { const el = $(id); return el ? el.value : ""; };
+  return {
+    title: val("s-title"),
+    persona_id: val("s-persona"),
+    user_id: val("s-user-id").trim(),
+    summary: val("s-summary"),
+    mode: val("s-mode"),
+    protected_tail: parseInt(val("s-tail"), 10) || 20,
+    summary_trigger: parseInt(val("s-trigger"), 10) || 40,
+    summary_instruction: val("s-summary-instruction"),
+  };
 }
 
 /** 渲染「总结用哪个模型」下拉。
@@ -437,26 +462,53 @@ export async function saveSessionConfig() {
     return;
   }
   try {
-    const s = await api("PATCH", `/api/v1/sessions/${state.currentSession.id}`, {
-      title: $("s-title").value,
-      persona_id: $("s-persona").value,
-      // ⚠️ **必须 trim**：用户 ID 是插件 `data["users"]` 的**键**，
-      //    尾随空格会造出一个看着一样、实际匹配不上的键
-      //    → 主动消息"找不到用户"，且极难排查。
-      user_id: $("s-user-id").value.trim(),
-      summary: $("s-summary").value,
-      policy: {
-        mode: $("s-mode").value,
-        protected_tail: parseInt($("s-tail").value, 10) || 20,
-        summary_trigger: parseInt($("s-trigger").value, 10) || 40,
-        // 🔴 这两项必须**一起提交** —— policy 是整块替换，
-        //    漏了它们会把用户刚设的总结模型/提示词静默清空
-        //    （而"保存"看起来是成功的）。
+    /* 🔴🔴 **只提交真正改动过的字段**（2026-10-31 修的真 bug）。
+     *
+     * 原来这里是**全量提交**：title / persona_id / user_id / summary / policy
+     * 一股脑发出去。对普通会话没问题，但**原生会话**（历史由陪伴插件维护）
+     * 有一批字段是**只读**的 —— `user_id`（umo 第三段，插件认人的键）与
+     * `summary`（历史正文摘要）由插件负责。全量提交时它们**必然**出现在
+     * patch 里 ⇒ 后端按设计回 409 ⇒ 用户看到的是
+     * 「保存失败：此聊天窗口的历史与身份由陪伴维护…」
+     * **哪怕他只想改一下标题**。
+     *
+     * 这就是"一个字段不可写，导致整张表单都保存不了"——
+     * 用户的原话是「设置面板什么改动都不行」。
+     *
+     * ⇒ 用 `state.sessionFormBaseline`（`fillSessionForm` 时记的）做**增量**：
+     *   只发改过的键。没动过的只读字段不会被带上，保存就能成功。
+     *   ⚠️ 增量还有个额外好处：不会把用户看不见的字段**覆盖回旧值**
+     *      （全量提交时，任何一处没同步上的字段都会被打回表单里的那份）。
+     */
+    const now = sessionFormSnapshot();
+    const base = state.sessionFormBaseline || {};
+    const payload = {};
+    for (const key of ["title", "persona_id", "user_id", "summary"]) {
+      if (now[key] !== base[key]) payload[key] = now[key];
+    }
+    // policy 是**整块替换**，所以只要有任一子项变了就整块发（并补上不在这张
+    // 表单里的 `summary_model`，否则它会被清空 —— 本项目踩过）。
+    const policyChanged = ["mode", "protected_tail", "summary_trigger", "summary_instruction"]
+      .some((k) => now[k] !== base[k]);
+    if (policyChanged) {
+      payload.policy = {
+        mode: now.mode,
+        protected_tail: now.protected_tail,
+        summary_trigger: now.summary_trigger,
+        // ⚠️ 不走增量：policy 整体替换，缺了它就会被清空
         summary_model: (state.currentSession || {}).policy?.summary_model || "",
-        // ⚠️ 提示词是**用户原文**：不 trim（只判空），否则会静默改掉他写的尾部换行
-        summary_instruction: $("s-summary-instruction").value,
-      },
-    });
+        // ⚠️ 用户原文：不 trim（只判空）
+        summary_instruction: now.summary_instruction,
+      };
+    }
+
+    if (!Object.keys(payload).length) {
+      // 什么都没改就点保存 —— 如实说，不要假装"已保存"（也别发一个空 PATCH）
+      showHint($("cfg-session-hint"), "没有改动，无需保存");
+      return;
+    }
+
+    const s = await api("PATCH", `/api/v1/sessions/${state.currentSession.id}`, payload);
     state.currentSession = s;
     const i = state.sessions.findIndex((x) => x.id === s.id);
     if (i >= 0) state.sessions[i] = s;
@@ -466,6 +518,9 @@ export async function saveSessionConfig() {
     // 刚改了"会话绑定的人设" → 聊天页那行提示要立刻跟着变
     // （否则用户绑完人设、切回聊天页，看到的还是旧提示）。
     renderChatPersonaHint();
+    // 🔴 保存成功后**刷新基线** —— 否则第二次点保存时，
+    //    "已经存进去的值"会被当成"改动"再发一遍（只读字段又会被带上）。
+    state.sessionFormBaseline = sessionFormSnapshot();
     showHint($("cfg-session-hint"), "已保存");
     refreshSessionInfo();
   } catch (e2) {

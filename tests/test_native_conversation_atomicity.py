@@ -158,7 +158,23 @@ async def test_projection_is_one_way_and_preserves_protocol_and_media_parts(nati
     assert await projection(sessions, "projection") == native_history
     assert (await sessions.get("projection")).message_count == 3
     assert (await sessions.get("projection")).summary == ""
-    assert (await stores[0].load_sections([CONVERSATIONS_SECTION]))[CONVERSATIONS_SECTION] == native_before
+
+    # 🔴 **投影是单向的：它不许把「面板侧的历史/摘要」写回插件那边**。
+    #
+    #    ⚠️ 原断言是"整个 `plugin_conversations` 逐字不变"—— 那太绝对了。
+    #       2026-10-31 起 `_project()` 会**刻意**给人设做同步
+    #       （把面板的 UUID 翻译成插件认的 `name` 写进 `persona_id`），
+    #       否则"面板绑了人设、QQ 那边完全无感"。
+    #       所以这里改成：**除了 `persona_id`，其它字段一个都不许变**。
+    #       单向性守的仍然是那件事（历史/摘要不许反向污染），
+    #       只是把"人设同步"这个**有意为之**的例外排除在外。
+    native_after = (await stores[0].load_sections([CONVERSATIONS_SECTION]))[CONVERSATIONS_SECTION]
+    assert set(native_after) == set(native_before)
+    for key in native_before:
+        strip = lambda d: {k: v for k, v in d.items() if k != "persona_id"}  # noqa: E731
+        assert strip(native_after[key]) == strip(native_before[key]), (
+            f"{key} 的插件侧记录被投影改动了（除 persona_id 外都不许动）"
+        )
 
 
 @pytest.mark.parametrize("change", ["extend", "replace", "truncate"])
@@ -680,3 +696,176 @@ async def test_reset_token_is_checked_after_pending_reset_transaction_commits(na
     assert after[CONVERSATIONS_SECTION][cid]["content"] == pair("seed")
     assert after[CONVERSATIONS_SECTION][cid]["reset_revision"] > captured.reset_revision
     assert await stores[0].current_revision() == revision + 1
+
+
+# ---------------------------------------------------------------------------
+# 人设同步：面板绑的人设要能被插件读到（方案 A，2026-10-31）
+# ---------------------------------------------------------------------------
+
+
+async def test_project_syncs_persona_name_into_plugin_conversation(tmp_path):
+    """`_project()` 要把面板绑的人设**翻译成 name** 写进 `plugin_conversations`。
+
+    🔴 为什么这条必须存在（AstrBot 能改、我们不能的根因）：
+       AstrBot 只有一套会话存储 —— 面板改 `persona_id`、插件读同一份 ⇒ 即改即生效。
+       我们有**两套**（`sessions` vs `plugin_conversations`）且从来没打通：
+       面板把人设存在 `sessions.<sid>.persona_id`（UUID），
+       而陪伴插件读的是 `conversations.persona_id`
+       （`native.py:397` 的 `persona_snapshot_lookup`）⇒ **绑了等于没绑**。
+
+    🔴 而且**必须写 name 不能写 UUID**：`multi_controller.py:244` 校验
+       `native["name"] == binding.persona_id`，`_persona_to_v3` 也写明
+       「`name` 是插件的主键」。写 UUID 会被判 `host_persona_unavailable`。
+
+    ⚠️ 判据要断言**具体值**（"糯米茨"），不能只断言"非空" ——
+       写进 UUID 也是非空的，那样这条判据就抓不住真 bug。
+    """
+    store = SqliteStore(tmp_path / "sync.sqlite")
+    await store.open()
+    try:
+        # 一个"人设 id → 名字"的极简映射：面板存 UUID，插件认 name
+        names = {"uuid-liloth": "liloth", "uuid-nuomi": "糯米茨"}
+        manager = StoreConversationManager(store, persona_name_of=names.get)
+        sessions = SessionRepository(store)
+
+        cid = await manager.new_conversation(UMO, content=pair("seed"))
+        await sessions.ensure("projection")
+        # 面板侧绑定（存的是 UUID）
+        await sessions.update("projection", {"persona_id": "uuid-nuomi"})
+
+        await manager.project_conversation(UMO, cid, "projection")
+
+        conv = await manager.get_conversation(UMO, cid)
+        assert conv.persona_id == "糯米茨", (
+            f"插件侧读到的是 {conv.persona_id!r} —— 应该是人设**名字**，不是 UUID"
+        )
+    finally:
+        await store.close()
+
+
+async def test_project_clears_plugin_persona_when_panel_unbinds(tmp_path):
+    """面板把绑定清空 ⇒ 插件侧也要清（否则它会继续用那个旧角色）。
+
+    ⚠️ 这条守的是"只写不清"的半吊子实现：只在有值时同步，清空时什么也不做，
+       插件就会一直拿着上一次的人设 —— 用户以为解绑了，实际没解。
+    """
+    store = SqliteStore(tmp_path / "sync2.sqlite")
+    await store.open()
+    try:
+        names = {"uuid-liloth": "liloth"}
+        manager = StoreConversationManager(store, persona_name_of=names.get)
+        sessions = SessionRepository(store)
+
+        cid = await manager.new_conversation(UMO, content=pair("seed"))
+        await sessions.ensure("projection")
+        await sessions.update("projection", {"persona_id": "uuid-liloth"})
+        await manager.project_conversation(UMO, cid, "projection")
+        assert (await manager.get_conversation(UMO, cid)).persona_id == "liloth"
+
+        # 面板解绑
+        await sessions.update("projection", {"persona_id": ""})
+        await manager.project_conversation(UMO, cid, "projection")
+        assert (await manager.get_conversation(UMO, cid)).persona_id == ""
+    finally:
+        await store.close()
+
+
+async def test_project_writes_empty_when_persona_unknown_instead_of_guessing(tmp_path):
+    """人设 id 查不到名字时**写空**，不要原样把 UUID 写进去。
+
+    🔴 写 UUID 的后果不是报错，而是插件抛 `host_persona_unavailable`
+       （"choose a persona that is currently loaded in AstrBot"）——
+       一个**看起来与本操作无关**的错误。
+    """
+    store = SqliteStore(tmp_path / "sync3.sqlite")
+    await store.open()
+    try:
+        # 空映射 = 谁都查不到（模拟人设已被删 / 缓存未预热）
+        manager = StoreConversationManager(store, persona_name_of=lambda pid: "")
+        sessions = SessionRepository(store)
+
+        cid = await manager.new_conversation(UMO, content=pair("seed"))
+        await sessions.ensure("projection")
+        await sessions.update("projection", {"persona_id": "uuid-gone"})
+        await manager.project_conversation(UMO, cid, "projection")
+
+        conv = await manager.get_conversation(UMO, cid)
+        assert conv.persona_id == "", (
+            f"查不到 name 时不该写入 {conv.persona_id!r}（插件会因此报 host_persona_unavailable）"
+        )
+    finally:
+        await store.close()
+
+
+async def test_update_persona_syncs_to_plugin_side_immediately(tmp_path):
+    """`sessions.update({persona_id})` 要**当场**把 name 写进 `plugin_conversations`。
+
+    🔴 为什么不能等下一次聊天：`project_conversation()` 只在聊天请求链路里被调
+       （`default_llm_reply.py:181`），所以"面板改完 → 下一轮 QQ 消息"之间
+       两侧**不一致**：面板显示已绑，插件仍是旧角色。
+       实测就是这么翻车的 —— 部署脚本 PATCH 后立即读，插件侧还是旧值 '莉莉丝'。
+
+    ⚠️ 必须验**同一个事务**里写进去的（而不是"稍后会有"）：
+       读完立刻断言，中间不做任何触发投影的动作。
+    """
+    store = SqliteStore(tmp_path / "sync4.sqlite")
+    await store.open()
+    try:
+        names = {"uuid-nuomi": "糯米茨"}
+        sessions = SessionRepository(store, persona_name_of=names.get)
+        manager = StoreConversationManager(store, persona_name_of=names.get)
+
+        # 造一条原生会话（cid + native_conversation_id 都齐）
+        cid = await manager.new_conversation(UMO, content=pair("seed"))
+        await sessions.ensure("projection")
+        await manager.project_conversation(UMO, cid, "projection")
+
+        # 面板改人设 —— **只做这一步**，不触发投影
+        await sessions.update("projection", {"persona_id": "uuid-nuomi"})
+
+        node = (await store.load_sections([CONVERSATIONS_SECTION]))[CONVERSATIONS_SECTION]
+        assert node[cid]["persona_id"] == "糯米茨", (
+            f"插件侧没同步（读到 {node[cid]['persona_id']!r}）—— 用户会在面板看到已绑、"
+            "而插件仍用旧角色"
+        )
+    finally:
+        await store.close()
+
+
+async def test_update_clearing_persona_clears_plugin_side_immediately(tmp_path):
+    """面板解绑 ⇒ 插件侧**当场**清空（不等到下次聊天）。"""
+    store = SqliteStore(tmp_path / "sync5.sqlite")
+    await store.open()
+    try:
+        names = {"uuid-nuomi": "糯米茨"}
+        sessions = SessionRepository(store, persona_name_of=names.get)
+        manager = StoreConversationManager(store, persona_name_of=names.get)
+
+        cid = await manager.new_conversation(UMO, content=pair("seed"))
+        await sessions.ensure("projection")
+        await manager.project_conversation(UMO, cid, "projection")
+        await sessions.update("projection", {"persona_id": "uuid-nuomi"})
+        node = (await store.load_sections([CONVERSATIONS_SECTION]))[CONVERSATIONS_SECTION]
+        assert node[cid]["persona_id"] == "糯米茨"
+
+        await sessions.update("projection", {"persona_id": ""})
+
+        node = (await store.load_sections([CONVERSATIONS_SECTION]))[CONVERSATIONS_SECTION]
+        assert node[cid]["persona_id"] == "", (
+            "解绑后插件侧仍有值 —— 插件会继续用那个已经不绑的角色"
+        )
+    finally:
+        await store.close()
+
+
+def test_section_names_match_between_modules():
+    """两处 `plugin_conversations` 常量必须**同一个值**。
+
+    ⚠️ `session_repo` 与 `conversation_manager` 各写了一份（前者不能 import 后者，
+       会成环）。两份漂了就会出现"写进 A 节、插件读 B 节"——
+       而那是**完全不报错**的静默失效。
+    """
+    from emotion_app.domain import conversation_manager as cm
+    from emotion_app.domain import session_repo as sr
+
+    assert sr.CONVERSATION_SECTION == cm.CONVERSATIONS_SECTION == "plugin_conversations"

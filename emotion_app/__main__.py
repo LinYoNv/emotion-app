@@ -82,7 +82,25 @@ async def _serve() -> int:
     await settings.load()
     personas = PersonaRepository(store)
     await personas._ensure()  # 预热，让"载入失败"在启动时就暴露
-    sessions = SessionRepository(store)
+
+    # 🔴 会话仓库要能把「人设 id → name」翻译出来（2026-10-31）：
+    #    改会话人设时会把值同步进 `plugin_conversations`（插件读那里），
+    #    而 AstrBot 的规范是 **`persona_id` 就等于人设的 `name`**
+    #    （`multi_controller.py:244` 校验 `native["name"] == persona_id`）。
+    #    ⚠️ 必须是**同步**回调（它跑在 store 事务里）⇒ 读上面刚预热好的 `_cache`。
+    def _persona_name_of(persona_id: str) -> str:
+        pid = str(persona_id or "").strip()
+        if not pid:
+            return ""
+        found = personas._cache.get(pid) if isinstance(personas._cache, dict) else None
+        if found is not None:
+            return str(getattr(found, "name", "") or "")
+        for item in (personas._cache or {}).values():
+            if str(getattr(item, "name", "") or "") == pid:
+                return pid
+        return ""
+
+    sessions = SessionRepository(store, persona_name_of=_persona_name_of)
 
     # 上游客户端：进程级复用连接池
     upstream = OpenAIChatBackend()

@@ -24,6 +24,10 @@ log = get_logger(__name__)
 
 SESSIONS_SECTION = "sessions"
 MESSAGES_SECTION = "messages"
+#: 🔴 插件侧的原生对话节（与 `conversation_manager.CONVERSATIONS_SECTION` **同一个值**）。
+#:    这里显式写一份是因为 `session_repo` 不该 import `conversation_manager`
+#:    （那会引入领域层内部循环依赖）。判据 `test_section_names_match` 守两处一致。
+CONVERSATION_SECTION = "plugin_conversations"
 
 #: 单会话消息上限（防御性；超出时保留最近 N 条并记 dropped）
 MAX_MESSAGES_PER_SESSION = 5000
@@ -252,8 +256,18 @@ def _new_umo_user_id() -> str:
 class SessionRepository:
     """会话与其消息的读写。"""
 
-    def __init__(self, store: StoreBackend) -> None:
+    def __init__(self, store: StoreBackend, *, persona_name_of: Any = None) -> None:
+        """
+        Args:
+            persona_name_of: **人设 id → 名字**的回调（`str -> str`），可为 None。
+                改 `persona_id` 时要把值同步进 `plugin_conversations`
+                （插件读那里），而 AstrBot 的规范是**`persona_id` 就等于 name**
+                （`multi_controller.py:244` 会校验 `native["name"] == persona_id`）。
+                不翻译直接写 UUID，插件会抛 `host_persona_unavailable`。
+                回调返回空串 = 查不到（如实写空，不猜）。
+        """
         self._store = store
+        self._persona_name_of = persona_name_of if callable(persona_name_of) else None
 
     # ---- 会话 ----
 
@@ -454,10 +468,21 @@ class SessionRepository:
             #       它就是 **umo 的第三段**，是插件认人的键
             #       （`data["users"][<user_id>]`）。改它 = 让面板和插件对不上号
             #       （面板以为绑好了，插件仍按旧 umo 查记忆/关系）。
-            if (s.native_origin or s.native_conversation_id) and {
-                "user_id", "summary", "summarized_upto",
-            }.intersection(patch):
-                raise NativeProjectionReadOnly()
+            blocked = (s.native_origin or s.native_conversation_id) and (
+                {"user_id", "summary", "summarized_upto"}.intersection(patch)
+            )
+            if blocked:
+                # 🔴 **点名具体是哪几个字段**，不要只说"历史由陪伴维护"。
+                #    用户改的可能是 3 个字段，他不该去猜是哪一个被拒。
+                #    （本项目要求：错误文案必须能直接指向下一步动作。）
+                names = sorted(blocked)
+                labels = {"user_id": "用户 ID", "summary": "摘要", "summarized_upto": "摘要进度"}
+                raise NativeProjectionReadOnly(
+                    "这个窗口的"
+                    + "、".join(labels.get(n, n) for n in names)
+                    + " 由陪伴插件维护，不能在面板里改。"
+                    "（标题、人设、上下文模式、这条会话用的模型仍然可以改。）"
+                )
             if {"summary", "summarized_upto", "policy"}.intersection(patch):
                 s.history_revision += 1
             # 🔴 这是**白名单**：不在里面的键会被**静默忽略**（不报错、不落盘）。
@@ -482,7 +507,63 @@ class SessionRepository:
             sessions[session_id] = s
             return s
 
+        # 🔴 **改了人设要就地同步到插件那侧**（2026-10-31，方案 A）。
+        #
+        #   为什么不能"等下一次聊天再同步"：`project_conversation()` 只在
+        #   `default_llm_reply.py:181` 的**聊天请求链路**里被调 —— 也就是
+        #   面板改完人设后，要等**下一轮 QQ 消息**才会同步过去。
+        #   期间两侧不一致：用户在面板看到"已绑 liloth"，插件那边还是旧角色。
+        #   实测就是这么翻车的（部署脚本 PATCH 后立即读，仍是 '莉莉丝'）。
+        #
+        #   ⇒ 在**同一次 `update_sections` 事务**里把 `plugin_conversations`
+        #     的 `persona_id` 一起改掉。两者要么都成功、要么都不写。
+        if "persona_id" in patch:
+            return await self._mutate_with_persona_sync(change, session_id)
+
         return await self._mutate(change, with_messages=False)
+
+    async def _mutate_with_persona_sync(self, change: Any, session_id: str) -> Any:
+        """原子地更新会话，并把 `persona_id` 同步进 `plugin_conversations`。
+
+        🔴 同步规则（与 `conversation_manager._project()` **同一口径**，别写第二套）：
+           * 面板存 UUID/AstrBot 存 name ⇒ 必须**翻译成 name**
+             （`multi_controller.py:244` 校验 `native["name"] == persona_id`）；
+           * 查不到就写空串，**不猜**（写 UUID 会让插件抛
+             `host_persona_unavailable`，一个看起来与本操作无关的错误）。
+
+        ⚠️ 只动**已存在**的原生会话记录（`native_conversation_id` 有值）：
+           没有原生侧记录时无从同步，如实跳过（不是失败）。
+        """
+        keys = [SESSIONS_SECTION, MESSAGES_SECTION, CONVERSATION_SECTION]
+
+        def mutate(raw):
+            sessions = self._decode_sessions(raw)
+            messages = self._decode_messages(raw)
+            result = change(sessions, messages)
+            raw[SESSIONS_SECTION] = {sid: s.to_dict() for sid, s in sessions.items()}
+            raw[MESSAGES_SECTION] = messages
+
+            node = raw.get(CONVERSATION_SECTION)
+            if not isinstance(node, dict):
+                node = {}
+            session = sessions.get(session_id)
+            cid = str(getattr(session, "native_conversation_id", "") or "") if session else ""
+            if cid and isinstance(node.get(cid), dict):
+                wanted = str(getattr(session, "persona_id", "") or "").strip()
+                name = ""
+                if wanted and self._persona_name_of is not None:
+                    try:
+                        name = str(self._persona_name_of(wanted) or "")
+                    except Exception:  # noqa: BLE001
+                        log.warning(
+                            "人设 id → name 翻译失败（%s），本轮不同步", wanted, exc_info=True
+                        )
+                        name = ""
+                node[cid]["persona_id"] = name
+                raw[CONVERSATION_SECTION] = node
+            return result
+
+        return await self._store.update_sections(keys, mutate)
 
     async def delete(self, session_id: str) -> None:
         def change(sessions, msgs):

@@ -535,6 +535,9 @@ class PluginHostService:
             # ⚠️ 那句文案是**误诊**：缺这个属性时"触发对话"也不会写缓存
             #    （两个缓存写入口都在 `manager` 分支之后），所以只能靠补桥修好。
             persona_manager = await self._build_persona_manager()
+            # 🔴 预热人设缓存：`_persona_name_of()` 要在**同步**事务里读它
+            #    （把面板的 persona_id 翻译成插件认的 name，见那里的说明）。
+            await self._warm_persona_cache()
 
             # 🔴 **让 ProviderManager 能读到人格**（2026-10-19 补）。
             #
@@ -990,6 +993,60 @@ class PluginHostService:
             logger.error("构造投递端口失败（按未接入处理）", exc_info=True)
             return None
 
+    def _persona_name_of(self, persona_id: str) -> str:
+        """人设 id → **名字**（AstrBot 的 `persona_id` 规范就是 name）。
+
+        🔴 为什么需要翻译（2026-10-31）：
+           面板存的是 UUID（`8981024ac6e8…`），而 AstrBot 与陪伴插件
+           认的是**人设名**（`_persona_to_v3`：「`name` 是插件的主键」；
+           `multi_controller.py:244` 还会校验 `native["name"] == 绑定的 persona_id`）。
+           直接把 UUID 写进 `plugin_conversations.persona_id`，插件必然
+           抛 `host_persona_unavailable` —— **看起来存了，其实用不上**。
+
+        ⚠️ **必须是同步的**：它从 `ConversationManager._project()` 里被调，
+           而那里正处在 store 的 `update_sections` 事务回调中（同步函数）。
+           所以读 `PersonaRepo._cache` 这份**已经载入好的内存快照**，
+           不发请求、不 await。
+           ⇒ 前提是装配时先 `await personas.list()` 预热过一次
+             （见 `start()` 里 `_warm_persona_cache()`）。
+
+        Returns:
+            人设的名字；查不到返回**空串**（调用方按"没有"处理，不猜）。
+        """
+        pid = str(persona_id or "").strip()
+        if not pid:
+            return ""
+        repo = self.personas
+        cache = getattr(repo, "_cache", None) if repo is not None else None
+        if not isinstance(cache, dict):
+            # 还没预热 —— 如实返回空，**不在这里偷偷 await**（也不猜名字）
+            logger.debug(
+                "人设缓存未预热，persona_id=%s 无法翻译成 name（本轮不写）", pid
+            )
+            return ""
+        found = cache.get(pid)
+        if found is not None:
+            return str(getattr(found, "name", "") or "")
+        # 也接受"传进来的本身就是 name"（插件配置里可能存的是 name）
+        for persona in cache.values():
+            if str(getattr(persona, "name", "") or "") == pid:
+                return pid
+        return ""
+
+    async def _warm_persona_cache(self) -> None:
+        """预热人设缓存（`PersonaRepo._cache`），供 `_persona_name_of` 同步读取。
+
+        ⚠️ 失败**不致命**：预热不了就退回"不写 persona_id"（如实），
+           不能让整个插件宿主起不来。
+        """
+        repo = self.personas
+        if repo is None:
+            return
+        try:
+            await repo.list()
+        except Exception:  # noqa: BLE001
+            logger.warning("预热人设缓存失败（persona_id 将无法翻译成 name）", exc_info=True)
+
     def _build_conversation_manager(self) -> Any:
         """造对话历史端口（让插件能存/取自己那份对话历史）。
 
@@ -1014,7 +1071,9 @@ class PluginHostService:
                 StoreConversationManager,
             )
 
-            self.conversation_manager = StoreConversationManager(store)
+            self.conversation_manager = StoreConversationManager(
+                store, persona_name_of=self._persona_name_of
+            )
             return self.conversation_manager
         except Exception:  # noqa: BLE001
             logger.error("构造对话历史端口失败（按未接入处理）", exc_info=True)

@@ -141,8 +141,25 @@ class StoreConversationManager:
        自用规模（一个用户几十条对话），这点开销可以忽略。
     """
 
-    def __init__(self, store: Any) -> None:
+    def __init__(self, store: Any, *, persona_name_of: Any = None) -> None:
+        """
+        Args:
+            persona_name_of: 🔴 **人设 id → 名字**的回调（`str -> str`），可为 None。
+                为什么需要它（2026-10-31）：AstrBot / 陪伴插件的规范是
+                **`persona_id` 就等于人设的 `name`**
+                （`_persona_to_v3` 注释原话「`name` 是插件的主键」；
+                 `multi_controller.py:243-244` 还会额外校验
+                 `native["name"] == binding.persona_id`，不等就抛
+                 `host_persona_unavailable`）。
+                而我们面板存的是 UUID ⇒ 直接同步过去**必然对不上**。
+                ⇒ 写 `plugin_conversations.persona_id` 时先翻译成 name。
+
+                ⚠️ 用回调而不是持有 repo：本模块是**领域层**，
+                   不该反向依赖人设仓库的存储形状（单向依赖）。
+                   回调返回空串 = 查不到，如实写空（不猜）。
+        """
         self._store = store
+        self._persona_name_of = persona_name_of if callable(persona_name_of) else None
 
     # ---- 内部：读写整个 section ----
 
@@ -366,8 +383,7 @@ class StoreConversationManager:
 
         return await self._mutate(change)
 
-    @staticmethod
-    def _project(raw: dict[str, Any], rec: dict[str, Any], session_id: str) -> None:
+    def _project(self, raw: dict[str, Any], rec: dict[str, Any], session_id: str) -> None:
         sessions = raw.get(SESSIONS_SECTION, {})
         messages = raw.get(MESSAGES_SECTION, {})
         if not isinstance(sessions, dict) or not isinstance(messages, dict):
@@ -406,6 +422,37 @@ class StoreConversationManager:
         if not linked or common != len(previous) or reset_changed:
             metadata["summary"] = ""
             metadata["summarized_upto"] = 0
+        # 🔴🔴 **把人设同步进插件能读的地方**（2026-10-31，方案 A）。
+        #
+        #   AstrBot 只有一套会话存储：面板改 `persona_id`、插件读同一份 ⇒ 改完即生效。
+        #   我们有两套（`sessions` vs `plugin_conversations`）且**从来没打通**，
+        #   于是面板绑了人设，QQ 那边完全无感。
+        #
+        #   陪伴插件读它的优先级（`native.py:364-415`）：
+        #     ① 窗口快照 ② 插件 session settings ③ 唯一角色映射
+        #     ④ `conversations.persona_id` → `resolve_selected_persona(conversation_persona_id)`
+        #   ⇒ 我们写第 ④ 层**不动** ①②③，所以**不会冲掉插件已绑好的角色**；
+        #      只在"还没绑"时提供兜底。这正是方案 A 安全的原因。
+        #
+        #   ⚠️ **必须写 name 而不是 UUID**：插件校验
+        #      `native["name"] == binding.persona_id`（`multi_controller.py:244`），
+        #      而 `_persona_to_v3` 也写明「`name` 是插件的主键」。
+        #      写 UUID 会被它判成 `host_persona_unavailable`。
+        #   ⚠️ 查不到映射时**写空串**（不猜、不保留旧值 —— 旧值可能指向已删的人设，
+        #      那会让插件拿到一个不存在的角色）。
+        wanted = str(metadata.get("persona_id") or "").strip()
+        if wanted and self._persona_name_of is not None:
+            try:
+                resolved = self._persona_name_of(wanted)
+            except Exception:  # noqa: BLE001 — 翻译失败不该让整个投影失败
+                log.warning("人设 id → name 翻译失败（%s），本轮不写 persona_id", wanted, exc_info=True)
+                resolved = None
+            if resolved is not None:
+                rec["persona_id"] = str(resolved or "")
+        elif not wanted:
+            # 面板明确清空了绑定 ⇒ 插件侧也要清（否则它会继续用一个旧角色）
+            rec["persona_id"] = ""
+
         metadata["native_origin"] = origin
         metadata["native_conversation_id"] = cid
         metadata["native_history_revision"] = native_revision

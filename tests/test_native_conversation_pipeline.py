@@ -1164,3 +1164,65 @@ async def test_cancelled_tool_turn_reports_error_role_not_stale_tool(external_pi
     assert response is not None
     assert response.role != "assistant", "cancelled turn must not claim assistant"
     assert response.role == "err", response.role
+
+
+async def test_native_session_can_still_change_editable_fields_only(external_pipeline):
+    """原生会话**只改可编辑字段**时必须成功 —— 这是「设置面板什么改动都不行」的正向判据。
+
+    🔴 用户原话：「设置面板什么改动都不行」。
+       真因是前端**全量提交**：title / persona_id / user_id / summary / policy
+       一股脑发出去，而原生会话的 `user_id` / `summary` 是只读的 ⇒
+       后端 409 ⇒ **哪怕只改个标题也存不了**。
+
+    修法两条（缺一不可）：
+      ① 前端 `saveSessionConfig()` 改成**增量**：只发改过的键；
+      ② 后端报错**点名具体字段**，不再只说"历史由陪伴维护"。
+
+    ⚠️ 本条守的是"**能改的确实能改**"。只把字段从拒绝列表删掉是不够的 ——
+       必须真的发出一个**只含可编辑字段**的 patch 并拿到 200 + 落盘。
+       反向那条（改了只读字段仍要 409）见
+       `test_http_cannot_fake_mutating_native_history`。
+    """
+    from emotion_app.web.default_llm_reply import build_external_chat_request
+
+    p = external_pipeline
+    request = await build_external_chat_request(p.chat, p.plugins, p.event())
+    client = p.app.test_client()
+    headers = {"Authorization": "Bearer isolated-token"}
+
+    # 面板"只改了标题和上下文模式"时，实际发出去的就是这么一个 patch
+    response = await client.patch(
+        f"/api/v1/sessions/{request.session_id}",
+        json={"title": "只改标题", "policy": {"mode": "recent_only", "protected_tail": 12}},
+        headers=headers,
+    )
+    assert response.status_code == 200, await response.get_json()
+
+    got = await (await client.get(f"/api/v1/sessions/{request.session_id}", headers=headers)).get_json()
+    session = got.get("data") or got
+    assert session.get("title") == "只改标题"
+    assert (session.get("policy") or {}).get("protected_tail") == 12
+
+
+@pytest.mark.parametrize("field,label", [
+    ("user_id", "用户 ID"),
+    ("summary", "摘要"),
+])
+async def test_native_readonly_rejection_names_the_offending_field(external_pipeline, field, label):
+    """被拒时必须**点名是哪个字段** —— 用户不该去猜三个字段里哪个不行。
+
+    ⚠️ 判据断言的是**具体字段名**，不是"报错了就行"：
+       只断言 409 的话，文案退化成一句"操作失败"也照样绿（本项目忌的假判据）。
+    """
+    from emotion_app.web.default_llm_reply import build_external_chat_request
+
+    p = external_pipeline
+    request = await build_external_chat_request(p.chat, p.plugins, p.event())
+    response = await p.app.test_client().patch(
+        f"/api/v1/sessions/{request.session_id}",
+        json={field: "x"},
+        headers={"Authorization": "Bearer isolated-token"},
+    )
+    assert response.status_code == 409
+    message = (await response.get_json())["error"]["message"]
+    assert label in message, message

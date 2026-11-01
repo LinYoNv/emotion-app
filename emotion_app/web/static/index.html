@@ -689,6 +689,18 @@
           <label>绑定人设（留空 = 用当前人设）
             <select id="s-persona"><option value="">（当前人设）</option></select>
           </label>
+          <!-- 🔴 **边界必须写在界面上**（情绪 2026-10-31 要求，方案 C）。
+               用户之前以为改这里就能给 QQ 那边换角色 —— 而实际有两套：
+                 * 这里 → 影响**本面板/网页聊天**用哪个系统提示词
+                 * QQ 那边 → 由陪伴插件自己的「角色绑定」决定
+               两套数据我们已经打通（会把人设名同步进 plugin_conversations，
+               供插件兜底时读），但**插件已绑好的角色优先**，不会被这里覆盖。
+               ⚠️ 不写这一句，用户会一直以为"改了没生效 = 有 bug"。 -->
+          <p class="hint persona-scope-hint">
+            <strong>只影响网页聊天</strong>的人设。
+            QQ 那边用什么角色由陪伴插件的「角色绑定」决定
+            —— 已绑好的不会被这里覆盖；没绑过时会用这里选的人设兜底。
+          </p>
           <label>插件用户 ID（= umo 第三段）
             <input id="s-user-id" placeholder="例如 sess-a1b2c3d4e5f6" />
           </label>

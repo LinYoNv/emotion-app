@@ -2257,3 +2257,18 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   gap: var(--sp-2);
   margin-top: var(--sp-3);
 }
+
+/* ==================== 人设作用范围说明 ====================
+   放在「绑定人设」下拉下方。它不是装饰 —— 是本项目的**边界说明**：
+   面板的人设与陪伴插件的角色绑定是两套数据，用户很容易以为改一处两处都变。
+   样式上刻意弱化（左侧竖线 + 小一号字），避免喧宾夺主。 */
+.persona-scope-hint {
+  margin: -2px 0 4px;
+  padding: 6px 10px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  border-left: 2px solid var(--border-strong);
+  color: var(--muted);
+  background: transparent;
+}
+.persona-scope-hint strong { color: var(--fg); font-weight: 600; }
