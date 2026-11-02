@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from companion_v2.adapters.astrbot.native import native_id
+from companion_v2.adapters.astrbot.native import event_account_id, event_peer_id, native_id, supported_platform_name
 from companion_v2.adapters.astrbot.staging_bootstrap import AstrBotStagingBootstrap
 from companion_v2.adapters.astrbot.staging_config import StagingConfiguration, StagingConfigurationError
 from companion_v2.capabilities import CapabilityManagementService
@@ -42,8 +42,9 @@ from .management_identity import dashboard_operator
 from .settings import HostControlError, HostSettings
 from .voice import NativeVoiceReply
 from .weather_settings import configured_weather_ports
+from .files.parsing import parser_availability
 from .service_balance import configured_balance_port
-from .news import configured_news_port
+from .news import configured_news_port, configured_search_port
 from .solar_terms import configured_solar_term_port
 from .qzone_client import QzoneHttpClient
 from .qzone_transport import build_qzone_transport
@@ -461,7 +462,12 @@ class AstrBotStagingController:
             managed_extensions=MANAGED_EXTENSIONS)
         weather_port, weather_alert_port = configured_weather_ports(self.config)
         from .model_settings import conversation_provider_resolver
+        from .relay_tools import RelayToolPort
         search_provider_resolver = SearchSettingsStore(self.data_root).selected_provider_id
+        def search_port_factory(context, query, result_count):
+            return configured_search_port(self.context, query=query, result_count=result_count,
+                task_context=context, topic="general",
+                deepseek_provider_resolver=search_provider_resolver)
         loaded = self.bootstrap.load(runtime_instance_id="astrbot-staging-" + uuid4().hex,
                                      review_only=review_only,
                                      native_tool_port=self.native_extensions,
@@ -471,6 +477,7 @@ class AstrBotStagingController:
                                      balance_port=configured_balance_port(self.config),
                                      news_port=configured_news_port(self.config, context=self.context,
                                          deepseek_provider_resolver=search_provider_resolver),
+                                     search_port_factory=search_port_factory,
                                      qzone_transport=self._qzone_transport(),
                                      solar_term_port=configured_solar_term_port(
                                          self.config.get("solar_terms") if isinstance(self.config, dict) else None),
@@ -480,13 +487,51 @@ class AstrBotStagingController:
                                      replacement_rules=self.settings.replacement_rules,
                                      fallback_on_refusal=self.settings.fallback_on_refusal,
                                      voice_policy=self.settings.voice_reply_policy
-                                         if self.settings.voice_reply_enabled else None)
+                                         if self.settings.voice_reply_enabled else None,
+                                     relay_tool_port_factory=lambda bridge: RelayToolPort(
+                                         bridge, native_types=self.native_types, enabled=not review_only))
         if loaded.failure is not None:
             await self.native_extensions.aclose()
             raise TaskError(loaded.failure.code, loaded.failure.reason)
         self.session = loaded.unwrap()
-        from .knowledge_sources import attach_official_knowledge
+        # 关键词材料：服务余额、当前模型与链接正文；读不到时各自判定不可用，登记本身不拦启动。
+        try:
+            from .service_balance import balance_keyword_material
+            from .model_route_material import model_route_keyword_material
+            from .web_read_material import web_read_keyword_material
+            from companion_v2.conversation.keyword_materials import KeywordMaterials
+            async def deepseek_fetch(url):
+                port = configured_search_port(self.context, query="链接正文", result_count=1,
+                    topic="general", deepseek_provider_resolver=search_provider_resolver)
+                if port is None or not callable(getattr(port, "fetch_article", None)):
+                    return None
+                return await port.fetch_article(url)
+            self.session.application.keyword_materials = KeywordMaterials((
+                balance_keyword_material(self.session.application),
+                model_route_keyword_material(self.session.application, self.context,
+                                             native_tool_port=self.native_extensions),
+                web_read_keyword_material(self.session.application, fetch=deepseek_fetch),
+            ))
+        except Exception as error:
+            logger.warning("[CompanionV2] 关键词材料登记失败 error_type=%s", type(error).__name__)
+        try:
+            from .files.parsing import report_parser_availability
+            report_parser_availability(logger)
+        except Exception as error:
+            logger.warning("[CompanionV2] 文档解析组件自检失败 error_type=%s", type(error).__name__)
+        try:
+            from .image_access import ensure_image_access
+            ensure_image_access(self.runtime, self.session.profile.target, observed_at=self.now())
+        except Exception as error:
+            logger.warning("[CompanionV2] 生图能力授权补齐失败 error_type=%s", type(error).__name__)
+        from .knowledge_sources import attach_official_knowledge, import_configured_sources_at_startup
         attach_official_knowledge(self.session.application, self.context)
+        # 配置的世界书材料在启动时刷新一次；来源缺失或损坏只记日志，不拦启动，重复刷新按内容去重。
+        try:
+            import_configured_sources_at_startup(self.session.application.runtime, self.context,
+                                                 at=self.now())
+        except Exception as error:
+            logger.warning("[CompanionV2] 启动知识导入失败 error_type=%s", type(error).__name__)
         self.session.bridge.forward_intake = self.settings.forward_intake
         from .semantic_models import NativeSemanticModels, configured_slang_search_port
         self.session.application.attach_semantics(NativeSemanticModels(self.context, self.settings.provider_id,
@@ -817,17 +862,17 @@ class AstrBotStagingController:
             return False
         scope = configuration.scope
         if (
-            type(event) is not self.native_types.event
+            not isinstance(event, self.native_types.event)
             or getattr(event, "unified_msg_origin", None)
             != f"{scope.platform}:FriendMessage:{scope.native_scope_id}"
             or session.application.state != "running"
         ):
             return False
         try:
-            message = event.message_obj
             return (
-                native_id(message.self_id) == scope.account_id
-                and native_id(message.sender.user_id) == scope.native_scope_id
+                supported_platform_name(getattr(event.platform_meta, "name", None))
+                and event_account_id(event) == scope.account_id
+                and event_peer_id(event) == scope.native_scope_id
                 and event.platform_meta.id == scope.platform
                 and event.bot is session.bridge.client(scope)
             )
@@ -943,10 +988,13 @@ class AstrBotStagingController:
             return {"handled": True, "ok": False, "reason": request.reason,
                     "reply": "人格名不能包含换行或过长，请用一行短名字重发。"}
 
+        persona_id = request.persona_id
+        if request.kind == "bind" and not persona_id:
+            persona_id = await self._window_persona(identity)
         parked = PendingBinding(platform_id=identity["platform_id"],
                                 account_id=identity["account_id"],
                                 participant_id=identity["participant_id"],
-                                persona_id=request.persona_id)
+                                persona_id=persona_id)
 
         if request.kind == "confirm":
             existing_binding = self._parked_binding()
@@ -983,6 +1031,17 @@ class AstrBotStagingController:
                     "reply": "这条绑定无法成立：" + str(error)}
         return {"handled": True, "ok": True, "confirmed": False, "reply": describe_pin(pinned),
                 "binding": self.binding_state()}
+
+    async def _window_persona(self, identity):
+        """The persona this private window actually speaks in, when unnamed."""
+        resolver = getattr(self.session_topology, "window_persona", None)
+        if not callable(resolver):
+            return ""
+        try:
+            return await resolver(identity["platform_id"], identity["participant_id"])
+        except Exception as error:
+            logger.debug("[CompanionV2] 绑定时读取当前人格失败 error_type=%s", type(error).__name__)
+            return ""
 
     async def receive_notice(self, event):
         if is_poke_notice(event):
@@ -1102,6 +1161,7 @@ class AstrBotStagingController:
             "model_request_sent_by_status": False,
             "platform_message_sent_by_status": False,
             "delivery_authorization": delivery_authorization,
+            "parser_availability": parser_availability(),
         }
 
     def register_routes(self) -> None:

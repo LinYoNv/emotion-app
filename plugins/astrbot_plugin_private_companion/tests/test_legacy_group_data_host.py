@@ -70,7 +70,8 @@ class LegacyGroupDataHostTests(GroupFixture, unittest.IsolatedAsyncioTestCase):
         return root
 
     async def plan(self, root, *, target="group-a", role="role-a"):
-        query = urlencode({"v1_root": str(root), "source_persona_id": "", "source_group_id": "789"})
+        # Match the setup page: empty primary-persona values are not sent.
+        query = urlencode({"v1_root": str(root), "source_group_id": "789"})
         response = await self.request("/plan", target=target, role=role, query=query)
         self.assertEqual(response["status"], "ok", response)
         return response["data"]
@@ -90,6 +91,23 @@ class LegacyGroupDataHostTests(GroupFixture, unittest.IsolatedAsyncioTestCase):
         return SourceBinding(self.controller.runtime.installation_id, role_id="role-a", persona_id="role-a",
             native_scope_ids=("300",), scope_kind=ScopeKind.GROUP,
             scope_route=(platform, bot, account))
+
+    async def test_primary_persona_preview_accepts_omitted_id_but_apply_requires_it(self):
+        root = self.source_root()
+        await self.start_host()
+        plan = await self.plan(root)
+        explicit = await self.request("/plan", query=urlencode({
+            "v1_root": str(root), "source_persona_id": "", "source_group_id": "789"}))
+        self.assertEqual(explicit["status"], "ok", explicit)
+        self.assertEqual(plan["source_persona_id"], "")
+        self.assertEqual(plan["plan_token"], explicit["data"]["plan_token"])
+        missing = await self.request("/apply", data={
+            "plan_token": plan["plan_token"], "source_group_id": "789",
+            "import_group_network": True, "import_group_worldbook": True,
+            "confirm_member_ids": True, "confirm_group_mapping": True,
+            "v1_root": str(root)})
+        self.assertEqual(missing["status"], "error", missing)
+        self.assertEqual(missing["data"]["code"], "legacy_request_invalid")
 
     async def test_mapping_import_is_explicit_and_isolated_across_same_id_platform_groups(self):
         root = self.source_root()
@@ -182,6 +200,45 @@ class LegacyGroupDataHostTests(GroupFixture, unittest.IsolatedAsyncioTestCase):
         network = GroupRelationshipStore(self.controller.runtime).projection_for_route(
             self.controller.runtime.installation_id, "qq-main", "bot-a", "100", "300", "role-a")
         self.assertEqual({item["native_account_id"] for item in network["members"]}, {"299"})
+
+    async def test_group_expression_import_keeps_rules_in_exact_group(self):
+        root = self.source_root()
+        path = root / "companions.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["groups"]["300"] = {"expression_profile": {
+            "learned_rules": [{"id": "group-greeting", "kind": "style",
+                "situation": "群友进来打招呼时", "pattern": "早呀",
+                "instruction": "轻快接话", "channels": ["group"],
+                "evidence_examples": ["早呀"]}],
+            "pending_samples": [{"id": "sample-1", "text": "早呀",
+                "ts": self.controller.now().timestamp()}]}}
+        path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+        await self.start_host()
+        query = urlencode({"v1_root": str(root), "source_group_id": "300"})
+        planned = await self.request("/plan", query=query)
+        self.assertEqual(planned["status"], "ok", planned)
+        plan = planned["data"]
+        self.assertEqual(plan["group_expression"]["adopted_count"], 1)
+        request_data = {"plan_token": plan["plan_token"], "source_persona_id": "",
+            "source_group_id": "300", "import_group_network": False,
+            "import_group_worldbook": False, "import_group_expression": True,
+            "confirm_member_ids": False, "confirm_group_mapping": True,
+            "confirm_expression_mapping": False, "v1_root": str(root)}
+        denied = await self.request("/apply", data=request_data)
+        self.assertEqual(denied["data"]["code"], "legacy_expression_mapping_confirmation_required")
+        imported = await self.request("/apply", data={**request_data,
+            "confirm_expression_mapping": True})
+        self.assertEqual(imported["status"], "ok", imported)
+        self.assertEqual(imported["data"]["group_expression"]["created"], 1)
+        replay_plan = (await self.request("/plan", query=query))["data"]
+        self.assertEqual(replay_plan["group_expression"]["remaining"], 0)
+        rows = self.controller.runtime.read_all(
+            "SELECT state, scope_key FROM expression_style_signals WHERE run_id LIKE 'legacy-expression:%'", ())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["state"], "adopted")
+        context = LegacyGroupDataWebAPI(self.controller, "group-a", "role-a")._scope_context(
+            self.controller.settings.target("group-a"))
+        self.assertEqual(rows[0]["scope_key"], digest(context.scope))
 
 
 if __name__ == "__main__":

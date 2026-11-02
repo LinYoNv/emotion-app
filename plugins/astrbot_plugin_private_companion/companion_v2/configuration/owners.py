@@ -58,15 +58,20 @@ class SparseConfigurationOwner:
         ids = tuple(field.field_id for field in fields)
         placeholders = ",".join("?" for _ in ids)
         layers = target.chain()
-        revisions = []
+        revision = 0
+        dependencies = []
         records = {}
         for layer in layers:
             row = self.runtime.read_one("SELECT revision FROM configuration_targets WHERE target_key = ?", (layer.key,))
-            revisions.append((layer.key, row["revision"] if row else 0))
+            revision = row["revision"] if row else 0
             records[layer.key] = {row["field_id"]: (json.loads(row["value_json"]), row["revision"]) for row in self.runtime.read_all(
                 f"SELECT field_id, value_json, revision FROM configuration_values WHERE target_key = ? AND field_id IN ({placeholders})",
                 (layer.key, *ids),
             )}
+            # Keep the whole target revision for the transaction's write check,
+            # but an open editor depends only on its requested fields. Otherwise
+            # saving one model task invalidates every other task in the role.
+            dependencies.append((layer.key, max((item[1] for item in records[layer.key].values()), default=0)))
         effective = {}
         for field in fields:
             value, source, source_revision = field.default, None, 0
@@ -76,7 +81,7 @@ class SparseConfigurationOwner:
                     value = field.validate(stored_value)
                     source = layer
             effective[field.field_id] = EffectiveValue(value, source, source == target, source_revision)
-        return OwnerSnapshot(revisions[-1][1], tuple(revisions), effective)
+        return OwnerSnapshot(revision, tuple(dependencies), effective)
 
     def write(
         self, target: ConfigTarget, fields: tuple[FieldDefinition, ...], *,

@@ -39,15 +39,20 @@ from .settings import HostControlError
 LEGACY_BOT_ID = "staging-bot"
 LEGACY_ROLE_ID = "staging-role"
 
-_ACCOUNT = re.compile(r"[0-9]+")
+_ACCOUNT = re.compile(r"[^\s\x00-\x1f\x7f:]+")
+_ASCII_ACCOUNT = re.compile(r"[0-9A-Za-z_-]+")
 _SAFE = re.compile(r"[^0-9a-z]+")
+_ROLE_CHANNEL_SUFFIX = re.compile(r"\s*[-_·－]\s*(?:私聊|群聊)\s*$")
 
 
 def _account(value: object, field: str) -> str:
-    """A OneBot account number, as the rest of the host validates them."""
-    if type(value) is not str or _ACCOUNT.fullmatch(value) is None:
+    """A native account/sender key (numeric OneBot or opaque official id)."""
+    valid = (type(value) is str and len(value) <= 128 and _ACCOUNT.fullmatch(value) is not None
+             and (_ASCII_ACCOUNT.fullmatch(value) is not None if value.isascii()
+                  else all(char.isalnum() or char in "._-@" for char in value)))
+    if not valid:
         raise HostControlError("host_identity_invalid",
-                               f"the {field} must be a numeric account, not a name or an empty value")
+                               f"the {field} must be a native account id, not a name or an empty value")
     return value
 
 
@@ -57,7 +62,19 @@ def derive_bot_id(account_id: str) -> str:
     Prefixed so a derived id can never be mistaken for the legacy constant, and so
     a stored profile says plainly where its bot identity came from.
     """
-    return "bot-" + _account(account_id, "bot account")
+    account = _account(account_id, "bot account")
+    if account.isascii():
+        return "bot-" + account
+    return "bot-" + digest({"native_account": account})[:32]
+
+
+def derive_core_target_id(platform_id: str, account_id: str, participant_id: str) -> str:
+    """Build an ASCII target key for a native binding, including Unicode ids."""
+    values = (platform_id, account_id, participant_id)
+    if any(type(value) is not str or not value.strip() for value in values):
+        raise HostControlError("host_identity_invalid", "the core binding identifiers are incomplete")
+    return "setup-core-" + digest({"platform_id": platform_id, "account_id": account_id,
+                                   "participant_id": participant_id})[:24]
 
 
 def derive_role_id(account_id: str, persona_id: str | None) -> str:
@@ -74,9 +91,10 @@ def derive_role_id(account_id: str, persona_id: str | None) -> str:
     """
     owner = _account(account_id, "bot account")
     persona = normalize_persona_id(persona_id)
+    owner_key = owner if owner.isascii() else digest({"native_account": owner})[:32]
     if not persona:
-        return "role-" + owner
-    return "role-" + owner + "-" + digest({"persona": persona})[:16]
+        return "role-" + owner_key
+    return "role-" + owner_key + "-" + digest({"persona": persona})[:16]
 
 
 def normalize_persona_id(persona_id: object) -> str:
@@ -135,17 +153,13 @@ def role_display_name(role_id: object, persona_ids: object = ()) -> str:
     """
     role = str(role_id or "").strip()
     if role and not role.startswith(("role-", "staging-", "dashboard:", "onebot-user:")):
-        for suffix in ("-私聊", "-群聊", "_私聊", "_群聊"):
-            if role.endswith(suffix) and len(role) > len(suffix):
-                role = role[:-len(suffix)].strip()
-                break
+        role = _ROLE_CHANNEL_SUFFIX.sub("", role).strip()
         return role or "当前角色"
     values = persona_ids if isinstance(persona_ids, (list, tuple, set)) else ()
     labels = []
     for value in values:
         text = "默认人格" if value in (None, "", "[%None]") else str(value).strip()
-        if text.endswith(("-私聊", "-群聊", "_私聊", "_群聊")):
-            text = text[:-3]
+        text = _ROLE_CHANNEL_SUFFIX.sub("", text).strip()
         if text and text not in labels:
             labels.append(text)
     return "、".join(labels) or (role if role else "当前角色")

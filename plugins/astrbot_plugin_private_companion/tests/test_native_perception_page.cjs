@@ -16,7 +16,7 @@ function status(token = "revision-1", timezone = "Asia/Shanghai", locationName =
       planning_weather_location:locationName ? JSON.stringify({name:locationName}) : "", planning_weather_max_age_minutes:120,
     }},
     model: {edit_token:token, settings:{calendar_enabled:true, calendar_timezone:timezone,
-      holiday_enabled:true, holiday_country:"CN",
+      health_enabled:false, health_proactive_enabled:false, holiday_enabled:true, holiday_country:"CN",
       lunar_enabled:true, automatic_solar_terms_enabled:false, almanac_enabled:false,
       platform_enabled:true, model_route_enabled:true, configured_modalities_enabled:true, guidance:""}},
      contact: {settings:{date_checkin_enabled:true, important_dates:"[]",
@@ -36,7 +36,7 @@ function harness() {
   const requests = [];
   const window = {
     CompanionProduct: {hosted:() => true, scopeKey:() => "role-1",
-      role:() => ({perception_native_api:"/astrbot_plugin_private_companion_v2/perception-native"}),
+      role:() => ({perception_native_api:"/astrbot_plugin_private_companion/perception-native"}),
       /* 页面取桥先问 bridgeNow()，没有再 await bridgeFor()。 */
       bridgeNow:() => window.AstrBotPluginPage,
       bridgeFor:() => ({then:resolve => resolve(window.AstrBotPluginPage)})},
@@ -168,17 +168,21 @@ test("the overview subscription publishes display fields without exposing config
   const unsubscribe = page.subscribe(value => { snapshot = value; });
   const next = status();
   next.environment.settings.planning_weather_location = JSON.stringify({name:"用户配置区域", latitude:12.34, longitude:56.78});
-  next.contact.settings.important_dates = JSON.stringify([{calendar:"gregorian",month:10,day:3,label:"相识纪念日"}]);
+  next.contact.settings.important_dates = JSON.stringify([{calendar:"gregorian",month:10,day:3,label:"旧版手动日期"}]);
   next.contact.settings.important_date_lookahead_days = 4;
+  next.contact.dates = JSON.stringify([{basis:"profile_role_birthday",label:"角色生日",
+    date:"2026-10-03",days_until:2,calendar:"gregorian"}]);
+  next.contact.lookaheadDays = 7;
   requests[0].resolve({status:"ok", data:next});
   await flush();
 
   assert.equal(snapshot.ready, true);
   assert.equal(snapshot.environment.locationName, "用户配置区域");
-  assert.equal(snapshot.contact.lookaheadDays, 4);
+  assert.equal(snapshot.contact.lookaheadDays, 7);
   assert.equal(snapshot.contact.balanceAwarenessEnabled, true);
   assert.equal(snapshot.contact.automaticAllowed, true);
-  assert.match(snapshot.contact.dates, /相识纪念日/);
+  assert.match(snapshot.contact.dates, /角色生日/);
+  assert.doesNotMatch(snapshot.contact.dates, /旧版手动日期/);
   assert.doesNotMatch(JSON.stringify(snapshot), /balance_(?:low|critical)_threshold|balance_include_amount_in_message/);
   assert.doesNotMatch(JSON.stringify(snapshot), /latitude|longitude|113\.75|23\.04/);
   unsubscribe();

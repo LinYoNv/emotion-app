@@ -13,11 +13,12 @@ from companion_v2.execution.models import (Lane, ProviderBinding, SideEffect, Ta
 from companion_v2.execution.runner import ExactTaskRunner
 from companion_v2.execution.service import outcome
 from companion_v2.model_gateway.models import ModelTaskProfile
-from companion_v2.identity_policy.private_domain import source_ref
+from companion_v2.identity_policy.private_domain import as_source_ref
 from companion_v2.identity_policy.interventions import (REST_WAKE_INTERVENTION,
     STATE_INTERVENTION, require_capability)
 from companion_v2.role_work.growth.configuration import skills_enabled
-from .service import FIELDS, INSTRUCTION
+from .service import FIELDS
+from . import maintenance_context
 from .configuration import FEATURE_SWITCHES
 from .ownership import role_owner, role_schedule_key
 from . import humanized
@@ -28,18 +29,30 @@ from .cycle_prompts import INSTRUCTION as CYCLE_INSTRUCTION, MAINTENANCE as CYCL
 logger = getLogger(__name__)
 
 KIND = "role.state.maintain"
+# One ceiling, two derived layers. The declared budget is 180 s, so the model round
+# that fills it must expire first and leave the margin for parsing the returned JSON
+# and committing the state record. Before this the round inherited
+# ModelTaskProfile's untouched 60 s default: the task promised three minutes while its
+# only slow step was cut at one minute, and the operator's configured value had no
+# relation to the time the round could actually spend.
+STATE_BUDGET_SECONDS = 180
+STATE_MARGIN_SECONDS = 30
+STATE_PROVIDER_TIMEOUT_SECONDS = STATE_BUDGET_SECONDS - STATE_MARGIN_SECONDS
 PREFLIGHT_RETRY_SECONDS = 30
 # The local patrol reads state once per bound role and never calls a model; the
 # throttle only keeps the wake loop from re-reading configuration on every tick.
 PATROL_CHECK_SECONDS = 60
 INTERVENTION_DIALOGUE_WINDOW = timedelta(minutes=3)
-PROMPT = INSTRUCTION + """
-维护角色此刻的连续状态，以原人格对实体、吃睡和周期的设定为准。依据汇集的完整材料与 maintenance_minutes 维护，不逐句波动；可以有日常起伏，也可以保持未知，不为更新添加疾病或戏剧冲突。
-理解每句话时辨明说话者、对象和前后文，并结合角色表达、状态连续性与可靠材料判断哪些内容属于角色。用户的经历仍属于用户；语境可以支持适度的主观感受变化，但不能把用户的客观经历移到角色身上。信息不足时保留 previous_simulation 或未知。实际睡眠以 sleep_execution 为准，不从清晨、沉默或对话推断已睡足、醒来或休息完成；按作息推算的困倦/准备休息只作表达参考，不改变执行时刻。
+PROMPT = """本轮是角色状态的后台维护，只生成 role_state 数据，不给聊天对象写回复。原人格决定身体设定与生活习惯；maintenance_minutes 是观察间隔，不是状态必须变差的周期。
+健康、能够照顾自己的普通生活是常态。疾病应有具体情境和连续过程，不为更新而随机生病，也不把一次不适反复当成新发病。previous_simulation 和 simulation_history 都是此前模型的模拟，重复保存不构成新的病情证据；结合原始时间判断同一次不适如何平稳、缓解或结束，不把“昨天”“整夜”每天滚动续写。
+若异常只剩长期重复的旧描述、缺乏近期独立材料支持，可以逐步回到惯常体验或保留未知，不必等待不存在的进食或服药执行系统才允许感受好转。已知仍在持续的具体症状则保持合理连续性，不无故抹去。
+recent_dialogue 是带时间、说话者的完整互动。分清用户与角色，用户的经历不移到角色身上；用户以“我”陈述的身体、睡眠、饥饿或情绪只属于用户，不把任一方的状态移到另一方。角色在互动中接受食物、照顾、药物或表达舒服些，可以自然影响饥饿、健康、心情与精力的模拟感受，注意先后顺序和已经反映过的影响，不机械叠加奖励，也不要求用户特定措辞。仅提供药物不等于已服用，更不等于立即痊愈；角色表达药效或缓解是可参考的主观体验，不是医疗诊断或真实服药回执。
+sleep_execution 记录实际睡眠，sleep_profile.has_sleep_history=false 或 sleep_execution=null 表示没有执行记录，不表示没睡、失眠或睡眠不足。自动睡眠未启用也不表示角色通宵。缺少进食、饮水记录同样不表示一直挨饿；允许按角色日常节律模拟普通饥饿、困倦与舒缓，不补造具体吃饭、入睡、醒来或服药经过。不能根据时间经过宣称现实行动已完成，不从清晨、沉默或对话推断已睡足、醒来或休息完成。
 energy 是 0 到 100 的主观精力。结合 previous_simulation 及 updated_at、当前时段、实际睡眠回执、睡眠压力/欠睡、质量、中断与活动连续调整，沿用不等于照抄。低值且无持续负荷或睡眠不足依据时，可随时间小幅回升至角色惯常水平，不必等睡眠回执才允许感受温和好转；好转不宣称已休息。接近日常水平后稳定或自然起伏，不突然满格或持续单向上升，不让过时疲惫永久锁低。
-持续负荷或明确欠睡时可偏低并在下轮重评；低质量睡眠、刚睡被叫醒或反复中断限制恢复，补足后渐进回升。午休只缓解部分困倦，睡眠压力不换算为固定精力扣分。深夜持续互动可以慢慢加深疲惫，短聊不要求改变作息；入睡在作息窗口内结合困倦决定，窗口结束仍未入睡再按计划兜底。
+持续负荷或明确欠睡时可偏低并在下轮重评；低质量睡眠、刚睡被叫醒或反复中断限制恢复，补足后渐进回升。午休只缓解部分困倦，睡眠压力不换算为固定精力扣分。深夜持续互动可以慢慢加深疲惫，短聊不要求改变作息；状态维护不代替睡眠执行器。
 busy 描述注意力，不决定是否拒答。共享状态只写角色自己的概括感受与活动，不写对象、他人位置或私人日程。当前窗口没新消息不表示不忙、情绪归零或状态结束；没有变化依据时保留有效状态或 null。
-临时影响使用含时区的合理 expires_at，到期不等于康复。presence 是公开 QQ 短状态，最多 8 个字符，写泛化活动（如阅读中、休息中），不含用户隐私。online_mode 可为 online/away/busy/invisible/null，仅在状态需要时改变；从忙碌或离开恢复可选 online，未知保留 null，不表示是否回应。
+临时影响使用含时区的合理 expires_at，表示下次复核时点，不是固定康复时刻；到期后重新评估当前感受，既不自动痊愈也不无依据续期。共享字段只写角色自己的概括感受，不记录聊天对象、私人互动原文或他人情况。presence 是公开 QQ 短状态，最多 8 个字符，写泛化活动（如阅读中、休息中）。
+online_mode 是会实际改变 QQ 账号的在线状态，away 会触发 QQ 原生离开自动回复，busy 也会改变账号对外表现；本插件不会自动设置 away 或 busy。不能用这些模式表达普通困倦、待休息、看书、注意力变化或窗口暂时没有消息。这些生活感受写在 sleep/busy/presence 中。正常接话、近期仍在连续互动时保持 online；previous_simulation 中过时的 away/busy 不因沿用旧状态而续期，旧值也应通过在线状态恢复。隐身仍只在明确配置时使用。online_mode 通常只输出 online/invisible/null；null 只表示本轮不改变平台状态。
 仅输出 JSON：energy 为 0 到 100 的整数或 null；hunger、health、sleep、busy、mood、location、cycle、presence、online_mode 通常为简短文字或 null，mood/cycle 按本轮各自结构协议；conditions 是 kind/text/expires_at 对象数组，kind 选 hunger/health/sleep/busy/mood/cycle/other，无临时变化填空数组。
 """
 STATE_INTERVENTION_INSTRUCTION = (
@@ -99,9 +112,9 @@ def _mood_instruction(*, enabled, axes, gate, reference, allowed, baseline, inte
         else "本轮不做情绪数值更新：保持上一轮各轴数值不变，只按当前材料更新 description。")
 
 
-def state_profile(provider, *, max_output_tokens=1024):
+def state_profile(provider, *, max_output_tokens=1024, timeout_seconds=STATE_PROVIDER_TIMEOUT_SECONDS):
     return ModelTaskProfile(KIND, Lane.BACKGROUND, provider, "保持原人格，维护自己的生活状态。",
-                            max_output_tokens=max_output_tokens)
+                            max_output_tokens=max_output_tokens, timeout_seconds=timeout_seconds)
 
 
 def _expression_preferences(settings):
@@ -145,7 +158,7 @@ class StateMaintenance:
         self._last_noted_inputs = {}
         self.registrations = (TaskRegistration(TaskDefinition(KIND, "role.state", KIND, Lane.BACKGROUND,
             side_effect=SideEffect.LOCAL, binding=ProviderBinding("role.state", "local", "1", "state-1"),
-            timeout_seconds=180, max_attempts=1, concurrency=1), self.validate),)
+            timeout_seconds=STATE_BUDGET_SECONDS, max_attempts=1, concurrency=1), self.validate),)
 
     def attach(self, app):
         self.app, self.service, self.tasks, self.gateway = app, app.role_state, app.tasks, app.gateway
@@ -367,6 +380,23 @@ class StateMaintenance:
                         start=stamp(at - INTERVENTION_DIALOGUE_WINDOW), end=stamp(at),
                         limit=16, max_chars=8000)
 
+    def _conversation_anchor(self, fallback, at):
+        """Process a pending window in its own context, then share only role feelings."""
+        selected, priority = fallback, None
+        for binding in tuple(self.bindings.values()):
+            context = binding[0]
+            if role_owner(context) != role_owner(fallback[0]) or not self._can_anchor_schedule(context):
+                continue
+            if not self.service.settings(context)[0]["enabled"]:
+                continue
+            start = maintenance_context.dialogue_start(self, context, at)
+            items = maintenance_context.recent_dialogue(self, context, at, start=start, end=stamp(at))
+            if items:
+                candidate = (start, -datetime.fromisoformat(items[-1]["at"]).timestamp(), context.key)
+                if priority is None or candidate < priority:
+                    selected, priority = binding, candidate
+        return selected
+
     def _skills(self, context, at):
         """The role's confirmed skills, so its activities can match what it can do.
 
@@ -472,6 +502,10 @@ class StateMaintenance:
         events = self._events(context, since=previous.get("updated_at"))
         input_fingerprint = digest([(event.scoped_key, encode(event.source)) for event in events])
         materials, sources = self._inputs(context, events)
+        dialogue_start = maintenance_context.dialogue_start(self, context, now)
+        recent_dialogue = (() if intervention else maintenance_context.recent_dialogue(
+            self, context, now, start=dialogue_start, end=stamp(now)))
+        sources = tuple(dict.fromkeys((*sources, *maintenance_context.dialogue_sources(self, recent_dialogue))))
         intervention_dialogue = (self._intervention_dialogue(context, now) if intervention else ())
         intervention_dialogue_fingerprint = digest([
             (item["observation_id"], item["content_hash"], item["speaker"])
@@ -489,8 +523,8 @@ class StateMaintenance:
         dependencies.extend(json.loads(encode(cycle_sources)))
         for item in calendar.get("items", []) + activities["items"]:
             dependencies.extend(item.get("sources", []))
-        sources = tuple(dict.fromkeys((*sources, *(source_ref(s) for s in mood_round["sources"]),
-                                       *(source_ref(s) for s in dependencies))))
+        sources = tuple(dict.fromkeys((*sources, *(as_source_ref(s) for s in mood_round["sources"]),
+                                       *(as_source_ref(s) for s in dependencies))))
         self.service.evidence.validate(context, sources)
         return {"context": context, "instruction": instruction, "request_id": request_id, "at": now,
             "revision": record["revision"] if record else 0, "record_hash": digest(record), "record": record,
@@ -498,6 +532,9 @@ class StateMaintenance:
             "settings": settings, "token": token, "sources": sources, "materials": materials,
             "calendar": calendar, "activities": activities, "cycle_timeline": cycle_timeline,
             "mood_round": mood_round, "sleep_execution": self.service.body_clock.read(context, now=now),
+            "sleep_profile": self.service.body_clock.profile(context, now=now),
+            "simulation_history": maintenance_context.simulation_history(self.service, context, now),
+            "recent_dialogue": recent_dialogue, "dialogue_start": dialogue_start,
             "growth_refs": growth_refs, "skills_partial": skills_partial,
             "intervention": bool(intervention),
             "intervention_dialogue": intervention_dialogue,
@@ -530,6 +567,11 @@ class StateMaintenance:
             if (job.get("intervention")
                     and self._input_epochs.get(spec.context.key, 0) != job["input_epoch"]):
                 raise TaskError("state_inputs_changed", "new conversation input superseded this intervention")
+            if not job.get("intervention"):
+                current_dialogue = maintenance_context.recent_dialogue(self, spec.context, at,
+                    start=job["dialogue_start"], end=stamp(job["at"]))
+                if maintenance_context.fingerprint(current_dialogue) != maintenance_context.fingerprint(job["recent_dialogue"]):
+                    raise TaskError("state_inputs_changed", "the maintenance dialogue changed")
             if job.get("intervention"):
                 dialogue = self._intervention_dialogue(spec.context, at)
                 fingerprint = digest([
@@ -573,16 +615,20 @@ class StateMaintenance:
         self.pending[key] = job
         try:
             require(self.tasks.submit(TaskSpec(key, context, KIND, digest(job), request_id,
-                job["at"], job["at"] + timedelta(seconds=180))))
+                job["at"], job["at"] + timedelta(seconds=STATE_BUDGET_SECONDS))))
             result = require(await self.runner.run(context, key))
-            if result.task.state in ("created", "retry_scheduled"):
-                require(self.tasks.discard_queued(key, reason="owner_unavailable"))
             task = require(self.tasks.read(context, key))
             response = {"task_id": key, "state": task.state, "reason": task.reason}
             if result.retry_at is not None:
                 response.update(state="deferred", retry_at=stamp(result.retry_at))
             if result.failure_code:
                 response["code"] = result.failure_code
+                if result.failure_code == "model_usage_unknown":
+                    failure = self.runtime.read_one("""SELECT f.code FROM model_calls c
+                        JOIN model_call_failures f USING(call_id)
+                        WHERE c.task_id = ? ORDER BY c.position DESC LIMIT 1""", (key,))
+                    if failure is not None:
+                        response["code"] = failure["code"]
             return response
         finally:
             self.pending.pop(key, None)
@@ -620,6 +666,8 @@ class StateMaintenance:
                 "interest_level": mood_round["interest"], "messages_since_last_round": mood_round["messages"],
                 "message_characters": mood_round["characters"], "numbers_may_move": mood_round["gate"] == "open"},
             "actual_activity_records": job["activities"], "sleep_execution": job["sleep_execution"],
+            "sleep_profile": job["sleep_profile"], "simulation_history": job["simulation_history"],
+            "recent_dialogue": job["recent_dialogue"],
             "intervention_dialogue": job.get("intervention_dialogue", ())})),) + (
                 (PromptMaterial("conversation.native", "intervention_dialogue",
                     encode({"conversation": job["intervention_dialogue"],
@@ -639,7 +687,7 @@ class StateMaintenance:
                 band=job["settings"]["mood_neutral_band"], cross_window=job["settings"]["mood_cross_window"])
             + _skills_instruction(refs=job["growth_refs"], partial=job["skills_partial"])
             + (STATE_INTERVENTION_INSTRUCTION if job.get("intervention") else ""),
-            context.role_binding, output_format="role_state")
+            context.role_binding, output_format="role_state", response_format="json_object")
         logger.debug("[CompanionV2][开发者追踪] 状态维护提示词 task=%s instruction=%r role_instruction=%r materials=%r",
                      run.task.task_id, request.instruction, request.role_instruction,
                      tuple(material.payload for material in request.context.materials))
@@ -662,6 +710,8 @@ class StateMaintenance:
                     mood_interest=(mood_round["interest"] if mood_round["gate"] == "open" and mood_error is None
                                    else None),
                     preserve_mood_dynamics=mood_error is not None)
+                if not job.get("intervention"):
+                    maintenance_context.settle_dialogue(self, context, job["at"])
                 self.committed.add(run.task.task_id)
                 run.record_operation(receipt["operation_id"])
             if mood_error is not None:
@@ -737,6 +787,7 @@ class StateMaintenance:
                         or self.foreground_busy(context) or context.key in self.workers or self.workers):
                     continue
                 now = self.tasks.now()
+                context, instruction, guard = self._conversation_anchor((context, instruction, guard), now)
                 self._clear_preflight(context)
                 stage = "budget"
                 deferred = self.gateway.ledger.background_deferral(context, KIND, at=now)
@@ -757,7 +808,7 @@ class StateMaintenance:
                     if not updated.rowcount:
                         continue
                 # next_at advances before dispatch; restart never repeats an unknown model request.
-                worker = asyncio.create_task(self.run(context, saved["instruction"],
+                worker = asyncio.create_task(self.run(context, instruction,
                     "state-period-" + digest([context.key, row["revision"], row["next_at"]])))
                 self.workers[context.key] = worker
                 self.worker_schedules[context.key] = row["context_key"]

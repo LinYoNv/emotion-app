@@ -13,6 +13,7 @@ installation that never touches the new field keeps its current delivery.
 
 from dataclasses import dataclass
 
+from companion_v2.conversation.text_processing import strip_internal_expression_protocol
 from .plan import CONTENT_KINDS
 
 
@@ -94,6 +95,11 @@ def build_component_plan(text, images=(), voice=None, *, position="after_media",
         raise ValueError("outbound images must be iterable") from error
     if any(image is None for image in images):
         raise ValueError("outbound image is missing")
+    if isinstance(text, str):
+        # Last-mile defense for proactive and session-send paths.  The core
+        # presentation pipeline already cleans ordinary replies; this catches
+        # components that were rebuilt or forwarded after that stage.
+        text = strip_internal_expression_protocol(text)
     if not isinstance(text, str) or (not text.strip() and (text != "" or not images)):
         raise ValueError("outbound text must be nonempty unless sending images alone")
     if image_position not in ("after_text", "before_text"):

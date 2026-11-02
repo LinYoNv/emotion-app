@@ -612,6 +612,35 @@ class CapabilityRepository:
             return Outcome.failed("capability_consent_revoked", "extension consent was revoked")
         return Outcome.success(authorization)
 
+    def latest_route_authorization(
+        self,
+        *,
+        extension_id: str,
+        capability_id: str,
+        subject: SubjectRef,
+        scope: ScopeRef,
+    ) -> CapabilityAuthorization | None:
+        """Read the latest retained choice on this route, including revocation.
+
+        This is only a default-provisioning input, never permission to invoke in
+        another conversation. Normal authorization still requires an exact scope.
+        """
+        if subject.installation_id != self._runtime.installation_id or scope.installation_id != self._runtime.installation_id:
+            raise ReferenceValidationError("capability choice crosses installation")
+        row = self._runtime.read_one(
+            """
+            SELECT * FROM capability_authorizations
+            WHERE extension_id = ? AND capability_id = ? AND subject_kind = ? AND subject_id = ?
+              AND installation_id = ? AND platform = ? AND scope_kind = ? AND native_scope_id = ?
+              AND bot_id = ? AND account_id = ? AND session_id = ?
+            ORDER BY updated_at DESC, revision DESC, state DESC
+            LIMIT 1
+            """,
+            (extension_id, capability_id, subject.kind.value, subject.subject_id,
+             *scope_values(scope)[:6], scope.session_id or ""),
+        )
+        return _authorization_from_row(row) if row is not None else None
+
     def set_settings(
         self,
         *,
@@ -773,6 +802,26 @@ class CapabilityRepository:
                     return Outcome(failure=projection.failure)
                 result.append(projection.unwrap())
             return Outcome.success(tuple(result))
+
+    def role_selection(self, *, extension_id: str, role: SubjectRef, bot_id: str | None = None) -> Outcome[CapabilityRoleSelection]:
+        """Read one role selection without requiring an installed package."""
+
+        if role.kind is not SubjectKind.BOT:
+            raise ReferenceValidationError("role must be a bot subject")
+        if role.installation_id != self._runtime.installation_id:
+            raise ReferenceValidationError("role belongs to another installation")
+        if bot_id is not None:
+            _opaque(bot_id, field="bot_id")
+        row = self._runtime.read_one(
+            """
+            SELECT * FROM capability_role_selections
+            WHERE extension_id = ? AND role_kind = ? AND role_id = ? AND bot_id = ?
+            """,
+            (extension_id, role.kind.value, role.subject_id, bot_id or ""),
+        )
+        if row is None:
+            return Outcome.failed("capability_role_not_enabled", "the capability has no selection for this role")
+        return Outcome.success(_role_from_row(row, installation_id=self._runtime.installation_id))
 
     def require_role_enabled(self, *, extension_id: str, role: SubjectRef, bot_id: str | None = None) -> Outcome[CapabilityRoleSelection]:
         with self._runtime.read_snapshot():

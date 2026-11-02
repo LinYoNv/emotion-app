@@ -6,7 +6,7 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-const HOST = "astrbot_plugin_private_companion_v2";
+const HOST = "astrbot_plugin_private_companion";
 const shellHtml = fs.readFileSync(path.join(__dirname, "../pages/陪伴小屋/index.html"), "utf8");
 const shellCss = fs.readFileSync(path.join(__dirname, "../pages/陪伴小屋/shell.css"), "utf8");
 const sidebarSource = fs.readFileSync(path.join(__dirname, "../pages/陪伴小屋/home-sidebar.js"), "utf8");
@@ -46,19 +46,28 @@ async function harness(savedTheme = null, extensions = [], options = {}) {
           group_memory_api: "/" + HOST + "/" + groupMemoryApi,
           reply_api: "/" + HOST + "/targets/first/roles/synthetic-role/reply"} : privateRole]}],
   };
+  if (options.wildcardFirstTarget) {
+    catalog.targets.unshift({...privateTarget, target_id: "wildcard", participant_id: "*",
+      display_name: "", roles: [privateRole]});
+  }
   if (options.multipleRoles) {
     const extra = {...privateRole, role_id: "another-role", role_name: "夜航",
       persona_ids: ["夜航"], state_api: "/" + HOST + "/targets/first/roles/another-role/state"};
     catalog.targets[0].roles.push(extra);
   }
   const navigations = [];
+  let largeText = false;
   const window = {
-    location: {href: "http://localhost/api/plugin/page/content/astrbot_plugin_private_companion_v2/cottage/"},
+    location: {href: "http://localhost/api/plugin/page/content/astrbot_plugin_private_companion/cottage/"},
     addEventListener(type, handler) { events[type] = handler; },
     navigate: (...route) => navigations.push(route),
     matchMedia: () => ({matches: false}),
     CompanionWorkspaceBundle: options.lazyBundles ? undefined
       : {host: "<p>host</p>", identity: "<p>directory</p>", relationships: "<p>relationship</p>", persona: "<p>persona</p>"},
+    CompanionDisplayPreferences: {
+      largeText: () => largeText,
+      setLargeText(value) { largeText = Boolean(value); window.CompanionProduct?.displayPreferencesChanged?.(); },
+    },
     AstrBotPluginPage: {
       ready: async () => ({pluginName: options.pluginName || HOST}),
       onContext(handler) { contextHandlers.add(handler); return () => contextHandlers.delete(handler); },
@@ -71,8 +80,9 @@ async function harness(savedTheme = null, extensions = [], options = {}) {
         if (options.summaryErrors?.[endpoint]) {
           return {status: "error", data: {code: options.summaryErrors[endpoint]}};
         }
+        if (endpoint === "page/display-preferences") return options.displayPreferences || {preferences: null};
         if (endpoint === "page/workspace-entry") return options.workspaceEntry || {content_path:
-          "/api/plugin/page/content/astrbot_plugin_private_companion_v2/%E9%99%AA%E4%BC%B4%E5%B0%8F%E5%B1%8B/?asset_token=fresh"};
+          "/api/plugin/page/content/astrbot_plugin_private_companion/%E9%99%AA%E4%BC%B4%E5%B0%8F%E5%B1%8B/?asset_token=fresh"};
         if (endpoint === "page/targets") return options.directoryUnavailable
           ? {status: "error", data: {code: options.directoryError || "staging_not_initialized"}} : nextDirectory || catalog;
         if (endpoint === "integration/manifest") return {extensions, providers:[], summary: {connected_count: 0}};
@@ -81,7 +91,7 @@ async function harness(savedTheme = null, extensions = [], options = {}) {
       apiPost: async (endpoint, body) => {
         calls.push({method: "POST", endpoint, body});
         if (options.postFailure) throw options.postFailure;
-        return {};
+        return {status: "ok", data: {preferences: body}};
       },
     },
   };
@@ -101,7 +111,7 @@ async function harness(savedTheme = null, extensions = [], options = {}) {
         window.CompanionWorkspaceBundle[name] = `<p>${name} lazy</p>`;
         script.onload?.();
       }
-    }}, body: {classList: {add() {}, remove() {}}},
+    }}, body: {classList: {add() {}, remove() {}, contains() { return false; }}},
     querySelector: selector => {
       const name = selector.match(/workspace-bundle="([a-z]+)"/)?.[1];
       return options.lazyBundles && name ? {content: {querySelector: () =>
@@ -150,6 +160,7 @@ async function harness(savedTheme = null, extensions = [], options = {}) {
       kind: "request", requestId, method, path: endpoint, body: {}, timeoutMs}});
   }
   return {product, calls, timers, warnings, loadedScripts, fetchCalls, frames, addFrame, identity, relationships, host, persona, events, request, document, stageRole, navigations, updates, catalog,
+    largeText: () => largeText,
     setDirectory(directory) {nextDirectory = directory;},
     hostTheme(isDark) {
       document.documentElement.dataset.theme = isDark ? "dark" : "light";
@@ -237,7 +248,7 @@ test("a bundle that still fails after token refresh identifies the remaining res
   const h = await harness(null, [], {lazyBundles: true, failWorkspaceLoads: 2,
     workspaceAssetUrl: "http://localhost/workspace-bundles/host.js?v=test&asset_token=stale",
     workspaceEntry: {content_path:
-      "/api/plugin/page/content/astrbot_plugin_private_companion_v2/%E9%99%AA%E4%BC%B4%E5%B0%8F%E5%B1%8B/?asset_token=fresh"}});
+      "/api/plugin/page/content/astrbot_plugin_private_companion/%E9%99%AA%E4%BC%B4%E5%B0%8F%E5%B1%8B/?asset_token=fresh"}});
   h.frames.splice(0);
   const host = h.addFrame("host");
   h.product.mountWorkspace();
@@ -288,6 +299,25 @@ test("server rejection envelopes stay confirmed through the product and workspac
   assert.equal(response.ok, false);
   assert.equal(response.code, "core_access_required");
   assert.equal(response.confirmed, true);
+});
+
+test("a bridge-only machine code is recovered and labeled with its workspace source", async () => {
+  /* The live Dashboard page bridge rejects with `new Error(message)` only:
+     a status=error envelope loses `data.code` before a workspace sees it. The
+     broker must recover the snake_case code and attach the source label so the
+     embedded page can explain which source failed. */
+  const h = await harness(null, [], {
+    getFailureEndpoint: "targets/first/roles/synthetic-role/persona",
+    getFailure: new Error("expression_group_context_required"),
+  });
+  h.product.mountWorkspace();
+  await h.request(h.persona, "GET", "persona", "persona-machine-code");
+  const response = h.persona.messages.find(message => message.requestId === "persona-machine-code");
+  assert.equal(response.ok, false);
+  assert.equal(response.code, "expression_group_context_required");
+  assert.match(response.sourceLabel, /私聊/);
+  assert.match(response.sourceLabel, /小伴/);
+  assert.equal(response.reason, "expression_group_context_required");
 });
 
 test("request timeouts are configurable and timeout diagnostics omit target and query identifiers", async () => {
@@ -370,6 +400,18 @@ test("the cottage selects a role without asking for a conversation target", asyn
   assert.equal(h.product.roleChoices().length, 2);
 });
 
+test("a shared role prefers its concrete private window over a wildcard template", async () => {
+  const h = await harness(null, [], {wildcardFirstTarget: true});
+  const choices = h.product.roleChoices();
+  assert.equal(choices.length, 1);
+  assert.equal(choices[0].target.target_id, "first");
+  assert.equal(h.product.target().target_id, "first");
+  await h.product.choose("wildcard", "synthetic-role");
+  assert.equal(h.product.target().target_id, "wildcard");
+  assert.equal(h.product.roleTarget().target_id, "first");
+  assert.match(h.product.role().state_api, /\/targets\/first\//);
+});
+
 test("the role cottage selector is inside the room and the outer status bar is absent", () => {
   const roomStart = shellHtml.indexOf('<div class="room-stage" id="stageScene">');
   const roleTitle = shellHtml.indexOf('id="stageRole"');
@@ -438,22 +480,24 @@ test("display labels preserve names while internal role and executor keys stay o
   assert.equal(h.product.identity().operator_id, "dashboard:synthetic-admin");
 });
 
-test("the account workspace relays account discovery, mappings and relationship discoveries", async () => {
+test("the account workspace relays account discovery, mappings, relationship discoveries and startup", async () => {
   const h = await harness();
   h.product.mountWorkspace();
-  for (const [method, endpoint] of [["GET", "accounts"], ["POST", "accounts"]]) {
+  for (const [method, endpoint] of [["GET", "accounts"], ["POST", "accounts"], ["POST", "accounts/model-provider"],
+    ["POST", "accounts/window-link"], ["POST", "accounts/window-unlink"], ["POST", "host/start"]]) {
     await h.request(h.host, method, endpoint);
     assert.equal(h.host.messages.at(-1).ok, true);
   }
   await h.request(h.host, "GET", "acquaintance");
   assert.equal(h.host.messages.at(-1).ok, true);
   assert.deepEqual(h.calls.map(call => `${call.method} ${call.endpoint}`),
-    ["GET accounts", "POST accounts", "GET acquaintance"]);
+    ["GET accounts", "POST accounts", "POST accounts/model-provider", "POST accounts/window-link",
+      "POST accounts/window-unlink", "POST host/start", "GET acquaintance"]);
   await h.request(h.host, "GET", "accounts/session");
   await h.request(h.host, "POST", "accounts/session/extra");
   await h.request(h.host, "POST", "acquaintance");
   await h.request(h.host, "GET", "acquaintance/authorization");
-  assert.equal(h.calls.length, 3);
+  assert.equal(h.calls.length, 7);
   assert.equal(h.host.messages.at(-1).ok, false);
 });
 
@@ -467,12 +511,12 @@ test("an uninitialized directory leaves role mapping available for automatic pre
   }
   h.product.mountWorkspace();
   assert.equal(h.host.srcdoc, "<p>host</p>");
-  for (const [method, endpoint] of [["GET", "accounts"], ["POST", "accounts"], ["GET", "host/status"]]) {
+  for (const [method, endpoint] of [["GET", "accounts"], ["POST", "accounts"], ["POST", "accounts/model-provider"], ["GET", "host/status"]]) {
     await h.request(h.host, method, endpoint);
     assert.equal(h.host.messages.at(-1).ok, true);
   }
   assert.deepEqual(h.calls.map(call => `${call.method} ${call.endpoint}`),
-    ["GET accounts", "POST accounts", "GET host/status"]);
+    ["GET accounts", "POST accounts", "POST accounts/model-provider", "GET host/status"]);
 });
 
 test("directory failures keep the cottage title and a recovered single role has no selector", async () => {
@@ -490,6 +534,16 @@ test("directory failures keep the cottage title and a recovered single role has 
   assert.match(h.stageRole.innerHTML, /小伴的小屋/);
   assert.doesNotMatch(h.stageRole.innerHTML, /<select/);
   assert(h.calls.every(call => call.method === "GET"));
+});
+
+test("reconnect paints the cached section summary before refreshing it", async () => {
+  const h = await harness(null, [], {captureTimers: true});
+  h.calls.length = 0;
+  const beforeTimers = h.timers.length;
+  await h.product.connect();
+  const summaryCalls = h.calls.filter(call => /\/(state|life|growth|memory|relationships)$/.test(call.endpoint));
+  assert.equal(summaryCalls.length, 0, "cached summary should paint without waiting for the section endpoints");
+  assert.ok(h.timers.length > beforeTimers, "a background refresh should still be scheduled");
 });
 
 test("runtime loading errors stay distinct from first-run completion in the home overview", async () => {
@@ -526,6 +580,32 @@ test("host context updates preserve the browser theme and synchronize every work
   assert.equal(h.document.documentElement.dataset.theme, "walnut");
   await h.product.connect();
   assert.equal(h.contextHandlers.size, 1, "reconnecting replaces the context subscription");
+});
+
+test("account display preferences restore after a sandboxed iframe reload and later changes save", async () => {
+  const saved = {
+    appearance: {theme: "walnut", density: "roomy", radius: "round", typeScale: "l", motion: "low"},
+    followLight: true,
+    largeText: true,
+  };
+  const h = await harness(null, [], {displayPreferences: {preferences: saved}});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.document.documentElement.dataset.theme, "walnut");
+  for (const [name, value] of Object.entries(saved.appearance)) {
+    assert.equal(h.product.appearance()[name], value, `${name} did not restore`);
+  }
+  assert.equal(h.product.followLight(), true);
+  assert.equal(h.largeText(), true, "large text restores with the same account preference document");
+
+  h.product.setAppearance("theme", "night");
+  h.product.setFollowLight(false);
+  await new Promise(resolve => setTimeout(resolve, 160));
+  const saves = h.calls.filter(call => call.method === "POST"
+    && call.endpoint === "page/display-preferences");
+  assert.equal(saves.length, 1, "one debounced save carries the complete preference document");
+  assert.equal(saves[0].body.appearance.theme, "night");
+  assert.equal(saves[0].body.followLight, false);
+  assert.equal(saves[0].body.largeText, true);
 });
 
 test("each workspace sends requests only to its own API and response channel", async () => {
@@ -583,6 +663,9 @@ test("identity workspace opens only the selected configured group's reply and me
       account_id: "100", group_id: "300", role_id: "synthetic-role"}}});
   assert.deepEqual(h.navigations, [["manage", "decision", ""], ["manage", "governance", "relationship"]],
     "unknown roles and group routes cannot redirect the workspace");
+  const navigationFailures = h.identity.messages.filter(message => message.kind === "navigate-failed");
+  assert.equal(navigationFailures.length, 2);
+  assert.match(navigationFailures[0].message, /角色映射已经变化.*重新读取群聊目录/);
 });
 
 test("identity workspace can navigate to first connection for group-target setup", async () => {
@@ -673,10 +756,10 @@ test("requests in flight during a mapping refresh receive a bounded stale-scope 
   assert.equal(h.relationships.messages.at(-1).code, "scope_changed");
 });
 
-test("account editor cannot relay manual runtime operations or native window edits", async () => {
+test("account editor cannot relay manual runtime operations or native session edits", async () => {
   const h = await harness();
   h.product.mountWorkspace();
-  for (const endpoint of ["host/probe", "host/initialize", "host/start", "host/stop", "accounts/session"]) {
+  for (const endpoint of ["host/probe", "host/initialize", "host/stop", "accounts/session"]) {
     await h.request(h.host, "POST", endpoint);
     assert.equal(h.host.messages.at(-1).ok, false);
   }
@@ -732,11 +815,11 @@ test("bundled Image and Screen furniture use the V2 lifecycle route and never li
   const lifecycle = h.calls.find(call => call.endpoint === "integration/lifecycle");
   assert.equal(lifecycle.method, "POST");
   assert.equal(JSON.stringify(lifecycle.body), JSON.stringify({extension_id: "image", action: "assemble",
-    expected_revision: 0, operation_key: "image-assemble"}));
+    expected_revision: 0, operation_key: "image-assemble", role_id: "synthetic-role", target_id: "first"}));
   await h.product.manageExtension("screen", "update", 4, "screen-sync");
   const update = h.calls.filter(call => call.endpoint === "integration/lifecycle").at(-1);
   assert.equal(JSON.stringify(update.body), JSON.stringify({extension_id: "companion.screen.native", action: "update",
-    expected_revision: 4, operation_key: "screen-sync"}));
+    expected_revision: 4, operation_key: "screen-sync", role_id: "synthetic-role", target_id: "first"}));
   assert.equal(h.calls.at(-1).endpoint, "integration/manifest", "家具状态来自真实 V2 manifest 刷新");
 });
 
@@ -748,7 +831,7 @@ test("Content, Reality, Together, Game and Live share the V2 lifecycle route", a
     await h.product.manageExtension(name, "pause", 3, name + "-pause");
     const command = h.calls.filter(call => call.endpoint === "integration/lifecycle").at(-1);
     assert.equal(JSON.stringify(command.body), JSON.stringify({extension_id:name, action:"pause",
-      expected_revision:3, operation_key:name + "-pause"}));
+      expected_revision:3, operation_key:name + "-pause", role_id:"synthetic-role", target_id:"first"}));
   }
 });
 

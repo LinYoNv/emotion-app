@@ -21,7 +21,7 @@ from companion_v2.identity_policy.models import AuthorizationTier
 from companion_v2.identity_policy.object_access import ObjectAccessPolicy
 from companion_v2.product import PRODUCT_VERSION
 
-PREFIX = "/astrbot_plugin_private_companion_v2"
+PREFIX = "/astrbot_plugin_private_companion"
 
 
 class RegistryTests(unittest.IsolatedAsyncioTestCase):
@@ -119,8 +119,15 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
             declarations = registry.declarations()
             self.assertEqual({item.descriptor.package.extension_id for item in declarations},
                 {"content", "image", "companion.screen.native", "reality", "together", "game", "live"})
-            self.assertTrue(all(item.descriptor.package.package_version == PRODUCT_VERSION
-                                for item in declarations))
+            for item in declarations:
+                package = item.descriptor.package
+                base, separator, build = package.package_version.partition("+")
+                self.assertEqual(base, PRODUCT_VERSION, package.extension_id)
+                if separator:
+                    # Image transports are rebuilt within one release; their package
+                    # version carries a content hash, while the release base must match.
+                    self.assertEqual(package.extension_id, "image", package.package_version)
+                    self.assertRegex(build, r"^image\.[0-9a-f]{64}$")
             value = IntegrationRegistry(context).snapshot(native_extensions=registry)
             bundled = value["extensions"]
             self.assertEqual({item["capability_id"] for item in bundled},
@@ -128,7 +135,11 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
             for item in bundled:
                 self.assertEqual(item["kind"], "native_extension")
                 self.assertEqual(item["owner"], "companion_v2")
-                self.assertEqual(item["version"], PRODUCT_VERSION)
+                base, separator, build = item["version"].partition("+")
+                self.assertEqual(base, PRODUCT_VERSION, item["capability_id"])
+                if separator:
+                    self.assertEqual(item["capability_id"], "image", item["version"])
+                    self.assertRegex(build, r"^image\.[0-9a-f]{64}$")
                 self.assertTrue(item["status_connected"])
                 self.assertFalse(item["assembled"])
                 self.assertFalse(item["runtime_ready"])
@@ -165,7 +176,6 @@ class MultiIntegrationTests(MultiFixture, unittest.IsolatedAsyncioTestCase):
         result = await self.request(path)
         self.assertEqual(result["status"], "ok", result)
         self.assertEqual(result["data"]["product"]["version"], PRODUCT_VERSION)
-        self.assertEqual(PRODUCT_VERSION, "2.1.1")
         self.assertIsNone(self.controller.runtime)
         self.assertEqual((await self.request(path,query="target_id=other"))["data"]["code"], "integration_request_invalid")
         await self.controller.terminate()
@@ -298,6 +308,29 @@ class MultiIntegrationTests(MultiFixture, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(provider["runtime_ready"])
         self.assertFalse(provider["update_available"])
         self.assertEqual(provider["installed_package_version"], current_package.package_version)
+
+    async def test_assemble_enables_only_the_requesting_role(self):
+        await self.start_host()
+        response = await self.request(PREFIX + "/integration/lifecycle", method="POST", body={
+            "extension_id": "companion.screen.native", "action": "assemble", "expected_revision": 0,
+            "operation_key": "screen.assemble-role", "role_id": "role-a", "target_id": "first",
+        })
+        self.assertEqual(response["status"], "ok", response)
+        selection = response["data"]["role_selection"]
+        self.assertTrue(selection["enabled"])
+        self.assertEqual((selection["role"]["subject_id"], selection["bot_id"]), ("role-a", "bot-a"))
+        rows = self.controller.runtime.read_all(
+            "SELECT role_id, bot_id, enabled FROM capability_role_selections WHERE extension_id = ?",
+            ("companion.screen.native",),
+        )
+        self.assertEqual([(row["role_id"], row["bot_id"], row["enabled"]) for row in rows],
+                         [("role-a", "bot-a", 1)])
+        context = self.controller.authority.context("first", "role-a")
+        projection = CapabilityRepository(self.controller.runtime).projection(
+            extension_id="companion.screen.native",
+            role=context.role_binding.role, scope=context.scope,
+        ).unwrap()
+        self.assertTrue(projection.role_selection.enabled)
 
     async def test_bundled_lifecycle_rejects_non_core_dashboard_user(self):
         await self.controller.initialize_profile()

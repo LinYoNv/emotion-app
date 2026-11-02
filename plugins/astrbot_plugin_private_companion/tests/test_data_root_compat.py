@@ -79,6 +79,13 @@ class V1TakeoverTests(unittest.TestCase):
             (v1 / "companions.json").write_text("{}", encoding="utf-8")
             self.assertEqual(resolve_data_root(v1), (v1 / V2_SUBDIRECTORY).resolve())
 
+    def test_sqlite_only_v1_root_gets_an_isolated_upgrade_directory(self):
+        with TemporaryDirectory() as temporary:
+            v1 = Path(temporary) / "astrbot_plugin_private_companion"
+            v1.mkdir()
+            (v1 / "companions.db").write_bytes(b"legacy database sentinel")
+            self.assertEqual(resolve_data_root(v1), (v1 / V2_SUBDIRECTORY).resolve())
+
     def test_v2_owner_marker_takes_precedence_over_v1_looking_files(self):
         with TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -103,6 +110,27 @@ class V1TakeoverTests(unittest.TestCase):
             v1 = base / "astrbot_plugin_private_companion"
             v1.mkdir(parents=True)
             self.assertEqual(resolve_data_root(v1), v1.resolve())
+
+
+class PluginCodeDirectoryRedirectTests(unittest.TestCase):
+    def test_get_data_dir_returning_plugin_code_is_redirected_to_plugin_data(self):
+        with TemporaryDirectory() as temporary:
+            data = Path(temporary) / "data"
+            code = data / "plugins" / "astrbot_plugin_private_companion"
+            code.mkdir(parents=True)
+            (code / "main.py").write_text("", encoding="utf-8")
+            self.assertEqual(resolve_data_root(code),
+                             (data / "plugin_data" / "astrbot_plugin_private_companion").resolve())
+
+    def test_existing_sibling_v2_root_wins_over_code_directory(self):
+        with TemporaryDirectory() as temporary:
+            data = Path(temporary) / "data"
+            code = data / "plugins" / "astrbot_plugin_private_companion"
+            code.mkdir(parents=True)
+            (code / "main.py").write_text("", encoding="utf-8")
+            sibling = _root_with_data(data / "plugin_data", "astrbot_plugin_private_companion_v2")
+            self.assertEqual(resolve_data_root(code), sibling.resolve())
+
 
 
 if __name__ == "__main__":

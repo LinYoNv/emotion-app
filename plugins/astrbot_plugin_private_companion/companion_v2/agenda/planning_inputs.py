@@ -101,6 +101,11 @@ def _role_state_summary(app, context, at):
                   if isinstance(item, dict) and isinstance(item.get("text"), str) and item.get("text").strip()]
     if conditions:
         summary["conditions"] = conditions[:4]
+    if summary:
+        summary["basis"] = "role_simulation"
+        summary["updated_at"] = state.get("updated_at")
+        if state.get("updated_at"):
+            summary["age_minutes"] = max(0, round((at - datetime.fromisoformat(state["updated_at"])).total_seconds() / 60))
     return summary or None
 
 

@@ -33,6 +33,7 @@ from companion_v2.identity_policy.models import (
 )
 from companion_v2.identity_policy.personas import ConversationRoute, PersonaBinding, PersonaDirectory, RuntimeIdentity, SelectorKind
 from companion_v2.identity_policy.repository import PersistentIdentityDirectory
+from companion_v2.model_gateway.models import MAX_MODEL_OUTPUT_TOKENS
 from companion_v2.relationships.private_access import REVOCABLE_ABSENCE_CODES, REVOCABLE_CAPABILITIES
 from companion_v2.screen import SCREEN_EXTENSION, SCREEN_PROCESS, SCREEN_READ
 from companion_v2.storage.models import OperationState
@@ -437,13 +438,15 @@ class AstrBotStagingBootstrap:
             persona_snapshot_lookup=types.persona_snapshot_lookup,
             persona_selection_lookup=types.persona_selection_lookup)
         native = self.context.get_provider_by_id(config.provider_id)
-        if type(native) is not types.provider or provider_fingerprint(native) != config.provider_fingerprint:
+        if not types.is_text_provider(native) or provider_fingerprint(native) != config.provider_fingerprint:
             raise TaskError("staging_provider_mismatch", "configured native provider fingerprint does not match")
         provider = AstrBotTextProvider(self.context, bridge=bridge,
             binding=ProviderBinding("model.text", config.provider_id, types.version, config.provider_fingerprint),
-            provider_id=config.provider_id, version=types.version, provider_type=types.provider,
+            provider_id=config.provider_id, version=types.version, provider_type=types.provider_types,
             function_tool_type=types.function_tool, tool_set_type=types.tool_set, tariff=config.tariff,
-            maximum_output_tokens=config.max_output_tokens, maximum_input_estimate=config.maximum_input_estimate,
+            # The probe only needs the provider ceiling; the saved default budget is
+            # a task setting and must not be read as a provider capability here.
+            maximum_output_tokens=MAX_MODEL_OUTPUT_TOKENS, maximum_input_estimate=config.maximum_input_estimate,
             output_parameter=config.output_parameter, streaming=config.streaming)
         if provider.native is not native:
             raise TaskError("staging_provider_mismatch", "native provider changed during bootstrap assembly")
@@ -506,14 +509,16 @@ class AstrBotStagingBootstrap:
              voice_policy=None, weather_port=None, weather_alert_port=None, balance_port=None, news_port=None, solar_term_port=None,
              qzone_transport=None,
              additional_providers=(), fallback_provider_id="", replacement_rules="[]",
-             fallback_on_refusal=False, review_only=False, default_provider_resolver=None) -> Outcome[AstrBotStagingSession]:
+             fallback_on_refusal=False, review_only=False, default_provider_resolver=None,
+             relay_tool_port_factory=None, search_port_factory=None) -> Outcome[AstrBotStagingSession]:
         """Read current authority and assemble; never initialize, grant or start work."""
         try:
             with self.runtime.read_snapshot():
                 return Outcome.success(self._load(runtime_instance_id, native_tool_port, voice, voice_policy,
                                                   weather_port, weather_alert_port, balance_port, news_port, solar_term_port, additional_providers,
                                                   fallback_provider_id, replacement_rules, fallback_on_refusal, review_only,
-                                                  qzone_transport, default_provider_resolver))
+                                                  qzone_transport, default_provider_resolver, relay_tool_port_factory,
+                                                  search_port_factory))
         except TaskError as error:
             return Outcome.failed(error.code, str(error))
         except Exception:
@@ -523,13 +528,14 @@ class AstrBotStagingBootstrap:
               voice_policy=None, weather_port=None, weather_alert_port=None, balance_port=None, news_port=None, solar_term_port=None,
               additional_providers=(), fallback_provider_id="", replacement_rules="[]",
               fallback_on_refusal=False, review_only=False, qzone_transport=None,
-              default_provider_resolver=None) -> AstrBotStagingSession:
+              default_provider_resolver=None, relay_tool_port_factory=None,
+              search_port_factory=None) -> AstrBotStagingSession:
         if self._marker() is None:
             raise TaskError("staging_not_initialized", "use explicit initialization on a fresh staging store first")
         target = self._target(self._time())
         config = self.configuration
         native = self.context.get_provider_by_id(config.provider_id)
-        if type(native) is not self.native_types.provider or provider_fingerprint(native) != config.provider_fingerprint:
+        if not self.native_types.is_text_provider(native) or provider_fingerprint(native) != config.provider_fingerprint:
             raise TaskError("staging_provider_mismatch", "configured native provider fingerprint does not match")
         profile = StagingProfile(target=target,
             runtime_identity=RuntimeIdentity(config.ecosystem_id, runtime_instance_id, "astrbot", config.host_id),
@@ -549,6 +555,8 @@ class AstrBotStagingBootstrap:
             additional_providers=additional_providers,
             fallback_provider_id=fallback_provider_id, replacement_rules=replacement_rules,
             fallback_on_refusal=fallback_on_refusal, review_only=review_only,
+            relay_tool_port_factory=relay_tool_port_factory,
+            search_port_factory=search_port_factory,
             profile_field_shapes={name: tuple(config._fingerprint_document().get(name, {}))
                                   for name in ("policy", "segmentation")},
             bootstrap_receipt_validated=True)

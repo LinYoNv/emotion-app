@@ -101,8 +101,10 @@ test("迁移始终先选目标与角色，地址来自页面目录", () => {
     || /legacy_api\)\s*\.replace\(/.test(source)
     || /\.replace\(\s*\/\^\\\//.test(source);
   assert.ok(normalized, "地址要相对路径化（交给页面桥的必须是插件内相对路径）");
-  assert.match(source, /if \(!legacyScope\) return legacyScopePanel\(\)/,
-    "没选之前给选择面板，而不是给按钮");
+  /* 第 1 步先解释角色，再给当前角色卡或页内创建；没角色时不只是一个空按钮。 */
+  assert.match(source, /function legacyRoleCardMarkup\(\)/, "第 1 步要有角色引导卡");
+  assert.match(source, /还没有可接收旧版资料的角色/, "没选角色时要显示引导创建说明");
+  assert.match(source, /data-go="manage" data-manage="host"/, "没角色时要能去角色管理新建");
   /* 三个动作都要走 legacyAddress()，没有地址就不发请求。 */
   for (const action of ["legacy-scan", "legacy-plan", "legacy-apply"]) {
     const at = source.indexOf(`action === "${action}"`);

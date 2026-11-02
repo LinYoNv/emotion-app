@@ -4,6 +4,10 @@
 def observe_native_reply_presence(application, prepared, stage):
     if not isinstance(prepared, dict):
         return
+    attention = getattr(application, "role_attention", None)
+    lease = prepared.get("role_attention")
+    if stage == "finished" and attention is not None and lease is not None:
+        attention.finish(lease)
     presence = getattr(application, "presence", None)
     context, turn_id = prepared.get("context"), prepared.get("turn_id")
     if presence is None or context is None or not turn_id:

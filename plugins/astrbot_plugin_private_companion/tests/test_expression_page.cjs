@@ -11,7 +11,7 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 /* refresh/save 里有多层 await，一次 flush 只推进一层微任务。 */
 const drains = async (times = 8) => { for (let index = 0; index < times; index += 1) await flush(); };
 const TOKEN = 'a'.repeat(64);
-const PREFIX = '/astrbot_plugin_private_companion_v2/';
+const PREFIX = '/astrbot_plugin_private_companion/';
 const plain = value => JSON.parse(JSON.stringify(value));
 const DEFAULTS = {private_learning_enabled: true};
 const FIELDS = {private_learning_enabled: {

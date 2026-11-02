@@ -12,9 +12,9 @@ window.CompanionPageGuards = (() => {
   const sources = new Map();
 
   /* 注册一条检查；返回注销函数。重复注册同名 id 会覆盖旧检查。 */
-  function register(id, title, dirty) {
+  function register(id, title, dirty, actions = {}) {
     if (typeof id !== "string" || !id || typeof dirty !== "function") return () => {};
-    sources.set(id, { id, title: title || id, dirty });
+    sources.set(id, { id, title: title || id, dirty, actions });
     return () => {
       if (sources.get(id)?.dirty === dirty) sources.delete(id);
     };
@@ -25,7 +25,8 @@ window.CompanionPageGuards = (() => {
     const pending = [];
     for (const source of sources.values()) {
       try {
-        if (source.dirty()) pending.push({ id: source.id, title: source.title, group: source.id });
+        if (source.dirty()) pending.push({ id: source.id, title: source.title, group: source.id,
+          fields: source.actions.fields?.() || [], save: source.actions.save, discard: source.actions.discard });
       } catch (error) {
         console.warn("[陪伴小屋] 未保存检查失败", source.id, error);
       }

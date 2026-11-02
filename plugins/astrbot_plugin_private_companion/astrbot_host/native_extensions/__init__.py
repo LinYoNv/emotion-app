@@ -8,6 +8,8 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import inspect
 import json
+import logging
+import traceback
 from types import MappingProxyType
 from typing import Callable, Mapping
 
@@ -21,6 +23,8 @@ from companion_v2.execution.models import TaskError, digest, encode, require
 from companion_v2.foundation.outcome import Outcome
 from companion_v2.foundation.refs import SourceRef, VersionRef
 from companion_v2.sources.models import GovernanceState, SourceRecord
+
+logger = logging.getLogger(__name__)
 
 from .discovery import discover
 from .images import IMAGE_ACTIONS, ImageReferenceLease, image_result_handler
@@ -39,6 +43,20 @@ def together_execution_binding(settings):
             "tts_provider_id": voice.provider_for_language(),
             "tts_language": voice.language,
             "tts_timeout_seconds": voice.timeout_seconds}
+
+
+def together_room_execution(binding, service):
+    """Pin explicit room model choices while retaining the verified host defaults."""
+    execution = dict(binding)
+    for target, setting in (("model_provider_id", "chat_provider_id"),
+                            ("tts_provider_id", "tts_provider_id")):
+        selected = str(getattr(service, setting, "") or "").strip()
+        if selected:
+            execution[target] = selected
+    timeout = getattr(service, "tts_timeout_seconds", None)
+    if type(timeout) is int and 15 <= timeout <= 180:
+        execution["tts_timeout_seconds"] = timeout
+    return execution
 
 
 class NativeExtensionRegistry(AstrBotToolPort):
@@ -67,6 +85,7 @@ class NativeExtensionRegistry(AstrBotToolPort):
         self.screen = None
         self.camera = None
         self._entries, discovered_issues = discover(context, excluded_extensions=managed_extensions)
+        self.managed_extensions = frozenset(managed_extensions)
         self._bundled_extensions = tuple(bundled_extensions)
         for lease in self._bundled_extensions:
             self._entries.update({item.host_tool_id: (item, lease) for item in lease.declarations()})
@@ -186,8 +205,57 @@ class NativeExtensionRegistry(AstrBotToolPort):
         for lease in self._bundled_extensions:
             if self._closed:
                 break
+            self._ensure_installation(lease)
             if self._should_start(lease):
                 lease.begin_start()
+        # 目录/准入排查用：一次打印自带的模块、声明数量与状态。
+        summary = []
+        for lease in self._bundled_extensions:
+            extension_id = lease.manifest.package.extension_id
+            declared = sum(1 for declaration in lease.declarations())
+            summary.append(f"{extension_id}:{declared}:{lease.state}:"
+                           f"{'blocked' if extension_id in self._blocked_extension_ids else 'ok'}")
+        logger.info("[CompanionV2][native] bundled=%s issues=%s image_enabled=%s",
+                    ",".join(summary), list(self.issues), self.image_enabled)
+
+    # 只在插件自带的「生图」模块上自动补齐：它的接口配置已经存在，缺的只是装配记录。
+    # 其他模块仍由用户显式装配，避免悄悄扩大能力授权。
+    AUTO_INSTALL_EXTENSIONS = frozenset({"image"})
+
+    def _ensure_installation(self, lease):
+        """随插件一起发货的原生模块，配置好就应该能用。
+
+        能力安装记录只由「装配」动作创建；如果用户只是在小屋里填好生图接口，
+        安装记录一直缺着，模块永远不会启动，模型也就拿不到生图工具。这里对
+        插件自带的生图模块做一次幂等补齐（已安装或未启用时什么都不做）。
+        """
+        extension_id = lease.manifest.package.extension_id
+        if (self._closed or self.runtime is None or extension_id not in self.managed_extensions
+                or extension_id not in self.AUTO_INSTALL_EXTENSIONS):
+            return
+        if extension_id == "image" and self.image_enabled is False:
+            return
+        repository = CapabilityRepository(self.runtime)
+        installed = repository.installation(extension_id=extension_id)
+        if installed.is_success:
+            return
+        if installed.failure is not None and installed.failure.code != "capability_not_installed":
+            return
+        package = lease.manifest.package
+        observed_at = self.now()
+        registered = repository.register_descriptor(package, registered_at=observed_at)
+        if registered.failure is not None and registered.failure.code not in ("capability_descriptor_conflict",
+                                                                             "capability_identity_conflict"):
+            logging.getLogger(__name__).warning(
+                "[CompanionV2] 原生模块装配登记失败 extension=%s code=%s",
+                extension_id, registered.failure.code)
+            return
+        acquired = repository.acquire(extension_id=extension_id, package_id=package.package_id,
+            package_version=package.package_version, expected_revision=0, observed_at=observed_at)
+        if acquired.failure is not None:
+            logging.getLogger(__name__).warning(
+                "[CompanionV2] 原生模块自动装配失败 extension=%s code=%s",
+                extension_id, acquired.failure.code)
 
     async def aclose(self):
         self.close()
@@ -322,7 +390,9 @@ class NativeExtensionRegistry(AstrBotToolPort):
             return Outcome.success(tuple(packages.values()))
         except TaskError as error:
             return Outcome.failed(error.code, str(error))
-        except Exception:
+        except Exception as error:
+            logging.getLogger(__name__).error("[Companion] 原生能力目录注册异常 error_type=%s\n%s",
+                type(error).__name__, "".join(traceback.format_tb(error.__traceback__)))
             return Outcome.failed("native_catalog_registration_failed", "native catalog registration failed")
 
     def _guard(self, host_tool_id, invocation):
@@ -402,7 +472,8 @@ class NativeExtensionRegistry(AstrBotToolPort):
                 raise TaskError("native_persona_guard_missing", "room creation requires a verified host persona")
             request["host_persona"] = await self.persona_guard(
                 invocation.context.scope, invocation.context.role_binding)
-            request["host_execution"] = dict(self.together_execution)
+            request["host_execution"] = together_room_execution(
+                self.together_execution, entry[1].instance)
             guard()
         if self.content is not None and invocation.descriptor.tool.action in CONTENT_ACTIONS:
             self.content.sources.synchronize()

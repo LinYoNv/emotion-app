@@ -46,10 +46,14 @@
       else applyDimension(message.name,message.value);
       return;
     }
+    if(message.kind==="navigate-failed"){
+      document.dispatchEvent(new CustomEvent("companion-navigate-failed",{detail:message}));return;
+    }
     if(message.kind!=="response"||!pending.has(message.requestId))return;
     const item=pending.get(message.requestId);pending.delete(message.requestId);clearTimeout(item.timer);
     if(message.ok)item.resolve(message.data);else item.reject(Object.assign(new Error(message.error),
-      {code:message.code,reason:message.reason,confirmed:message.confirmed===true}));
+      {code:message.code,reason:message.reason,sourceLabel:message.sourceLabel,
+        confirmed:message.confirmed===true}));
   });
   function request(method,path,body,options){return new Promise((resolve,reject)=>{
     const requestId="workspace-"+(++count);

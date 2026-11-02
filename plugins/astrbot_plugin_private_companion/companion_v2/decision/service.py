@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import logging
 import re
+import sqlite3
 from time import perf_counter
 from uuid import uuid4
 
 from .client import LayaClientError, LayaDecisionClient
-from .store import LayaSettingsStore
+from .contract import LayaDecision
+from .store import MODE_MODELS, LayaSettingsStore
 
 
 logger = logging.getLogger(__name__)
+_FOLLOWUP_REASONS = frozenset({"active_follow_up", "reply_follow_up"})
+_FOLLOWUP_REPLY_ACTIONS = frozenset({"reply", "interject", "clarify"})
 _SAFE_SKIP_REASONS = frozenset({"facts_invalid", "robot_message_reference", "explicit_event_rule"})
 _SAFE_FAILURE_REASONS = {
     "laya_package_missing": "当前 AstrBot Python 环境未安装 Laya。",
@@ -23,6 +28,7 @@ _SAFE_FAILURE_REASONS = {
     "laya_inference_failed": "Laya 本地推理失败。",
     "laya_inference_timeout": "Laya 本地判断超时，本轮继续普通回复流程。",
     "laya_transport_failed": "Laya 服务连接失败。",
+    "laya_auth_failed": "判断服务鉴权失败。",
     "laya_response_invalid": "Laya 返回格式无效。",
     "laya_response_too_large": "Laya 响应超过允许大小。",
     "laya_contract_invalid": "Laya 返回了插件合同之外的分类。",
@@ -44,11 +50,11 @@ def _safe_log_reason(reason_code, reason):
     return _SAFE_FAILURE_REASONS.get(reason_code, "Laya 调用失败；详细信息请查看 AstrBot 开发者日志。")
 
 
-def _diagnostic_json(value, limit):
+def _diagnostic_json(value, limit, *, sort_keys=False):
     if value is None:
         return None
     try:
-        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=sort_keys)
     except (TypeError, ValueError, RecursionError):
         encoded = json.dumps({"unavailable": True}, separators=(",", ":"))
     if len(encoded) <= limit:
@@ -60,6 +66,21 @@ def _diagnostic_json(value, limit):
         if len(bounded) <= limit:
             return bounded
         preview = preview[:len(preview) // 2]
+
+
+def _write_failure_detail(error):
+    """Describe a row the database refused without quoting the row.
+
+    SQLite's own message names the table, column or CHECK that rejected the write
+    (``CHECK constraint failed: mode IN ('local', 'remote')``) and never repeats
+    the stored values, so it is the one piece of a rejected ledger write that an
+    operator can act on. Anything else keeps its type name only.
+    """
+
+    if not isinstance(error, sqlite3.Error):
+        return "-"
+    detail = " ".join(str(error).split())
+    return detail[:160] or "-"
 
 
 def _intervention_trace(client):
@@ -74,6 +95,40 @@ def _intervention_trace(client):
         "response": {"format": response.get("format")} if response else None,
         "processing": processing,
     }
+
+
+def _apply_followup_confidence_gate(decision: LayaDecision, facts: dict, threshold: int):
+    """Suppress weak automatic continuations using Laya's calibrated action score.
+
+    The threshold is deliberately scoped to the two follow-up candidates. A
+    direct mention or an ordinary interjection is not blocked by this setting;
+    those paths keep their existing explicit switches. A missing confidence
+    fails open because an older server must not silently stop normal replies.
+    """
+    reason = facts.get("candidate_reason") if type(facts) is dict else None
+    if threshold <= 0 or reason not in _FOLLOWUP_REASONS or decision.action not in _FOLLOWUP_REPLY_ACTIONS:
+        return decision, None
+    gate = {"candidate_reason": reason, "threshold_percent": threshold,
+            "original_action": decision.action}
+    if decision.action_confidence is None:
+        return decision, {**gate, "status": "confidence_unavailable"}
+    confidence = decision.action_confidence
+    gate.update({"action_confidence": round(confidence, 4),
+                 "action_probability_percent": round(confidence * 100, 2)})
+    if confidence * 100 >= threshold:
+        return decision, {**gate, "status": "passed"}
+    return replace(decision, action="silent"), {**gate, "status": "below_threshold",
+                                                "effective_action": "silent"}
+
+
+def _ledger_mode(mode):
+    """The decision ledger predates Workers AI; that backend shares the remote row.
+
+    ``laya_decision_events.mode`` carries a CHECK constraint for the three
+    original backends, so a call from the Workers AI transport would otherwise
+    lose its whole ledger row instead of being recorded.
+    """
+    return "remote" if mode == "workers_ai" else mode
 
 
 class LayaDecisionService:
@@ -109,7 +164,8 @@ class LayaDecisionService:
                 connection.execute("UPDATE laya_decision_events SET processing_json = ? WHERE event_id = ?",
                                    (_diagnostic_json(processing, 16384), event_id))
         except Exception as error:
-            logger.warning("Laya 决策应用结果写入失败 code=%s", type(error).__name__)
+            logger.warning("Laya 决策应用结果写入失败 code=%s detail=%s",
+                           type(error).__name__, _write_failure_detail(error))
 
     def status(self) -> dict:
         status = self.store.read()
@@ -122,12 +178,12 @@ class LayaDecisionService:
         return self.store.update(revision, changes)
 
     def _client(self, values: dict) -> LayaDecisionClient:
-        if values["mode"] == "remote" and not values["endpoint"].strip():
-            raise LayaClientError("laya_endpoint_missing", "远程模式需要填写 Laya SystemOne 服务地址")
+        if values["mode"] != "local" and not values["endpoint"].strip():
+            raise LayaClientError("laya_endpoint_missing", "远程或 Jev 模式需要填写判断服务地址")
         if self.client_factory is None:
             raise LayaClientError("laya_client_unavailable", "Laya 执行适配器暂不可用，本轮继续普通回复流程")
         return self.client_factory(mode=values["mode"], endpoint=values["endpoint"],
-                                   local_model_path=values["local_model_path"],
+                                   local_model_path=values["local_model_path"], model=values["remote_model"],
                                    api_key=values["api_key"], timeout_seconds=values["timeout_seconds"])
 
     async def test(self) -> dict:
@@ -146,7 +202,8 @@ class LayaDecisionService:
         decision = result.document()
         self._record(test_values, "ok", round((perf_counter() - started) * 1000), decision=decision,
                      trace=getattr(client, "last_trace", None))
-        return {"status": "ok", "mode": values["mode"], "default_model": "multilingual",
+        return {"status": "ok", "mode": values["mode"],
+                "default_model": values["remote_model"] or MODE_MODELS[values["mode"]],
                 "decision": decision}
 
     async def decide(self, facts: dict) -> dict:
@@ -182,11 +239,25 @@ class LayaDecisionService:
                          reason_code=type(error).__name__, reason=_safe_log_reason(type(error).__name__, str(error)),
                          trace=getattr(client, "last_trace", None))
             raise
-        decision = result.document()
+        decision, confidence_gate = _apply_followup_confidence_gate(
+            result, facts, values["followup_confidence_threshold"])
+        decision_document = decision.document()
         elapsed_ms = round((perf_counter() - started) * 1000)
-        self._record(values, "ok", elapsed_ms, decision=decision, trace=getattr(client, "last_trace", None))
-        return {"status": "ok", "decision": decision, "mode": values["mode"],
-                "elapsed_ms": elapsed_ms, "enabled_fields": dict(values["decision_fields"])}
+        trace = getattr(client, "last_trace", None)
+        if confidence_gate is not None and isinstance(trace, dict):
+            trace = {**trace, "processing": dict(trace.get("processing") or {})}
+            trace["processing"]["confidence_gate"] = confidence_gate
+            trace["processing"]["model_decision"] = result.document()
+            trace["processing"]["effective_decision"] = decision_document
+        self._record(values, "ok", elapsed_ms, decision=decision_document, trace=trace)
+        response = {"status": "ok", "decision": decision_document, "mode": values["mode"],
+                    "elapsed_ms": elapsed_ms, "enabled_fields": dict(values["decision_fields"]),
+                    "action_confidence": result.action_confidence}
+        if confidence_gate is not None:
+            response["confidence_gate"] = confidence_gate
+        if confidence_gate is not None and confidence_gate["status"] == "below_threshold":
+            response["reason"] = "laya_followup_confidence_below_threshold"
+        return response
 
     async def classify_intervention(self, facts: dict) -> dict:
         """Use one bounded Laya question after the host has checked permission."""
@@ -243,8 +314,11 @@ class LayaDecisionService:
         if self.runtime is None or self.origin_key is None:
             return
         try:
-            decision_json = json.dumps(decision, ensure_ascii=False, separators=(",", ":")) if decision else None
-            enabled_fields_json = json.dumps(values["decision_fields"], sort_keys=True, separators=(",", ":"))
+            # 这两列的宽度由 laya_decision_events 的 CHECK 定死：超限的 JSON 会被库
+            # 直接拒绝，整条台账连同一句「写入失败」一起消失。改成带上 truncated 标记
+            # 的预览后，行还在，读者也知道自己看到的是被截断的文档。
+            decision_json = _diagnostic_json(decision, 4096) if decision else None
+            enabled_fields_json = _diagnostic_json(values["decision_fields"], 2048, sort_keys=True)
             safe_reason = _safe_log_reason(reason_code, reason) if reason_code else None
             trace = trace if isinstance(trace, dict) else {}
             processing = dict(trace.get("processing") or {})
@@ -260,7 +334,7 @@ class LayaDecisionService:
                     (event_id, origin_key, batch_id, source, status, mode, reason_code, reason, elapsed_ms,
                      decision_json, enabled_fields_json, request_json, response_json, processing_json, observed_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (event_id, self.origin_key, self.event_ref, self.source, status, values["mode"],
+                    (event_id, self.origin_key, self.event_ref, self.source, status, _ledger_mode(values["mode"]),
                      str(reason_code)[:96] if reason_code else None, str(safe_reason)[:1000] if safe_reason else None,
                      elapsed_ms, decision_json, enabled_fields_json, request_json, response_json, processing_json,
                      datetime.now(timezone.utc).isoformat()))
@@ -269,4 +343,5 @@ class LayaDecisionService:
                     ORDER BY observed_at DESC, rowid DESC LIMIT -1 OFFSET 2000)""", (self.origin_key,))
             self._last_recorded_event_id = event_id
         except Exception as error:
-            logger.warning("Laya 决策记录写入失败 code=%s", type(error).__name__)
+            logger.warning("Laya 决策记录写入失败 code=%s detail=%s",
+                           type(error).__name__, _write_failure_detail(error))

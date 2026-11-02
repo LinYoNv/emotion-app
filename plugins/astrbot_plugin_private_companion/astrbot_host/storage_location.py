@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
 import sqlite3
 import tempfile
 from uuid import uuid4
+
+from companion_v2.storage.sqlite_path import readonly_uri
+
+
+logger = logging.getLogger(__name__)
 
 
 PLUGIN_NAME = "astrbot_plugin_private_companion_v2"
@@ -23,7 +29,12 @@ LEGACY_DATA_NAMES = ("astrbot_plugin_private_companion_v2",)
 # V2 不能把库建在 V1 用户的数据里，改用这个子目录。
 V2_SUBDIRECTORY = "companion-7"
 # V1 的数据目录特征：它把全部陪伴数据放在这几个文件里。
-_V1_MARKERS = ("companions.json", ".storage-backend-state.json")
+_V1_MARKERS = ("companions.json", "companions.db", ".storage-backend-state.json")
+# 某些 AstrBot 版本会让 get_data_dir() 返回插件代码目录。代码目录不能作为
+# V2 数据根；识别后改写到 AstrBot 标准的 data/plugin_data/<plugin> 目录。
+_PLUGIN_CODE_MARKERS = ("main.py", "pyproject.toml")
+_PLUGIN_CODE_NAMES = frozenset(("astrbot_plugin_private_companion", "astrbot_plugin_private_companion_v2",
+                                "astrbot_plugin_remember_you"))
 
 
 def _looks_like_data_root(path: Path) -> bool:
@@ -49,6 +60,27 @@ def _looks_like_v1_root(path: Path) -> bool:
     return any((path / name).exists() for name in _V1_MARKERS)
 
 
+def _looks_like_plugin_code_dir(path: Path) -> bool:
+    """True for the installed plugin code tree, never for a V2 data directory."""
+    if not path.is_dir():
+        return False
+    if not any((path / marker).is_file() for marker in _PLUGIN_CODE_MARKERS):
+        return False
+    return path.name.casefold() in _PLUGIN_CODE_NAMES
+
+
+def _plugin_data_sibling(code_dir: Path) -> Path:
+    """Map a plugin code tree to a sibling plugin_data directory.
+
+    AstrBot normally uses ``<data>/plugin_data/<plugin>``.  Some hosts return
+    the code tree itself from ``get_data_dir``; in that case use the conventional
+    sibling for the standard layout, or the nearest external fallback otherwise.
+    """
+    parent = code_dir.parent
+    base = parent.parent if parent.name.casefold() in ("plugins", "plugin") else parent
+    return base / "plugin_data" / code_dir.name
+
+
 def resolve_data_root(default_root: Path, *, legacy_names=LEGACY_DATA_NAMES) -> Path:
     """插件改名前后的数据根解析。
 
@@ -58,6 +90,10 @@ def resolve_data_root(default_root: Path, *, legacy_names=LEGACY_DATA_NAMES) -> 
     时以现在的名字为准，避免改名后新旧目录各写一半。
     """
     default = Path(default_root).resolve()
+    if _looks_like_plugin_code_dir(default):
+        sibling = _plugin_data_sibling(default)
+        if sibling is not None:
+            default = sibling.resolve()
     if _looks_like_data_root(default):
         return default
     for name in legacy_names:
@@ -86,6 +122,10 @@ def selected_root(default_root: Path, selected_path: object) -> Path:
     if not candidate.is_absolute():
         raise ValueError("storage path must be absolute")
     target = (candidate / PLUGIN_NAME).resolve()
+    if _looks_like_plugin_code_dir(target):
+        raise ValueError("storage path cannot be the plugin code directory")
+    if _looks_like_v1_root(target):
+        raise ValueError("storage path cannot be the V1 data directory")
     if target == default or target.is_relative_to(default) or default.is_relative_to(target):
         raise ValueError("storage path cannot be inside the current plugin data directory")
     return target
@@ -123,7 +163,14 @@ def selected_backup_directory(runtime_root: Path, selected_path: object, install
 
 
 def _backup_installations(directory: Path) -> tuple[str, ...]:
-    from companion_v2.storage.backup import BACKUP_FORMAT
+    """Installation ids with a restorable snapshot pair in this directory.
+
+    Both formats count (review P2-7): filtering on the current ``BACKUP_FORMAT``
+    silently skipped every 7.0.7 pair, so switching the backup directory left the
+    only usable old backups behind — and a later cleanup of the old directory then
+    lost them for good.
+    """
+    from companion_v2.storage.backup import BACKUP_FORMAT, LEGACY_BACKUP_FORMAT
 
     identities = set()
     if not directory.is_dir() or _is_link(directory):
@@ -134,7 +181,7 @@ def _backup_installations(directory: Path) -> tuple[str, ...]:
         try:
             document = json.loads(sidecar.read_text(encoding="utf-8"))
             identity = document.get("installation_id")
-            if (document.get("format") == BACKUP_FORMAT and type(identity) is str
+            if (document.get("format") in {BACKUP_FORMAT, LEGACY_BACKUP_FORMAT} and type(identity) is str
                     and identity and len(identity) <= 512):
                 identities.add(identity)
         except (OSError, ValueError, TypeError, AttributeError):
@@ -149,7 +196,7 @@ def _runtime_root_for_installation(plugin_root: Path, installation_id: str) -> P
             continue
         connection = None
         try:
-            connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25)
+            connection = sqlite3.connect(readonly_uri(database), uri=True, timeout=0.25)
             row = connection.execute(
                 "SELECT value FROM runtime_metadata WHERE key = 'installation_id'").fetchone()
             if row is not None and row[0] == installation_id:
@@ -166,8 +213,16 @@ def _runtime_root_for_installation(plugin_root: Path, installation_id: str) -> P
 
 
 def relocate_backup_storage(plugin_root: Path, current_path: object,
-                            selected_path: object) -> tuple[tuple[tuple[Path, Path], Path], ...]:
-    """Copy verified pairs to per-installation folders before changing the path."""
+                            selected_path: object,
+                            report: dict | None = None) -> tuple[tuple[tuple[Path, Path], Path], ...]:
+    """Copy verified pairs to per-installation folders before changing the path.
+
+    An incomplete pair in the source used to abort the whole move with an
+    ``OSError`` and no way out (review P2-4). Complete pairs are copied and the
+    incomplete ones are skipped and named in ``report["skipped"]`` — they are left
+    untouched in the old directory, so nothing is lost and the switch can finish.
+    A pair a staged restore still depends on is never skipped: the copy fails closed.
+    """
     from companion_v2.storage.management import backup_directories, copy_backup_snapshots
 
     root = Path(plugin_root).resolve()
@@ -181,15 +236,27 @@ def relocate_backup_storage(plugin_root: Path, current_path: object,
         next_base.mkdir(parents=True, exist_ok=True)
 
     source_root = current_base or root
+    skipped: list[dict] = []
     transfers = []
     for source in backup_directories(source_root):
         for installation_id in _backup_installations(source):
             destination = (selected_backup_directory(root, selected_path, installation_id, plugin_root=root)
                            if next_base is not None
                            else _runtime_root_for_installation(root, installation_id) / "backups")
-            pairs = copy_backup_snapshots(source, destination, installation_id=installation_id)
+            snapshot_report: dict = {}
+            pairs = copy_backup_snapshots(source, destination, installation_id=installation_id,
+                                          skip_incomplete=True, data_root=source.parent,
+                                          report=snapshot_report)
+            skipped.extend({**item, "directory": str(source)} for item in snapshot_report.get("skipped", ()))
             if pairs:
                 transfers.append((pairs, destination))
+    if report is not None:
+        report.clear()
+        report.update({"skipped": skipped, "skipped_count": len(skipped),
+                       "transferred": sum(len(pairs) for pairs, _destination in transfers)})
+    if skipped:
+        logger.warning("[CompanionV2] 备份目录迁移跳过 %d 个不完整快照（保留在原目录）: %s",
+                       len(skipped), ", ".join(item["snapshot_id"] or item["sidecar"] for item in skipped[:5]))
     return tuple(transfers)
 
 
@@ -235,15 +302,19 @@ def _finish_pending_cleanup(default: Path, document: dict | None, current: Path)
     if type(source_value) is not str:
         return
     source = Path(source_value).resolve()
-    if source != current:
-        if source == default:
-            _remove_contents(default, preserve={POINTER_NAME})
+    try:
+        if source != current:
+            if source == default:
+                _remove_contents(default, preserve={POINTER_NAME}, tolerant=True)
+            else:
+                _remove_owned_root(source, tolerant=True)
+        if current == default:
+            (default / POINTER_NAME).unlink(missing_ok=True)
         else:
-            _remove_owned_root(source)
-    if current == default:
-        (default / POINTER_NAME).unlink(missing_ok=True)
-    else:
-        _write_pointer(default, {"path": str(current)})
+            _write_pointer(default, {"path": str(current)})
+    except OSError as error:
+        # 收尾失败不影响启动；保留 cleanup_source，下次启动继续尝试。
+        logger.warning("[CompanionV2] 待清理的旧数据根仍未完成 error_type=%s", type(error).__name__)
 
 
 def _files(root: Path):
@@ -266,19 +337,33 @@ def _digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _remove_contents(root: Path, *, preserve: set[str] = frozenset()) -> None:
+def _remove_contents(root: Path, *, preserve: set[str] = frozenset(), tolerant: bool = False) -> None:
+    """删除根目录下的内容。
+
+    Windows 上深路径删除可能抛 ``FileNotFoundError``（路径已不存在）或其它
+    ``OSError``；搬迁收尾时这类失败**绝不能**让插件加载失败，所以 ``tolerant``
+    只记录、不抛出，留给下次启动的 ``cleanup_source`` 重试。
+    """
     if not root.is_dir():
         return
     for child in root.iterdir():
         if child.name in preserve:
             continue
-        if child.is_dir() and not _is_link(child):
-            shutil.rmtree(child)
-        else:
-            child.rmdir() if child.is_dir() else child.unlink()
+        try:
+            if child.is_dir() and not _is_link(child):
+                shutil.rmtree(child)
+            else:
+                child.rmdir() if child.is_dir() else child.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            if not tolerant:
+                raise
+            logger.warning("[CompanionV2] 数据根清理未完成 path=%s error_type=%s",
+                           child.name, type(error).__name__)
 
 
-def _remove_owned_root(root: Path) -> None:
+def _remove_owned_root(root: Path, *, tolerant: bool = False) -> None:
     if not root.exists() or _is_link(root):
         return
     owner_path = root / OWNER_NAME
@@ -288,9 +373,14 @@ def _remove_owned_root(root: Path) -> None:
         return
     if not isinstance(owner, dict) or owner.get("format") != _FORMAT:
         return
-    _remove_contents(root, preserve={OWNER_NAME})
-    owner_path.unlink(missing_ok=True)
-    root.rmdir()
+    _remove_contents(root, preserve={OWNER_NAME}, tolerant=tolerant)
+    try:
+        owner_path.unlink(missing_ok=True)
+        root.rmdir()
+    except OSError as error:
+        if not tolerant:
+            raise
+        logger.warning("[CompanionV2] 旧数据根收尾未完成 error_type=%s", type(error).__name__)
 
 
 def _copy_verified(source: Path, destination: Path) -> None:
@@ -306,7 +396,7 @@ def _copy_verified(source: Path, destination: Path) -> None:
 
 def prepare_storage_root(default_root: Path, config: object) -> Path:
     """Move V2 data before controllers open it; the AstrBot root keeps a tiny pointer."""
-    default = Path(default_root).resolve()
+    default = resolve_data_root(Path(default_root).resolve())
     storage = config.get("storage", {}) if isinstance(config, dict) else {}
     selected = storage.get("path", "") if isinstance(storage, dict) else ""
     pointer_document = _read_pointer_document(default)
@@ -354,9 +444,10 @@ def prepare_storage_root(default_root: Path, config: object) -> Path:
                 desired.rmdir()
             os.replace(stage_root, desired)
             _write_pointer(default, {"path": str(desired), "cleanup_source": str(current)})
-            _remove_contents(default, preserve={POINTER_NAME})
+            # 搬迁已经成功：收尾清理任何失败都不能让插件加载失败。
+            _remove_contents(default, preserve={POINTER_NAME}, tolerant=True)
         if current != default:
-            _remove_owned_root(current)
+            _remove_owned_root(current, tolerant=True)
         if is_default_destination:
             pointer.unlink(missing_ok=True)
         else:

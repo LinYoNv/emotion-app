@@ -259,7 +259,8 @@ def prepare_core_reply_tracking(event, prepared, *, admission, now, reason="", m
             note_live(context, event_id, active=True)
         at, instruction = now(), prepared.get("instruction", "")
         _dispatch(state, lambda: admission.record_core_reply(context, event_id, instruction=instruction,
-                                                            reason=reason, mentioned=mentioned, at=at))
+            reason=reason, mentioned=mentioned, at=at,
+            continuation=(prepared.get("group_admission") or {}).get("continuation")))
     except Exception as error:
         logger.warning("[CompanionV2] 核心群回复准入记录暂不可用 error_type=%s", type(error).__name__)
     event.send = state["_send_wrapper"]
@@ -267,6 +268,35 @@ def prepare_core_reply_tracking(event, prepared, *, admission, now, reason="", m
         event.send_streaming = state["_streaming_wrapper"]
     _log(state, "admitted")
     return state
+
+
+def adopt_core_reply_tracking(event, *, admission, now, submit=None, prepared=None, reopen=False):
+    """Keep group bookkeeping attached after a plugin instance is replaced."""
+    state = event.get_extra(CORE_REPLY_TRACKING_EXTRA)
+    if not isinstance(state, dict):
+        return False
+    state["admission"], state["now"], state["submit"] = admission, now, submit
+    if isinstance(prepared, Mapping):
+        state["laya"] = dict(prepared.get("laya_decision") or {})
+        group = prepared.get("group_admission") or {}
+        state["reason"] = group.get("reason") or state.get("reason", "")
+        state["mentioned"] = bool(group.get("mentioned", state.get("mentioned", False)))
+    core = event.get_extra(CORE_REPLY_CONTEXT_EXTRA)
+    if (isinstance(core, dict) and not core.get("send_attempts")
+            and not core.get("send_unknown")):
+        state["completed"] = False
+        state["send_state"] = "not_started"
+        state["send_attempts"] = 0
+        state["send_returns"] = 0
+        state["unknown_sends"] = 0
+        state["send_failed"] = 0
+        if reopen and not state["inflight"]:
+            state["inflight"] = True
+            _persist(state, "inflight")
+    event.send = state["_send_wrapper"]
+    if callable(state["_original_streaming"]):
+        event.send_streaming = state["_streaming_wrapper"]
+    return True
 
 
 def mark_core_reply_inflight(event):

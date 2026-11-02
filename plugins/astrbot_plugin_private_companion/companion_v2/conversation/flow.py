@@ -19,6 +19,7 @@ from companion_v2.foundation.refs import ScopeKind
 from companion_v2.diagnostics.inbound import InboundNoReplyLedger, SUPPRESSED, UNMET
 from companion_v2.model_gateway.failures import ModelFailure
 from .messages import DELIVERY_KIND
+from . import debounce_log
 from .media.reply import reply_manifest
 from .busy_gate import deadline_for_deferral, validate_defer_seconds
 from .group_timing import short_input_wait
@@ -156,11 +157,30 @@ class ConversationFlow:
                     due = max(previous_due, min(due, deadline))
                 connection.execute("UPDATE conversation_flows SET due_at = ?, deadline_at = ?, reason = ? WHERE batch_id = ?",
                                    (stamp(due), stamp(deadline), reason, batch_id))
+                if context.scope.kind is ScopeKind.GROUP:
+                    group_text = ""
+                    try:
+                        group_text = self.messages._read_source(
+                            event.source, context, event.capability, now).payload
+                    except Exception:
+                        pass
+                    started = datetime.fromisoformat(tail["merge_until"]) - timedelta(
+                        seconds=policy.maximum_wait_seconds)
+                    debounce_log.followup(
+                        "group", group_text, target=context.scope.native_scope_id,
+                        count=count + 1,
+                        elapsed_ms=max(0.0, (now - started).total_seconds() * 1000),
+                        timing_text=debounce_log.timing(
+                            quiet_ms=policy.quiet_seconds * 1000,
+                            max_wait_ms=policy.maximum_wait_seconds * 1000),
+                    )
             else:
                 policy, initial_wait = self.policy, self.policy.quiet_seconds
+                group_text = ""
                 if context.scope.kind is ScopeKind.GROUP and self.messages.reply_settings is not None:
                     values = self.messages.reply_settings.capture(context, now)["settings"]
                     source = self.messages._read_source(event.source, context, event.capability, now)
+                    group_text = source.payload
                     initial_wait = max(initial_wait, min(short_input_wait(event, source.payload, values),
                                                         policy.turn_timeout_seconds - 0.001))
                     policy = replace(policy, maximum_wait_seconds=max(policy.maximum_wait_seconds, initial_wait))
@@ -178,6 +198,14 @@ class ConversationFlow:
                     (batch_id, context.scope.key, merge_key, stamp(due_at),
                      stamp(now + timedelta(seconds=policy.maximum_wait_seconds)),
                      stamp(deadline_at), encode(policy), "busy_delay" if defer > 0 else "debounce"))
+                if context.scope.kind is ScopeKind.GROUP:
+                    debounce_log.window(
+                        "group", target=context.scope.native_scope_id, text=group_text,
+                        timing_text=debounce_log.timing(
+                            quiet_ms=policy.quiet_seconds * 1000,
+                            initial_ms=initial_wait * 1000,
+                            max_wait_ms=policy.maximum_wait_seconds * 1000),
+                    )
             return batch_id
 
     def _update(self, batch_id, *, state, due_at=None, reason=""):

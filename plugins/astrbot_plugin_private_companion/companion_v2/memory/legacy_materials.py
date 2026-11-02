@@ -19,6 +19,8 @@ from threading import RLock
 from companion_v2.execution.models import TaskError, digest, encode
 from companion_v2.execution.service import outcome
 from companion_v2.foundation.refs import ScopeKind
+from companion_v2.legacy.sqlite_snapshot import open_readonly_sqlite_snapshot
+from companion_v2.storage.sqlite_path import readonly_uri
 from .legacy_policy import evaluate_legacy_memory_access
 
 
@@ -187,7 +189,7 @@ def _safe_database(path: str | Path):
 
 
 def _readonly(path: Path):
-    connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=10)
+    connection = open_readonly_sqlite_snapshot(path, timeout=10)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA query_only=ON")
     connection.execute("BEGIN")
@@ -1121,7 +1123,7 @@ class LegacyMemoryMaterials:
         path = self.runtime.data_root / DATABASE_FILENAME
         if not path.exists():
             raise TaskError("legacy_memory_result_changed", "historical result is no longer available")
-        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)
+        connection = sqlite3.connect(readonly_uri(path), uri=True, timeout=5)
         connection.row_factory = sqlite3.Row
         try:
             tables = {row[0] for row in connection.execute(

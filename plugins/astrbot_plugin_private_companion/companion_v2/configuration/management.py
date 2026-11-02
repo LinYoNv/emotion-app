@@ -27,6 +27,10 @@ from ..conversation.participation import (CONFIG_GROUP as PARTICIPATION_GROUP,
     CONFIG_OWNER as PARTICIPATION_OWNER, configuration_fields as participation_fields)
 from ..conversation.recall_settings import (GROUP as RECALL_GROUP, OWNER as RECALL_OWNER,
     configuration_fields as recall_fields)
+from ..conversation.web_understanding import (GROUP as WEB_GROUP, OWNER as WEB_OWNER,
+    configuration_fields as web_fields)
+from ..conversation.relay_settings import (GROUP as RELAY_GROUP, OWNER as RELAY_OWNER,
+    configuration_fields as relay_fields)
 from ..expression.reaction_configuration import (GROUP as REACTION_GROUP, OWNER as REACTION_OWNER,
     configuration_fields as reaction_fields)
 from ..expression.configuration import (GROUP as EXPRESSION_GROUP, OWNER as EXPRESSION_OWNER,
@@ -291,6 +295,22 @@ class RecallManagement(GroupEditor):
     group, owner = RECALL_GROUP, RECALL_OWNER
     layers = recall_fields()[0].layers
     error_prefix = "recall"
+
+
+class WebUnderstandingManagement(GroupEditor):
+    """Reading a page the participant linked, window scoped."""
+
+    group, owner = WEB_GROUP, WEB_OWNER
+    layers = web_fields()[0].layers
+    error_prefix = "web_understanding"
+
+
+class RelayManagement(GroupEditor):
+    """Cross-window relaying: who may send where, and whether it needs confirmation."""
+
+    group, owner = RELAY_GROUP, RELAY_OWNER
+    layers = relay_fields()[0].layers
+    error_prefix = "relay"
 
 
 class ScreenManagement(GroupEditor):

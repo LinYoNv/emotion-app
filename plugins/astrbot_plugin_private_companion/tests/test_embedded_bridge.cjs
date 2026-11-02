@@ -8,24 +8,27 @@ const vm = require("node:vm");
 const SOURCE = fs.readFileSync(path.join(__dirname, "../pages/陪伴小屋/embedded-bridge.js"), "utf8");
 
 function harness() {
-  const messages = [], timers = [];
+  const messages = [], timers = [], documentEvents = {};
   let onMessage;
   const parent = {postMessage(message) { messages.push(message); }};
   const window = {
     parent,
     addEventListener(type, handler) { if (type === "message") onMessage = handler; },
   };
-  const document = {addEventListener() {}};
+  const document = {addEventListener(type, handler) { documentEvents[type] = handler; },
+    dispatchEvent(event) { documentEvents[event.type]?.(event); }};
   const setTimeout = (callback, ms) => {
     const timer = {callback, ms, cleared: false};
     timers.push(timer);
     return timer;
   };
   const clearTimeout = timer => { if (timer) timer.cleared = true; };
+  class TestCustomEvent { constructor(type, init = {}) { this.type = type; this.detail = init.detail; } }
   vm.runInNewContext(SOURCE, {window, document, parent, setTimeout, clearTimeout,
-    Promise, Map, Number, Math, Object, String, CustomEvent: class {}});
+    Promise, Map, Number, Math, Object, String, CustomEvent: TestCustomEvent});
   messages.length = 0;
-  return {window, parent, messages, timers, respond: data => onMessage({source: parent, data})};
+  return {window, parent, messages, timers, documentEvents,
+    respond: data => onMessage({source: parent, data})};
 }
 
 test("embedded workspace carries a migration timeout through the host bridge", async () => {
@@ -49,6 +52,16 @@ test("ordinary embedded requests keep their short default and timeout input is c
   void capped.window.AstrBotPluginPage.apiGet("setup/plan", {}, {timeoutMs: 900000});
   assert.equal(capped.messages[0].timeoutMs, 300000);
   assert.equal(capped.timers[0].ms, 301000);
+});
+
+test("navigation failures reach the embedded workspace instead of failing silently", () => {
+  const h = harness();
+  const seen = [];
+  h.documentEvents["companion-navigate-failed"] = event => seen.push(event.detail);
+  h.respond({channel: "companion-workspace", kind: "navigate-failed", tab: "group-reply",
+    message: "这个群的人格或角色映射已经变化，请重新读取群聊目录后再试。"});
+  assert.equal(seen.length, 1);
+  assert.match(seen[0].message, /角色映射已经变化/);
 });
 
 test("an embedded timeout carries an explicit ambiguous transport code", async () => {

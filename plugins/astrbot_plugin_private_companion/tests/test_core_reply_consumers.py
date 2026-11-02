@@ -5,7 +5,7 @@ import base64
 from datetime import timedelta
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from companion_v2.conversation.recalls import MessageRecall
 from companion_v2.execution.models import TaskError, digest, encode, require, stamp
@@ -98,6 +98,9 @@ class CorePrivateConsumerTests(MultiFixture, unittest.IsolatedAsyncioTestCase):
         owner.observe = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("derived card unavailable"))
         prepared = await self.prepared("consumer-observer-failed", "嗯哼，那就这样说定啦")
         owner.observe = original
+        # Source capture finishes before the optional background role rebind.
+        # Learning consumes that binding, so wait for it as the host does.
+        await asyncio.gather(*tuple(self.controller.session.core_reply_maintenance._pending))
         context = prepared["context"]
         self.bind_expression_owner(context)
         ExpressionConfigurationOwner(self.app.runtime).write(target_for(context), configuration_fields(),
@@ -140,6 +143,37 @@ class CorePrivateConsumerTests(MultiFixture, unittest.IsolatedAsyncioTestCase):
         self.clock.advance(timedelta(seconds=1))
         await self.prepared("consumer-style-feedback", "这个语气怪怪的，别这样说")
         self.assertEqual(feedback.usage(self.app.runtime, owner, scope)[signal_id]["negative_count"], 1)
+        self.assert_core_only()
+
+    async def test_native_prompt_pins_rotation_rules_without_offering_the_whole_pool(self):
+        source = await self.prepared("consumer-pool-source", "嗯哼，就这么定啦")
+        context = source["context"]
+        self.bind_expression_owner(context)
+        samples = self.samples(context)
+        owner, scope = digest(self.app.expression_samples.role_owner(context)), digest(context.scope)
+        run_id = "expression-run:native-pool"
+        identifiers = [run_id + ":signal:" + str(index) for index in range(3)]
+        with self.app.runtime.transaction() as connection:
+            connection.execute("""INSERT INTO expression_style_runs VALUES
+                (?, ?, ?, ?, ?, '轻松接话', 'pending', ?, NULL)""", (run_id, owner, scope,
+                encode({**sample_document(samples), "context_key": context.key}),
+                samples.material_hash, stamp(self.clock.now())))
+            for index, signal_id in enumerate(identifiers):
+                connection.execute("""INSERT INTO expression_style_signals
+                    (signal_id, run_id, owner_key, scope_key, dimension, observation, proposal, confidence,
+                     evidence_json, state, created_at, decided_at, decided_by, decision_key, ordinal)
+                    VALUES (?, ?, ?, ?, 'diction', ?, ?, 0.8, ?, 'adopted', ?, ?, 'operator', 'adopt', ?)""",
+                    (signal_id, run_id, owner, scope, f"观察{index}", f"自然使用口语{index}",
+                     encode([samples.samples[0].handle]), stamp(self.clock.now()), stamp(self.clock.now()), index))
+        self.clock.advance(timedelta(seconds=1))
+        prepared = await self.prepared("consumer-pool-send", "今天怎么样")
+        injected = prepared["expression_signal_ids"]
+        self.assertEqual(len(injected), 2, "one turn pins rules_per_turn rules and counts exactly those")
+        prompt = prepared["prompt_instruction"]
+        self.assertTrue(all(identifier in prompt for identifier in injected))
+        omitted = [identifier for identifier in identifiers if identifier not in injected]
+        self.assertEqual(len(omitted), 1)
+        self.assertNotIn(omitted[0], prompt, "the native prompt must not carry unused candidates")
         self.assert_core_only()
 
     async def media_collection(self, *, withdraw=False):
@@ -218,6 +252,63 @@ class CoreGroupConsumerTests(GroupFixture, unittest.IsolatedAsyncioTestCase):
         prepared = result.unwrap()
         self.assertIsNotNone(await prepared["native_source_future"])
         return prepared
+
+    async def test_listening_group_collects_image_only_animation_without_starting_a_reply(self):
+        from astrbot.core.message.components import Image
+        from tests.test_semantic_integration import animation
+        semantic = self.app.tools.semantic
+        cfg = semantic.store.settings()
+        semantic.store.configure({"reactions_collection_group_enabled": True,
+            "reactions_collection_group_probability": 1.0}, cfg["revision"])
+        original = animation()
+        event = self.group_event(identifier="listening-group-sticker", text="")
+        event.message_obj.message.append(Image.fromBase64(base64.b64encode(original.content).decode("ascii")))
+        semantic.gateway.port.analyze = AsyncMock(return_value={"suitable": True, "name": "挥手",
+            "description": "挥手的聊天表情", "intents": "回应招呼"})
+        observer = self.controller.session.core_reply_observations
+        participation = self.app.tools.group_participation
+        with patch.object(participation.admission, "candidate", return_value=""), \
+                patch.object(observer, "media", wraps=observer.media) as collect:
+            result = await self.controller.group_reply_candidate(event)
+        self.assertTrue(result.is_success, result.failure)
+        self.assertFalse(result.unwrap()["admitted"])
+        collect.assert_called_once()
+        self.assertTrue(collect.call_args.kwargs["collection_only"])
+        prepared = collect.call_args.args[1]
+        await asyncio.gather(*tuple(observer._pending))
+        while semantic.background:
+            await asyncio.gather(*tuple(semantic.background.values()))
+        owner = semantic.reaction_owner(prepared["context"])
+        items = semantic.store.list(owner, "reaction")
+        self.assertEqual(len(items), 1, semantic.errors)
+        self.assertEqual(items[0]["payload"]["collection_source"], "group_capture")
+        self.assertEqual(semantic.reactions.captured(items[0]).content, original.content)
+        self.assertEqual(len(semantic.reactions.captured(items[0]).frames), len(original.frames))
+        self.assertEqual(semantic.store.reaction_collection_summary(owner)["totals"]["group_capture"]["added"], 1)
+        self.assertEqual(self.app.runtime.read_all("SELECT batch_id FROM conversation_batches", ()), ())
+        self.assertEqual(self.native.provider.client.state.calls, [])
+        self.assertEqual(self.native.platforms["qq-main"].client._api._wsr_api.calls, [])
+        self.assertFalse(self.app.state_maintenance.foreground_busy(prepared["context"]))
+
+    async def test_listening_group_does_not_download_when_collection_is_disabled_or_not_sampled(self):
+        from astrbot.core.message.components import Image
+        from tests.test_semantic_integration import picture
+        semantic = self.app.tools.semantic
+        participation = self.app.tools.group_participation
+        original = picture()
+        for enabled in (False, True):
+            cfg = semantic.store.settings()
+            semantic.store.configure({"reactions_collection_group_enabled": enabled,
+                "reactions_collection_group_probability": 0.0}, cfg["revision"])
+            event = self.group_event(identifier="listening-disabled-" + str(enabled), text="")
+            event.message_obj.message.append(Image.fromBase64(base64.b64encode(original.content).decode("ascii")))
+            with patch.object(participation.admission, "candidate", return_value=""), \
+                    patch("astrbot_host.core_reply_media.load_native_image", new_callable=AsyncMock) as download:
+                result = await self.controller.group_reply_candidate(event)
+                self.assertTrue(result.is_success, result.failure)
+                self.assertFalse(result.unwrap()["admitted"])
+                await asyncio.gather(*tuple(self.controller.session.core_reply_observations._pending))
+                download.assert_not_awaited()
 
     async def test_native_group_samples_bind_learning_api_and_relationship_graph(self):
         from astrbot_host.group_reply_api import GroupReplyWebAPI

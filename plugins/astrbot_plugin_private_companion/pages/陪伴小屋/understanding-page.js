@@ -2,7 +2,7 @@
 window.CompanionUnderstandingPage = (() => {
   const tabs = [
     ["overview", "总览"], ["image", "图片理解"], ["video", "视频理解"],
-    ["file", "文件理解"], ["forwards", "合并转发"],
+    ["file", "文件理解"], ["web", "网页理解"], ["forwards", "合并转发"],
   ];
   let root = null;
   let active = "overview";
@@ -55,6 +55,7 @@ window.CompanionUnderstandingPage = (() => {
       ["视觉转述缓存上限", number("private_image_vision_cache_max_items", "条"), status("enable_private_image_vision_cache")],
       ["识图失败冷却", number("private_image_provider_failure_cooldown_seconds", "秒"), ""],
       ["上下文描述条数", number("context_image_caption_max_items", "张"), status("enable_context_image_captioning")],
+      ["AstrBot 原生动图优化", status("astrbot_animated_image_understanding_enabled"), ""],
     ];
     if (tab === "video") return [
       ["视频理解状态", status("video_understanding_enabled"), ""],
@@ -63,10 +64,27 @@ window.CompanionUnderstandingPage = (() => {
     ];
     if (tab === "file") {
       const count = formatCount();
+      const parsers = replyStatus?.documents || {};
+      const suffixes = Object.keys(parsers);
+      const ready = suffixes.filter(name => parsers[name] === true).length;
+      const missing = suffixes.filter(name => parsers[name] !== true)
+        .map(name => name.replace(/^\./, "").toUpperCase());
       return [
         ["纳入格式", count === null ? "—" : `${count} / 5 类`, ""],
         ["解析预算", `${number("file_understanding_max_size_mb", "MB")} · ${number("file_understanding_timeout_seconds", "秒")}`, ""],
         ["文件理解状态", status("file_understanding_enabled"), ""],
+        ["解析组件", suffixes.length ? `${ready} / ${suffixes.length} 可用` : "—",
+          missing.length ? `缺少 ${missing.join("、")}` : ""],
+      ];
+    }
+    if (tab === "web") {
+      const web = replyStatus?.web || {};
+      const value = name => Number.isFinite(Number(web[name])) ? Number(web[name]) : null;
+      return [
+        ["链接读取", web.enabled === false ? "已关闭" : web.enabled === true ? "已启用" : "—", ""],
+        ["每轮条数", value("max_links") === null ? "—" : `${value("max_links")} 条`, ""],
+        ["单页正文", value("max_chars") === null ? "—" : `${value("max_chars")} 字`, ""],
+        ["抓取超时", value("timeout_seconds") === null ? "—" : `${value("timeout_seconds")} 秒`, ""],
       ];
     }
     const intake = hostStatus?.forwardIntake || {};

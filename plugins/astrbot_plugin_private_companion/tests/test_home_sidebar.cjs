@@ -105,6 +105,24 @@ test("滚动时间线标出空档长度，并在数据不完整时停止推断",
   assert.doesNotMatch(partial,/class="home-agenda-gap"/);
 });
 
+test("节目单把安排标题和说明放在时间之前，短空档不占主列表", () => {
+  const state=status([
+    event("早已过去","2026-09-30T01:00:00Z","2026-09-30T01:30:00Z"),
+    event("傍晚安排","2026-09-30T10:00:00Z","2026-09-30T11:00:00Z"),
+    event("稍后安排","2026-09-30T04:15:00Z","2026-09-30T04:45:00Z"),
+  ]);
+  const activities=[{activity_id:"active",state:"active",title:"正在阅读",started_at:"2026-09-30T03:30:00Z",due_at:"2026-09-30T05:00:00Z",checkpoint:"读完这一章"}];
+  const html=renderSchedule({now,state,life:life(activities)});
+  assert.match(html,/home-agenda-program-meta/);
+  assert.match(html,/今日上演/);
+  assert.match(html,/已经落幕/);
+  assert.match(html,/counter-reset:agenda-act 1/);
+  assert.match(html,/正在阅读/);
+  assert.match(html,/读完这一章/);
+  assert.doesNotMatch(html,/30分钟/,"短空档不应占主列表");
+  assert.doesNotMatch(html,/今天已结束/);
+});
+
 test("共享睡眠以确认标记睡眠中，跨日计划有日期，并说明缺少执行窗口", () => {
   const state=status([]);
   state.body_sleep={state:"sleeping",started_at:"2026-09-30T00:00:00Z",planned_wake_at:"2026-09-30T03:00:00Z"};
@@ -184,6 +202,21 @@ test("空日程仍说明自动规划状态，并区分调度巡检与日程覆�
   assert.doesNotMatch(html,/class="home-agenda-date"/);
   state.planning.calendar_enabled=false;
   assert.match(renderSchedule({now,state,life:life([])}),/日历写入尚未开启/);
+});
+
+test("当日规划失败时显示原因和后续评估，不把空日历画成全天空闲", () => {
+  const state=status([]);
+  state.planning={enabled:true,calendar_enabled:true,next_check:"2026-09-30T04:01:00Z",
+    daily_result:{state:"failed",code:"provider_wait_timed_out"},next_review_at:"2026-09-30T10:00:00Z"};
+  const html=renderSchedule({now,state,life:life([])});
+  assert.match(html,/今日规划尚未生成/);
+  assert.match(html,/当日规划未完成：模型等待超时/);
+  assert.match(html,/18:00 重新评估剩余时段/);
+  assert.doesNotMatch(html,/今日暂无安排|当前未安排|调度巡检/);
+  state.planning.running=true;
+  assert.match(renderSchedule({now,state,life:life([])}),/今日规划正在生成/);
+  state.planning.running=false;state.planning.daily_result={state:"succeeded",saved:0};
+  assert.match(renderSchedule({now,state,life:life([])}),/今日暂无安排/);
 });
 
 test("四项图标用不同状态呈现，无法归类的自由描述原样保留在详情中", () => {

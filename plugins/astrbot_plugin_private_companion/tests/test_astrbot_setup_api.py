@@ -16,7 +16,8 @@ from tests.test_management_access import NOW
 from astrbot_host.binding_store import PendingBinding, write_binding
 from astrbot_host.controller import AstrBotStagingController
 from astrbot_host.multi_controller import AstrBotMultiController
-from astrbot_host.setup_api import SetupWebAPI
+from astrbot_host.setup_api import (PROACTIVE_TEST_FAILURE_LABELS, PROACTIVE_TEST_STAGE_BY_CODE,
+                                    PROACTIVE_TEST_SUGGESTIONS, SetupWebAPI)
 from companion_v2.adapters.astrbot.staging import NativeAdapterTypes
 from companion_v2.execution.models import TaskError
 from companion_v2.proactive.diagnostic_models import DiagnosticSourceError
@@ -58,9 +59,29 @@ class AstrBotSetupFlowTests(unittest.IsolatedAsyncioTestCase):
         with patch("astrbot_host.setup_api.request", request):
             return await getattr(self.api, name)()
 
+    async def test_profile_save_accepts_the_full_field_set(self):
+        body = {
+            "target": "role_profile",
+            "operation_key": "setup-profile-body-limit",
+            "edit_token": "0" * 64,
+            "changes": {"identity": "身" * 2000, "personality": "格" * 2400,
+                        "world": "世" * 4200},
+        }
+        self.assertGreater(len(json.dumps(body, ensure_ascii=False).encode("utf-8")), 4096)
+        reached = []
+
+        async def stop_after_body():
+            reached.append(True)
+            raise TaskError("test_body_accepted", "profile body was accepted")
+
+        with patch.object(self.api, "_setup_context", stop_after_body):
+            result = await self.call("save_profile", body)
+        self.assertTrue(reached, result)
+        self.assertEqual(result["data"]["code"], "test_body_accepted")
+
     async def test_setup_api_has_no_runtime_mode_endpoint_or_status_field(self):
         routes = {route for route, *_ in self.api.routes()}
-        self.assertNotIn("/astrbot_plugin_private_companion_v2/setup/mode", routes)
+        self.assertNotIn("/astrbot_plugin_private_companion/setup/mode", routes)
         status = await self.call("status")
         self.assertEqual(status["status"], "ok", status)
         self.assertNotIn("mode", status["data"])
@@ -78,6 +99,36 @@ class AstrBotSetupFlowTests(unittest.IsolatedAsyncioTestCase):
                 return receipt
             await asyncio.sleep(0.01)
         self.fail(f"proactive test did not reach a terminal receipt: {self.api.progress.read()['proactive_test']}")
+
+    async def skip_optional_setup_sections(self):
+        for step in ("proactive", "life", "group"):
+            result = await self.call("complete", {"step": step, "skipped": True})
+            self.assertEqual(result["status"], "ok", result)
+
+    def test_proactive_authorization_diagnostics_distinguish_login_and_core_permission(self):
+        cases = {
+            "dashboard_identity_required": "Dashboard 登录身份不可用",
+            "unbound_identity": "Dashboard 身份尚未完成绑定",
+            "binding_revoked": "Dashboard 身份绑定已撤销",
+            "binding_expired": "Dashboard 身份绑定已过期",
+            "binding_not_active": "Dashboard 身份绑定尚未生效",
+            "binding_rebound": "Dashboard 身份已重新绑定",
+            "scope_installation_mismatch": "Dashboard 身份不属于当前安装",
+            "scope_not_granted": "当前 Dashboard 身份未获该配置范围授权",
+            "core_access_required": "当前 Dashboard 身份没有核心管理权限",
+            "authorization_denied": "当前 Dashboard 身份没有配置管理权限",
+            "authorization_revoked": "当前 Dashboard 身份的管理授权已撤销",
+            "authorization_expired": "当前 Dashboard 身份的管理授权已过期",
+            "authorization_not_active": "当前 Dashboard 身份的管理授权尚未生效",
+        }
+        for code, title in cases.items():
+            with self.subTest(code=code):
+                self.assertEqual(PROACTIVE_TEST_STAGE_BY_CODE[code], "authorization")
+                self.assertEqual(PROACTIVE_TEST_FAILURE_LABELS[code][1], title)
+                self.assertTrue(PROACTIVE_TEST_SUGGESTIONS[code])
+                result = SetupWebAPI._diagnostic_failure("screen", None, "authorization", code, code)
+                self.assertEqual(result["failure_title"], title)
+                self.assertIn(result["suggestion"], PROACTIVE_TEST_SUGGESTIONS.values())
 
     def message_calls(self):
         calls = self.native.platform.client._api._wsr_api.calls
@@ -541,6 +592,14 @@ class AstrBotSetupFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.message_calls(), [])
         self.assertEqual(self.native.provider.client.state.calls, [])
 
+    async def test_model_can_be_saved_while_the_shared_host_is_running(self):
+        await self.enter_model_step()
+        with patch.object(self.controller, "initialize_profile",
+                          AsyncMock(return_value=Outcome.failed("host_must_stop", "host is running"))):
+            result = await self.call("model", {"provider_id": "native-model"})
+        self.assertEqual(result["status"], "ok", result)
+        self.assertTrue(result["data"].get("restart_required"))
+
     async def test_model_selection_rejects_unloaded_provider_without_saving(self):
         await self.enter_model_step()
 
@@ -549,6 +608,30 @@ class AstrBotSetupFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["data"]["code"], "host_provider_unavailable")
         self.assertEqual(self.config["model"]["provider_id"], "native-model")
         self.assertIsNone(self.controller.runtime)
+
+    async def test_model_selection_accepts_namespaced_astrbot_provider_id(self):
+        provider_id = "deepseek/deepseek-flash"
+        provider = FakeProvider()
+        provider.provider_config["id"] = provider_id
+        provider.meta = lambda: NS(id=provider_id, name=provider_id)
+        providers = {"native-model": self.native.provider, provider_id: provider}
+        self.native.get_all_providers = lambda: list(providers.values())
+        self.native.get_provider_by_id = lambda selected: providers.get(selected)
+        await self.enter_model_step()
+
+        result = await self.call("model", {"provider_id": provider_id})
+
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(self.config["model"]["provider_id"], provider_id)
+
+    async def test_model_apply_failure_is_not_misreported_as_invalid_provider(self):
+        await self.enter_model_step()
+        self.controller.save_plugin_config = Mock(side_effect=ValueError("fixture write failure"))
+
+        result = await self.call("model", {"provider_id": "native-model"})
+
+        self.assertEqual(result["data"]["code"], "setup_model_apply_failed")
+        self.assertEqual(self.config["model"]["provider_id"], "native-model")
 
     async def test_model_setup_uses_all_loaded_providers_without_registering_them(self):
         secondary = FakeProvider()
@@ -705,6 +788,7 @@ class AstrBotSetupFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.call("complete", {"step": "model", "skipped": False}))["status"], "ok")
         self.assertEqual((await self.call("complete", {"step": "knowledge", "skipped": True}))["status"], "ok")
         self.assertEqual((await self.call("complete", {"step": "relationships", "skipped": True}))["status"], "ok")
+        await self.skip_optional_setup_sections()
         await self.prepare_trusted_conversation_source()
 
         generated_text = "想起你说过的航行计划。"
@@ -730,12 +814,68 @@ class AstrBotSetupFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(settings["enabled"])
         self.assertFalse(settings["automatic_enabled"])
 
+    async def test_proactive_poll_does_not_load_host_catalog_or_upgrade_plan(self):
+        from astrbot_host.setup_state import SETUP_STEPS
+        for step in SETUP_STEPS:
+            self.api.progress.complete(step)
+        self.api.progress.begin_proactive_test(attempt_id="poll-only", started_at=NOW.isoformat())
+        self.api._test_task = asyncio.get_running_loop().create_future()
+        try:
+            with patch.object(self.controller, "status", side_effect=AssertionError("host discovery")), \
+                    patch("astrbot_host.upgrade_setup.UpgradeSetup.plan", new=AsyncMock(
+                        side_effect=AssertionError("migration discovery"))):
+                result = await self.call("proactive_test_status")
+            self.assertEqual(result["status"], "ok", result)
+            self.assertEqual(result["data"]["proactive_test"]["state"], "started")
+            self.assertFalse(result["data"]["ready"])
+            denied = await self.call("proactive_test_status", username="api_key:fixture")
+            self.assertEqual(denied["data"]["code"], "dashboard_identity_required")
+        finally:
+            self.api._test_task.cancel()
+
+    async def test_proactive_test_stops_when_generation_has_already_failed(self):
+        from astrbot_host.setup_state import SETUP_STEPS
+        for step in SETUP_STEPS:
+            self.api.progress.complete(step)
+        manager = NS(status=Mock(return_value=Outcome.success({"settings": {"enabled": True}})))
+        candidate = {"opportunity": object(), "intents": (), "role_instruction": "fixture",
+                     "route": {"id": "chat", "label": "chat", "variant": "fixture"},
+                     "diagnostic_origin": {}}
+        for generation in ("failed", "cancelled", "expired", "dead_letter", "uncertain"):
+            with self.subTest(generation=generation):
+                self.api.progress.path.unlink(missing_ok=True)
+                for step in SETUP_STEPS:
+                    self.api.progress.complete(step)
+                self.api.progress.begin_proactive_test(attempt_id=generation, started_at=NOW.isoformat())
+                app = NS(
+                    contact_schedule=NS(diagnostic_candidate=AsyncMock(return_value=candidate)),
+                    tasks=NS(read=Mock(return_value=Outcome.success(NS(reason="model_generation_failed")))),
+                    proactive=NS(task_id=Mock(return_value="task-1"),
+                        contact=AsyncMock(return_value=Outcome.success(NS(task=NS(task_id="task-1")))),
+                        observe=Mock(return_value=Outcome.success({"generation": generation,
+                            "delivery": None, "judge": None, "skipped": False}))))
+                with patch.object(self.api, "_test_context", new=AsyncMock(return_value=(NS(application=app), object(), ""))), \
+                        patch("astrbot_host.setup_api.dashboard_operator", return_value=object()), \
+                        patch("astrbot_host.setup_api.ContactManagement", return_value=manager), \
+                        patch.object(self.api, "_restore_test_contact_permission_with_context"), \
+                        patch("astrbot_host.setup_api.asyncio.sleep", new=AsyncMock(
+                            side_effect=AssertionError("a terminal generation must not keep polling"))):
+                    await self.api._execute_proactive_test("administrator", generation)
+                receipt = self.api.progress.read()["proactive_test"]
+                self.assertEqual(receipt["state"], "unknown" if generation == "uncertain" else "failed")
+                self.assertEqual(receipt["error_code"], "setup_contact_generation_failed")
+                states = {item["stage"]: item["state"] for item in receipt["stages"]}
+                self.assertEqual(states["model_generation"], "failed")
+                self.assertEqual(states["delivery"], "skipped")
+                app.proactive.observe.assert_called_once()
+
     async def test_recipient_confirmation_finishes_unknown_test_without_sending_again(self):
         await self.enter_model_step()
         await self.call("model", {"provider_id": "native-model"})
         await self.call("complete", {"step": "model", "skipped": False})
         await self.call("complete", {"step": "knowledge", "skipped": True})
         await self.call("complete", {"step": "relationships", "skipped": True})
+        await self.skip_optional_setup_sections()
         await self.prepare_trusted_conversation_source()
         self.prepare_contact_model()
         reverse_api = self.native.platform.client._api._wsr_api
@@ -784,6 +924,7 @@ class AstrBotSetupFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.call("complete", {"step": "model", "skipped": False}))["status"], "ok")
         self.assertEqual((await self.call("complete", {"step": "knowledge", "skipped": True}))["status"], "ok")
         self.assertEqual((await self.call("complete", {"step": "relationships", "skipped": True}))["status"], "ok")
+        await self.skip_optional_setup_sections()
         await self.prepare_trusted_conversation_source()
         self.prepare_contact_model()
         self.assertEqual((await self.call("proactive_test", {"enable_proactive": True}))["data"]["state"], "started")
@@ -805,6 +946,7 @@ class AstrBotSetupFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.call("complete", {"step": "model", "skipped": False}))["status"], "ok")
         self.assertEqual((await self.call("complete", {"step": "knowledge", "skipped": True}))["status"], "ok")
         self.assertEqual((await self.call("complete", {"step": "relationships", "skipped": True}))["status"], "ok")
+        await self.skip_optional_setup_sections()
 
         started = await self.controller.start()
         self.assertIsNone(started.failure, started.failure)
@@ -842,13 +984,26 @@ class AstrBotSetupFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(restored["automatic_enabled"])
         from companion_v2.proactive.configuration import GROUP, target_for
         recovered_identity = recovered_session.application.tasks.identity
-        self.assertFalse(any(grant.capability == GROUP and grant.grant_id.startswith("proactive-managed:")
+        self.assertTrue(any(grant.capability == GROUP and grant.grant_id.startswith("proactive-managed:")
             and grant.state.value == "active" for grant in recovered_identity.snapshot().grants))
         legacy = recovered_session.application.runtime.read_one(
             "SELECT value_json FROM configuration_values WHERE target_key = ? AND field_id = ?",
             (target_for(context).key, GROUP + ".enabled"))
         self.assertEqual(legacy["value_json"], "false")
         self.assertEqual(self.message_calls(), [])
+
+        started = await self.controller.start()
+        self.assertIsNone(started.failure, started.failure)
+        active_session = self.controller.session
+        active_context = active_session.profile.target
+        operator = dashboard_operator(self.controller.runtime, "administrator", at=NOW)
+        manager = ContactManagement(active_session.application, active_context)
+        current = manager.status(operator).unwrap()
+        manager.configure(operator, {"operation_key": "reenable-after-setup-test",
+            "edit_token": current["edit_token"], "changes": {"enabled": True}}).unwrap()
+        access = active_session.application.tasks.identity.authorize(
+            active_context.actor, scope=active_context.scope, capability=GROUP, observed_at=NOW)
+        self.assertTrue(access.is_success, access.failure)
 
     async def test_reconnect_route_starts_only_a_completed_setup(self):
         denied = await self.call("reconnect_host")
@@ -859,6 +1014,7 @@ class AstrBotSetupFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.call("complete", {"step": "model", "skipped": False}))["status"], "ok")
         self.assertEqual((await self.call("complete", {"step": "knowledge", "skipped": True}))["status"], "ok")
         self.assertEqual((await self.call("complete", {"step": "relationships", "skipped": True}))["status"], "ok")
+        await self.skip_optional_setup_sections()
         await self.prepare_trusted_conversation_source()
         self.prepare_contact_model()
         self.assertEqual((await self.call("proactive_test", {"enable_proactive": True}))["data"]["state"], "started")
@@ -869,6 +1025,52 @@ class AstrBotSetupFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(connected["status"], "ok", connected)
         self.assertTrue(connected["data"]["status"]["host"]["accepting"])
+
+    async def test_unfinished_guide_is_not_reported_as_an_unreplayable_test(self):
+        # A fresh install: the guide is still open, and no attempt has ever run.
+        # Reporting setup_test_non_replayable here sent the operator looking for a
+        # replay problem while proactive_test was still null.
+        await self.enter_model_step()
+        self.assertEqual((await self.call("model", {"provider_id": "native-model"}))["status"], "ok")
+        self.assertEqual((await self.call("complete", {"step": "model", "skipped": False}))["status"], "ok")
+        self.assertEqual((await self.call("complete", {"step": "knowledge", "skipped": True}))["status"], "ok")
+        self.assertEqual((await self.call("complete", {"step": "relationships", "skipped": True}))["status"], "ok")
+        await self.prepare_trusted_conversation_source()
+        self.prepare_contact_model()
+        model_calls_before = len(self.native.provider.client.state.calls)
+
+        result = await self.call("proactive_test", {"enable_proactive": True})
+
+        self.assertEqual(result["status"], "error", result)
+        self.assertEqual(result["data"]["code"], "setup_steps_incomplete", result)
+        self.assertEqual(result["message"], "setup_steps_incomplete")
+        self.assertIn("guided setup steps", result["reason"])
+        self.assertIsNone(self.api.progress.read()["proactive_test"])
+        # Nothing was dispatched and no attempt was recorded: the refusal happened
+        # before the test could start, exactly like the null receipt says.
+        self.assertEqual(len(self.native.provider.client.state.calls), model_calls_before)
+
+    async def test_a_started_test_still_reports_the_non_replayable_code(self):
+        # The genuine replay refusal must keep its original code and message.
+        await self.enter_model_step()
+        self.assertEqual((await self.call("model", {"provider_id": "native-model"}))["status"], "ok")
+        for step, skipped in (("model", False), ("knowledge", True), ("relationships", True),
+                              ("proactive", True), ("life", True), ("group", True)):
+            self.assertEqual((await self.call("complete", {"step": step, "skipped": skipped}))["status"], "ok")
+        await self.prepare_trusted_conversation_source()
+        self.prepare_contact_model()
+        self.native.platform.client._api._wsr_api.error = TimeoutError("the message may have been sent")
+
+        first = await self.call("proactive_test", {"enable_proactive": True})
+        self.assertEqual(first["data"]["state"], "started", first)
+        receipt = await self.wait_for_test()
+        self.assertEqual(receipt["state"], "unknown", receipt)
+
+        again = await self.call("proactive_test", {"enable_proactive": True})
+
+        self.assertEqual(again["status"], "error", again)
+        self.assertEqual(again["data"]["code"], "setup_test_non_replayable", again)
+        self.assertIn("cannot be replayed", again["reason"])
 
 
 if __name__ == "__main__":

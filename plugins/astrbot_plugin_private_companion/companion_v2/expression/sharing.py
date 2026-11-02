@@ -6,6 +6,7 @@ import math
 
 from .learning import (APPLICABILITY_FIELDS, DIMENSIONS, MAX_OBSERVATION_CHARS,
                        MAX_PROPOSAL_CHARS, candidate_signature, normalize_applicability)
+from .rule_details import normalize as normalize_form
 
 
 PACK_SCHEMA = "private-companion-expression-pack"
@@ -99,11 +100,22 @@ def normalize_pack(raw):
                     if "keywords" not in supplied_applicability and type(rule.get("tags")) is list:
                         supplied_applicability["keywords"] = rule["tags"]
                 applicability = normalize_applicability(supplied_applicability)
+                form = rule.get("expression")
+                if (form is None and rule.get("kind") in ("style", "grammar")
+                        and type(rule.get("pattern")) is str and 0 < len(rule["pattern"]) <= 500
+                        and len(observation) <= 240):
+                    form = {"kind": rule["kind"], "situation": observation,
+                            "pattern": rule["pattern"], "avoid": rule.get("avoid", "")}
+                form = normalize_form(form) if form is not None else None
+                if form:
+                    for value in form.values():
+                        if value:
+                            _line(value, MAX_PROPOSAL_CHARS, "expression_form")
             except (TypeError, ValueError) as error:
                 rejected.append({"group_index": group_index, "rule_index": rule_index,
                                  "reason": str(error) or "invalid_rule"})
                 continue
-            signature = candidate_signature(dimension, observation, proposal, applicability)
+            signature = candidate_signature(dimension, observation, proposal, applicability, form)
             if signature in seen:
                 rejected.append({"group_index": group_index, "rule_index": rule_index,
                                  "reason": "duplicate_in_pack"})
@@ -111,6 +123,7 @@ def normalize_pack(raw):
             seen.add(signature)
             signals.append({"dimension": dimension, "observation": observation,
                             "proposal": proposal, "applicability": applicability,
+                            "expression": form,
                             "confidence": float(confidence)})
             if len(signals) > MAX_IMPORT_SIGNALS:
                 raise ValueError("too_many_signals")
@@ -128,13 +141,22 @@ def build_pack(signals, *, title="陪伴表达分享", exported_at=""):
         proposal = signal["proposal"]
         applicability = normalize_applicability(signal.get("applicability"))
         kind = "grammar" if dimension == "sentence_rhythm" else "style"
+        form = signal.get("expression")
+        form = normalize_form(form) if form is not None else None
         groups.append({"id": f"group-{index:03d}", "label": signal["observation"], "rules": [{
-            "kind": kind,
+            "kind": form["kind"] if form else kind,
             "dimension": dimension,
             "label": DIMENSION_LABELS.get(dimension, "表达形式"),
-            "situation": signal["observation"],
-            "pattern": proposal,
+            # The observation is the learned note, the situation belongs to the
+            # concrete form. Exporting both keeps a round trip lossless: import
+            # prefers "observation", so re-importing a rule cannot reword it into
+            # a different-looking duplicate.
+            "observation": signal["observation"],
+            "situation": form["situation"] if form else signal["observation"],
+            "pattern": form["pattern"] if form else proposal,
             "instruction": proposal,
+            "proposal": proposal,
+            **({"expression": form, "avoid": form["avoid"]} if form else {}),
             "signals": [dimension],
             **applicability,
         }]})

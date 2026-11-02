@@ -8,6 +8,19 @@ from unittest.mock import patch
 
 from companion_v2.conversation.foreground import BackgroundPromptTrigger
 from companion_v2.proactive.configuration import ImportantDate, important_dates, local_time
+from companion_v2.relationships import anniversaries
+from companion_v2.relationships.profile import (
+    GROUP as RELATIONSHIP_PROFILE_GROUP,
+    RelationshipProfileConfigurationOwner,
+    configuration_fields as relationship_profile_fields,
+    target_for as relationship_profile_target_for,
+)
+from companion_v2.role_profile.configuration import (
+    GROUP as ROLE_PROFILE_GROUP,
+    RoleProfileConfigurationOwner,
+    configuration_fields as role_profile_fields,
+    target_for as role_profile_target_for,
+)
 from tests.contact_schedule_support import ContactScheduleFixture
 from tests.test_role_tool_loop import answered
 
@@ -25,6 +38,100 @@ class DateContactTests(ContactScheduleFixture, unittest.IsolatedAsyncioTestCase)
             values["date_checkin_enabled"] = enabled
         self.settings(app, values).unwrap()
         return app
+
+    def set_role_birthday(self, app, value):
+        context = self.contact_context()
+        owner = RoleProfileConfigurationOwner(app.runtime)
+        target = role_profile_target_for(context)
+        fields = role_profile_fields()
+        snapshot = owner.read(target, fields)
+        owner.write(target, fields, changes={ROLE_PROFILE_GROUP + ".birthday": value},
+                    reset=(), expected_revision=snapshot.revision,
+                    observed_at=self.clock.now())
+
+    def set_user_birthday(self, app, value):
+        context = self.contact_context()
+        owner = RelationshipProfileConfigurationOwner(app.runtime)
+        target = relationship_profile_target_for(context)
+        fields = relationship_profile_fields()
+        snapshot = owner.read(target, fields)
+        owner.write(target, fields, changes={RELATIONSHIP_PROFILE_GROUP + ".user_birthday": value},
+                    reset=(), expected_revision=snapshot.revision,
+                    observed_at=self.clock.now())
+
+    async def test_profile_birthdays_are_used_without_a_manual_date_list(self):
+        app = await self.setup_date(dates="[]")
+        self.set_role_birthday(app, "9月21日")
+        self.set_user_birthday(app, "纪念日 9月21日")
+        self.advance(app, 60)
+        await self.automatic_delivery(app)
+        payload = self.contact_calls()[0].original.context.materials[0].payload
+        self.assertIn("角色档案中的生日或纪念日「角色生日」", payload)
+        self.assertIn("当前私聊资料中的生日或纪念日「对方纪念日」", payload)
+        marker = json.loads(self.contacts(app)[0]["record_json"])["automatic_origin"]["date_event"]
+        self.assertEqual(marker["entries"], [
+            {"basis": "profile_role_birthday", "label": "角色生日",
+             "date": "2026-09-21", "calendar": "gregorian"},
+            {"basis": "profile_relationship_date", "label": "对方纪念日",
+             "date": "2026-09-21", "calendar": "gregorian"},
+        ])
+        rows = app.contact_schedule.date_events.upcoming(
+            self.contact_context(), self.preferences(app), self.clock.now(), lookahead_days=7)
+        self.assertEqual({row["label"]: row["days_until"] for row in rows},
+                         {"角色生日": 0, "对方纪念日": 0})
+
+    async def test_profile_date_lookahead_and_dashboard_projection_need_no_manual_json(self):
+        app = await self.setup_date(dates="[]")
+        self.settings(app, {"important_date_lookahead_days": 4}).unwrap()
+        self.set_role_birthday(app, "9月24日")
+        self.set_user_birthday(app, "纪念日 9月25日")
+        preferences = self.preferences(app)
+        events = app.contact_schedule.date_events
+        zone = ZoneInfo(preferences.values["quiet_timezone"])
+        wall = local_time(preferences.values["date_checkin_time"])
+        opening = datetime.combine(self.clock.now().astimezone(zone).date(), wall,
+                                   tzinfo=zone).astimezone(timezone.utc)
+        slot = events._slot(self.contact_context(), preferences, opening)
+        self.assertIsNotNone(slot)
+        self.assertEqual(slot[1]["entries"], [
+            {"basis": "profile_role_birthday", "label": "角色生日",
+             "date": "2026-09-24", "calendar": "gregorian", "days_until": 3},
+            {"basis": "profile_relationship_date", "label": "对方纪念日",
+             "date": "2026-09-25", "calendar": "gregorian", "days_until": 4},
+        ])
+        rows = events.upcoming(self.contact_context(), preferences, self.clock.now(),
+                               lookahead_days=7)
+        self.assertEqual([(row["label"], row["days_until"]) for row in rows],
+                         [("角色生日", 3), ("对方纪念日", 4)])
+
+    async def test_daily_reflection_can_remember_an_interaction_anniversary_without_configuration(self):
+        app = await self.setup_date(dates="[]")
+        created = anniversaries.remember(app.runtime, self.contact_context(), {
+            "label": "第一次认真说出喜欢",
+            "reason": "用户原话明确说出第一次告白。",
+            "confidence": 0.92,
+            "evidence_handle": "s1",
+            "occurred_at": "2026-09-21T00:30:00+00:00",
+            "month": 9,
+            "day": 21,
+            "timezone": "Asia/Shanghai",
+        }, source_run_id="daily-reflection", at=self.clock.now())
+        self.assertEqual(created["state"], "created")
+        self.advance(app, 60)
+        await self.automatic_delivery(app)
+        payload = self.contact_calls()[0].original.context.materials[0].payload
+        self.assertIn("每日反思记下的互动纪念日「第一次认真说出喜欢」", payload)
+        marker = json.loads(self.contacts(app)[0]["record_json"])["automatic_origin"]["date_event"]
+        self.assertEqual(marker["entries"], [{
+            "basis": "auto_relationship_anniversary",
+            "label": "第一次认真说出喜欢",
+            "date": "2026-09-21",
+            "calendar": "gregorian",
+        }])
+        rows = app.contact_schedule.date_events.upcoming(
+            self.contact_context(), self.preferences(app), self.clock.now(), lookahead_days=7)
+        self.assertEqual([(row["label"], row["days_until"]) for row in rows],
+                         [("第一次认真说出喜欢", 0)])
 
     async def test_opt_in_and_valid_explicit_dates_are_required(self):
         app = await self.setup_date(enabled=None)
@@ -77,9 +184,11 @@ class DateContactTests(ContactScheduleFixture, unittest.IsolatedAsyncioTestCase)
     async def test_configured_lunar_date_uses_local_day_and_keeps_its_basis(self):
         app = await self.setup_date(dates=LUNAR_JSON)
         self.advance(app, 60)
-        await self.automatic_delivery(app)
+        with patch("companion_v2.proactive.date_events.lunar_date_parts",
+                   return_value=(2026, 8, 11, False)):
+            await self.automatic_delivery(app)
         request = self.contact_calls()[0].original
-        self.assertIn("管理员配置农历日期", request.context.materials[0].payload)
+        self.assertIn("旧版手动保留的农历日期", request.context.materials[0].payload)
         marker = json.loads(self.contacts(app)[0]["record_json"])["automatic_origin"]["date_event"]
         self.assertEqual(marker["entries"], [{"basis": "operator_configured_lunar_date",
             "label": "农历纪念日", "lunar_year": 2026, "leap_month": False}])

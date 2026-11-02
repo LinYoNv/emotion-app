@@ -58,8 +58,8 @@
 .decision-editors .wb{gap:var(--sp-3)}
 .decision-editors .wb-card-head{display:none}
 .decision-editors .wb-rail-legend{display:none}
-.decision-editors .wb-card-body{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:start;gap:var(--sp-3);min-width:0}
-.decision-editors .wb-group{min-width:0;margin:0;padding:var(--sp-4);border:1px solid var(--t-line);border-radius:var(--r-sm);background:var(--t-surface)}
+.decision-editors .wb-card-body{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:stretch;gap:var(--sp-3);min-width:0}
+.decision-editors .wb-group{min-width:0;height:100%;margin:0;padding:var(--sp-4);border:1px solid var(--t-line);border-radius:var(--r-sm);background:var(--t-surface)}
 .decision-editors .wb-group+.wb-group{margin:0;padding:var(--sp-4);border:1px solid var(--t-line)}
 .decision-editors .wb-group-head{margin:0 0 var(--sp-3);padding-bottom:var(--sp-3);border-bottom:1px solid var(--t-line);font-size:var(--fs-lead)}
 .decision-editors .wb-fields{grid-template-columns:minmax(0,1fr);gap:0}

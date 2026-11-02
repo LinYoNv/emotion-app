@@ -140,6 +140,61 @@ class LegacyArchiveTests(unittest.TestCase):
                 archived_work_rows(root/'archive','../v1','work','jobs')
             self.assertEqual(hashlib.sha256(database.read_bytes()).hexdigest(),before)
 
+    def test_nested_runtime_is_excluded_from_v1_archive_and_revalidated(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "v1"
+            runtime = source / "companion-7"
+            runtime.mkdir(parents=True)
+            (source / "companions.json").write_text("{}", encoding="utf-8")
+            (runtime / "companion-v2.sqlite3").write_bytes(b"new runtime")
+            plan = build_v1_archive_plan(source, exclude_roots=(runtime,))
+            result = copy_v1_archive(plan, root / "archive")
+            archive = root / "archive" / result["archive_id"]
+            self.assertFalse((archive / "files" / "companion-7").exists())
+            self.assertEqual(result["file_count"], 1)
+            self.assertEqual(verify_v1_archive(archive)["file_count"], 1)
+
+    def test_archive_inside_the_excluded_runtime_root_is_allowed(self):
+        """覆盖升级布局：V2 数据根就在 V1 目录里，归档到它下面不能算「写在来源内」。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "v1"
+            runtime = source / "companion-7"
+            runtime.mkdir(parents=True)
+            (source / "companions.json").write_text("{}", encoding="utf-8")
+            (runtime / "companion-v2.sqlite3").write_bytes(b"new runtime")
+            plan = build_v1_archive_plan(source, exclude_roots=(runtime,))
+
+            result = copy_v1_archive(plan, runtime / "legacy-v1-archives")
+
+            self.assertEqual(result["file_count"], 1)
+            self.assertTrue((runtime / "legacy-v1-archives" / result["archive_id"] / "files"
+                             / "companions.json").is_file())
+
+    def test_archive_inside_the_source_without_exclusion_is_still_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "v1"
+            source.mkdir()
+            (source / "companions.json").write_text("{}", encoding="utf-8")
+            plan = build_v1_archive_plan(source)
+            with self.assertRaisesRegex(ValueError, "archive_destination_inside_source"):
+                copy_v1_archive(plan, source / "legacy-v1-archives")
+
+    def test_windows_long_path_is_reported_before_the_copy_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "v1"
+            deep = source / ("d" * 120)
+            deep.mkdir(parents=True)
+            (deep / ("f" * 120 + ".bin")).write_bytes(b"payload")
+            plan = build_v1_archive_plan(source)
+            archive_root = root / ("a" * 80) / "legacy-v1-archives"
+            with patch.object(archive_module.os, "name", "nt"):
+                with self.assertRaisesRegex(OSError, "archive_path_too_long"):
+                    copy_v1_archive(plan, archive_root)
+
 
 if __name__ == "__main__":
     unittest.main()

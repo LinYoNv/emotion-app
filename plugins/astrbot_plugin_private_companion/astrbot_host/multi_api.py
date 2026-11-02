@@ -1,6 +1,7 @@
 """Dashboard control and immutable per-owner administration routes."""
 
 from types import SimpleNamespace
+import logging
 
 from astrbot.api.web import request
 from companion_v2.execution.models import TaskError, digest
@@ -17,6 +18,7 @@ from .growth_api import GrowthWebAPI, PREFIX as GROWTH_PREFIX
 from .web_api import StagingWebAPI, outcome_response
 from .group_settings import GroupTarget
 from .group_memory_api import GroupMemoryWebAPI
+from .group_model_api import GroupModelWebAPI
 from .group_reply_api import GroupReplyWebAPI
 from .page_api import PageWebAPI
 from .acquaintance_api import AcquaintanceWebAPI
@@ -40,9 +42,13 @@ from .host_options_api import HostOptionsWebAPI
 from .storage_api import StorageWebAPI
 from .display_names import display_names
 from .identity_derivation import role_display_name
+from .role_paths import HOST_PREFIX as PREFIX, role_legacy_paths
+from .performance_mode import performance_enabled, performance_status
+from .huawei_health.api import HuaweiHealthWebAPI
 
 
-PREFIX = "/astrbot_plugin_private_companion/host"
+logger = logging.getLogger(__name__)
+
 INSTALLATION_CONFIGURATION_SECTIONS = ("proactive.contact", "reaction", "budget")
 TARGET_CONFIGURATION_SECTIONS = tuple(name for name in SECTIONS
     if name not in INSTALLATION_CONFIGURATION_SECTIONS)
@@ -74,7 +80,16 @@ class TargetControllerView:
         session = controller.session or controller.last_session
         if session is None or controller.runtime is None:
             return None
-        context = controller.authority.context(self.target_id, self.role_id)
+        try:
+            context = controller.authority.context(self.target_id, self.role_id)
+        except TaskError:
+            # A role shared by several windows only has its context registered
+            # on the primary route; page reads for an alias should use that same
+            # role context instead of failing with a generic "unreadable" note.
+            link = controller.settings.window_link_for_target(self.target_id)
+            if link is None:
+                raise
+            context = controller.authority.context(link.primary_target_id, self.role_id)
         return SimpleNamespace(application=session.application, profile=SimpleNamespace(target=context))
 
     @property
@@ -114,11 +129,26 @@ class MultiHostWebAPI:
         self.controller = controller
         self._registered_routes = []
 
+    def _register_routes(self, register, routes):
+        registered = getattr(self.controller.context, "registered_web_apis", None)
+        snapshot = list(registered) if isinstance(registered, list) else None
+        try:
+            for route, handler, methods, description in routes:
+                register(route, handler, methods, description)
+                self._registered_routes.append((route, handler))
+        except Exception:
+            if snapshot is not None:
+                registered[:] = snapshot
+                self._registered_routes.clear()
+            else:
+                self.unregister()
+            raise
+
     def target_inventory(self):
         settings = self.controller.settings
         if settings is None:
             return []
-        return [{**vars(target), "scope_kind": "group" if isinstance(target, GroupTarget) else "private",
+        inventory = [{**vars(target), "scope_kind": "group" if isinstance(target, GroupTarget) else "private",
             "delivery_mode": settings.delivery_mode_for(target),
             "group_delivery_authorization": (self.controller.authority.group_delivery.status(target)
                 if isinstance(target, GroupTarget) and self.controller.authority is not None
@@ -136,8 +166,7 @@ class MultiHostWebAPI:
              "config_api": (None if isinstance(target, GroupTarget) else
                             PREFIX + "/targets/" + target.target_id + "/roles/" + digest(role) + "/config"),
              "role_config_api": None,
-             "model_api": (None if isinstance(target, GroupTarget) else
-                           PREFIX + "/targets/" + target.target_id + "/roles/" + digest(role) + "/model"),
+             "model_api": PREFIX + "/targets/" + target.target_id + "/roles/" + digest(role) + "/model",
              "perception_native_api": (None if isinstance(target, GroupTarget) else
                            PREFIX + "/targets/" + target.target_id + "/roles/" + digest(role) + "/perception-native"),
              "reality_access_api": (None if isinstance(target, GroupTarget) else
@@ -162,12 +191,41 @@ class MultiHostWebAPI:
                           PREFIX + "/targets/" + target.target_id + "/roles/" + digest(role) + "/growth"),
              # V1 迁移写的是角色设置，所以它和别的域路由一样按角色挂：
              # 页面先选目标与角色，再对着那个角色的路径侦察、试算、执行。
-             "legacy_api": (None if isinstance(target, GroupTarget) else
-                            PREFIX + "/targets/" + target.target_id + "/roles/" + digest(role) + "/legacy"),
-             "legacy_group_data_api": (PREFIX + "/targets/" + target.target_id + "/roles/"
-                            + digest(role) + "/legacy-group-data" if isinstance(target, GroupTarget) else None)}
+             **role_legacy_paths(target.target_id, role,
+                                 "group" if isinstance(target, GroupTarget) else "private")}
             for role in sorted({p.role_id for p in settings.personas if p.bot_id == target.bot_id})]}
             for target in settings.all_targets]
+        self._ensure_role_routes(inventory)
+        return inventory
+
+    def _ensure_role_routes(self, inventory):
+        """Refresh per-role routes when a role was mapped after this host started.
+
+        ``register()`` builds one route per role known at boot. Saving a new
+        persona mapping later used to leave the page manifest advertising a
+        ``config_api`` (and every other per-role API) whose route did not exist;
+        AstrBot then answered "未找到该路由" on the role-profile tab. Refresh once
+        when the inventory proves a route is missing.
+        """
+        if getattr(self, "_role_routes_refresh_failed", False):
+            return
+        if getattr(self, "_refreshing_role_routes", False):
+            return
+        registered = {route for route, _ in self._registered_routes}
+        expected = {role.get("config_api") for target in inventory
+                    for role in target.get("roles", []) if role.get("config_api")}
+        if not expected or expected <= registered:
+            return
+        self._refreshing_role_routes = True
+        try:
+            self.controller.unregister_routes()
+            self.controller.register_routes()
+        except Exception:
+            self._role_routes_refresh_failed = True
+            logger.warning("[CompanionV2] 角色路由刷新失败 error_type=%s",
+                           "registration_failed")
+        finally:
+            self._refreshing_role_routes = False
 
     @staticmethod
     def _admin():
@@ -185,6 +243,15 @@ class MultiHostWebAPI:
             if self.controller._terminated:
                 status = self.controller.status()
             return {"status": "ok", "data": status}
+        except TaskError as error:
+            return outcome_response(Outcome.failed(error.code, str(error)))
+
+    async def api_performance(self):
+        try:
+            self._admin()
+            return {"status": "ok", "data": performance_status(
+                getattr(self.controller, "config", {}),
+                enabled=getattr(self.controller, "_performance_mode_enabled", None))}
         except TaskError as error:
             return outcome_response(Outcome.failed(error.code, str(error)))
 
@@ -227,12 +294,22 @@ class MultiHostWebAPI:
         register = getattr(self.controller.context, "register_web_api", None)
         if not callable(register):
             raise TaskError("host_web_api_unavailable", "this host does not support plugin Web APIs")
-        routes = [(PREFIX + "/status", self.api_status, ["GET"], "Companion V2 multi-target status")] + PageWebAPI(self.controller).routes() + IntegrationWebAPI(self.controller).routes() + AcquaintanceWebAPI(self.controller).routes()
+        routes = [
+            (PREFIX + "/status", self.api_status, ["GET"], "Companion V2 multi-target status"),
+            (PREFIX + "/performance", self.api_performance, ["GET"], "Companion V2 page performance mode"),
+        ]
+        lite_mode = performance_enabled(getattr(self.controller, "config", {}))
+        self.controller._performance_mode_enabled = lite_mode
+        if lite_mode:
+            self._register_routes(register, routes)
+            return
+        routes += PageWebAPI(self.controller).routes() + IntegrationWebAPI(self.controller).routes() + AcquaintanceWebAPI(self.controller).routes()
         routes += SemanticWebAPI(self.controller).routes()
         routes += SetupWebAPI(self.controller).routes()
         routes += AccountSessionWebAPI(self.controller).routes()
         routes += PerceptionWebAPI(self.controller).routes()
         routes += NativeExtensionWebAPI(self.controller).routes()
+        routes += HuaweiHealthWebAPI(self.controller).routes()
         # 备份是安装级的：它不需要目标，快照覆盖当前运行档的那棵 V2 数据根
         # （多目标下是 installations/<installation_key>/runtime）。所以这里挂一次，
         # 不像其它域路由那样按角色重挂。暂存还原的生效点在 multi_controller
@@ -261,20 +338,25 @@ class MultiHostWebAPI:
                         role["group_memory_api"]))
                     routes.extend(GroupReplyWebAPI(self.controller, target["target_id"], role["role_id"]).routes(
                         role["reply_api"]))
+                    routes.extend(GroupModelWebAPI(self.controller, target["target_id"], role["role_id"]).routes(
+                        role["model_api"]))
                     routes.extend(LegacyGroupDataWebAPI(self.controller, target["target_id"], role["role_id"]).routes(
                         role["legacy_group_data_api"]))
                 if role["memory_api"] is None:
                     continue
+                source_target_id = getattr(self.controller, "role_source_target_id",
+                    lambda _role_id, fallback: fallback)(role["role_id"], target["target_id"])
                 view = TargetControllerView(self.controller, target["target_id"], role["role_id"])
+                role_view = TargetControllerView(self.controller, source_target_id, role["role_id"])
                 api = MemoryWebAPI(view)
                 routes.extend((role["memory_api"] + path.removeprefix(MEMORY_PREFIX), handler, methods, description)
                               for path, handler, methods, description in api.routes())
                 routes.extend((role["state_api"] + path.removeprefix(STATE_PREFIX), handler, methods, description)
-                              for path, handler, methods, description in StateWebAPI(view).routes())
+                              for path, handler, methods, description in StateWebAPI(role_view).routes())
                 routes.extend((role["reply_api"] + path.removeprefix(REPLY_PREFIX), handler, methods, description)
                               for path, handler, methods, description in ReplyWebAPI(view).routes())
                 routes.extend((role["model_api"] + path.removeprefix(MODEL_PREFIX), handler, methods, description)
-                              for path, handler, methods, description in ModelWebAPI(view).routes())
+                              for path, handler, methods, description in ModelWebAPI(role_view).routes())
                 routes.extend((role["perception_native_api"] + path.removeprefix(NATIVE_PERCEPTION_PREFIX),
                                handler, methods, description)
                               for path, handler, methods, description in NativePerceptionWebAPI(view).routes())
@@ -291,7 +373,7 @@ class MultiHostWebAPI:
                                handler, methods, description)
                               for path, handler, methods, description in QzoneWebAPI(view).routes())
                 routes.extend((role["life_api"] + path.removeprefix(LIFE_PREFIX), handler, methods, description)
-                              for path, handler, methods, description in LifeWebAPI(view).routes())
+                              for path, handler, methods, description in LifeWebAPI(role_view).routes())
                 routes.extend((role["relationships_api"] + path.removeprefix(RELATIONSHIP_PREFIX), handler, methods, description)
                               for path, handler, methods, description in RelationshipWebAPI(view).routes())
                 routes.extend((role["growth_api"] + path.removeprefix(GROWTH_PREFIX), handler, methods, description)
@@ -306,16 +388,4 @@ class MultiHostWebAPI:
                 routes.extend((role["image_material_api"] + path.removeprefix(IMAGE_MATERIAL_PREFIX),
                                handler, methods, description)
                               for path, handler, methods, description in ImageMaterialsWebAPI(view).routes())
-        registered = getattr(self.controller.context, "registered_web_apis", None)
-        snapshot = list(registered) if isinstance(registered, list) else None
-        try:
-            for route, handler, methods, description in routes:
-                register(route, handler, methods, description)
-                self._registered_routes.append((route, handler))
-        except Exception:
-            if snapshot is not None:
-                registered[:] = snapshot
-                self._registered_routes.clear()
-            else:
-                self.unregister()
-            raise
+        self._register_routes(register, routes)

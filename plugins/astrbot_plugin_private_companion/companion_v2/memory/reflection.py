@@ -16,8 +16,10 @@ from companion_v2.foundation.refs import SourceRef, VersionRef
 from companion_v2.foundation.refs import ScopeKind
 from companion_v2.model_gateway.models import ModelTaskProfile
 from companion_v2.sources.models import SourceRecord
+from companion_v2.relationships import anniversaries
 
 from . import codec
+from .configuration import target_for
 from .models import AtomRef, owner_key, text, timestamp
 from .prompts import REFLECTION_INSTRUCTION
 from .reflection_output import REFLECTION_SCHEMA, proposal_for_repair
@@ -46,8 +48,10 @@ class MemoryReflection:
         self._closed, self._invocations = False, set()
         self.selection = ReflectionSelection(self)
         binding = ProviderBinding("memory.extract", "local", "1", "memory-extract-1")
+        # Model routing allows 600 seconds per provider, with one fallback.
+        # The task must leave room for both attempts and its local checkpoint.
         self.registrations = (TaskRegistration(TaskDefinition(KIND, "memory", "memory.reflect", Lane.BACKGROUND,
-            side_effect=SideEffect.LOCAL, binding=binding, timeout_seconds=180, max_attempts=1, concurrency=1), self.validate),)
+            side_effect=SideEffect.LOCAL, binding=binding, timeout_seconds=1230, max_attempts=1, concurrency=1), self.validate),)
 
     def attach(self, memory, gateway, *, require_running=None):
         if self.gateway is not None or gateway.runtime is not self.runtime or memory.runtime is not self.runtime:
@@ -65,6 +69,13 @@ class MemoryReflection:
         if row is None or TaskContext.restore(json.loads(row["context_json"])).key != context.key:
             raise TaskError("memory_reflection_unavailable", "reflection belongs to its original authenticated context")
         return row
+
+    def _task_timeout(self, context):
+        group = self.gateway.router.profiles[KIND].group
+        snapshot = require(self.gateway.router.configuration.read(context.actor,
+            target=target_for(context), group_id=group, observed_at=self.tasks.now()))
+        timeout = snapshot.fields[group + ".timeout_seconds"].value
+        return max(180, 2 * timeout + 30)
 
     @outcome
     def prepare(self, context, *, request_id, start, end, role_instruction, maximum_sources=32, maximum_chars=24000, schedule_ref=None,
@@ -242,13 +253,15 @@ class MemoryReflection:
                 return Outcome.failed("memory_reflection_failed", "the known failed attempt needs an explicit retry request")
             if KIND not in self.gateway.router.profiles:
                 raise TaskError("model_task_unregistered", "host has not configured memory reflection")
+            timeout_seconds = self._task_timeout(context) if row["task_id"] is None else 0
             with self.runtime.transaction() as connection:
                 self._validate_inputs(context, row)
                 task_id = row["task_id"] or "memory-extract-task-" + digest(batch_id)
                 connection.execute("UPDATE memory_reflections SET task_id = ? WHERE batch_id = ?", (task_id, batch_id))
                 now = self.tasks.now()
                 if row["task_id"] is None:
-                    require(self.tasks.submit(TaskSpec(task_id, context, KIND, batch_id, batch_id, now, now + timedelta(seconds=180))))
+                    require(self.tasks.submit(TaskSpec(task_id, context, KIND, batch_id, batch_id,
+                        now, now + timedelta(seconds=timeout_seconds))))
             invocation = asyncio.current_task()
             self._invocations.add(invocation)
             try:
@@ -485,6 +498,29 @@ class MemoryReflection:
                     manifest = json.loads(row["manifest_json"])
                     output.setdefault("rejected", []).append({"item_id": entry["item_id"], "raw": proposal_for_repair(entry["proposal"], manifest), "kind": "proposal",
                         "problem": {"code": result.failure.code, "path": "proposal"}})
+                receipts["sequence"] = self._sequence(context)
+                connection.execute("UPDATE memory_reflections SET receipts_json = ?, result_json = ?, updated_at = ? WHERE batch_id = ?",
+                                   (encode(receipts), encode(output), stamp(self.tasks.now()), batch_id))
+        for entry in output.get("anniversaries", []):
+            with self.runtime.transaction() as connection:
+                row = self._row(context, batch_id)
+                self._validate_inputs(context, row)
+                receipts = json.loads(row["receipts_json"])
+                key = entry["item_id"]
+                if key in receipts["items"]:
+                    continue
+                try:
+                    result = anniversaries.remember(
+                        self.runtime, context, entry, source_run_id=batch_id, at=self.tasks.now())
+                except (TypeError, ValueError, KeyError):
+                    result = {"state": "rejected", "code": "anniversary_invalid"}
+                receipts["items"][key] = result
+                if result.get("state") in {"limit", "rejected"}:
+                    output.setdefault("rejected", []).append({
+                        "item_id": key, "raw": entry, "kind": "anniversary",
+                        "problem": {"code": result.get("code", "anniversary_limit"),
+                                    "path": "anniversaries"},
+                    })
                 receipts["sequence"] = self._sequence(context)
                 connection.execute("UPDATE memory_reflections SET receipts_json = ?, result_json = ?, updated_at = ? WHERE batch_id = ?",
                                    (encode(receipts), encode(output), stamp(self.tasks.now()), batch_id))

@@ -18,13 +18,15 @@ from astrbot.core.pipeline.process_stage.follow_up import _ACTIVE_AGENT_RUNNERS
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 from mcp.types import CallToolResult
 
-from astrbot_host.core_reply import prepare_core_reply_event
-from astrbot_host.core_reply_tools import close_core_reply_tools, inject_core_reply_tools, native_tool_name
+from astrbot_host.core_reply import CORE_REPLY_CONTEXT_EXTRA, prepare_core_reply_event
+from astrbot_host.core_reply_tools import (CoreReplyToolSession, close_core_reply_tools, group_tool_manifest,
+                                           inject_core_reply_tools, native_tool_name)
 from astrbot_host.core_reply_telemetry import observe_core_agent_begin, prepare_core_reply_telemetry
 from astrbot_host.core_reply_tool_dispatch import observe_core_tool_dispatch_begin, restore_core_tool_dispatch
 from companion_v2.agenda.service import AgendaService
 from companion_v2.execution.models import TaskError, require
 from companion_v2.foundation.outcome import Outcome
+from companion_v2.foundation.refs import ScopeKind
 from companion_v2.model_gateway.models import MAX_TOOL_CATALOG
 from tests.test_astrbot_core_reply import FakeEvent
 from tests.test_external_tools import ExternalFixture
@@ -69,6 +71,32 @@ class CoreReplyToolsTests(ExternalFixture, unittest.IsolatedAsyncioTestCase):
         wrapper = self.wrapper(action, arguments, call_id, event)
         output = [value async for value in call_local_llm_tool(wrapper, tool.call, "call", **arguments)]
         return json.loads(output[-1])
+
+    def test_group_tool_manifest_is_static_and_ordered(self):
+        offered = tuple(NS(spec=NS(action=action)) for action in (
+            "news.lookup", "group.memory.query", "slang.search",
+            "group.participation.choose", "group.behavior.learn", "turn.evidence"))
+        lean = [item.spec.action for item in group_tool_manifest(offered, "lean")]
+        self.assertEqual(lean, ["group.participation.choose", "group.memory.query", "slang.search"])
+        standard = [item.spec.action for item in group_tool_manifest(offered, "standard")]
+        self.assertEqual(standard, ["group.participation.choose", "group.memory.query", "slang.search",
+                                    "group.behavior.learn", "turn.evidence"])
+        full = [item.spec.action for item in group_tool_manifest(offered, "full")]
+        self.assertEqual(full, [item.spec.action for item in offered])
+
+    def test_tool_order_is_canonical_for_gemini_and_anthropic_serialisers(self):
+        async def handler(event, **arguments):
+            return "native"
+
+        # AstrBot sorts only the OpenAI schema; Gemini/Anthropic keep insertion
+        # order, so host registration order would otherwise reach the provider.
+        later = FunctionTool("zz_native", "Later tool", {"type": "object"}, handler)
+        earlier = FunctionTool("aa_native", "Earlier tool", {"type": "object"}, handler)
+        self.request.func_tool = ToolSet(tools=[later, earlier])
+        inject_core_reply_tools(self.event, self.request, application=self.app)
+        names = [tool.name for tool in self.request.func_tool.tools]
+        self.assertEqual(names, sorted(names))
+        self.assertIn("aa_native", names)
 
     def test_append_keeps_native_handlers_and_does_not_mutate_shared_catalog(self):
         async def existing_handler(event, **arguments):
@@ -138,6 +166,14 @@ class CoreReplyToolsTests(ExternalFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runtime.read_one("SELECT COUNT(*) n FROM model_rounds", ())["n"], 0)
         self.assertEqual(self.event.sent, [])
 
+    async def test_native_external_tool_remaps_a_changed_provider_binding(self):
+        changed = replace(self.bindings["device.play"], version="2", generation="host-reloaded")
+        self.bindings["device.play"] = changed
+        result = await self.call_native("device.play", {"query": "music"})
+        self.assertEqual(result["state"], "succeeded")
+        self.assertEqual(len(self.extension_calls), 1)
+        self.assertEqual(self.extension_calls[0].descriptor.binding, changed)
+
     async def test_unknown_external_action_cannot_be_replayed_under_another_id_or_event(self):
         async def unknown(invocation):
             return self.response(invocation, state="unknown")
@@ -145,6 +181,12 @@ class CoreReplyToolsTests(ExternalFixture, unittest.IsolatedAsyncioTestCase):
         self.extension_behavior = unknown
         result = await self.call_native("device.play", {"query": "music"})
         self.assertEqual(result["state"], "unknown")
+        lookup = await self.call_native("operation.lookup", {"operation_id": result["operation_id"]}, "wrong-owner-lookup")
+        self.assertEqual(lookup["code"], "invalid_agenda_id")
+        self.assertEqual(lookup["state"], "failed")
+        original = self.tools.external._row(result["invocation_id"])
+        receipt, _ = self.tools.external.snapshot(original, self.context, self.clock.now())
+        self.assertEqual(receipt["state"], "unknown")
         again = await self.call_native("device.play", {"query": "music"}, "another-call")
         self.assertEqual(again["code"], "external_effect_unresolved")
         event, request = self.prepare("another-event")
@@ -177,6 +219,31 @@ class CoreReplyToolsTests(ExternalFixture, unittest.IsolatedAsyncioTestCase):
         denied = await self.call_native("device.play", {"query": 7})
         self.assertEqual(denied["code"], "invalid_tool_arguments")
         self.assertEqual(self.extension_calls, [])
+
+    async def test_group_skip_latches_delivery_guard_when_authorization_fails(self):
+        event = FakeEvent()
+        prepared = {"context": self.context, "event_id": "group-skip-failed"}
+
+        async def stopped(_prepared):
+            return Outcome.failed("host_not_running", "test host stopped")
+
+        prepare_core_reply_event(event, prepared, authorize=stopped)
+        state = event.get_extra(CORE_REPLY_CONTEXT_EXTRA)
+        session = CoreReplyToolSession.__new__(CoreReplyToolSession)
+        session.event, session.state, session.prepared = event, state, prepared
+        session.context = NS(scope=NS(kind=ScopeKind.GROUP))
+        session.application = self.app
+        session.native_run_context, session.native_calls = None, []
+        arguments = {"mode": "skip", "reason": "话题已经结束"}
+        wrapper = self.wrapper("group.participation.choose", arguments, event=event)
+
+        result = json.loads(await session.call("group.participation.choose", wrapper, arguments))
+
+        self.assertEqual(result["code"], "host_not_running")
+        self.assertEqual(state["group_participation"]["mode"], "skip")
+        state["delivery_guard_active"] = True
+        await event.send("不应发送")
+        self.assertEqual(event.sent, [])
 
     async def test_images_use_native_mcp_contract_and_original_generation_is_reused(self):
         async def with_image(invocation):

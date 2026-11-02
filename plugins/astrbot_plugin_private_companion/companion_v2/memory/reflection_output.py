@@ -4,6 +4,7 @@ import json
 import re
 
 from companion_v2.execution.models import TaskError, digest, encode
+from companion_v2.relationships import anniversaries
 from companion_v2.sources.privacy import redact_fields, redact_text
 
 from . import codec
@@ -41,6 +42,12 @@ REFLECTION_SCHEMA = object_schema({
     })},
     "pending_decisions": {"type": "array", "items": object_schema({
         "operation_id": {"type": "string"}, "decision": {"type": "string", "enum": ["accept", "discard"]},
+    })},
+    "anniversaries": {"type": "array", "maxItems": 1, "items": object_schema({
+        "label": {"type": "string"},
+        "reason": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "evidence_handle": {"type": "string"},
     })},
 })
 
@@ -113,7 +120,7 @@ def parse_output(raw):
     except (ValueError, UnicodeError, RecursionError):
         raise OutputProblem("invalid_json") from None
     if (type(result) is not dict or not {"summary", "proposals"}.issubset(result)
-            or set(result) - {"summary", "proposals", "pending_decisions"}):
+            or set(result) - {"summary", "proposals", "pending_decisions", "anniversaries"}):
         raise OutputProblem("invalid_shape")
     try:
         text(result["summary"], "summary", 8192, empty=True)
@@ -124,6 +131,9 @@ def parse_output(raw):
     decisions = result.get("pending_decisions", [])
     if type(decisions) is not list or len(decisions) > 32:
         raise OutputProblem("invalid_decisions", "$.pending_decisions")
+    anniversary_items = result.get("anniversaries", [])
+    if type(anniversary_items) is not list or len(anniversary_items) > 1:
+        raise OutputProblem("invalid_anniversaries", "$.anniversaries")
     return result
 
 
@@ -248,6 +258,18 @@ def validate_output(reflection, context, manifest, output):
                      "proposal": json.loads(encode(proposal)) if proposal else None, "problem": problem, "kind": "proposal"}
         candidates.append(candidate)
         identifiers.setdefault(identifier, []).append(candidate)
+    rejected = []
+    timezone_name = "Asia/Shanghai"
+    try:
+        settings = reflection.memory.settings.read(context)[0] if reflection.memory.settings else {}
+        timezone_name = settings.get("memory.reflection_timezone", timezone_name)
+    except Exception:
+        pass
+    anniversary_candidates, anniversary_rejected = anniversaries.validate_candidates(
+        output.get("anniversaries", []), context=context,
+        resolve_evidence=lambda handle: resolver.resolve(context, None, handle),
+        timezone_name=timezone_name, at=reflection.tasks.now())
+    rejected.extend(anniversary_rejected)
     pending = {v["operation_id"]: v for v in manifest.get("pending", [])}
     for index, decision in enumerate(output.get("pending_decisions", [])):
         identifier, groups, problem = "decision-" + str(index + 1), set(), None
@@ -299,7 +321,7 @@ def validate_output(reflection, context, manifest, output):
                 candidate["problem"] = {"code": "related_item_unresolved", "path": "proposal"}
                 blocked.update(candidate["groups"])
                 changed = True
-    proposals, decisions, rejected = [], [], []
+    proposals, decisions = [], []
     for candidate in candidates:
         if candidate["problem"]:
             rejected.append({k: candidate[k] for k in ("item_id", "raw", "kind", "problem")})
@@ -312,5 +334,6 @@ def validate_output(reflection, context, manifest, output):
         for identifier in sorted(set(allowed) - set(identifiers)):
             rejected.append({"item_id": identifier, "raw": None, "kind": "missing",
                              "problem": {"code": "missing_repair_item", "path": "proposals"}})
-    return {"summary": redact_text(output["summary"]), "proposals": proposals, "pending_decisions": decisions,
+    return {"summary": redact_text(output["summary"]), "proposals": proposals,
+            "pending_decisions": decisions, "anniversaries": anniversary_candidates,
             "rejected": rejected}

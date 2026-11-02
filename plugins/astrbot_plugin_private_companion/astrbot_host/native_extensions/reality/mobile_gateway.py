@@ -35,6 +35,7 @@ except Exception:
 PLUGIN_NAME = 'astrbot_plugin_private_companion.reality'
 MOBILE_API_VERSION = '1.0'
 MOBILE_MAX_BODY_BYTES = 256 * 1024
+MOBILE_STATUS_DISCOVERY_TIMEOUT_SECONDS = 4.0
 MOBILE_MAX_SESSIONS_PER_USER = 8
 MOBILE_PROXY_MAX_WS_BYTES = 16 * 1024 * 1024
 MOBILE_TELEMETRY_MAX_MEASUREMENTS = 32
@@ -122,12 +123,29 @@ class MobileGatewayMixin:
         hours = self._cfg_int('mobile.session_ttl_hours', 168, 1, 720)
         return hours * 60 * 60
 
+    def _mobile_core_user_id(self) -> str:
+        getter = getattr(self, 'v2_host_api', None)
+        api = getter() if callable(getter) else None
+        core_ids_getter = getattr(api, 'mobile_core_pairing_candidates', None) if api is not None else None
+        if not callable(core_ids_getter):
+            return ''
+        try:
+            values = core_ids_getter()
+        except Exception:
+            values = []
+        candidates = {_clean(item, 120) for item in values if _clean(item, 120)} \
+            if isinstance(values, (list, tuple, set)) else set()
+        return next(iter(candidates)) if len(candidates) == 1 else ''
+
     def _mobile_allowed_user_id(self) -> str:
         configured = self._cfg_str('mobile.allowed_user_id', '')
         if configured:
             return configured
         getter = getattr(self, 'v2_host_api', None)
         api = getter() if callable(getter) else None
+        core_ids_getter = getattr(api, 'mobile_core_pairing_candidates', None) if api is not None else None
+        if callable(core_ids_getter):
+            return self._mobile_core_user_id()
         ids_getter = getattr(api, 'mobile_pairing_candidates', None)
         try:
             values = ids_getter() if callable(ids_getter) else []
@@ -711,10 +729,37 @@ class MobileGatewayMixin:
         return {'available': bool(result.get('available')), 'enabled': bool(result.get('enabled')),
                 'running': bool(result.get('running')), 'ready': ready, 'blockers': blockers, 'games': games}
 
-    async def _mobile_status_response(self, auth: dict[str, Any], *, session_token: str='') -> dict[str, Any]:
+    async def _mobile_status_response(self, auth: dict[str, Any], *, session_token: str='',
+                                      discover_capabilities: bool=True) -> dict[str, Any]:
         user_id = _clean(auth.get('user_id'), 120)
-        game_status = await self._mobile_game_status(session_token=session_token)
-        status = await self._mobile_v2_together_status(session_token=session_token) or {}
+        async def read_game_status() -> dict[str, Any]:
+            try:
+                return await asyncio.wait_for(
+                    self._mobile_game_status(session_token=session_token),
+                    timeout=MOBILE_STATUS_DISCOVERY_TIMEOUT_SECONDS)
+            except Exception:
+                return {'available': False, 'ready': False,
+                        'blockers': ['暂时无法确认此手机用户的游戏授权'], 'games': []}
+
+        async def read_together_status() -> dict[str, Any]:
+            try:
+                return (await asyncio.wait_for(
+                    self._mobile_v2_together_status(session_token=session_token),
+                    timeout=MOBILE_STATUS_DISCOVERY_TIMEOUT_SECONDS
+                )) or {}
+            except Exception:
+                return {'matched': True, 'available': False, 'ready': False,
+                        'capabilities': {}, 'modes': [], 'reason': 'mobile_v2_unavailable'}
+
+        # Pairing should establish the session first; optional room/game
+        # discovery must not serialize or indefinitely delay that response.
+        if discover_capabilities:
+            game_status, status = await asyncio.gather(read_game_status(), read_together_status())
+        else:
+            game_status = {'available': False, 'ready': False,
+                           'blockers': ['连接完成后同步游戏状态'], 'games': []}
+            status = {'matched': True, 'available': False, 'ready': False,
+                      'capabilities': {}, 'modes': [], 'reason': 'mobile_status_pending'}
         matched = status.get('matched') is True
         available = matched and bool(status.get('available'))
         actions = status.get('capabilities') if type(status.get('capabilities')) is dict else {}
@@ -809,7 +854,10 @@ class MobileGatewayMixin:
         session = {'user_id': user_id, 'device_name': _clean(payload.get('device_name'), 100) or '陪伴终端 Android', 'created_at': now, 'last_seen_at': now, 'expires_at': now + self._mobile_session_ttl()}
         self._mobile_store_session(session_token, session)
         self._mobile_pair_rate_limited(succeeded=True)
-        result = await self._mobile_status_response(session, session_token=session_token)
+        # Return the session immediately; the Android client fetches the full
+        # capability status on its next request after pairing succeeds.
+        result = await self._mobile_status_response(
+            session, session_token=session_token, discover_capabilities=False)
         result['data']['session_token'] = session_token
         result['data']['session_expires_at'] = session['expires_at']
         logger.info('[RealityCompanion] Android 移动端已配对: user=%s device=%s', user_id, session['device_name'])
@@ -1743,10 +1791,15 @@ class MobileGatewayMixin:
         prefix = f'/{PLUGIN_NAME}/mobile'
         app = web.Application(client_max_size=MOBILE_MAX_BODY_BYTES)
         canonical_routes = (('GET', '/health', self.mobile_health), ('POST', '/pair', self.mobile_pair), ('GET', '/status', self.mobile_status), ('GET', '/persona', self.mobile_get_persona), ('POST', '/persona', self.mobile_set_persona), ('POST', '/room/create', self.mobile_create_room), ('POST', '/room/invite', self.mobile_invite_room), ('POST', '/room/join', self.mobile_join_room), ('POST', '/game/room/create', self.mobile_create_game_room), ('POST', '/room/prepare', self.mobile_prepare_rooms), ('POST', '/location', self.mobile_location), ('POST', '/location/heartbeat', self.mobile_location_heartbeat), ('POST', '/location/revoke', self.mobile_revoke_location), ('POST', '/device/status', self.mobile_device_status), ('POST', '/device/activity', self.mobile_device_activity), ('POST', '/telemetry', self.mobile_telemetry), ('POST', '/screen/heartbeat', self.mobile_screen_heartbeat), ('POST', '/session/close', self.mobile_close_session))
-        routes = canonical_routes + tuple(((method, f'{prefix}{path}', handler) for method, path, handler in canonical_routes if path != '/health'))
+        legacy_prefixes = (prefix, '/astrbot_plugin_reality_companion/mobile')
+        routes = canonical_routes + tuple(
+            (method, f'{route_prefix}{path}', handler)
+            for route_prefix in legacy_prefixes
+            for method, path, handler in canonical_routes
+        )
         for method, path, handler in routes:
             app.router.add_route(method, path, functools.partial(self._mobile_aiohttp_dispatch, handler=handler))
-        for path in ('/snapshot', f'{prefix}/snapshot'):
+        for path in ('/snapshot', *(f'{route_prefix}/snapshot' for route_prefix in legacy_prefixes)):
             app.router.add_route('GET', path, functools.partial(self._mobile_aiohttp_dispatch, handler=self.mobile_snapshot))
         if self._mobile_proxy_rooms_enabled() and aiohttp is not None:
             proxy_routes = (('*', '/join/{tail:.*}', functools.partial(self._mobile_room_proxy, service='together')), ('GET', '/media/{tail:.*}', functools.partial(self._mobile_room_proxy, service='together')), ('GET', '/avatar', functools.partial(self._mobile_room_proxy, service='together')), ('*', '/api/novels/{tail:.*}', functools.partial(self._mobile_room_proxy, service='together')), ('*', '/assets/{name}', self._mobile_room_assets_proxy), ('GET', '/native-assets/{name}', functools.partial(self._mobile_room_proxy, service='game')), ('*', '/api/room/{tail:.*}', functools.partial(self._mobile_room_proxy, service='game')), ('*', '/api/native/{tail:.*}', functools.partial(self._mobile_room_proxy, service='game')), ('GET', '/room/{access_token}', functools.partial(self._mobile_room_proxy, service='game')), ('GET', '/native/{access_token}', functools.partial(self._mobile_room_proxy, service='game')), ('GET', '/ws', self._mobile_room_ws_proxy))
@@ -1829,20 +1882,23 @@ class MobileGatewayMixin:
             async def wrapped(*args, **kwargs):
                 return await handler(*args, **kwargs)
             return wrapped
-        prefix = f'/{PLUGIN_NAME}/mobile'
-        register_api(f'{prefix}/pair', route(self.mobile_pair), ['POST'], 'Reality Companion mobile pair')
-        register_api(f'{prefix}/status', route(self.mobile_status), ['GET'], 'Reality Companion mobile status')
-        register_api(f'{prefix}/snapshot', route(self.mobile_snapshot), ['GET'], 'Read the paired user snapshot through V2 native authorization')
-        register_api(f'{prefix}/room/create', route(self.mobile_create_room), ['POST'], 'Reality Companion mobile room')
-        register_api(f'{prefix}/room/invite', route(self.mobile_invite_room), ['POST'], 'Reality Companion mobile room invitation')
-        register_api(f'{prefix}/room/join', route(self.mobile_join_room), ['POST'], 'Reality Companion mobile room join')
-        register_api(f'{prefix}/game/room/create', route(self.mobile_create_game_room), ['POST'], 'Reality Companion mobile game room')
-        register_api(f'{prefix}/room/prepare', route(self.mobile_prepare_rooms), ['POST'], 'Reality Companion warm mobile room')
-        register_api(f'{prefix}/location', route(self.mobile_location), ['POST'], 'Reality Companion mobile location')
-        register_api(f'{prefix}/location/heartbeat', route(self.mobile_location_heartbeat), ['POST'], 'Reality Companion mobile location heartbeat')
-        register_api(f'{prefix}/location/revoke', route(self.mobile_revoke_location), ['POST'], 'Reality Companion revoke mobile location')
-        register_api(f'{prefix}/device/status', route(self.mobile_device_status), ['POST'], 'Reality Companion mobile device status')
-        register_api(f'{prefix}/device/activity', route(self.mobile_device_activity), ['POST'], 'Reality Companion mobile activity summary')
-        register_api(f'{prefix}/telemetry', route(self.mobile_telemetry), ['POST'], 'Reality Companion mobile telemetry')
-        register_api(f'{prefix}/screen/heartbeat', route(self.mobile_screen_heartbeat), ['POST'], 'Reality Companion mobile screen status')
-        register_api(f'{prefix}/session/close', route(self.mobile_close_session), ['POST'], 'Reality Companion mobile close')
+        prefixes = (f'/{PLUGIN_NAME}/mobile', '/astrbot_plugin_reality_companion/mobile')
+        endpoints = (('/pair', self.mobile_pair, ['POST'], 'Reality Companion mobile pair'),
+                     ('/status', self.mobile_status, ['GET'], 'Reality Companion mobile status'),
+                     ('/snapshot', self.mobile_snapshot, ['GET'], 'Read the paired user snapshot through V2 native authorization'),
+                     ('/room/create', self.mobile_create_room, ['POST'], 'Reality Companion mobile room'),
+                     ('/room/invite', self.mobile_invite_room, ['POST'], 'Reality Companion mobile room invitation'),
+                     ('/room/join', self.mobile_join_room, ['POST'], 'Reality Companion mobile room join'),
+                     ('/game/room/create', self.mobile_create_game_room, ['POST'], 'Reality Companion mobile game room'),
+                     ('/room/prepare', self.mobile_prepare_rooms, ['POST'], 'Reality Companion warm mobile room'),
+                     ('/location', self.mobile_location, ['POST'], 'Reality Companion mobile location'),
+                     ('/location/heartbeat', self.mobile_location_heartbeat, ['POST'], 'Reality Companion mobile location heartbeat'),
+                     ('/location/revoke', self.mobile_revoke_location, ['POST'], 'Reality Companion revoke mobile location'),
+                     ('/device/status', self.mobile_device_status, ['POST'], 'Reality Companion mobile device status'),
+                     ('/device/activity', self.mobile_device_activity, ['POST'], 'Reality Companion mobile activity summary'),
+                     ('/telemetry', self.mobile_telemetry, ['POST'], 'Reality Companion mobile telemetry'),
+                     ('/screen/heartbeat', self.mobile_screen_heartbeat, ['POST'], 'Reality Companion mobile screen status'),
+                     ('/session/close', self.mobile_close_session, ['POST'], 'Reality Companion mobile close'))
+        for prefix in prefixes:
+            for path, handler, methods, description in endpoints:
+                register_api(f'{prefix}{path}', route(handler), methods, description)

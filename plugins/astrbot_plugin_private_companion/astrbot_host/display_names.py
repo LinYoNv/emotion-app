@@ -141,7 +141,8 @@ class PlatformDisplayNames:
     async def persons(self, persons, *, cached_only=False):
         async def enrich(person):
             row = dict(person)
-            if row.get("admin_nickname") or row.get("name_basis") == "administrator":
+            if (row.get("admin_nickname") or row.get("name_basis") == "administrator"
+                    or row.get("name_basis") == "legacy" and row.get("legacy_maintained")):
                 return row
             name = await self.lookup(row.get("platform"), row.get("account_id"), "private",
                                      row.get("native_account_id"), cached_only=cached_only)

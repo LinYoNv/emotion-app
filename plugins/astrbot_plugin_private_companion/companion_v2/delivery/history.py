@@ -15,7 +15,8 @@ from .media import manifest_hash, payload_hash
 
 
 VERSION = "delivery.history.v1"
-MAX_ITEMS = 8
+DEFAULT_ITEMS = 8
+MAX_ITEMS = 64
 MAX_REFERENCES = MAX_ITEMS * 64
 MAX_SCAN_ROUNDS = 64
 MAX_CHARS = 8192
@@ -135,7 +136,7 @@ class BackgroundHistory:
 
     def _capture(self, context, at, *, action, limit, max_chars):
         require(self.tasks.authorize_context(context, action=action, observed_at=at))
-        item_cap = MAX_ITEMS if limit is None else max(0, min(int(limit), MAX_ITEMS))
+        item_cap = DEFAULT_ITEMS if limit is None else max(0, min(int(limit), MAX_ITEMS))
         char_cap = MAX_CHARS if max_chars is None else max(0, min(int(max_chars), MAX_CHARS))
         snapshot = {"version": VERSION, "context_key": context.key, "references": []}
         if not item_cap or not char_cap:

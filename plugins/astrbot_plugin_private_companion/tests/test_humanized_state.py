@@ -143,6 +143,14 @@ class HumanizedBandTests(unittest.TestCase):
         # Without material the dial adds nothing rather than a generic claim.
         self.assertEqual(humanized.instruction({"values": {}}, intensity=100), "")
 
+    def test_sleep_words_do_not_determine_pacing_without_a_current_receipt(self):
+        for text in ("睡得很好，不困了", "睡眠充足", "没有疲劳", "睡前想看书", "昨晚有点困", "刚被吵醒"):
+            with self.subTest(text=text):
+                self.assertFalse(humanized.is_sleepy({"values": {"sleep": text,
+                    "conditions": [{"kind": "sleep", "text": text}]}}))
+        self.assertFalse(humanized.is_sleepy({"sleep_execution": {
+            "state": "awake", "ended_at": "2026-09-21T07:30:00+00:00"}}))
+
     def test_patrol_time_contract_and_retention_pruning(self):
         self.assertEqual(humanized.parse_patrol_time("04:00").hour, 4)
         for bad in ("4:00", "04:00:00", "24:00", "", None, "04:60"):

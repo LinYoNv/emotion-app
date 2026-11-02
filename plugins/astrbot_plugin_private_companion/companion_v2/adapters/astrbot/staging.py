@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, replace
 from companion_v2.adapters.astrbot.memory_owner import memory_owner_provider
 from companion_v2.adapters.astrbot.memory_push import memory_push_provider
 from companion_v2.adapters.astrbot.onebot import OneBotPrivateSender
+from companion_v2.adapters.astrbot.platform_sender import AstrBotPlatformSender
 from companion_v2.configuration.models import ConfigLayer, ConfigTarget
 from companion_v2.configuration.registry import FieldRegistry
 from companion_v2.conversation.delivery import DeliveryReceipt, LocalSender
@@ -33,7 +34,7 @@ from companion_v2.identity_policy.personas import RuntimeIdentity
 from companion_v2.conversation.content.authoring_tasks import authoring_profiles
 from companion_v2.identity_policy.repository import PersistentIdentityDirectory
 from companion_v2.model_gateway.budget import BudgetSoftPolicy
-from companion_v2.model_gateway.models import BudgetPolicy, ModelTaskProfile
+from companion_v2.model_gateway.models import BudgetPolicy, MAX_MODEL_OUTPUT_TOKENS, ModelTaskProfile
 from companion_v2.role_work.journal.writing import writing_profiles
 from companion_v2.proactive.service import contact_profile, persona_judge_profile
 from companion_v2.role_work.reader import reading_profile
@@ -49,13 +50,15 @@ from companion_v2.screen.interpretation import screen_interpretation_profile
 from companion_v2.conversation.media.image_narration import image_narration_profile
 from companion_v2.conversation.media.video.narration import video_narration_profile
 from companion_v2.conversation.media.understanding import intake_settings as file_intake_settings
+from companion_v2.conversation.relay_settings import configuration_fields as relay_configuration_fields
 from .presence import OneBotPresencePort
 from companion_v2.storage.models import OperationState
 from companion_v2.storage.repositories import OperationRepository
 
 from .application import AstrBotCompanionHost
-from .native import HostAccount, HostPersona, NativePrivateBridge, account_number, check_version, persona_instruction
-from .provider import AstrBotTextProvider, UsageTariff, provider_fingerprint
+from .tools import CompositeAstrBotToolPort
+from .native import HostAccount, HostPersona, NativePrivateBridge, check_version, persona_instruction, route_id
+from .provider import AstrBotTextProvider, REPLY_TASK_CAPABILITIES, UsageTariff, provider_fingerprint
 from .provider_catalog import TextProviderSettings, assemble_providers, loaded_routing
 from .staging_config import DELIVERY_CAPABILITY, DELIVERY_GRANT_ID
 from .staging_delivery import delivery_grants, require_delivery_access
@@ -90,9 +93,27 @@ class NativeAdapterTypes:
     session_persona_override_lookup: object | None = None
     persona_snapshot_lookup: object | None = None
     persona_selection_lookup: object | None = None
+    text_provider_types: tuple[type, ...] = ()
+
+    @property
+    def provider_types(self):
+        """Every native class the V2 text transport may wrap.
+
+        OpenAI-compatible providers keep using ``provider``; additional classes
+        (for example AstrBot's native Google GenAI provider) are listed here and
+        translated by the same adapter.
+        """
+        return (self.provider,) + tuple(self.text_provider_types)
+
+    def is_text_provider(self, provider):
+        """Registered class or the public AstrBot text-provider surface."""
+        from .provider import looks_like_text_provider
+        return isinstance(provider, self.provider_types) or looks_like_text_provider(provider)
 
     def __post_init__(self):
         check_version(self.version)
+        if any(not isinstance(item, type) for item in self.text_provider_types):
+            raise ValueError("text provider types must be native provider classes")
         if (self.file is None) != (self.file_loader is None) or (self.file is not None and (
                 not isinstance(self.file, type) or not callable(self.file_loader))):
             raise ValueError("file intake requires an explicit native type and loader")
@@ -164,8 +185,8 @@ class StagingProfile:
                 or self.target.audience.recipients != (self.target.actor.subject,)
                 or self.persona.bot_id != scope.bot_id or self.persona.role != self.target.role_binding.role):
             raise ValueError("staging requires one consistent private target, host, account and persona")
-        account_number(scope.account_id)
-        account_number(scope.native_scope_id)
+        route_id(scope.account_id)
+        route_id(scope.native_scope_id)
         if self.delivery_mode == "preview":
             object.__setattr__(self, "delivery_mode", "onebot_private")
         elif self.delivery_mode != "onebot_private":
@@ -218,7 +239,8 @@ class AstrBotStagingSession:
                  native_tool_port=None, now=None, voice=None, voice_policy=None, weather_port=None,
                  weather_alert_port=None, balance_port=None, news_port=None, solar_term_port=None, qzone_transport=None, additional_providers=(), fallback_provider_id="", replacement_rules="[]",
                  fallback_on_refusal=False, review_only=False, profile_field_shapes=None,
-                 bootstrap_receipt_validated=False, default_provider_resolver=None):
+                 bootstrap_receipt_validated=False, default_provider_resolver=None,
+                 relay_tool_port_factory=None, search_port_factory=None):
         if runtime.installation_id != profile.target.scope.installation_id:
             raise ValueError("staging storage and target must have the same installation")
         self.runtime, self.profile, self.native_types = runtime, profile, native_types
@@ -247,14 +269,14 @@ class AstrBotStagingSession:
         self.identity = PersistentIdentityDirectory(runtime)
         # These identities are stable across a restart of the same native config.
         native = context.get_provider_by_id(profile.provider_id)
-        if type(native) is not native_types.provider:
+        if not native_types.is_text_provider(native):
             raise ValueError("staging provider is unavailable or has an unverified native type")
         binding = ProviderBinding("model.text", profile.provider_id, native_types.version,
             provider_fingerprint(native))
         self.model = AstrBotTextProvider(context, bridge=self.bridge, binding=binding,
-            provider_id=profile.provider_id, version=native_types.version, provider_type=native_types.provider,
+            provider_id=profile.provider_id, version=native_types.version, provider_type=native_types.provider_types,
             function_tool_type=native_types.function_tool, tool_set_type=native_types.tool_set,
-            tariff=profile.tariff, maximum_output_tokens=profile.max_output_tokens,
+            tariff=profile.tariff, maximum_output_tokens=MAX_MODEL_OUTPUT_TOKENS,
             maximum_input_estimate=profile.maximum_input_estimate, output_parameter=profile.output_parameter,
             streaming=profile.streaming)
         if self.model.native is not native:
@@ -262,7 +284,7 @@ class AstrBotStagingSession:
         self.model._current()
         self.models = (self.model,) + assemble_providers(context, bridge=self.bridge, native_types=native_types,
             primary_id=profile.provider_id, additional=additional_providers,
-            defaults=TextProviderSettings(profile.provider_id, profile.tariff, profile.max_output_tokens,
+            defaults=TextProviderSettings(profile.provider_id, profile.tariff, MAX_MODEL_OUTPUT_TOKENS,
                 profile.maximum_input_estimate, profile.output_parameter, profile.streaming))
         fallback_provider_id, replacement_rules = loaded_routing(fallback_provider_id, replacement_rules,
             (model.binding.provider for model in self.models))
@@ -273,7 +295,7 @@ class AstrBotStagingSession:
         self.model_profile = ModelTaskProfile(REPLY_KIND, Lane.FOREGROUND, profile.provider_id,
             profile.task_prompt, default_fallback=fallback_provider_id, replacement_rules=replacement_rules,
             fallback_on_refusal=fallback_on_refusal,
-            max_output_tokens=profile.max_output_tokens, capabilities=("text", "tools"),
+            max_output_tokens=profile.max_output_tokens, capabilities=REPLY_TASK_CAPABILITIES,
             prompt_sections=expression_prompt_sections())
         self.writing_profiles = writing_profiles(profile.provider_id, max_output_tokens=profile.max_output_tokens)
         self.reading_profile = reading_profile(profile.provider_id, max_output_tokens=profile.max_output_tokens)
@@ -292,25 +314,36 @@ class AstrBotStagingSession:
                     screen_interpretation_profile(profile.provider_id), *narration_profiles,
                     *native_video_profiles) + self.writing_profiles + (self.reading_profile,) + authoring_profiles(
                         profile.provider_id, draft_tokens=profile.max_output_tokens)
-        registry = FieldRegistry(version="astrbot-staging.v1", fields=configuration_fields(profiles))
+        registry_fields = configuration_fields(profiles)
+        registry_ids = {item.field_id for item in registry_fields}
+        registry_fields += tuple(field for field in relay_configuration_fields()
+                                 if field.field_id not in registry_ids)
+        registry = FieldRegistry(version="astrbot-staging.v1", fields=registry_fields)
         self.sender_binding = ProviderBinding("message.delivery", "astrbot-staging.onebot_private",
             native_types.version, digest([target.key, profile.persona, "onebot_private"]))
         if self._uses_local_sender:
             sender = LocalSender(self.sender_binding, self._preview, supports_images=True)
         else:
-            sender = OneBotPrivateSender(self.bridge, binding=self.sender_binding, version=native_types.version,
+            sender_type = (OneBotPrivateSender
+                           if self.bridge.platform_name(target.scope) == "aiocqhttp"
+                           else AstrBotPlatformSender)
+            sender = sender_type(self.bridge, binding=self.sender_binding, version=native_types.version,
                 reverse_api_type=native_types.reverse_api, authorize=self.require_delivery_authorization,
                 now=now, voice=voice,
                 voice_delivery=VoiceReplyDelivery(runtime, now) if voice is not None else None,
                 reaction_image_format=lambda: self.application.semantics.store.settings()["reactions_image_format"]
                     if self.application.semantics is not None else "image").local_sender()
+        tool_port = native_tool_port
+        if relay_tool_port_factory is not None:
+            relay_port = relay_tool_port_factory(self.bridge)
+            tool_port = CompositeAstrBotToolPort(native_tool_port, relay_port)
         self.host = AstrBotCompanionHost(runtime, event_port=self.bridge.ports, identity_port=self.bridge.ports,
             role_port=self.bridge.ports, runtime_identity=profile.runtime_identity, registry=registry,
             profiles=profiles, providers=tuple(model.local_provider() for model in self.models), budget=profile.budget,
             budget_soft=profile.budget_soft,
             default_provider_resolver=default_provider_resolver,
             sender=sender, policy=profile.policy, limits=profile.limits, now=now,
-            tool_port=native_tool_port, segmentation=profile.segmentation, voice_policy=voice_policy,
+            tool_port=tool_port, segmentation=profile.segmentation, voice_policy=voice_policy,
             # 记忆归属读的是别家插件自己公开的声明；适配层的这一个函数是唯一的跨插件
             # 读取点（核心不能反向导入宿主包，见 companion_v2/capabilities/ownership.py）。
             # 写入端口与它共用同一条发现路径和同一个 context：日记、梦境与主动消息
@@ -320,6 +353,7 @@ class AstrBotStagingSession:
             weather_port=weather_port, weather_alert_port=weather_alert_port, balance_port=balance_port,
             solar_term_port=solar_term_port,
             news_port=news_port,
+            search_port_factory=search_port_factory,
             qzone_transport=qzone_transport,
             presence_port=OneBotPresencePort(self.bridge, reverse_api_type=native_types.reverse_api,
                 authorize=self.require_delivery_authorization, now=lambda: self.application.now())
@@ -536,12 +570,12 @@ class AstrBotStagingSession:
         snapshot = self._configuration()
         adoption = require(app.configuration.application_status(target.actor, target=self.config_target,
             group_id=self.model_profile.group, observed_at=app.now()))
-        streaming_available = callable(getattr(self.model.native, "_query_stream", None))
+        streaming_available = self.model.streaming_supported
         report = {"state": app.state, "profile_hash": self.profile_hash,
             "delivery_mode": "onebot_private", "configuration_token": snapshot.resolution_token,
             "review_only": self.review_only,
             "configuration_application": adoption.state, "model_generation": adoption.generation,
-            "task_generation": app.tasks.generation, "model_transport": "astrbot_openai",
+            "task_generation": app.tasks.generation, "model_transport": self.model.local_provider().transport,
             "streaming": {"requested": self.profile.streaming, "available": streaming_available,
                           "ready": not self.profile.streaming or streaming_available,
                           "transport": "astrbot_native_query_stream" if streaming_available else None,

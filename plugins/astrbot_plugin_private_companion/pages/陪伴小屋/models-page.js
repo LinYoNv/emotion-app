@@ -3,6 +3,10 @@
 window.CompanionModelsPage = (() => {
   const PREFIX = "/astrbot_plugin_private_companion/";
   const routing = ["provider", "fallback", "max_output_tokens"];
+  const MAX_MODEL_OUTPUT_TOKENS = 65536;
+  const TASK_CONFIG_TIMEOUT_MS = 30000;
+  const TASK_CONFIG_RETRY_TIMEOUT_MS = 30000;
+  const VOICE_SAVE_TIMEOUT_MS = 30000;
   const fields = ["provider", "fallback", "prompt", "max_output_tokens", "timeout_seconds", "replacement_rules", "fallback_on_refusal", "refusal_terms", "replacement_scope"];
   const fieldLabel = { provider: "主模型提供方", fallback: "备用模型提供方", prompt: "附加提示词",
     max_output_tokens: "输出上限", timeout_seconds: "请求超时", replacement_rules: "替换规则",
@@ -35,7 +39,7 @@ window.CompanionModelsPage = (() => {
     model_provider_unavailable: "所选 AstrBot 模型未加载或暂不可用于 V2。", model_capability_mismatch: "所选模型提供方不支持这项任务。", model_output_limit: "输出上限超过所选模型提供方能力。",
     model_catalog_unavailable: "无法读取已加载的 AstrBot 文本模型提供方。",
     model_fallback_duplicate: "备用模型提供方必须与主模型提供方不同。", core_access_required: "当前账号没有管理权限。", dashboard_identity_required: "请从已登录的 AstrBot 管理界面打开小屋。",
-    staging_not_initialized: "角色数据尚未就绪，请在「账号与会话」保存角色映射；已保存可重新读取状态。", staging_host_terminated: "插件已停止，请重新打开插件。", bridge_timeout: "连接超时，请核对原保存结果。",
+    staging_not_initialized: "角色数据尚未就绪。请先在「账号与会话」完成角色映射并准备启动；共享启动模型会自动跟随 AstrBot 当前模型，也可在账号页固定。", staging_host_terminated: "插件已停止，请重新打开插件。", bridge_timeout: "连接超时，请核对原保存结果。",
     model_route_invalid: "替换规则未通过校验：请检查规则默认模型提供方、匹配方式与时段。",
     model_refused: "所选模型提供方拒绝了这次请求。",
     model_probe_timeout: "测试超时，结果未知。", model_probe_failed: "模型提供方未返回可确认结果。",
@@ -57,14 +61,15 @@ window.CompanionModelsPage = (() => {
     tts_provider_test_unsupported: "该语音服务不支持连接自检，可继续使用测试合成验证。",
     tts_provider_unloaded: "语音服务尚未加载，请先启用并刷新宿主状态。",
     laya_config_conflict: "Laya 配置已变化，请刷新后再保存。", laya_config_invalid: "Laya 配置未通过校验，请核对接入方式。",
-    laya_config_unreadable: "Laya 配置无法读取，请检查插件数据目录。", laya_endpoint_missing: "远程模式需要填写 Laya 服务地址。",
+    laya_config_unreadable: "Laya 配置无法读取，请检查插件数据目录。", laya_endpoint_missing: "远程或 Jev 模式需要填写判断服务地址。",
     laya_endpoint_invalid: "Laya 服务地址必须是 HTTP(S) 地址。", laya_model_invalid: "Laya 检查点选择无效。",
     laya_mode_invalid: "Laya 接入方式无效。", laya_package_missing: "当前 AstrBot Python 环境未安装 Laya。",
     laya_initialization_failed: "Laya Router 初始化失败，请检查安装和运行环境。", laya_inference_failed: "Laya 本地推理失败，请查看详细日志。",
     laya_initializing: "Laya 本地模型正在预热，请就绪后再测试；聊天继续按原有流程处理。",
     laya_model_path_invalid: "本地检查点目录不完整，请选择含有 Laya 权重、配置和分词器的文件夹。",
     laya_inference_timeout: "Laya 本地判断超过调用超时，本轮继续普通回复流程。",
-    laya_transport_failed: "Laya 连接失败，请检查地址、网络和远程服务状态。", laya_http_error: "Laya HTTP 服务返回错误，详细信息见下方。",
+    laya_transport_failed: "Laya 连接失败，请检查地址、网络和远程服务状态；部分网关会直接断开无效密钥，请同时核对 API Key。", laya_http_error: "Laya HTTP 服务返回错误，详细信息见下方。",
+    laya_auth_failed: "判断服务鉴权失败，请核对 API Key 与服务端访问权限。",
     laya_response_invalid: "Laya 返回缺少官方 SystemOne 所需分类。", laya_contract_invalid: "Laya 分类超出插件决策合同，已拒绝采用。",
     laya_rule_skip: "这类事件由程序规则处理，不调用 Laya。", laya_no_decision_fields: "没有启用任何 Laya 决策分类。",
     search_config_conflict: "搜索配置已变化，请刷新后再保存。", search_config_invalid: "搜索配置无效，请刷新并重新选择 Provider。",
@@ -81,10 +86,21 @@ window.CompanionModelsPage = (() => {
   const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const failure = (code, confirmed = false, details = {}) => Object.assign(new Error(code), { code, confirmed, ...details });
   const states = new Map();
+  const EXPAND_KEY = "companion-model-expanded.v1";
+  function expandStorageKey(scopeKey) { return EXPAND_KEY + ":" + scopeKey; }
+  function restoreExpanded(scopeKey) {
+    try { const raw = localStorage.getItem(expandStorageKey(scopeKey)); const parsed = raw ? JSON.parse(raw) : null;
+      return parsed && typeof parsed === "object" ? parsed : {}; } catch { return {}; }
+  }
+  function rememberExpanded(state, key) {
+    try { const scopeKey = state.__scopeKey; if (!scopeKey) return;
+      localStorage.setItem(expandStorageKey(scopeKey), JSON.stringify(state.expOpen || {})); } catch { }
+  }
   let root = null, path = null, key = null, state = null, version = 0;
   const current = (ticket, s) => ticket === version && state === s && root?.isConnected;
   const taskOf = (s, kind) => s.status?.tasks.find(task => task.kind === kind) || null;
   const configSource = source => ({ default: "插件默认", host_conversation: "AstrBot 会话", installation: "安装级", role: "角色级", window: "当前对象" }[source] || "上级配置");
+  const windowLabel = s => s.status?.scope_kind === "group" ? "当前群聊微调" : "当前私聊微调";
   const adoption = state => ({ applied: "已采用", next_task: "下次任务", consumer_not_started: "尚未运行", failed: "采用失败", pending: "等待采用", restart_required: "需重启" }[state] || state);
   const taskName = kind => names.get(kind) || { group: "其他任务", label: "其他模型任务", description: "V2 注册任务" };
   const taskGroups = s => {
@@ -108,9 +124,9 @@ window.CompanionModelsPage = (() => {
   const available = (s, task) => s.status.providers.filter(p => task.capabilities.every(cap => p.capabilities.includes(cap)));
   const effective = (task, draft, name) => draft.inherited[name] ? task.fields[name].inherited_value : draft.values[name];
   const providerFor = (task, draft) => coreReply(task) ? "" : effective(task, draft, "provider");
-  const limitFor = (s, task, draft) => Math.min(32768, ...["provider", "fallback"]
+  const limitFor = (s, task, draft) => Math.min(MAX_MODEL_OUTPUT_TOKENS, ...["provider", "fallback"]
     .map(name => effective(task, draft, name)).filter(Boolean)
-    .map(id => s.status.providers.find(provider => provider.id === id)?.max_output_tokens || 32768));
+    .map(id => s.status.providers.find(provider => provider.id === id)?.max_output_tokens || MAX_MODEL_OUTPUT_TOKENS));
   function fitLimit(s, task, draft) { const limit = limitFor(s, task, draft);
     if (effective(task, draft, "max_output_tokens") <= limit) return false;
     draft.values.max_output_tokens = limit; draft.inherited.max_output_tokens = false; return true; }
@@ -123,14 +139,16 @@ window.CompanionModelsPage = (() => {
   const visible = s => snapshot(s).filter(task => shown(s, task));
   const selected = s => s.selection.filter(kind => taskOf(s, kind) && !coreReply(taskOf(s, kind)));
   const pendingCount = s => snapshot(s).reduce((count, task) => { const draft = s.drafts.get(task.kind); return count + (draft && !draft.pending && dirty(task, draft) ? 1 : 0); }, 0);
+  const pendingSaveCount = s => snapshot(s).reduce((count, task) => count + (s.drafts.get(task.kind)?.pending ? 1 : 0), 0);
   function readPending(kind) { try { const p = JSON.parse(sessionStorage.getItem(storageKey(kind)));
     if (!p || p.kind !== kind || typeof p.operation_key !== "string" || typeof p.edit_token !== "string" || !p.changes || !Array.isArray(p.reset)) return null;
     if (p.layer === undefined) p.layer = "window";
     return p; } catch { return null; } }
   function storePending(kind, p) { try { if (p) sessionStorage.setItem(storageKey(kind), JSON.stringify(p)); else sessionStorage.removeItem(storageKey(kind)); } catch { } }
   const newDraft = task => ({ layer: task.configuration_layer || "role", token: task.edit_token,
+    base: Object.fromEntries(Object.entries(task.fields).map(([name, field]) => [name, {...field}])),
     values: Object.fromEntries(fields.map(name => [name, task.fields[name].value])),
-    inherited: Object.fromEntries(fields.map(name => [name, !task.fields[name].explicit])), touched: false, stale: false, pending: readPending(task.kind) });
+    inherited: Object.fromEntries(fields.map(name => [name, !task.fields[name].explicit])), touched: false, stale: false, conflicts: [], pending: readPending(task.kind) });
   /* The replacement fields are optional in the payload: newer hosts expose them,
      older ones only ship the routing fields. Missing ones degrade to inherited. */
   const plainField = value => ({ value, inherited_value: value, source: "default", inherited_source: "default", explicit: false });
@@ -149,6 +167,25 @@ window.CompanionModelsPage = (() => {
       else if (!field.explicit || draft.values[name] !== field.value) changes[name] = draft.values[name]; }
     return { changes, reset }; }
   const dirty = (task, draft) => { const p = patchFor(task, draft); return Object.keys(p.changes).length > 0 || p.reset.length > 0; };
+  const sameField = (a, b) => JSON.stringify([a?.value, !!a?.explicit, a?.inherited_value, a?.source, a?.inherited_source])
+    === JSON.stringify([b?.value, !!b?.explicit, b?.inherited_value, b?.source, b?.inherited_source]);
+  function reconcileDraft(task, draft) {
+    // Unknown saves keep their exact operation and baseline until reconciled.
+    if (draft.pending) { draft.stale ||= draft.token !== task.edit_token; return draft; }
+    const base = draft.base || task.fields, patch = patchFor({...task, fields: base}, draft);
+    const edited = [...Object.keys(patch.changes), ...patch.reset], next = newDraft(task);
+    for (const name of edited) {
+      next.values[name] = draft.values[name]; next.inherited[name] = draft.inherited[name];
+      const alreadyCurrent = draft.inherited[name] ? !task.fields[name].explicit
+        : task.fields[name].explicit && draft.values[name] === task.fields[name].value;
+      if ((!sameField(base[name], task.fields[name]) || draft.conflicts?.includes(name)) && !alreadyCurrent) next.conflicts.push(name);
+    }
+    next.touched = edited.length > 0;
+    if (next.conflicts.length || next.layer !== draft.layer) {
+      next.token = draft.token; next.stale = true;
+    }
+    return next;
+  }
   /* The Dashboard bridge normally returns the inner ``data`` object.  Some
      older bridges and tests still return the complete response envelope.  A
      voice probe's inner result also has ``status: "ok"``; only treat a value
@@ -172,7 +209,7 @@ window.CompanionModelsPage = (() => {
     }
     return {wrapped: null, value: response};
   };
-  async function api(method, endpoint, body, timeout = 15000) { let timer;
+  async function api(method, endpoint, body, timeout = 30000) { let timer;
     try { const bridge = window.CompanionProduct.bridgeNow() || await window.CompanionProduct.bridgeFor();
       const response = await Promise.race([method === "GET" ? bridge.apiGet(endpoint, body) : bridge.apiPost(endpoint, body), new Promise((_, reject) => { timer = setTimeout(() => reject(failure("bridge_timeout")), timeout); })]);
       const {wrapped, value} = responseContent(response);
@@ -183,20 +220,31 @@ window.CompanionModelsPage = (() => {
       if (!value || typeof value !== "object" || Array.isArray(value)) throw failure("invalid_response");
       return value;
     } finally { clearTimeout(timer); } }
+  const isBridgeTimeout = err => (err?.code || err?.message) === "bridge_timeout";
+  async function configureTask(payload) {
+    // The host makes configure idempotent by operation_key. A bridge timeout
+    // is therefore an unknown result, not a failed write: re-send that exact
+    // operation once before asking the user to reconcile it manually.
+    try { return await api("POST", path + "/configure", payload, TASK_CONFIG_TIMEOUT_MS); }
+    catch (err) {
+      if (!isBridgeTimeout(err)) throw err;
+      return api("POST", path + "/configure", payload, TASK_CONFIG_RETRY_TIMEOUT_MS);
+    }
+  }
   function validateStatus(data) { if (!Array.isArray(data.tasks) || !Array.isArray(data.providers) || data.tasks.some(task =>
     typeof task.kind !== "string" || typeof task.edit_token !== "string" || task.edit_token.length !== 64
     || !task.fields || routing.some(name => !task.fields[name]) || routing.some(name => !Object.hasOwn(task.fields[name], "value")))) throw failure("invalid_response"); return data; }
   function setStatus(s, data) { s.status = validateStatus(normalize(data));
     for (const task of data.tasks) { const draft = s.drafts.get(task.kind);
       if (!draft) { s.drafts.set(task.kind, newDraft(task)); continue; }
-      if (draft.token !== task.edit_token) { if (!draft.touched && !draft.pending) s.drafts.set(task.kind, newDraft(task)); else draft.stale = true; } }
+      s.drafts.set(task.kind, reconcileDraft(task, draft)); }
     const kinds = new Set(data.tasks.map(task => task.kind)); s.selection = s.selection.filter(kind => kinds.has(kind));
     if (s.expanded && !kinds.has(s.expanded)) s.expanded = null; }
   const projected = (task, patch, name) => Object.hasOwn(patch.changes, name) ? patch.changes[name]
     : (patch.reset.includes(name) ? task.fields[name].inherited_value : task.fields[name].value);
   function validatePatch(task, p) { if (!Object.keys(p.changes).length && !p.reset.length) return false;
     if (Object.hasOwn(p.changes, "prompt") && (typeof p.changes.prompt !== "string" || p.changes.prompt.length > 8000)) return false;
-    if (Object.hasOwn(p.changes, "max_output_tokens") && (!Number.isInteger(p.changes.max_output_tokens) || p.changes.max_output_tokens < 1 || p.changes.max_output_tokens > 32768)) return false;
+    if (Object.hasOwn(p.changes, "max_output_tokens") && (!Number.isInteger(p.changes.max_output_tokens) || p.changes.max_output_tokens < 1 || p.changes.max_output_tokens > MAX_MODEL_OUTPUT_TOKENS)) return false;
     if (Object.hasOwn(p.changes, "timeout_seconds") && (!Number.isInteger(p.changes.timeout_seconds) || p.changes.timeout_seconds < 1 || p.changes.timeout_seconds > 600)) return false;
     if (Object.hasOwn(p.changes, "replacement_scope") && !["plugin", "conversation", "all"].includes(p.changes.replacement_scope)) return false;
     if (Object.hasOwn(p.changes, "fallback_on_refusal") && typeof p.changes.fallback_on_refusal !== "boolean") return false;
@@ -219,6 +267,9 @@ window.CompanionModelsPage = (() => {
     voice: '<path d="M12 3a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3Z"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>',
     image: '<rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="m4 18 5-5 3 3 3-3 5 5"/>',
     search: '<circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 4.5 4.5"/>',
+    map: '<circle cx="12" cy="12" r="2.2"/><path d="M12 3a9 9 0 1 0 9 9"/><path d="M12 7a5 5 0 1 0 5 5"/>',
+    cfg: '<path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/>',
+    pol: '<path d="M4 7h4l3 10h4M14 7h6M17 4l3 3-3 3M8 17H4M5 14l-3 3 3 3"/>',
     reply: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2Z"/>',
     memory: '<circle cx="12" cy="12" r="9"/><path d="M12 8v4l2.5 2.5"/>',
     life: '<rect x="3" y="4" width="18" height="17" rx="2"/><path d="M8 2v4M16 2v4M3 10h18"/>',
@@ -241,7 +292,7 @@ window.CompanionModelsPage = (() => {
   function toolbar(s) { const count = selected(s).length;
     return `<div class="model-toolbar"><label class="model-search"><span>搜索任务</span>
         <input type="search" data-model-search value="${esc(s.query)}" placeholder="名称、用途或任务键"></label>
-      <div class="model-switches" role="group" aria-label="配置作用域">${[["role", "角色默认"], ["window", "当前私聊微调"]].map(([layer, label]) => `<button type="button" data-model-layer="${layer}" aria-pressed="${s.layer === layer}" class="${s.layer === layer ? "active" : ""}" ${s.busy || s.loading ? "disabled" : ""}>${label}</button>`).join("")}</div>
+      <div class="model-switches" role="group" aria-label="配置作用域">${[["role", "角色默认"], ["window", windowLabel(s)]].map(([layer, label]) => `<button type="button" data-model-layer="${layer}" aria-pressed="${s.layer === layer}" class="${s.layer === layer ? "active" : ""}" ${s.busy || s.loading ? "disabled" : ""}>${label}</button>`).join("")}</div>
       <label class="model-provider-filter"><span>模型提供方</span><select data-model-provider-filter aria-label="按模型提供方筛选">
         <option value="" ${s.providerFilter ? "" : "selected"}>全部提供方</option>${(s.status?.providers || []).map(provider => `<option value="${esc(provider.id)}" ${s.providerFilter === provider.id ? "selected" : ""}>${esc(providerLabel(provider))}</option>`).join("")}</select></label>
       <div class="model-switches" role="group" aria-label="视图">${[["tasks", "按任务"], ["providers", "按提供方"]].map(([id, label]) => `<button type="button" data-model-view="${id}" aria-pressed="${s.view === id}" class="${s.view === id ? "active" : ""}">${label}</button>`).join("")}</div>
@@ -253,11 +304,13 @@ window.CompanionModelsPage = (() => {
       <select data-model-assign aria-label="批量指派模型提供方" ${s.busy || s.loading || s.denied ? "disabled" : ""}><option value="">批量指派模型提供方…</option>${(s.status?.providers || []).map(provider => `<option value="${esc(provider.id)}">${esc(provider.id)}</option>`).join("")}</select>
       <button type="button" class="button small" data-model-action="inherit" ${s.busy || s.loading || s.denied ? "disabled" : ""}>恢复跟随上级</button>
       <button type="button" class="button small" data-model-action="clear-selection">取消选择</button></div>` : ""}`; }
-  function queue(s) { const count = pendingCount(s); if (!count) return "";
+  function queue(s) { const count = pendingCount(s), pending = pendingSaveCount(s); if (!count && !pending) return "";
+    const status = [count ? `<b>${count}</b> 项改动待保存` : "",
+      pending ? `<b>${pending}</b> 项保存结果待核对` : ""].filter(Boolean).join(" · ");
     return `<div class="model-queue ${s.busy ? "busy" : ""}" role="status">
-      <span><b>${count}</b> 项改动待保存 · 保存前不影响正在进行的任务</span>
-      <button type="button" class="button primary small" data-model-action="save-all" ${s.busy || s.loading ? "disabled" : ""}>全部保存</button>
-      <button type="button" class="button small" data-model-action="discard-all" ${s.busy || s.loading ? "disabled" : ""}>全部放弃</button></div>`; }
+      <span>${status}${count ? " · 保存前不影响正在进行的任务" : " · 可重试原操作，服务端会按操作键去重"}</span>
+      <button type="button" class="button primary small" data-model-action="save-all" ${s.busy || s.loading ? "disabled" : ""}>${pending ? (count ? "核对并保存" : "核对保存") : "全部保存"}</button>
+      ${count ? `<button type="button" class="button small" data-model-action="discard-all" ${s.busy || s.loading ? "disabled" : ""}>全部放弃</button>` : ""}</div>`; }
   /* Provider 的显示名：`id · 模型名`。
      只写 id 时，同一个 AstrBot 上挂两个同类型 Provider（很常见：一个便宜一个强）
      在下拉里是两行一模一样的字，选错只能靠试。模型名才是区分它们的信息。
@@ -274,31 +327,38 @@ window.CompanionModelsPage = (() => {
       ${selected && !providers.some(p => p.id === selected) ? `<option value="${esc(selected)}" selected>${esc(selected)} · 当前不可用</option>` : ""}`; }
   function sourceCell(s, task, draft) { const field = task.fields.provider;
     if (draft.inherited.provider) return `<span class="model-source inherit">跟随 ${esc(configSource(field.inherited_source || "default"))}</span>`;
-    if (field.explicit) return `<span class="model-source own">${draft.layer === "role" ? "角色单独设置" : "当前私聊单独设置"}</span>`;
+    if (field.explicit) return `<span class="model-source own">${draft.layer === "role" ? "角色单独设置" : windowLabel(s) + "单独设置"}</span>`;
     return `<span class="model-source pending">待保存</span>`; }
+  function conflictNotice(task, draft) {
+    if (!draft.stale) return "";
+    const value = field => String(field ?? "").slice(0, 200) || "空";
+    const details = (draft.conflicts || []).map(name => `<p><b>${esc(fieldLabel[name] || name)}</b>：当前值「${esc(value(task.fields[name].value))}」；草稿「${esc(draft.inherited[name] ? "跟随上级" : value(draft.values[name]))}」</p>`).join("");
+    return `<div class="model-alert" role="alert">${details ? "以下字段也在别处改过，请核对后选择保留草稿或放弃。" : "配置已更新，请重新读取后核对草稿。"}${details}</div>`;
+  }
   /* Design: precise config uses one card per task (sc.fn), not a table. */
   function coreReplyCard(s, task) {
-    const draft = s.drafts.get(task.kind), locked = s.loading || s.busy || s.denied || draft.pending;
+    const draft = s.drafts.get(task.kind), locked = s.loading || s.busy || s.denied;
+    const fieldLocked = locked || !!draft.pending;
     return `<article class="model-fncard${s.expanded === task.kind ? " open" : ""}" data-fncard="${esc(task.kind)}">
       <div class="model-sc-tp"><div class="model-eb">对话<span class="st"><span class="model-tag g">AstrBot 核心</span></span></div>
         <div class="model-ti">${icon(ICONS.reply)}<b>对话回复</b></div><p class="model-ds">${esc(task.routing_note || "普通回复采用 AstrBot 当前会话模型。")}</p></div>
       <div class="model-sc-bd">
-        ${draft.stale ? '<div class="model-alert">配置已更新，核对后可保留草稿。</div>' : ""}
+        ${conflictNotice(task, draft)}
         ${draft.pending ? '<div class="model-alert">上次保存结果未确认，请核对原保存。</div>' : ""}
         <label class="model-fd dash"><span class="model-cap">对话附加提示 <em>直接注入核心回复 · 最多 8000 字</em></span>
-          <textarea rows="5" maxlength="8000" data-model-field="prompt" data-model-kind="${esc(task.kind)}" ${locked ? "disabled" : ""}>${esc(effective(task, draft, "prompt"))}</textarea></label>
-        <div class="model-inh"><label><input type="checkbox" data-model-inherit="prompt" data-model-kind="${esc(task.kind)}" ${draft.inherited.prompt ? "checked" : ""} ${locked ? "disabled" : ""}>附加提示跟随上级</label></div>
+          <textarea rows="5" maxlength="8000" data-model-field="prompt" data-model-kind="${esc(task.kind)}" ${fieldLocked ? "disabled" : ""}>${esc(effective(task, draft, "prompt"))}</textarea></label>
+        <div class="model-inh"><label><input type="checkbox" data-model-inherit="prompt" data-model-kind="${esc(task.kind)}" ${draft.inherited.prompt ? "checked" : ""} ${fieldLocked ? "disabled" : ""}>附加提示跟随上级</label></div>
       </div><div class="model-sc-rf"><div class="r"><b>模型与呈现</b><span>AstrBot 当前会话的模型、工具往返、流式、分段和插件装饰</span></div>
         <div class="r"><b>提示组成</b><span>在「治理与维护 → 任务提示词」查看 V2 附加层与背景规则；人格与历史在 AstrBot 管理。</span></div></div>
       <div class="model-sc-ft"><code>${esc(task.kind)}</code><span class="model-grow"></span>
         ${draft.stale && !draft.pending ? `<button type="button" class="button small" data-model-action="rebase" data-model-kind="${esc(task.kind)}">已核对，保留草稿</button>` : ""}
-        ${draft.pending ? `<button type="button" class="button small" data-model-action="retry" data-model-kind="${esc(task.kind)}" ${s.busy ? "disabled" : ""}>核对原保存结果</button>` : ""}
-        <button type="button" class="button small" data-model-action="discard" data-model-kind="${esc(task.kind)}" ${locked ? "disabled" : ""}>放弃</button>
-        <button type="button" class="button small primary" data-model-action="save-one" data-model-kind="${esc(task.kind)}" ${locked || draft.stale || !dirty(task, draft) ? "disabled" : ""}>保存</button>
+        <button type="button" class="button small" data-model-action="discard" data-model-kind="${esc(task.kind)}" ${locked || draft.pending ? "disabled" : ""}>放弃</button>
+        <button type="button" class="button small primary" data-model-action="save-one" data-model-kind="${esc(task.kind)}" ${locked || (!draft.pending && (draft.stale || !dirty(task, draft))) ? "disabled" : ""}>${draft.pending ? "核对保存" : "保存"}</button>
       </div></article>`;
   }
   function fnCard(s, task) { const info = taskName(task.kind), draft = s.drafts.get(task.kind), locked = s.loading || s.busy || s.denied;
     if (coreReply(task)) return coreReplyCard(s, task);
+    const fieldLocked = locked || !!draft.pending;
     const picked = s.selection.includes(task.kind), open = s.expanded === task.kind, waiting = dirty(task, draft) && !draft?.pending;
     const limit = limitFor(s, task, draft);
     const main = providerFor(task, draft), fallback = effective(task, draft, "fallback");
@@ -307,30 +367,30 @@ window.CompanionModelsPage = (() => {
     const testing = main && s.testing.has(main), result = main ? s.providerTests[main] : null;
     return `<article class="model-fncard${open ? " open" : ""}${waiting ? " dirty" : ""}${picked ? " picked" : ""}" data-fncard="${esc(task.kind)}">
       <div class="model-sc-tp">
-        <div class="model-eb">${draft.layer === "role" ? "角色默认" : "当前私聊微调"} · ${esc(info.group)}<span class="st">${own ? '<span class="model-tag a">单独设置</span>' : '<span class="model-tag n">跟随上级</span>'}</span></div>
+        <div class="model-eb">${draft.layer === "role" ? "角色默认" : windowLabel(s)} · ${esc(info.group)}<span class="st">${own ? '<span class="model-tag a">单独设置</span>' : '<span class="model-tag n">跟随上级</span>'}</span></div>
         <div class="model-ti">${icon(groupIcon(info.group))}<b>${esc(info.label)}</b>
           <label class="model-pick"><input type="checkbox" data-model-pick="${esc(task.kind)}" ${picked ? "checked" : ""} aria-label="选择 ${esc(info.label)}"></label>
           <span class="model-tag ${task.lane === "foreground" ? "g" : "n"}">${task.lane === "foreground" ? "前台" : "后台"}</span></div>
-        
+
         <div class="model-rl">${task.capabilities.map(cap => `<span>${esc(capabilityLabel(cap))}</span>`).join("") || "<span>无能力声明</span>"}</div>
       </div>
       <div class="model-sc-bd">
-        ${draft.stale ? '<div class="model-alert">当前配置已更新。核对字段后，可保留草稿以新版本为基准继续编辑。</div>' : ""}
+        ${conflictNotice(task, draft)}
         ${draft.pending ? '<div class="model-alert">上次保存结果未确认。请核对原操作，避免重复提交。</div>' : ""}
         <label class="model-fd"><span class="model-cap">主模型提供方 <em>上级默认 ${esc(task.fields.provider.inherited_value || "未设置")}</em></span>
-          <span class="model-msel"><i style="background:${pillColor(main)}"></i><select data-model-field="provider" data-model-kind="${esc(task.kind)}" aria-label="${esc(info.label)} 主模型提供方" ${locked || draft.pending ? "disabled" : ""}>${providerOptions(s, task, draft, "provider")}</select></span></label>
+          <span class="model-msel"><i style="background:${pillColor(main)}"></i><select data-model-field="provider" data-model-kind="${esc(task.kind)}" aria-label="${esc(info.label)} 主模型提供方" ${fieldLocked ? "disabled" : ""}>${providerOptions(s, task, draft, "provider")}</select></span></label>
         <label class="model-fd"><span class="model-cap">备用模型提供方 <em>主模型失败、超时或拒答时尝试一次</em></span>
-          <span class="model-msel"><i style="background:${pillColor(fallback)}"></i><select data-model-field="fallback" data-model-kind="${esc(task.kind)}" aria-label="${esc(info.label)} 备用模型提供方" ${locked || draft.pending ? "disabled" : ""}>${providerOptions(s, task, draft, "fallback")}</select></span></label>
+          <span class="model-msel"><i style="background:${pillColor(fallback)}"></i><select data-model-field="fallback" data-model-kind="${esc(task.kind)}" aria-label="${esc(info.label)} 备用模型提供方" ${fieldLocked ? "disabled" : ""}>${providerOptions(s, task, draft, "fallback")}</select></span></label>
         <div class="model-duo">
           <label class="model-fd"><span class="model-cap">请求超时</span>
-            <span class="model-unit"><input type="number" min="1" max="600" step="1" data-model-field="timeout_seconds" data-model-kind="${esc(task.kind)}" value="${esc(effective(task, draft, "timeout_seconds"))}" ${locked || draft.pending ? "disabled" : ""}><i>秒</i></span></label>
+            <span class="model-unit"><input type="number" min="1" max="600" step="1" data-model-field="timeout_seconds" data-model-kind="${esc(task.kind)}" value="${esc(effective(task, draft, "timeout_seconds"))}" ${fieldLocked ? "disabled" : ""}><i>秒</i></span></label>
           <label class="model-fd"><span class="model-cap">单次输出上限</span>
-            <span class="model-unit"><input type="number" min="1" max="${limit}" step="1" data-model-field="max_output_tokens" data-model-kind="${esc(task.kind)}" value="${esc(effective(task, draft, "max_output_tokens"))}" ${locked || draft.pending ? "disabled" : ""}><i>令牌</i></span></label>
+            <span class="model-unit"><input type="number" min="1" max="${limit}" step="1" data-model-field="max_output_tokens" data-model-kind="${esc(task.kind)}" value="${esc(effective(task, draft, "max_output_tokens"))}" ${fieldLocked ? "disabled" : ""}><i>令牌</i></span></label>
         </div>
         <label class="model-fd dash"><span class="model-cap">任务附加提示词 <em>最多 8000 字</em></span>
-          <textarea rows="3" maxlength="8000" data-model-field="prompt" data-model-kind="${esc(task.kind)}" ${locked || draft.pending ? "disabled" : ""}>${esc(draft.inherited.prompt ? task.fields.prompt.inherited_value : draft.values.prompt)}</textarea></label>
+          <textarea rows="3" maxlength="8000" data-model-field="prompt" data-model-kind="${esc(task.kind)}" ${fieldLocked ? "disabled" : ""}>${esc(draft.inherited.prompt ? task.fields.prompt.inherited_value : draft.values.prompt)}</textarea></label>
         <div class="model-inh"><span class="lab">未单独设置时跟随上级</span>
-          ${fields.map(name => `<label><input type="checkbox" data-model-inherit="${name}" data-model-kind="${esc(task.kind)}" ${draft.inherited[name] ? "checked" : ""} ${locked || draft.pending ? "disabled" : ""}>${esc(fieldLabel[name])}</label>`).join("")}</div>
+          ${fields.map(name => `<label><input type="checkbox" data-model-inherit="${name}" data-model-kind="${esc(task.kind)}" ${draft.inherited[name] ? "checked" : ""} ${fieldLocked ? "disabled" : ""}>${esc(fieldLabel[name])}</label>`).join("")}</div>
       </div>
       <div class="model-sc-rf">
         <div class="r"><b>来源</b><span>${sourceCell(s, task, draft)}</span></div>
@@ -342,9 +402,8 @@ window.CompanionModelsPage = (() => {
         <button type="button" class="button small" data-provider-test="${esc(main)}" ${!main || testing ? "disabled" : ""}>测试</button>
         <span class="model-grow"></span>
         ${draft.stale && !draft.pending ? `<button type="button" class="button small" data-model-action="rebase" data-model-kind="${esc(task.kind)}">已核对，保留草稿</button>` : ""}
-        ${draft.pending ? `<button type="button" class="button small" data-model-action="retry" data-model-kind="${esc(task.kind)}" ${s.busy ? "disabled" : ""}>核对原保存结果</button>` : ""}
-        <button type="button" class="button small" data-model-action="discard" data-model-kind="${esc(task.kind)}" ${locked ? "disabled" : ""}>放弃</button>
-        <button type="button" class="button small primary" data-model-action="save-one" data-model-kind="${esc(task.kind)}" ${locked || draft.stale || !dirty(task, draft) ? "disabled" : ""}>保存</button>
+        <button type="button" class="button small" data-model-action="discard" data-model-kind="${esc(task.kind)}" ${locked || draft.pending ? "disabled" : ""}>放弃</button>
+        <button type="button" class="button small primary" data-model-action="save-one" data-model-kind="${esc(task.kind)}" ${locked || (!draft.pending && (draft.stale || !dirty(task, draft))) ? "disabled" : ""}>${draft.pending ? "核对保存" : "保存"}</button>
       </div>
     </article>`; }
   function taskCards(s) { const rows = visible(s); if (!rows.length) return '<p class="model-empty">没有匹配的任务。</p>';
@@ -363,17 +422,19 @@ window.CompanionModelsPage = (() => {
            return `<li><button type="button" data-model-open="${esc(task.kind)}" aria-label="编辑 ${esc(info.label)} 的模型配置">${esc(info.label)}</button></li>`; }).join("") || '<li class="model-empty">还没有任务走这个模型提供方。</li>'}</ul>
          ${capable.length > routed.length ? `<p class="model-provider-note">还有 ${capable.length - routed.length} 项能力相符的任务由其他模型提供方承担。</p>` : ""}</article>`; }).filter(Boolean);
     return panels.length ? `<div class="model-providers">${panels.join("")}</div>` : '<p class="model-empty">没有匹配的任务。</p>'; }
-  function body(s) { if (!s.status) return '<p class="model-empty">角色就绪后显示可用模型任务。</p>';
+  function body(s) { if (!s.status) return s.bad
+    ? `<div class="model-empty" role="status"><p>任务配置尚未读取成功，请重新读取。</p><button type="button" class="button primary small" data-model-action="refresh" ${s.loading || s.busy ? "disabled" : ""}>重新读取</button></div>`
+    : '<p class="model-empty">角色就绪后显示可用模型任务。</p>';
     if (!snapshot(s).length) return '<p class="model-empty">当前没有可用的模型任务。</p>';
     return s.view === "providers" ? providerView(s) : taskCards(s); }
   function syncInput(kind) { const s = state; if (!root || !s) return;
     const slot = root.querySelector(".model-queue-slot"); if (slot) slot.innerHTML = queue(s);
     const task = taskOf(s, kind), draft = s.drafts.get(kind);
     const save = [...root.querySelectorAll('[data-model-action="save-one"]')].find(button => button.dataset.modelKind === kind);
-    if (save && task && draft) save.disabled = draft.stale || draft.pending || !dirty(task, draft); }
+    if (save && task && draft) { save.disabled = !draft.pending && (draft.stale || !dirty(task, draft)); save.textContent = draft.pending ? "核对保存" : "保存"; } }
   /* ---------- functional actions ---------- */
   async function refresh() { const s = state, ticket = version; if (!s || s.loading || s.busy) return; s.loading = true; s.notice = "正在读取任务配置…"; render();
-    try { const data = await api("GET", path, {layer: s.layer || "role"}); if (!current(ticket, s)) return; setStatus(s, data); s.bad = false; s.denied = false; s.notice = "已读取当前任务配置。"; }
+    try { const data = await api("GET", path, {layer: s.layer || "role"}, TASK_CONFIG_TIMEOUT_MS); if (!current(ticket, s)) return; setStatus(s, data); s.bad = false; s.denied = false; s.notice = "已读取当前任务配置。"; }
     catch (err) { if (!current(ticket, s)) return;
       /* 失败后的页面只能显示错误与重试入口，不能把上一次的任务路由、Provider
          和可编辑草稿继续当成当前真实配置。未提交草稿和待核对保存仍保留，
@@ -384,46 +445,96 @@ window.CompanionModelsPage = (() => {
       for (const draft of s.drafts.values()) {
         if (draft && (draft.touched || draft.pending)) draft.stale = true;
       }
-      s.bad = true; s.denied = true; s.notice = fail(err, "无法读取任务配置，请重新读取状态。"); }
+      s.bad = true; s.denied = false; s.notice = fail(err, "无法读取任务配置，请点击重新读取。"); }
     finally { s.loading = false; if (current(ticket, s)) render(); } }
-  async function saveTasks(s, kinds) { if (s.busy || s.loading || s.denied) return; const unsaved = kinds.filter(kind => { const task = taskOf(s, kind), draft = s.drafts.get(kind);
-    return task && draft && !draft.stale && !draft.pending && dirty(task, draft); });
-    if (!unsaved.length) { s.bad = true; s.notice = "这些任务没有待保存的改动。"; render(); return; }
-    const ticket = version; s.busy = true; s.bad = false; s.notice = `正在保存 ${unsaved.length} 项任务路由…`; render();
-    const failed = []; let saved = 0;
-    for (const kind of unsaved) { if (ticket !== version) return;
+  async function reloadConflict(s, ticket) {
+    const data = await api("GET", path, {layer: s.layer || "role"}, TASK_CONFIG_TIMEOUT_MS);
+    if (!current(ticket, s)) return false;
+    setStatus(s, data); s.denied = false;
+    const conflict = snapshot(s).find(task => s.drafts.get(task.kind)?.stale && !s.drafts.get(task.kind)?.pending);
+    if (conflict) {
+      s.sub = "cfg"; s.cm = "precise"; s.view = "tasks"; s.expanded = conflict.kind;
+      s.query = ""; s.providerFilter = null; s.custom = null; s.lane = "all";
+    }
+    return true;
+  }
+  async function rebase(s, kind) {
+    const ticket = version; s.busy = true; s.notice = "正在核对最新配置…"; render();
+    try {
+      if (!await reloadConflict(s, ticket)) return;
+      const task = taskOf(s, kind), draft = s.drafts.get(kind);
+      if (!task || !draft || draft.pending || draft.layer !== (task.configuration_layer || "role")) return;
+      draft.token = task.edit_token; draft.base = newDraft(task).base; draft.stale = false; draft.conflicts = [];
+      s.notice = "已读取最新配置并保留草稿，点击保存后生效。"; s.bad = false;
+    } catch (err) { if (current(ticket, s)) { s.bad = true; s.notice = fail(err, "未能读取最新配置，请重新读取后再核对。"); } }
+    finally { s.busy = false; if (current(ticket, s)) render(); }
+  }
+  async function saveTasks(s, kinds) {
+    if (s.busy || s.loading) return;
+    if (s.denied) { s.bad = true; s.notice = "当前尚未读取到任务配置，请先点击重新读取。"; render(); return; }
+    const entries = kinds.map(kind => ({kind, task: taskOf(s, kind), draft: s.drafts.get(kind)}))
+      .filter(item => item.task && item.draft);
+    const pending = entries.filter(item => item.draft.pending);
+    const unsaved = entries.filter(item => !item.draft.pending && !item.draft.stale && dirty(item.task, item.draft));
+    const stale = entries.filter(item => !item.draft.pending && item.draft.stale);
+    if (!pending.length && !unsaved.length) {
+      s.bad = true;
+      s.notice = stale.length ? `${stale.length} 项草稿已过期，请核对最新配置后再保存。`
+        : "这些任务没有待保存的改动。";
+      render(); return;
+    }
+    const ticket = version; s.busy = true; s.bad = false;
+    s.notice = pending.length && !unsaved.length ? `正在核对 ${pending.length} 项原保存结果…`
+      : `正在保存 ${pending.length + unsaved.length} 项任务路由…`;
+    render();
+    const failed = []; let saved = 0, confirmed = 0, conflict = false, layerChanged = false;
+    for (const kind of pending.concat(unsaved).map(item => item.kind)) {
+      if (ticket !== version) return;
       const task = taskOf(s, kind), draft = s.drafts.get(kind); if (!task || !draft) continue;
-      const patch = patchFor(task, draft);
-      if (!validatePatch(task, patch)) { failed.push(`${taskName(kind).label}：字段校验未通过`); continue; }
-      draft.pending = { kind, layer: draft.layer, operation_key: crypto.randomUUID(), edit_token: draft.token, ...patch }; storePending(kind, draft.pending); render();
-      try { const result = await api("POST", path + "/configure", draft.pending);
+      let payload = draft.pending;
+      if (!payload) {
+        const patch = patchFor(task, draft);
+        if (!validatePatch(task, patch)) { failed.push(`${taskName(kind).label}：字段校验未通过`); continue; }
+        payload = {kind, layer: draft.layer, operation_key: crypto.randomUUID(), edit_token: draft.token, ...patch};
+        draft.pending = payload; storePending(kind, payload); render();
+      }
+      try { const result = await configureTask(payload);
         if (ticket !== version) return;
         if (result?.task?.kind !== kind || typeof result.replayed !== "boolean") throw failure("invalid_response");
-        storePending(kind, null); const index = s.status.tasks.findIndex(t => t.kind === kind); if (index >= 0) s.status.tasks[index] = result.task;
-        s.drafts.set(kind, newDraft(result.task)); saved++; }
-      catch (err) { if (ticket !== version) return;
-        if (err.confirmed) { storePending(kind, null); draft.pending = null; draft.stale = true; }
+        storePending(kind, null); draft.pending = null;
+        if (result.task.configuration_layer && result.task.configuration_layer !== s.layer) {
+          layerChanged = true;
+        } else {
+          const index = s.status.tasks.findIndex(t => t.kind === kind); if (index >= 0) s.status.tasks[index] = result.task;
+          s.drafts.set(kind, newDraft(result.task));
+        }
+        saved++; if (result.replayed) confirmed++;
+      } catch (err) { if (ticket !== version) return;
+        if (err.confirmed) { storePending(kind, null); draft.pending = null;
+          if ((err.code || err.message) === "configuration_revision_conflict") { draft.stale = true; conflict = true; } }
         failed.push(`${taskName(kind).label}：${fail(err, "保存未通过")}`); }
-      render(); }
+      render();
+    }
     if (ticket !== version) return;
+    if (conflict) { try { await reloadConflict(s, ticket); } catch { /* Keep the draft locked until a successful read. */ } }
+    if (ticket !== version) return;
+    if (layerChanged) { s.busy = false; await refresh(); if (!s.bad) s.notice = "当前作用域已重新读取，请核对保留的草稿。"; return; }
     s.busy = false; s.bad = failed.length > 0;
-    s.notice = failed.length ? `已保存 ${saved} 项；${failed.length} 项未通过：${failed.join("；")}。改动仍保留，核对后可继续保存。`
-      : `已保存 ${saved} 项。下一次启动的任务会采用当前配置。`;
+    const leftPending = kinds.reduce((count, kind) => count + (s.drafts.get(kind)?.pending ? 1 : 0), 0);
+    const recovery = leftPending
+      ? `其中 ${leftPending} 项保存结果仍待核对；可再次点击全部保存复用原操作键重试。`
+      : conflict ? "有冲突的字段已标出，请核对后继续保存。"
+      : "改动仍保留，可修改后继续保存。";
+    if (failed.length) {
+      s.notice = `已保存 ${saved} 项；${failed.length} 项未通过：${failed.join("；")} ${recovery}`;
+    } else {
+      s.notice = confirmed && saved === confirmed
+        ? `原保存已确认（${confirmed} 项）。下一次任务会采用当前配置。`
+        : `已保存 ${saved} 项。下一次启动的任务会采用当前配置。`;
+      s.bad = false;
+    }
     render(); }
-  async function retry(s, kind) { const task = taskOf(s, kind), draft = s.drafts.get(kind); if (!draft?.pending || s.busy) return;
-    const ticket = version; s.busy = true; s.notice = "正在核对原保存结果…"; render();
-    try { const result = await api("POST", path + "/configure", draft.pending); if (!current(ticket, s)) return;
-      if (result?.task?.kind !== kind || typeof result.replayed !== "boolean") throw failure("invalid_response");
-      if (result.task.configuration_layer && result.task.configuration_layer !== s.layer) {
-        storePending(kind, null); draft.pending = null; s.busy = false; await refresh();
-        s.notice = result.replayed ? "原保存已确认。当前作用域已重新读取。" : "已保存。当前作用域已重新读取。"; return;
-      }
-      storePending(kind, null); const index = s.status.tasks.findIndex(t => t.kind === kind); if (index >= 0) s.status.tasks[index] = result.task;
-      s.drafts.set(kind, newDraft(result.task)); s.bad = false; s.notice = result.replayed ? "原保存已确认。下一次任务会采用当前配置。" : "已保存。下一次任务会采用当前配置。"; }
-    catch (err) { if (!current(ticket, s)) return; s.bad = true;
-      if (err.confirmed) { storePending(kind, null); draft.pending = null; draft.stale = true; s.notice = fail(err, "保存未通过。请刷新并核对。"); }
-      else s.notice = "保存结果尚未确认。请核对原保存结果后继续编辑。"; }
-    finally { s.busy = false; if (current(ticket, s)) render(); } }
+  async function retry(s, kind) { return saveTasks(s, [kind]); }
   function assign(s, providerId) { const kinds = selected(s); if (!providerId || !kinds.length) return;
     const skipped = []; let changed = 0;
     for (const kind of kinds) { const task = taskOf(s, kind), draft = s.drafts.get(kind); if (!task || !draft || draft.pending || draft.stale) continue;
@@ -473,7 +584,7 @@ window.CompanionModelsPage = (() => {
     const goto = event.target.closest("[data-drawer-goto]");
     if (goto) { s.drawer = null; s.sub = "cfg"; s.cm = "precise"; s.view = "tasks"; s.providerFilter = goto.dataset.drawerGoto; render(); return; }
     const exp = event.target.closest("[data-model-exp]");
-    if (exp) { const key = exp.dataset.modelExp; s.expOpen[key] = !s.expOpen[key]; render(); return; }
+    if (exp) { const key = exp.dataset.modelExp; s.expOpen[key] = !s.expOpen[key]; rememberExpanded(s, key); render(); return; }
     const gpick = event.target.closest("[data-model-gpick]");
     if (gpick) { const key = gpick.dataset.modelGpick;
       const kinds = key.startsWith("lane:") ? snapshot(s).filter(t => t.lane === key.slice(5)).map(t => t.kind)
@@ -532,18 +643,26 @@ window.CompanionModelsPage = (() => {
     const draft = s.drafts.get(kind); if (!draft) return;
     if (action === "save-one") { saveTasks(s, [kind]); return; }
     if (action === "discard") { s.drafts.set(kind, newDraft(taskOf(s, kind))); s.notice = "草稿已放弃。"; s.bad = false; render(); }
-    if (action === "rebase") { draft.token = taskOf(s, kind).edit_token; draft.stale = false; s.notice = "已采用当前版本作为保存基准，草稿仍待保存。"; s.bad = false; render(); }
-    if (action === "retry") retry(s, kind); }
+    if (action === "rebase") { rebase(s, kind); return; }
+    if (action === "retry") { retry(s, kind); return; } }
   /* ---------- voice model ---------- */
   const voiceCurrent = v => v.data.languages.find(l => l.k === v.ui.lang) || v.data.languages[0];
   const voiceBinding = (v, lang) => v.draft.bindings[lang.k] ?? "";
+  const voiceChannelBinding = (v, channel, lang) => v.draft.channels?.[channel]?.[lang.k] ?? "";
   const voiceChanges = v => { const changes = {};
     for (const lang of v.data.languages) { const name = `voice_${lang.k}_provider_id`;
       if (voiceBinding(v, lang) !== lang.bind) changes[name] = voiceBinding(v, lang); }
+    for (const channel of v.data.channels || []) for (const lang of v.data.languages) {
+      const name = `voice_${channel.k}_${lang.k}_provider_id`;
+      const current = voiceChannelBinding(v, channel.k, lang), saved = channel.bindings?.[lang.k] ?? "";
+      if (current !== saved) changes[name] = current;
+    }
     if (v.draft.timeout_seconds !== v.data.timeout_seconds) changes.voice_timeout_seconds = v.draft.timeout_seconds;
     return changes; };
   const voiceDirty = v => !!v.draft && Object.keys(voiceChanges(v)).length > 0;
-  const voiceDraft = data => ({bindings: Object.fromEntries(data.languages.map(lang => [lang.k, lang.bind])), timeout_seconds: data.timeout_seconds});
+  const voiceDraft = data => ({bindings: Object.fromEntries(data.languages.map(lang => [lang.k, lang.bind])),
+    channels: Object.fromEntries((data.channels || []).map(channel => [channel.k, {...(channel.bindings || {})}])),
+    timeout_seconds: data.timeout_seconds});
   async function voiceRefresh(s) { const v = s.voice, ticket = version; if (v.loading) return; v.loading = true; v.notice = "正在读取语音配置…"; render();
     try { const data = await api("GET", path + "/voice"); if (!current(ticket, s)) return;
       if (!Array.isArray(data.languages) || !Array.isArray(data.providers) || typeof data.edit_token !== "string") throw failure("invalid_response");
@@ -558,12 +677,29 @@ window.CompanionModelsPage = (() => {
       v.bad = true; v.notice = "语音超时需要设置为 1–120 秒。"; render(); return; }
     const ticket = version, command = retry ? v.pending : {operation_key: crypto.randomUUID(), edit_token: v.data.edit_token, changes: voiceChanges(v)};
     if (!command) return; v.pending = command; v.busy = true; v.bad = false; v.notice = "正在保存语音配置…"; render();
-    try { const data = await api("POST", path + "/voice/save", command); if (!current(ticket, s)) return;
+    let uncertain = retry;
+    try {
+      let data;
+      try { data = await api("POST", path + "/voice/save", command, VOICE_SAVE_TIMEOUT_MS); }
+      catch (err) {
+        if (err?.code !== "bridge_timeout" || retry || !current(ticket, s)) throw err;
+        uncertain = true;
+        v.notice = "保存超时，正在核对原保存结果…"; render();
+        data = await api("POST", path + "/voice/save", command, VOICE_SAVE_TIMEOUT_MS);
+      }
+      if (!current(ticket, s)) return;
       if (!Array.isArray(data.languages) || typeof data.edit_token !== "string") throw failure("invalid_response");
       v.data = data; v.draft = voiceDraft(data); v.pending = null; v.stale = false; v.notice = data.replayed ? "原保存已确认。" : "语音配置已保存，下一次语音回复生效。"; }
     catch (err) { if (!current(ticket, s)) return; v.bad = true;
-      if (err.confirmed) { v.pending = null; v.stale = true; }
-      v.notice = err.confirmed ? (fail(err, "保存未通过，请刷新核对配置。")) : "保存结果未确认，可重试同一请求核对结果。"; }
+      if (err.code === "host_busy") {
+        /* 核对请求没写入不代表最初的超时请求没写入，仍保留原操作。 */
+        if (!uncertain) { v.pending = null; v.stale = false; }
+        v.notice = uncertain ? "宿主正忙，原保存结果仍待核对，请稍后核对原保存结果。"
+          : "宿主正在启动或切换，请稍后重试；本次没有写入，草稿已保留。";
+      } else {
+        if (err.confirmed) { v.pending = null; v.stale = true; }
+        v.notice = err.confirmed ? (fail(err, "保存未通过，请刷新核对配置。")) : "保存结果未确认，可重试同一请求核对结果。";
+      } }
     finally { v.busy = false; if (current(ticket, s)) render(); } }
   function clearVoiceTest(v) { if (v.lastTest?.audioUrl && typeof window.URL?.revokeObjectURL === "function") window.URL.revokeObjectURL(v.lastTest.audioUrl); v.lastTest = null; }
   function voiceAudioUrl(result) {
@@ -687,8 +823,8 @@ window.CompanionModelsPage = (() => {
       ${items.length ? `<label class="model-fd"><span class="model-cap">编辑对象</span>
           <select data-tts-pick>${items.map(option => `<option value="${esc(option.id)}" ${option.id === (item && item.id) ? "selected" : ""}>${esc(option.id)} · ${esc(option.label)}${option.enable ? " · 已启用" : " · 停用"}${option.loaded ? "" : " · 未加载"}</option>`).join("")}</select></label>` : '<p class="model-empty">还没有可管理的语音服务。</p>'}
       ${item && values ? `<div class="model-tts-fields">
-          <label class="model-fd"><span class="model-cap">启用 <em>停用的语音服务不能被语种绑定使用</em></span>
-            <label class="model-switch"><input type="checkbox" data-tts-enable ${values.enable ? "checked" : ""}><i></i></label></label>
+          <div class="model-fd"><span class="model-cap">启用 <em>停用的语音服务不能被语种绑定使用</em></span>
+            <label class="model-switch"><input type="checkbox" aria-label="启用语音服务" data-tts-enable ${values.enable ? "checked" : ""}><i></i></label></div>
            ${fieldMarkup}
         </div>
          <div class="model-editor-actions">
@@ -769,9 +905,28 @@ window.CompanionModelsPage = (() => {
     const bound = v.data.languages.filter(item => voiceBinding(v, item)).length;
     const missing = binding && !loaded;
     const shared = binding ? v.data.languages.filter(item => item.k !== lang.k && voiceBinding(v, item) === binding) : [];
+    const providerLabel = item => [item?.id, item?.model, item?.voice].filter(Boolean).join(" · ");
     const dot = item => { const b = voiceBinding(v, item); return !b ? "var(--m-line2)" : v.data.providers.some(p => p.id === b) ? "var(--m-green)" : "var(--m-red)"; };
-    const sub = item => { const b = voiceBinding(v, item); return b ? esc(b) + (v.data.providers.some(p => p.id === b) ? " · 已加载" : " · 未加载") : "跟随当前会话的语音服务"; };
+    const sub = item => { const b = voiceBinding(v, item); const provider = v.data.providers.find(p => p.id === b);
+      return b ? esc(provider ? providerLabel(provider) : b) + (provider ? " · 已加载" : " · 未加载") : "跟随当前会话的语音服务"; };
     const test = v.lastTest;
+    const channels = v.data.channels || [];
+    const voiceOptions = selected => ['<option value="">跟随语种绑定</option>',
+      ...v.data.providers.map(p => `<option value="${esc(p.id)}" ${p.id === selected ? "selected" : ""}>${esc(providerLabel(p))}</option>`),
+      ...(selected && !v.data.providers.some(p => p.id === selected)
+        ? [`<option value="${esc(selected)}" selected>${esc(selected)} · 未加载</option>`] : [])].join("");
+    const channelMatrix = channels.length ? `<div class="model-card model-vmatrix-card">
+      <div class="model-phead"><div class="model-grow"><span class="model-eb">按渠道指定语音合成</span><h3>私聊 / 群聊 TTS 总览</h3></div>
+        <span class="model-tag n">留空沿用语种绑定</span></div>
+      <p class="model-note">不必切换上方语种标签，可在这里一次看清并设置每个语种在私聊、群聊分别使用哪个 TTS。列头的「全部跟随」只清空该渠道的覆盖。</p>
+      <div class="model-vmatrix" style="--voice-channels:${channels.length}">
+        <div class="model-vmatrix-head"><span>语种</span>${channels.map(channel => `<span>${esc(channel.n)}
+          <button type="button" class="model-vmatrix-clear" data-voice-clear-channel="${esc(channel.k)}" ${v.busy || v.loading || v.pending ? "disabled" : ""}>全部跟随</button></span>`).join("")}</div>
+        ${v.data.languages.map(item => `<div class="model-vmatrix-row"><b>${esc(item.n)}</b>${channels.map(channel => `<label class="model-vmatrix-cell">
+          <em class="model-vmatrix-channel">${esc(channel.n)} · ${esc(item.n)}</em>
+          <select data-voice-channel="${esc(channel.k)}" data-voice-matrix-lang="${esc(item.k)}" ${v.busy || v.loading || v.pending ? "disabled" : ""}>${voiceOptions(voiceChannelBinding(v, channel.k, item))}</select>
+          <small>${voiceChannelBinding(v, channel.k, item) ? "渠道覆盖" : `跟随${esc(item.n)}语种`}</small></label>`).join("")}</div>`).join("")}
+      </div></div>` : "";
     return `<div class="model-voice">
       <div class="model-card"><div class="model-phead"><div class="model-grow"><span class="model-eb">合成后端</span><h3>语音模型</h3></div>
           <button type="button" class="button small" data-go="manage" data-manage="expression" data-manage-subtab="voice">语音增强设置 ↗</button>
@@ -780,13 +935,17 @@ window.CompanionModelsPage = (() => {
       <div class="model-card"><div class="model-phead"><div class="model-grow"><span class="model-eb">按语种配置语音合成</span><h3>${esc(lang.n)}</h3></div>
           <span class="model-tag ${missing ? "r" : binding ? "g" : "n"}">${missing ? "绑定未加载" : binding ? "已加载" : "跟随会话"}</span>
           <button type="button" class="button small" data-voice-editor ${v.loading || v.busy ? "disabled" : ""}>${v.editorOpen ? "收起连接管理" : "新建 / 编辑连接"}</button></div>
-        <div class="model-vtabs">${v.data.languages.map(item => `<button type="button" data-voice-lang="${esc(item.k)}" class="${item.k === lang.k ? "on" : ""}"><b><i class="d" style="background:${dot(item)}"></i>${esc(item.n)}</b><small>${sub(item)}</small></button>`).join("")}</div>
+        <div class="model-vtabs">${v.data.languages.map(item => `<button type="button" data-voice-lang="${esc(item.k)}" class="${item.k === lang.k ? "on" : ""}" title="${sub(item)}"><b><i class="d" style="background:${dot(item)}"></i>${esc(item.n)}</b><small>${sub(item)}</small></button>`).join("")}</div>
         ${shared.length ? `<div class="model-sharewarn"><span style="flex:1">该语音服务同时绑定到${shared.map(item => item.n).join("、")}。V2 按语种独立保存，修改当前语种不会影响其他语种。</span>
           <button type="button" class="button small" data-voice-unbind ${v.busy || v.loading || v.pending ? "disabled" : ""}>解除${shared.map(item => item.n).join("、")}绑定</button></div>` : ""}
         <div class="model-vbar"><label class="model-fd"><span class="model-cap">${esc(lang.n)} 语音服务 <em>连接、凭据和声音由 AstrBot 语音配置管理</em></span>
           <select data-voice-provider ${v.busy || v.loading || v.pending ? "disabled" : ""}><option value="">跟随 AstrBot 当前会话的语音服务</option>
-            ${v.data.providers.map(p => `<option value="${esc(p.id)}" ${p.id === binding ? "selected" : ""}>${esc(p.id)}</option>`).join("")}
+            ${v.data.providers.map(p => `<option value="${esc(p.id)}" ${p.id === binding ? "selected" : ""}>${esc(providerLabel(p))}</option>`).join("")}
             ${missing ? `<option value="${esc(binding)}" selected>${esc(binding)} · 未加载</option>` : ""}</select></label></div>
+        ${(v.data.channels || []).map(channel => `<div class="model-vbar"><label class="model-fd"><span class="model-cap">${esc(channel.n)} · ${esc(lang.n)} 覆盖 <em>留空跟随上面的语种绑定</em></span>
+          <select data-voice-channel="${esc(channel.k)}" ${v.busy || v.loading || v.pending ? "disabled" : ""}><option value="">跟随语种绑定</option>
+            ${v.data.providers.map(p => `<option value="${esc(p.id)}" ${voiceChannelBinding(v, channel.k, lang) === p.id ? "selected" : ""}>${esc(providerLabel(p))}</option>`).join("")}
+            ${voiceChannelBinding(v, channel.k, lang) && !v.data.providers.some(p => p.id === voiceChannelBinding(v, channel.k, lang)) ? `<option value="${esc(voiceChannelBinding(v, channel.k, lang))}" selected>${esc(voiceChannelBinding(v, channel.k, lang))} · 未加载</option>` : ""}</select></label></div>`).join("")}
         <div class="model-vfoot"><span class="model-sample">合成样句：${esc(VOICE_SAMPLES[lang.k] || "")}</span>
           <span class="model-res">${v.testing ? '<span class="model-sp"></span>测试中'
             : test ? `<span class="model-resk ${test.status === "ok" ? "ok" : "bad"}">${test.status === "ok" ? "✓" : "！"}</span>${esc(voiceTestLabel(test))}` : ""}</span>
@@ -796,6 +955,7 @@ window.CompanionModelsPage = (() => {
           <span class="model-note">${binding ? "测试音频只在此处试听，不会发送到聊天。" : "未指定时由 AstrBot 当前会话选择语音合成服务。"}</span>
           <button type="button" class="button small primary" data-ve-test ${!loaded || v.testing ? "disabled" : ""}>${v.testing ? "测试中…" : "测试合成"}</button></div>
       </div>
+      ${channelMatrix}
       ${v.editorOpen ? ttsEditor(s) : ""}
       <div class="model-card"><div class="model-phead"><div class="model-grow"><span class="model-eb">语音请求</span><h3>合成超时与保存</h3></div></div>
         <div class="model-fd"><span class="model-cap">合成超时（秒）</span>
@@ -807,6 +967,10 @@ window.CompanionModelsPage = (() => {
       ${v.notice ? `<div class="model-notice ${v.bad ? "error" : ""}" role="status">${esc(v.notice)}</div>` : ""}</div>`; }
   function voiceInput(s, event) { const v = s.voice; if (v.loading || v.busy) return; const t = event.target;
     if (t.matches("[data-voice-provider]")) { if (!v.draft || v.pending) return; v.draft.bindings[voiceCurrent(v).k] = t.value; clearVoiceTest(v); render(); }
+    if (t.matches("[data-voice-channel]")) { if (!v.draft || v.pending) return;
+      const channel = t.dataset.voiceChannel; if (!v.draft.channels[channel]) v.draft.channels[channel] = {};
+      const lang = t.dataset.voiceMatrixLang || voiceCurrent(v).k;
+      v.draft.channels[channel][lang] = t.value; clearVoiceTest(v); render(); }
     if (t.matches("[data-voice-timeout]")) { if (!v.draft || v.pending) return; v.draft.timeout_seconds = t.valueAsNumber; if (event.type === "change") render(); }
     if (t.matches("[data-tts-field]")) { const item = ttsSelected(v); if (!item || v.ttsBusy) return;
       const values = ttsValues(v, item), key = t.dataset.ttsField;
@@ -818,6 +982,14 @@ window.CompanionModelsPage = (() => {
     if (t.matches("[data-tts-id]")) { v.createDraft.id = t.value; return; }
     if (t.matches("[data-tts-pick]")) { v.editorId = t.value; if (event.type === "change") render(); return; } }
   function voiceClick(s, event) { const v = s.voice, t = event.target;
+    const clearChannel = t.closest("[data-voice-clear-channel]");
+    if (clearChannel) {
+      if (v.busy || v.loading || v.pending || !v.draft) return;
+      const channel = clearChannel.dataset.voiceClearChannel;
+      if (!v.draft.channels[channel]) v.draft.channels[channel] = {};
+      for (const item of v.data.languages) v.draft.channels[channel][item.k] = "";
+      clearVoiceTest(v); render(); return;
+    }
     const lang = t.closest("[data-voice-lang]"); if (lang) { if (v.ui.lang !== lang.dataset.voiceLang) clearVoiceTest(v); v.ui.lang = lang.dataset.voiceLang; render(); return; }
     if (t.closest("[data-voice-editor]")) { v.editorOpen = !v.editorOpen; if (v.editorOpen && !v.catalog) ttsCatalogLoad(s); render(); return; }
     if (t.closest("[data-tts-create-toggle]")) { v.creating = !v.creating; render(); return; }
@@ -845,12 +1017,16 @@ window.CompanionModelsPage = (() => {
     ["tool_need", "判断能力需求", "只提供能力提示，不负责授权或发起工具"],
   ];
   const layaDraftFrom = data => ({enabled: !!data.enabled, mode: data.mode || "local", endpoint: data.endpoint || "",
-    local_model_path: data.local_model_path || "",
+    local_model_path: data.local_model_path || "", remote_model: data.remote_model || "",
     api_key: "", timeout_seconds: Number(data.timeout_seconds) || 20,
+    followup_confidence_threshold: Math.max(0, Math.min(100, Number(data.followup_confidence_threshold) || 0)),
     decision_fields: Object.fromEntries(LAYA_DECISION_FIELDS.map(([key]) => [key, data.decision_fields?.[key] !== false]))});
   const layaChanges = l => { const changes = {};
-    ["enabled", "mode", "endpoint", "timeout_seconds", "local_model_path"].forEach(key => {
-      if (l.draft[key] !== (key === "local_model_path" ? l.data[key] || "" : l.data[key])) changes[key] = l.draft[key]; });
+    ["enabled", "mode", "endpoint", "timeout_seconds", "local_model_path", "remote_model", "followup_confidence_threshold"].forEach(key => {
+      const current = key === "local_model_path" || key === "remote_model" ? l.data[key] || ""
+        : key === "followup_confidence_threshold" ? Math.max(0, Math.min(100, Number(l.data[key]) || 0))
+        : l.data[key];
+      if (l.draft[key] !== current) changes[key] = l.draft[key]; });
     if (LAYA_DECISION_FIELDS.some(([key]) => l.draft.decision_fields[key] !== (l.data.decision_fields?.[key] !== false)))
       changes.decision_fields = l.draft.decision_fields;
     if (l.draft.api_key) changes.api_key = l.draft.api_key;
@@ -869,7 +1045,12 @@ window.CompanionModelsPage = (() => {
     finally { l.busy = false; if (current(ticket, s)) render(); } }
   async function layaTest(s) { const l = s.laya; if (l.busy || l.loading || !l.data) return;
     if (layaDirty(l)) { l.bad = true; l.notice = "请先保存当前 Laya 配置，再执行连接或模型下载测试。"; render(); return; }
-    const ticket = version; l.busy = true; l.test = {status: "testing"}; l.notice = l.data.mode === "local" ? "正在调用官方 Router；首次测试会自动下载检查点…" : "正在调用官方 SystemOne HTTP 接口…"; render();
+    if ((l.draft?.mode || l.data.mode) === "local" && l.data.local_runtime_state === "gpu_unavailable") {
+      l.bad = true;
+      l.notice = "本地 Laya 无法测试：当前 AstrBot Python 的 PyTorch 不支持 CUDA。请安装 CUDA 版 PyTorch 并重启，或切换到远程 HTTP 服务。";
+      render(); return;
+    }
+    const ticket = version; l.busy = true; l.test = {status: "testing"}; l.notice = l.data.mode === "local" ? "正在调用官方 Router；首次测试会自动下载检查点…" : l.data.mode === "jev" ? "正在调用 Jev 判断服务…" : l.data.mode === "workers_ai" ? "正在调用 Cloudflare Workers AI…" : "正在调用官方 SystemOne HTTP 接口…"; render();
     try { const result = await api("POST", path + "/laya/test", {}, 600000); if (!current(ticket, s)) return;
       l.test = result; l.notice = "Laya 调用完成；当前模式和检查点已验证。"; l.bad = false; await layaRefreshQuiet(s, ticket); }
     catch (err) { if (!current(ticket, s)) return; l.test = {status: "unknown", code: err.code || err.message, reason: err.reason || ""}; l.bad = true; l.notice = fail(err, "Laya 连接测试未完成。"); }
@@ -917,6 +1098,11 @@ window.CompanionModelsPage = (() => {
     if (target.closest("[data-search-save]")) searchSave(s); }
   async function layaDecide(s) { const l = s.laya; if (l.busy || l.loading || !l.data) return;
     if (layaDirty(l)) { l.bad = true; l.notice = "请先保存当前 Laya 配置，再执行决策预览。"; render(); return; }
+    if ((l.draft?.mode || l.data.mode) === "local" && l.data.local_runtime_state === "gpu_unavailable") {
+      l.bad = true;
+      l.notice = "本地 Laya 无法调用：当前 AstrBot Python 的 PyTorch 不支持 CUDA。请安装 CUDA 版 PyTorch 并重启，或切换到远程 HTTP 服务。";
+      render(); return;
+    }
     const text = String(l.previewText || "").trim(); if (!text) { l.bad = true; l.notice = "先输入一段测试消息。"; render(); return; }
     const ticket = version; l.busy = true; l.preview = {status: "testing"}; l.notice = "正在请求 Laya 进行语义分类…"; render();
     try { const result = await api("POST", path + "/laya/decide", {facts: {message_kind: "text", user_text: text}}, 125000); if (!current(ticket, s)) return;
@@ -928,15 +1114,26 @@ window.CompanionModelsPage = (() => {
     if (type === "bool") return `<label class="model-fd"><span class="model-cap">${label}<em>${hint}</em></span><label class="model-switch"><input type="checkbox" data-laya-field="${key}" ${value ? "checked" : ""} ${disabled ? "disabled" : ""}><i></i></label></label>`;
     return `<label class="model-fd"><span class="model-cap">${label}<em>${hint}</em></span><input type="${type}" data-laya-field="${key}" value="${esc(value)}" ${disabled ? "disabled" : ""}></label>`;
   }
+  function layaPercentField(l, key, label, hint) {
+    const value = l.draft?.[key] ?? 0, disabled = l.loading || l.busy;
+    return `<label class="model-fd"><span class="model-cap">${label}<em>${hint}</em></span><span class="model-unit"><input type="number" min="0" max="100" step="1" data-laya-field="${key}" value="${esc(value)}" ${disabled ? "disabled" : ""}><i>%</i></span></label>`;
+  }
   function layaSelect(l, key, label, hint, options) { const value = l.draft?.[key] || "", disabled = l.loading || l.busy;
     return `<label class="model-fd"><span class="model-cap">${label}<em>${hint}</em></span><select data-laya-field="${key}" ${disabled ? "disabled" : ""}>${options.map(([id, name]) => `<option value="${id}" ${value === id ? "selected" : ""}>${name}</option>`).join("")}</select></label>`; }
   async function layaCopyInstall(s, field) { const command = s.laya.data?.[field || "install_command"] || ""; if (!command) return;
-    try { await navigator.clipboard.writeText(command); s.laya.notice = field === "remote_start_command" ? "已复制 Laya 服务启动命令。" : field === "remote_install_command" ? "已复制远程 Laya 服务依赖安装命令。" : "已复制当前 AstrBot Python 环境的安装命令。安装后重启 AstrBot，再刷新状态。"; s.laya.bad = false; }
+    try { await navigator.clipboard.writeText(command); s.laya.notice = field === "torch_install_command" ? "已复制 CUDA 版 PyTorch 安装命令；请按驱动确认 cu128 是否兼容，安装后重启 AstrBot。" : field === "remote_start_command" ? "已复制 Laya 服务启动命令。" : field === "remote_install_command" ? "已复制远程 Laya 服务依赖安装命令。" : "已复制当前 AstrBot Python 环境的安装命令。安装后重启 AstrBot，再刷新状态。"; s.laya.bad = false; }
     catch { s.laya.notice = "无法访问剪贴板，请选中并复制下方命令。"; s.laya.bad = false; } render(); }
   function layaResult(result) { if (!result) return ""; if (result.status === "testing") return '<div class="model-notice">正在等待 Laya…</div>'; if (result.status === "skipped") return `<div class="model-notice">本次未调用 Laya：${esc(result.reason || "程序规则已处理")}</div>`;
     if (result.status !== "ok") return `<div class="model-notice error">${esc(fail(result, "Laya 结果未知。"))}</div>`;
     const decision = result.decision; if (!decision) return "";
-    return `<div class="model-laya-result"><b>决策结果</b><code>${esc(JSON.stringify(decision, null, 2))}</code></div>`; }
+    const meta = [];
+    if (typeof result.action_confidence === "number" && Number.isFinite(result.action_confidence))
+      meta.push(`行动置信度 ${(result.action_confidence * 100).toFixed(1)}%`);
+    if (result.confidence_gate?.status === "below_threshold")
+      meta.push(`低于连续接话阈值 ${result.confidence_gate.threshold_percent}%，已改为旁听`);
+    else if (result.confidence_gate?.status === "confidence_unavailable")
+      meta.push("当前服务未返回行动概率，阈值未强制执行");
+    return `<div class="model-laya-result"><b>决策结果${meta.length ? ` · ${esc(meta.join(" · "))}` : ""}</b><code>${esc(JSON.stringify(decision, null, 2))}</code></div>`; }
   function layaHistoryMarkup(l) { const events = Array.isArray(l.logs) ? l.logs : [];
     if (!events.length) return '<p class="model-laya-history-empty">暂无 Laya 调用记录。</p>';
     const labels = {ok: "成功", skipped: "跳过", failed: "失败"}, sources = {conversation: "实际对话", dashboard_preview: "页面预览", probe: "连接测试"};
@@ -955,21 +1152,38 @@ window.CompanionModelsPage = (() => {
     }).join("")}</ol>`; }
   function layaPane(s) { const l = s.laya; if (!l.data) return `<div class="model-card"><p class="model-empty">${esc(l.notice || "正在读取 Laya 配置…")}</p></div>`;
     const dirty = layaDirty(l), installed = l.data.package_installed, mode = l.draft?.mode || l.data.mode;
+    const gpuUnavailable = mode === "local" && l.data.local_runtime_state === "gpu_unavailable";
+    const runtimeLabel = gpuUnavailable ? "CUDA 不可用" : mode === "local" ? "本地 Python" : mode === "jev" ? "Jev 判断服务" : mode === "workers_ai" ? "Cloudflare Workers AI" : "远程 HTTP";
+    const packageKpi = mode === "local" ? installed ? `已安装 ${l.data.package_version || ""}` : "待安装" : "外部服务";
+    const modelKpi = mode === "jev" ? l.data.default_model || "jev-latest"
+      : mode === "workers_ai" ? l.data.default_model || "未填写"
+      : mode === "remote" ? "远程管理" : l.data.model_cache_ready ? "已缓存" : "首次调用下载";
+    const torchText = [l.data.torch_version, l.data.cuda_version ? `CUDA ${l.data.cuda_version}` : "无 CUDA"]
+      .filter(Boolean).join(" · ");
     return `<div class="model-subpane model-laya-pane">
-      <div class="model-card"><div class="model-phead"><div class="model-grow"><span class="model-eb">可选能力 · 语义决策</span><h3>Laya 决策模型</h3><p class="model-note">在回复前判断是否接话、等待、沉默及表达形式。配置全局生效；仅群聊候选进入 Laya 判断，私聊始终走 AstrBot 核心回复。模型不输出时间、段数等数值；执行遵循宿主配置和权限。</p></div><button type="button" class="button small" data-laya-refresh ${l.loading || l.busy ? "disabled" : ""}>刷新</button></div>
-        <div class="model-kpis">${kpi(!l.data.enabled ? "未启用" : mode === "local" && l.data.local_runtime_state === "warming" ? "正在预热" : "已启用", "运行状态", l.data.enabled ? "g" : "a")}${kpi(mode === "remote" ? "远程模式" : installed ? `已安装 ${l.data.package_version || ""}` : "待安装", "Python 包")}${kpi(mode === "remote" ? "远程管理" : l.data.model_cache_ready ? "已缓存" : "首次调用下载", "模型权重")}${kpi(mode === "local" ? "本地 Python" : "远程 HTTP", "接入方式")}</div>
-        <div class="model-laya-fields">${layaField(l, "enabled", "启用 Laya", "关闭时调用会跳过", "bool")}${layaSelect(l, "mode", "接入方式", "选择 AstrBot 本地 Python 或官方服务接口", [["local", "本地 Python 包"], ["remote", "远程 HTTP 服务"]])}${mode === "remote" ? layaField(l, "endpoint", "SystemOne 服务地址", "可填服务根地址、/v1 或完整 /v1/systemone") : ""}${mode === "remote" ? layaField(l, "api_key", "API Key", l.data.api_key_set ? "已配置；留空保留现有密钥" : "可选，按远程服务配置", "password") : ""}${layaField(l, "timeout_seconds", "调用超时（秒）", "用于本地推理或远程连接，不参与语义判断", "number")}</div>
+      <div class="model-card"><div class="model-phead"><div class="model-grow"><span class="model-eb">可选能力 · 语义决策</span><h3>Laya 决策模型</h3><p class="model-note">在回复前判断是否接话、等待、沉默及表达形式。配置全局生效；仅群聊候选进入 Laya 判断，私聊始终走 AstrBot 核心回复，另由回复页的私聊收尾判断在纯道别时安静。模型不输出时间、段数等数值；行动概率只用于下方可选的连续接话阈值，执行仍遵循宿主配置和权限。接入方式支持本地 Laya 包、官方 SystemOne 服务、Jev 判断服务与 Cloudflare Workers AI，四者共用同一份决策合同。</p></div><button type="button" class="button small" data-laya-refresh ${l.loading || l.busy ? "disabled" : ""}>刷新</button></div>
+        <div class="model-kpis">${kpi(!l.data.enabled ? "未启用" : mode === "local" && l.data.local_runtime_state === "warming" ? "正在预热" : "已启用", "运行状态", l.data.enabled ? "g" : "a")}${kpi(packageKpi, mode === "local" ? "Python 包" : "依赖来源")}${kpi(modelKpi, mode === "jev" || mode === "workers_ai" ? "判断模型" : "模型权重")}${kpi(runtimeLabel, "接入方式", gpuUnavailable ? "r" : "")}</div>
+        ${gpuUnavailable ? `<div class="model-alert"><b>本地 Laya 当前不可用：</b>当前 AstrBot Python 使用的是 CPU 版 PyTorch${torchText ? `（${esc(torchText)}）` : ""}。Laya 本地模式需要 CUDA；请安装与驱动匹配的 CUDA 版 PyTorch 后重启 AstrBot，或在上方把接入方式切到「远程 HTTP 服务」或「Jev 判断服务」。
+          <div class="model-editor-actions"><button type="button" class="button small" data-laya-copy="torch_install_command">复制 CUDA PyTorch 安装命令</button></div>
+          ${l.data.torch_install_command ? `<code class="model-laya-cmd">${esc(l.data.torch_install_command)}</code><small>命令默认使用 cu128；请按显卡驱动把 cu128 换成 cu126 等兼容版本。安装会替换当前 CPU 版 torch，但不会改动已安装的 laya。</small>` : ""}</div>` : ""}
+        <div class="model-laya-fields">${layaField(l, "enabled", "启用 Laya", "关闭时调用会跳过", "bool")}${layaSelect(l, "mode", "接入方式", "选择 AstrBot 本地 Python、官方 SystemOne 服务、Jev 判断服务或 Cloudflare Workers AI", [["local", "本地 Python 包"], ["remote", "远程 HTTP 服务"], ["jev", "Jev 判断服务"], ["workers_ai", "Cloudflare Workers AI"]])}${mode === "remote" ? layaField(l, "endpoint", "SystemOne 服务地址", "可填服务根地址、/v1 或完整 /v1/systemone") : ""}${mode === "jev" ? layaField(l, "endpoint", "判断服务地址", "可填服务根地址、/v1 或完整 /v1/chat/completions；走 OpenAI 兼容接口") : ""}${mode === "workers_ai" ? layaField(l, "endpoint", "Workers AI 地址", "填 accounts/<ACCOUNT_ID>/ai/run，或只填 accounts/<ACCOUNT_ID>；模型写在请求体里") : ""}${mode !== "local" ? layaField(l, "api_key", "API Key", l.data.api_key_set ? "已配置；留空保留现有密钥" : "按服务端要求填写；留空表示不鉴权", "password") : ""}${mode !== "local" ? layaField(l, "remote_model", "判断模型名", mode === "jev" ? "留空使用 jev-latest；网关上的模型名可在此覆盖" : mode === "workers_ai" ? "留空使用 @cf/cloudflare/clef（吃每日免费神经元额度）；更快可用 @cf/cloudflare/clef-flash，第三方模型如 typesafe/jev-1.14.0 需单独付费" : "留空使用官方 multilingual；仅自建服务改名时才需要填写") : ""}${layaField(l, "timeout_seconds", "调用超时（秒）", "用于本地推理或远程连接，不参与语义判断", "number")}${layaPercentField(l, "followup_confidence_threshold", "连续接话置信阈值", "0 关闭；仅约束非点名续接。Laya 行动概率低于此值时改为旁听，建议从 40–55% 起按日志校准")}</div>
         ${mode === "local" ? `<div class="model-laya-fields">${layaField(l, "local_model_path", "本地检查点目录", "可选择微调模型；留空使用官方多语言模型。所有会话共用此选择。")}</div>` : ""}
         <section class="model-laya-decisions" aria-label="决策分类配置"><div><strong>决策分类</strong><span>仅启用的分类会发送给 Laya；关闭的分类沿用宿主配置。</span></div><div class="model-laya-decision-grid">${LAYA_DECISION_FIELDS.map(([key, label, hint]) => `<label class="model-laya-option"><span><strong>${label}</strong><small>${hint}</small></span><span class="model-switch"><input type="checkbox" data-laya-decision="${key}" ${l.draft.decision_fields[key] ? "checked" : ""} ${l.loading || l.busy ? "disabled" : ""}><i></i></span></label>`).join("")}</div></section>
-        <div class="model-editor-actions"><button type="button" class="button primary" data-laya-save ${!dirty || l.busy || l.loading || l.stale ? "disabled" : ""}>保存 Laya 配置</button><button type="button" class="button" data-laya-test ${l.busy || l.loading ? "disabled" : ""}>${mode === "local" && installed && !l.data.model_cache_ready ? "下载并验证模型" : "测试 Laya 调用"}</button></div>
+        <div class="model-editor-actions"><button type="button" class="button primary" data-laya-save ${!dirty || l.busy || l.loading || l.stale ? "disabled" : ""}>保存 Laya 配置</button><button type="button" class="button" data-laya-test ${l.busy || l.loading || gpuUnavailable ? "disabled" : ""}>${mode === "local" && installed && !l.data.model_cache_ready ? "下载并验证模型" : "测试 Laya 调用"}</button></div>
         ${l.stale ? '<div class="model-alert">配置已在别处变化，请刷新后核对。</div>' : ""}${l.notice ? `<div class="model-notice${l.bad ? " error" : ""}">${esc(l.notice)}</div>` : ""}${l.test ? layaResult(l.test) : ""}
       </div>
-      <div class="model-card"><div class="model-phead"><div class="model-grow"><span class="model-eb">官方依赖与权重缓存</span><h3>安装 Laya Python 包</h3></div></div><p class="model-note">插件发行包不包含 Laya 包或检查点权重。将下方命令复制到 AstrBot 所在环境执行；本地首次推理会由官方 Router 自动从 Hugging Face 下载所选检查点。</p>
+      ${mode === "workers_ai" ? `<div class="model-card"><div class="model-phead"><div class="model-grow"><span class="model-eb">外部判断服务</span><h3>Cloudflare Workers AI</h3></div></div><p class="model-note">Cloudflare Workers AI 把模型判断放在 <code>/ai/run</code>：模型名写在请求体里，<code>state</code> 与 <code>questions</code> 需要嵌进 <code>input</code> 对象，而不是与 <code>model</code> 平级。插件会按这个外壳发送，并把返回的 <code>result</code> 解包成同一份 <code>answers</code> 决策合同；判断失败只影响本轮判断，不会阻塞正常回复。</p>
+        <div class="model-state">判断模型：<code>${esc(l.data.default_model || "@cf/cloudflare/clef")}</code> · 请求路径：<code>/ai/run</code> · 请求体：<code>{"model": ..., "input": {"state": ..., "questions": ...}}</code></div>
+        <div class="model-state"><code>@cf/cloudflare/clef</code> 与 <code>clef-flash</code> 使用 Workers AI 每日免费神经元额度；<code>typesafe/jev-1.14.0</code> 等第三方模型不共享该额度，额度不足时 Cloudflare 返回 402，原因显示在下方运行记录里。</div>
+      </div>` : ""}${mode === "jev" ? `<div class="model-card"><div class="model-phead"><div class="model-grow"><span class="model-eb">外部判断服务</span><h3>Jev 判断服务</h3></div></div><p class="model-note">Jev 是结构化判断模型：不生成文本，也不识别像素，只按 state 与分类问题返回每个分类的概率。插件把这份判断请求包进一次 OpenAI 兼容的 <code>chat/completions</code> 调用，再把 answers 按同一份决策合同解析；判断失败只影响本轮判断，不会阻塞正常回复。这种接入方式不需要本地 Python 包或权重缓存。</p>
+        <div class="model-state">判断模型：<code>${esc(l.data.default_model || "jev-latest")}</code> · 请求路径：<code>/v1/chat/completions</code> · 决策合同：<code>state + questions → answers</code></div>
+        <div class="model-state">密钥只保存在插件数据目录的决策配置里，不写入调用日志；失败原因显示在下方运行记录。</div>
+      </div>` : mode === "workers_ai" ? "" : `<div class="model-card"><div class="model-phead"><div class="model-grow"><span class="model-eb">官方依赖与权重缓存</span><h3>安装 Laya Python 包</h3></div></div><p class="model-note">插件发行包不包含 Laya 包或检查点权重。将下方命令复制到 AstrBot 所在环境执行；本地首次推理会由官方 Router 自动从 Hugging Face 下载所选检查点。</p>
         <div class="model-laya-install"><code>${esc(l.data.install_command || "")}</code><button type="button" class="button small" data-laya-copy="install_command" ${l.busy || l.loading ? "disabled" : ""}>复制安装命令</button></div>
         ${mode === "remote" ? `<p class="model-note">远程服务端使用 Laya 官方 SystemOne 接口，地址以 <code>/v1/systemone</code> 结尾；服务端需要单独部署，以下命令使用本机 AstrBot Python 作为示例。</p><div class="model-laya-install"><code>${esc(l.data.remote_install_command || "")}</code><button type="button" class="button small" data-laya-copy="remote_install_command" ${l.busy || l.loading ? "disabled" : ""}>复制服务端安装命令</button></div><div class="model-laya-install"><code>${esc(l.data.remote_start_command || "")}</code><button type="button" class="button small" data-laya-copy="remote_start_command" ${l.busy || l.loading ? "disabled" : ""}>复制服务启动命令</button></div>` : ""}
         <div class="model-state">Python：<code>${esc(l.data.python_executable || "未知")}</code> · 权重缓存：<code>${esc(l.data.model_cache_path || "由 Hugging Face 默认配置决定")}</code></div>
         <div class="model-state">上游源码与版本：<a href="https://github.com/NandhaKishorM/laya" target="_blank" rel="noreferrer">NandhaKishorM/laya</a> · <a href="https://huggingface.co/convaiinnovations/laya-multilingual" target="_blank" rel="noreferrer">Multilingual 权重</a></div>
-      </div>
+      </div>`}
       <div class="model-card"><div class="model-phead"><div class="model-grow"><span class="model-eb">调用预览</span><h3>测试一次语义决策</h3></div></div><label class="model-fd"><span class="model-cap">测试消息<em>只提交这段文字与固定的文本类型事实</em></span><textarea data-laya-preview rows="4" ${l.busy || l.loading ? "disabled" : ""}>${esc(l.previewText || "")}</textarea></label><div class="model-editor-actions"><button type="button" class="button primary" data-laya-decide ${l.busy || l.loading || !l.data.enabled ? "disabled" : ""}>调用 Laya</button></div>${l.preview ? layaResult(l.preview) : ""}</div>
       <div class="model-card"><div class="model-phead"><div class="model-grow"><span class="model-eb">运行记录 · 最近 50 条</span><h3>Laya 调用日志</h3></div></div>${layaHistoryMarkup(l)}</div>
     </div>`; }
@@ -977,7 +1191,10 @@ window.CompanionModelsPage = (() => {
     if (t.matches("[data-laya-preview]")) { l.previewText = t.value; return; }
     if (t.matches("[data-laya-decision]") && l.draft) { l.draft.decision_fields[t.dataset.layaDecision] = t.checked; if (event.type === "change") { l.bad = false; render(); } return; }
     const key = t.dataset.layaField; if (!key || !l.draft || l.loading || l.busy) return;
-    l.draft[key] = t.type === "checkbox" ? t.checked : t.type === "number" ? t.valueAsNumber : t.value;
+    const value = t.type === "checkbox" ? t.checked : t.type === "number" ? t.valueAsNumber : t.value;
+    l.draft[key] = key === "followup_confidence_threshold"
+      ? Math.max(0, Math.min(100, Number.isFinite(Number(value)) ? Math.round(Number(value)) : 0))
+      : value;
     if (event.type === "change") { l.bad = false; render(); } }
   function layaClick(s, event) { const t = event.target;
     if (t.closest("[data-laya-refresh]")) { layaRefresh(s); return; }
@@ -1021,9 +1238,46 @@ window.CompanionModelsPage = (() => {
     if (["auto", "sd_webui"].includes(selected)) routes.push("sd_webui");
     return {generate: [...routes], edit: [...routes]};
   };
+  const IMAGE_PLATFORMS = {auto: "自动识别", openai: "OpenAI 兼容", openrouter: "OpenRouter", agnes: "Agnes", sensenova: "商汤日日新", minimax: "MiniMax", bailian: "阿里云百炼", modelscope: "魔搭社区", doubao: "火山引擎 / 豆包", gemini: "Google Gemini"};
+  const IMAGE_PROTOCOL_SUPPORT = {auto: "根据地址识别协议", openai: "文生图 · 改图", openrouter: "文生图 · 改图", agnes: "文生图 · 改图", sensenova: "文生图 · 改图", minimax: "仅文生图", doubao: "文生图 · 改图", bailian: "已保留配置 · 需异步协议适配", modelscope: "已保留配置 · 需协议适配", gemini: "已保留配置 · 需协议适配"};
+  const imageModelFamily = model => {
+    const parts = String(model || "").trim().toLowerCase().split(/[/:]+/).filter(Boolean);
+    return parts.some(part => part.startsWith("gpt-image-") || part.startsWith("chatgpt-image-")) ? "gpt-image"
+      : parts.some(part => part.startsWith("dall-e") || part.startsWith("dalle")) ? "dall-e" : "";
+  };
+  const imageQualityHelp = item => imageModelFamily(item.model) === "gpt-image"
+    ? "GPT Image 只接受自动/低/中/高；升级前保存的「标准/高清」会按服务端默认处理，不会发送（保存一次即修正），返回格式也不会发送。"
+    : "默认不发送 quality；standard/hd 只对 dall-e 系列有效。";
+  const imageResponseFormatHelp = item => imageModelFamily(item.model) === "gpt-image"
+    ? "GPT Image 不支持 response_format；升级前保存的 b64_json 会被忽略（保存一次即修正）。"
+    : "默认不发送 response_format；base64 与图片 URL 都能读取。";
+  const imageLegacyQualityNote = item => item.legacy_protocol_defaults
+    || (imageModelFamily(item.model) === "gpt-image"
+      && (["standard", "hd"].includes(item.quality) || item.response_format === "b64_json"))
+    ? '<small class="model-img-legacy-note">升级前保存的「标准/高清」或 b64_json 在 GPT Image 上不会发送；保存一次即按服务端默认清理。</small>'
+    : "";
+  function imageEffectivePlatform(endpoint) {
+    if (endpoint?.platform !== "auto") return endpoint?.platform;
+    const url = String(endpoint?.base_url || "").toLowerCase(), model = String(endpoint?.model || "").toLowerCase();
+    if (url.includes("minimax") || ["image-01", "image-01-live"].includes(model)) return "minimax";
+    if (url.includes("openrouter.ai")) return "openrouter";
+    if (url.includes("agnes-ai.com") || model.startsWith("agnes-image-")) return "agnes";
+    if (url.includes("sensenova.cn") || model.startsWith("senova-")) return "sensenova";
+    if (url.includes("volces.com") || url.includes("volcengine")) return "doubao";
+    if (url.includes("dashscope.aliyuncs.com")) return "bailian";
+    if (url.includes("modelscope.cn")) return "modelscope";
+    if (url.includes("generativelanguage.googleapis.com")) return "gemini";
+    return "openai";
+  }
   const imageNormalized = config => {
     const value = JSON.parse(JSON.stringify(config));
     value.endpoints = Array.isArray(value.endpoints) ? value.endpoints : [];
+    for (const endpoint of value.endpoints) {
+      endpoint.quality ??= "";
+      endpoint.response_format ??= "";
+      endpoint.max_reference_images ??= 1;
+      endpoint.size_label ??= `${endpoint.width || 1024}x${endpoint.height || 1024}`;
+    }
     value.comfyui = value.comfyui && typeof value.comfyui === "object" ? value.comfyui : {};
     value.sd_webui = value.sd_webui && typeof value.sd_webui === "object" ? value.sd_webui : {};
     if (!value.operation_routes || typeof value.operation_routes !== "object") value.operation_routes = imageDefaultRoutes(value);
@@ -1040,15 +1294,27 @@ window.CompanionModelsPage = (() => {
     const workflows = config.comfyui?.workflows || {};
     return {"sd.generate": stringify(opParams("generate")), "sd.edit": stringify(opParams("edit")),
       "comfy.generate": stringify(workflows.generate), "comfy.edit": stringify(workflows.edit),
-      "comfy.mask_edit": stringify(workflows.mask_edit)};
+      "comfy.mask_edit": stringify(workflows.mask_edit), "legacy.options": stringify(config.legacy_options),
+      ...Object.fromEntries((config.endpoints || []).map(item => [`headers.${item.id}`, ""]))};
   }
   function imageConfigSet(s, data) {
     const i = s.image, normalized = imageNormalized(data.settings);
-    if (i.config?.revision !== data.revision) i.endpointTests = {};
+    if (i.config?.revision !== data.revision) {
+      /* A new revision invalidates the results and the keys: the stored request
+         fingerprint only carries endpoint_id, not base_url/api_key, so replaying
+         an old key would show the previous result instead of testing this one. */
+      const previous = !!i.config;
+      i.endpointTests = {}; i.endpointTestKeys = {};
+      if (previous) imageTestPersist(i);
+    } else {
+      const known = new Set((normalized.endpoints || []).map(item => item.id));
+      for (const id of Object.keys(i.endpointTestKeys || {})) if (!known.has(id)) delete i.endpointTestKeys[id];
+    }
     i.endpointTesting = null;
     i.config = data; i.configBase = JSON.parse(JSON.stringify(normalized));
     i.configDraft = JSON.parse(JSON.stringify(normalized));
     i.configTextBase = imageConfigText(normalized); i.configText = {...i.configTextBase};
+    imageTestRestore(i);
   }
   async function imageConfigRefresh(s) {
     const i = s.image;
@@ -1062,7 +1328,7 @@ window.CompanionModelsPage = (() => {
     } catch (err) { if (!current(ticket, s)) return; i.configBad = true; i.configNotice = fail(err, "无法读取生图模型配置。"); }
     finally { i.configLoading = false; if (current(ticket, s)) render(); }
   }
-  async function imageRefresh(s) { const i = s.image, ticket = version; if (i.loading) return; i.loading = true; i.notice = "正在读取内置生图能力…"; render();
+  async function imageRefresh(s) { const i = s.image, ticket = version; if (i.loading) return; void loadImageSchema(s); i.loading = true; i.notice = "正在读取内置生图能力…"; render();
     try { const data = await api("GET", path + "/image"); if (!current(ticket, s)) return;
       if (!Array.isArray(data.actions) || !data.enabled || Object.keys(IMAGE_LABELS).some(action => typeof data.enabled[action] !== "boolean")) throw failure("invalid_response");
       if (!imageDirty(i)) i.draft = {...data.enabled}; i.data = data; i.loaded = true; i.bad = false; i.notice = "已读取当前内置动作状态。"; }
@@ -1083,22 +1349,101 @@ window.CompanionModelsPage = (() => {
         : `${IMAGE_LABELS[action]}未就绪：${imageDiagnostic(result.diagnostic_code)}。`; }
     catch (err) { if (!current(ticket, s)) return; i.bad = true; i.notice = fail(err, "注册检查未完成。"); }
     finally { i.testing = null; if (current(ticket, s)) render(); } }
+  /* Endpoint tests are idempotent by operation key: the service stores one
+     operation per (scope, request_id=operation_key), replays it when the
+     fingerprint matches, and never dispatches a duplicate.  A key therefore
+     belongs to one endpoint and one configuration revision, and may only be
+     reused while the result is still unsettled.  A settled result or a changed
+     revision allocates a new key: the stored request fingerprint carries only
+     endpoint_id (not base_url/api_key), so an old key would replay the previous
+     result instead of testing the saved configuration. */
+  const IMAGE_TEST_PENDING = new Set(["pending", "prepared", "dispatching"]);
+  const IMAGE_TEST_TERMINAL = new Set(["succeeded", "failed", "stopped"]);
+  const IMAGE_TEST_STORAGE = "companion-model-image-tests.v1";
+  const imageTestUnsettled = status => status === "unknown" || IMAGE_TEST_PENDING.has(status);
+  const imageTestStorage = () => key ? `${IMAGE_TEST_STORAGE}:${key}` : "";
+  const imageTestElapsed = test => test?.recheck && Number(test.elapsed_ms) < 50
+    ? "沿用上次结果" : `${Number(test?.elapsed_ms) || 0} ms`;
+  function imageEndpointTestStatus(value) {
+    const status = typeof value === "string" ? value : "";
+    if (IMAGE_TEST_TERMINAL.has(status) || status === "unknown") return status;
+    return IMAGE_TEST_PENDING.has(status) ? "pending" : "";
+  }
+  function imageEndpointTestKey(i, endpointId) {
+    const revision = typeof i.config?.revision === "string" ? i.config.revision : "";
+    const previous = i.endpointTests?.[endpointId];
+    const settled = !previous || IMAGE_TEST_TERMINAL.has(previous.status);
+    const slots = (i.endpointTestKeys ||= {});
+    if (!slots[endpointId] || slots[endpointId].revision !== revision || settled)
+      slots[endpointId] = {revision, key: crypto.randomUUID()};
+    return slots[endpointId].key;
+  }
+  /* Only an unsettled test survives a reload.  Persisting a settled result
+     would make the next "generate" click replay it instead of generating. */
+  function imageTestPersist(i, storage = imageTestStorage()) {
+    if (!storage) return;
+    const revision = typeof i.config?.revision === "string" ? i.config.revision : "";
+    const records = {};
+    for (const [id, test] of Object.entries(i.endpointTests || {})) {
+      const slot = i.endpointTestKeys?.[id];
+      if (!slot || typeof slot.key !== "string" || !slot.key || slot.revision !== revision
+          || !imageTestUnsettled(test?.status)) continue;
+      records[id] = {revision: slot.revision, key: slot.key, status: test.status,
+        error: test.error || "", elapsed_ms: test.elapsed_ms};
+    }
+    try {
+      if (Object.keys(records).length) sessionStorage.setItem(storage, JSON.stringify(records));
+      else sessionStorage.removeItem(storage);
+    } catch { }
+  }
+  function imageTestRestore(i) {
+    const storage = imageTestStorage();
+    if (!storage) return;
+    let records = null;
+    try { records = JSON.parse(sessionStorage.getItem(storage) || "null"); } catch { return; }
+    if (!records || typeof records !== "object" || Array.isArray(records)) return;
+    const revision = typeof i.config?.revision === "string" ? i.config.revision : "";
+    const known = new Set((i.configDraft?.endpoints || []).map(item => item.id));
+    for (const [id, record] of Object.entries(records)) {
+      if (!known.has(id) || !record || record.revision !== revision || typeof record.key !== "string"
+          || !record.key || !imageTestUnsettled(record.status) || i.endpointTests?.[id]) continue;
+      (i.endpointTestKeys ||= {})[id] = {revision, key: record.key};
+      (i.endpointTests ||= {})[id] = {status: record.status, error: record.error || "",
+        elapsed_ms: record.elapsed_ms, recheck: true};
+    }
+    /* Drop entries that no longer match this revision or endpoint set. */
+    imageTestPersist(i, storage);
+  }
   async function imageEndpointTest(s, endpointId) {
     const i = s.image, endpoint = i.config?.settings?.endpoints?.find(item => item.id === endpointId);
     if (!endpoint || !endpoint.enabled || i.endpointTesting || imageConfigDirty(i)) return;
-    const ticket = version, operationKey = crypto.randomUUID();
-    i.endpointTests ||= {}; i.endpointTests[endpointId] = {status: "testing"}; i.endpointTesting = endpointId; render();
+    const ticket = version, storage = imageTestStorage();
+    const recheck = imageTestUnsettled(i.endpointTests?.[endpointId]?.status);
+    const operationKey = imageEndpointTestKey(i, endpointId);
+    i.endpointTests ||= {}; i.endpointTests[endpointId] = {status: "testing", recheck};
+    i.endpointTesting = endpointId; render();
     try {
       const timeout = Math.max(30000, (Number(endpoint.timeout_seconds) || 180) * 1000 + 10000);
       const result = await api("POST", path + "/image/output/test",
         {endpoint_id: endpointId, operation_key: operationKey}, timeout);
-      if (!current(ticket, s)) return;
-      if (!["succeeded", "failed", "unknown", "pending"].includes(result.status)) throw failure("invalid_response");
-      i.endpointTests[endpointId] = {status: result.status, elapsed_ms: result.elapsed_ms, error: result.error || ""};
+      const status = imageEndpointTestStatus(result?.status);
+      /* prepared/dispatching are the same unsettled operation as pending;
+         stopped means it never left the queue.  Anything unrecognised stays
+         unknown: the request may already have reached the provider, and a
+         fresh key would submit (and bill) a second generation. */
+      i.endpointTests[endpointId] = status
+        ? {status, elapsed_ms: result.elapsed_ms, error: result.error || "", recheck}
+        : {status: "unknown", error: "返回状态无法识别，请核对原测试", recheck};
     } catch (err) {
-      if (!current(ticket, s)) return;
-      i.endpointTests[endpointId] = {status: "error", error: err.code || "model_image_output_failed"};
-    } finally { i.endpointTesting = null; if (current(ticket, s)) render(); }
+      /* A bridge timeout/transport failure is not an error state: the service
+         may have accepted the request.  Keeping the same key makes the next
+         click a read-only recheck instead of a second paid generation. */
+      i.endpointTests[endpointId] = {status: "unknown", recheck,
+        error: `${err?.code === "bridge_timeout" ? "请求可能已被受理" : "测试结果未确认"}，请核对原测试`};
+    } finally {
+      i.endpointTesting = null; imageTestPersist(i, storage);
+      if (current(ticket, s)) render();
+    }
   }
   function imageConfigSaveValue(i) {
     const value = JSON.parse(JSON.stringify(i.configDraft));
@@ -1111,13 +1456,32 @@ window.CompanionModelsPage = (() => {
     const baseText = i.configTextBase || {};
     for (const operation of ["generate", "edit"]) {
       if (i.configText[`sd.${operation}`] !== baseText[`sd.${operation}`]) {
-        value.sd_webui.parameters ||= {}; value.sd_webui.parameters[operation] = parse(`sd.${operation}`);
+        const parsed = parse(`sd.${operation}`);
+        const edited = value.sd_webui.parameters?.[operation] || {};
+        const baseline = i.configBase.sd_webui?.parameters?.[operation] || {};
+        for (const name of Object.keys(imageSchema?.sd_webui?.fields || {})) {
+          if (JSON.stringify(edited[name]) !== JSON.stringify(baseline[name]) && Object.hasOwn(edited, name)) {
+            parsed[name] = edited[name];
+          }
+        }
+        value.sd_webui.parameters ||= {}; value.sd_webui.parameters[operation] = parsed;
       }
     }
     for (const key of ["generate", "edit", "mask_edit"]) {
       const name = `comfy.${key}`;
       if (i.configText[name] !== baseText[name]) {
         value.comfyui.workflows ||= {}; value.comfyui.workflows[key] = parse(name);
+      }
+    }
+    if (i.configText["legacy.options"] !== baseText["legacy.options"])
+      value.legacy_options = parse("legacy.options");
+    for (const endpoint of value.endpoints || []) {
+      endpoint.name = String(endpoint.name || "").trim();
+      const key = `headers.${endpoint.id}`;
+      if (i.configText[key] !== baseText[key] && i.configText[key]?.trim()) {
+        const parsed = parse(key);
+        endpoint.custom_headers = parsed;
+        endpoint.clear_custom_headers = false;
       }
     }
     return value;
@@ -1137,18 +1501,29 @@ window.CompanionModelsPage = (() => {
     finally { i.configSaving = false; if (current(ticket, s)) render(); }
   }
   const imageCurrentOperation = i => IMAGE_VIEWS[i.view || "generate"].operation;
+  const imageEndpointLabel = (item, fallback = "未命名图片模型") =>
+    String(item?.name || "").trim() || String(item?.model || "").trim() || fallback;
   function imageRouteAvailable(config, route, operation) {
     if (route.startsWith("online:")) {
       const endpoint = config.endpoints.find(item => item.id === route.slice(7));
-      const platform = endpoint?.platform === "auto" ? (/minimax/i.test(endpoint?.base_url || "") ? "minimax" : "openai") : endpoint?.platform;
-      return !endpoint ? "模型配置缺失" : !endpoint.enabled ? "已停用" : !endpoint.base_url || !endpoint.model ? "待补齐连接" :
-        operation === "edit" && platform === "minimax" ? "此协议仅支持文生图" : platform === "minimax" ? "文生图" : "文生图 · 改图";
+      if (!endpoint) return "模型配置缺失";
+      const platform = imageEffectivePlatform(endpoint);
+      if (["bailian", "modelscope", "gemini"].includes(platform)) return "协议未接入 · 当前不可调用";
+      if (operation === "edit" && platform === "minimax") return "仅支持文生图";
+      if (operation === "edit" && Number(endpoint.max_reference_images) < 1) return "未启用参考图改图";
+      if (!endpoint.base_url || !endpoint.model) return "待补齐连接";
+      if (!endpoint.enabled) return "模型已停用";
+      if (!config.enabled) return "生图后端已关闭";
+      return operation === "generate" ? "可用于文生图" : "可用于改图";
     }
-    if (route === "sd_webui") return config.sd_webui?.base_url ? "支持文生图 · 改图 · 蒙版局部改图" : "待配置地址";
+    if (route === "sd_webui") return !config.sd_webui?.base_url ? "待配置地址" :
+      config.enabled ? "可用于文生图 · 改图 · 蒙版局部改图" : "生图后端已关闭";
     if (route === "comfyui") {
       const flows = config.comfyui?.workflows || {};
-      const support = [flows.generate ? "文生图" : "", flows.edit ? "改图" : "", flows.mask_edit ? "蒙版局部改图" : ""].filter(Boolean);
-      return support.join(" · ") || "待配置工作流";
+      if (!config.comfyui?.base_url) return "待配置地址";
+      const support = operation === "generate" ? (flows.generate ? ["文生图"] : [])
+        : [flows.edit ? "改图" : "", flows.mask_edit ? "蒙版局部改图" : ""].filter(Boolean);
+      return !support.length ? "此功能未绑定工作流" : config.enabled ? "可用于" + support.join(" · ") : "生图后端已关闭";
     }
     return "";
   }
@@ -1156,48 +1531,105 @@ window.CompanionModelsPage = (() => {
     const disable = disabled ? " disabled" : "";
     return `<label class="model-img-field"><span>${label}</span><input type="${type}" data-img-config-field="${esc(field)}" value="${esc(value ?? "")}" ${attrs}${disable}>${help ? `<small>${help}</small>` : ""}</label>`;
   }
+  function imageEndpointConnectionFields(i, item, base, disabled) {
+    const option = value => `<option value="${value}"${item.platform === value ? " selected" : ""}>${IMAGE_PLATFORMS[value]}</option>`;
+    const options = `<optgroup label="已接入协议">${["auto", "openai", "openrouter", "agnes", "sensenova", "minimax", "doubao"].map(option).join("")}</optgroup><optgroup label="待适配 · 可保留原配置">${["bailian", "modelscope", "gemini"].map(option).join("")}</optgroup>`;
+    const headerKey = `headers.${item.id}`;
+    const headerCount = item.custom_header_names?.length || 0;
+    const headerPlaceholder = item.custom_headers_set ? `已保存 ${headerCount} 个请求头 · 留空保留` : "可选：填写服务商要求的自定义请求头";
+    const keyField = `${imageConfigField("API Key", `${base}.api_key`, "", "password",
+      `autocomplete="new-password" placeholder="${item.api_key_set ? "已保存 · 留空保留" : "按服务商要求填写"}"`,
+      item.api_key_set ? "输入新密钥会替换当前密钥。" : "不要求鉴权时可留空。", disabled)}${item.api_key_set ?
+      `<label class="model-img-field model-img-inline"><span>密钥</span><span><input type="checkbox" data-img-config-field="${base}.clear_api_key"${item.clear_api_key ? " checked" : ""}${disabled ? " disabled" : ""}>清除已保存密钥</span></label>` : ""}`;
+    const headersField = `<label class="model-img-field model-img-json"><span>自定义请求头（JSON）</span><textarea rows="3" spellcheck="false" data-img-config-json="${esc(headerKey)}" placeholder="${esc(headerPlaceholder)}"${disabled ? " disabled" : ""}>${esc(i.configText?.[headerKey] || "")}</textarea><small>${item.custom_headers_set ? `已保存：${esc((item.custom_header_names || []).join("、"))}。` : "可留空。"}填写新对象会替换现有自定义请求头。</small></label>${item.custom_headers_set ?
+      `<label class="model-img-field model-img-inline"><span>请求头</span><span><input type="checkbox" data-img-config-field="${base}.clear_custom_headers"${item.clear_custom_headers ? " checked" : ""}${disabled ? " disabled" : ""}>清除已保存请求头</span></label>` : ""}`;
+    return `<label class="model-img-field"><span>协议</span><select data-img-config-field="${base}.platform"${disabled ? " disabled" : ""}>${options}</select><small>${esc(IMAGE_PROTOCOL_SUPPORT[item.platform] || "请按服务商文档选择")}</small></label>${imageConfigField("API 根地址", `${base}.base_url`, item.base_url, "url", 'placeholder="https://api.example.com/v1"', "可填根地址或完整 images 地址；查询参数会保留，不会重复拼接路径。", disabled)}${imageConfigField("超时秒数", `${base}.timeout_seconds`, item.timeout_seconds, "number", 'min="1" max="1800" step="1"', "本模型请求按此超时；任务等待预算取所有启用模型中的最长值（1–1800 秒），保存后下一次任务生效，正在执行的任务保持原时限。", disabled)}${keyField}${headersField}`;
+  }
+  const IMAGE_ROUTE_TONES = ["#4f7f64", "#5b70a6", "#9a6a3d", "#795b96", "#a65353", "#3f7b89"];
+  function imageRouteHost(value) {
+    try { return new URL(String(value || "")).host || "未配置地址"; }
+    catch { return String(value || "").replace(/^https?:\/\//, "").split("/")[0] || "未配置地址"; }
+  }
+  function imageRouteSupportTone(value) {
+    return /可用于|可调用|就绪|可用/.test(String(value || "")) ? "is-ready" : "is-off";
+  }
+  function imageRouteToggle(ref, expanded, label) {
+    return `<summary data-img-route-expand="${esc(ref)}" class="model-img-route-toggle" aria-expanded="${expanded}"><span class="model-img-route-toggle-mark"><i data-lucide="${expanded ? "chevron-up" : "chevron-down"}" aria-hidden="true"></i></span><span class="model-img-route-toggle-copy"><b>${expanded ? "收起配置" : "展开配置"}</b><small>${esc(label)}</small></span><span class="model-img-route-toggle-state">${expanded ? "收起" : "展开"}</span></summary>`;
+  }
   function imageRouteCard(i, ref, index, config) {
     const disabled = i.configSaving || i.configLoading || !!i.endpointTesting;
+    const expanded = i.expandedImageRoutes?.[ref] ?? index === 0;
     const controls = `<div class="model-img-route-tools"><button type="button" class="output-icon-button" data-img-route-move="up" data-img-route-index="${index}" aria-label="上移优先级"${disabled || index === 0 ? " disabled" : ""}><i data-lucide="arrow-up" aria-hidden="true"></i></button><button type="button" class="output-icon-button" data-img-route-move="down" data-img-route-index="${index}" aria-label="下移优先级"${disabled || index === (config.operation_routes[imageCurrentOperation(i)] || []).length - 1 ? " disabled" : ""}><i data-lucide="arrow-down" aria-hidden="true"></i></button><button type="button" class="output-icon-button" data-img-route-remove="${esc(ref)}" aria-label="从当前功能移除" title="从当前功能移除"${disabled ? " disabled" : ""}><i data-lucide="x" aria-hidden="true"></i></button></div>`;
     if (ref.startsWith("online:")) {
       const endpointId = ref.slice(7), endpointIndex = config.endpoints.findIndex(item => item.id === endpointId), item = config.endpoints[endpointIndex];
       if (!item) return `<article class="model-img-route"><header><span class="model-img-priority">${index + 1}</span><strong>模型配置缺失</strong>${controls}</header></article>`;
       const base = `endpoints.${endpointIndex}`;
       const test = i.endpointTests?.[item.id], testing = i.endpointTesting === item.id;
-      const testLabel = test?.status === "succeeded" ? `测试成功 · ${Number(test.elapsed_ms) || 0} ms`
+      const recheckable = !!test && imageTestUnsettled(test.status);
+      const recheckMode = recheckable || (testing && !!test?.recheck);
+      const testLabel = test?.status === "succeeded" ? `测试成功 · ${imageTestElapsed(test)}`
         : test?.status === "failed" ? `生成失败 · ${test.error || "服务商拒绝请求"}`
-        : test?.status === "unknown" ? `结果未知 · ${test.error || "请先核对服务商记录"}`
-        : test?.status === "pending" ? "请求已提交，结果待确认"
-        : test?.status === "error" ? `测试未完成 · ${test.error || "未知错误"}` : "";
-      const testDisabled = disabled || imageConfigDirty(i) || !item.enabled;
-      return `<article class="model-img-route"><header><span class="model-img-priority">${index + 1}</span><div class="model-img-route-title"><strong>${esc(item.name || item.model || "未命名图片模型")}</strong><small>${esc(item.model || "未设置模型 ID")} · ${esc(item.platform || "auto")}</small></div><span class="model-img-route-support">${esc(imageRouteAvailable(config, ref, imageCurrentOperation(i)))}</span>${controls}<button type="button" class="button small danger" data-img-endpoint-remove="${esc(item.id)}"${disabled ? " disabled" : ""}>删除模型</button></header>
-        <div class="model-img-endpoint-test"><button type="button" class="button small" data-img-endpoint-test="${esc(item.id)}"${testDisabled ? " disabled" : ""}>${testing ? "生成中…" : "生成测试图"}</button><span role="status" data-state="${esc(test?.status || "")}">${esc(testLabel)}</span></div>
-        <div class="model-img-route-grid"><label class="model-img-field"><span>协议</span><select data-img-config-field="${base}.platform"${disabled ? " disabled" : ""}><option value="openai"${item.platform === "openai" ? " selected" : ""}>OpenAI 兼容</option><option value="minimax"${item.platform === "minimax" ? " selected" : ""}>MiniMax</option><option value="auto"${item.platform === "auto" ? " selected" : ""}>自动识别</option></select></label>${imageConfigField("模型 ID", `${base}.model`, item.model, "text", 'maxlength="240" placeholder="服务商提供的模型 ID"', "")}${imageConfigField("API 根地址", `${base}.base_url`, item.base_url, "url", 'placeholder="https://api.example.com/v1"', "")}${imageConfigField("宽度", `${base}.width`, item.width, "number", 'min="64" max="8192" step="64"', "像素")}${imageConfigField("高度", `${base}.height`, item.height, "number", 'min="64" max="8192" step="64"', "像素")}${imageConfigField("超时秒数", `${base}.timeout_seconds`, item.timeout_seconds, "number", 'min="1" max="1800" step="1"', "")}${imageConfigField("端点名称", `${base}.name`, item.name, "text", 'maxlength="240"', "")}${imageConfigField("API Key", `${base}.api_key`, "", "password", `autocomplete="new-password" placeholder="${item.api_key_set ? "已保存 · 留空保留" : "按服务商要求填写"}"`, item.api_key_set ? "输入新密钥会替换当前密钥。" : "不要求鉴权时可留空。", disabled)}<label class="model-img-field model-img-inline"><span>启用模型</span><input type="checkbox" data-img-config-field="${base}.enabled"${item.enabled ? " checked" : ""}${disabled ? " disabled" : ""}></label>${item.api_key_set ? `<label class="model-img-field model-img-inline"><span>密钥</span><span><input type="checkbox" data-img-config-field="${base}.clear_api_key"${item.clear_api_key ? " checked" : ""}${disabled ? " disabled" : ""}>清除已保存密钥</span></label>` : ""}</div></article>`;
+        : test?.status === "unknown" ? `结果未知 · ${test.error || "请核对原测试"}`
+        : test?.status === "pending" ? "请求已提交，结果待确认 · 请核对原测试"
+        : test?.status === "stopped" ? "测试已中断 · 未发出生成请求，可重新测试" : "";
+      const testDisabled = disabled || imageConfigDirty(i) || !config.enabled || !item.enabled ||
+        ["bailian", "modelscope", "gemini"].includes(imageEffectivePlatform(item));
+      const connectionFields = imageEndpointConnectionFields(i, item, base, disabled);
+      const modelFields = `${imageConfigField("模型 ID", `${base}.model`, item.model, "text", 'maxlength="240" placeholder="服务商提供的模型 ID"', "")}${imageConfigField("尺寸标签", `${base}.size_label`, item.size_label || `${item.width}x${item.height}`, "text", 'maxlength="64" placeholder="如 1024x1024、1K、auto"', "服务商接受标签时保留原值；宽高用于通用协议")}${imageConfigField("宽度", `${base}.width`, item.width, "number", 'min="64" max="8192" step="64"', "像素")}${imageConfigField("高度", `${base}.height`, item.height, "number", 'min="64" max="8192" step="64"', "像素")}${item.platform === "minimax" ? "" : `<label class="model-img-field"><span>图片质量</span><select data-img-config-field="${base}.quality"${disabled ? " disabled" : ""}>${[["", "服务端默认（不发送）"], ["auto", "自动"], ["low", "低"], ["medium", "中"], ["high", "高"], ["standard", "标准（dall-e 专用）"], ["hd", "高清（dall-e 专用）"]].map(([value, label]) => `<option value="${value}"${item.quality === value ? " selected" : ""}>${label}</option>`).join("")}</select><small>${esc(imageQualityHelp(item))}</small>${imageLegacyQualityNote(item)}</label><label class="model-img-field"><span>返回格式</span><select data-img-config-field="${base}.response_format"${disabled ? " disabled" : ""}>${[["", "按服务端默认（推荐）"], ["b64_json", "b64_json（旧式 dall-e 兼容）"]].map(([value, label]) => `<option value="${value}"${item.response_format === value ? " selected" : ""}>${label}</option>`).join("")}</select><small>${esc(imageResponseFormatHelp(item))}</small></label>${imageConfigField("最多参考图", `${base}.max_reference_images`, item.max_reference_images, "number", 'min="0" max="8" step="1"', "设为 0 时此模型仅用于文生图")}`}<label class="model-img-field model-img-inline"><span>启用模型</span><input type="checkbox" data-img-config-field="${base}.enabled"${item.enabled ? " checked" : ""}${disabled ? " disabled" : ""}></label>`;
+      const tone = IMAGE_ROUTE_TONES[index % IMAGE_ROUTE_TONES.length];
+      const support = imageRouteAvailable(config, ref, imageCurrentOperation(i));
+      return `<article class="model-img-route" data-img-route-card="${esc(ref)}" style="--route-tone:${tone}"><header><span class="model-img-priority">${index + 1}</span><div class="model-img-route-title"><span class="model-img-route-name-wrap" title="点击修改模型显示名称；留空时显示模型 ID"><input type="text" class="model-img-route-name" data-img-config-field="${base}.name" value="${esc(item.name || "")}" maxlength="240" placeholder="${esc(imageEndpointLabel(item, "自定义名称"))}" aria-label="自定义模型名称"${disabled ? " disabled" : ""}><i data-lucide="pencil" aria-hidden="true"></i></span><div class="model-img-route-meta"><span class="model-img-route-id" title="${esc(item.model || "")}">${esc(item.model || "未设置模型 ID")}</span><span class="model-img-route-kind">${esc(IMAGE_PLATFORMS[item.platform] || "自动识别")}</span><span class="model-img-route-host" title="${esc(item.base_url || "")}">${esc(imageRouteHost(item.base_url))}</span></div></div><span class="model-img-route-support ${imageRouteSupportTone(support)}">${esc(support)}</span>${controls}</header>
+        <details class="model-img-route-details"${expanded ? " open" : ""}>${imageRouteToggle(ref, expanded, "连接、测试与生图参数")}
+        <div class="model-img-endpoint-test"><button type="button" class="button small" data-img-endpoint-test="${esc(item.id)}" title="${recheckMode ? "核对同一次测试，不会再次提交生成请求" : "真实生成一张图片，可能产生费用"}"${testDisabled ? " disabled" : ""}>${testing ? (test?.recheck ? "核对中…" : "生成中…") : recheckable ? "核对原测试" : "生成测试图"}</button><span role="status" data-state="${esc(test?.status || "")}">${esc(testLabel)}</span></div>
+        <fieldset class="model-schema-group"><legend>连接</legend><div class="model-img-route-grid">${connectionFields}</div></fieldset>
+        <fieldset class="model-schema-group"><legend>生图参数</legend><div class="model-img-route-grid">${modelFields}</div></fieldset><div class="model-img-route-delete"><button type="button" class="button small danger" data-img-endpoint-remove="${esc(item.id)}"${disabled ? " disabled" : ""}>删除此模型</button></div></details></article>`;
     }
     const name = IMAGE_LOCAL_LABELS[ref], item = config[ref] || {}, workflows = item.workflows || {};
     const op = imageCurrentOperation(i), disable = disabled;
     const flowFields = ref === "comfyui" ? (op === "generate" ? ["generate"] : ["edit", "mask_edit"]).map(operation => {
       const title = operation === "mask_edit" ? "蒙版局部改图工作流" : operation === "edit" ? "普通改图工作流" : "文生图工作流";
       const key = `comfy.${operation}`;
-      return `<label class="model-img-field model-img-json"><span>${title}</span><textarea rows="6" spellcheck="false" data-img-config-json="${key}"${disable ? " disabled" : ""}>${esc(i.configText?.[key] || JSON.stringify(workflows[operation] || {}, null, 2))}</textarea></label>`;
-    }).join("") : `<label class="model-img-field model-img-json"><span>${op === "generate" ? "文生图参数" : "改图参数"}（JSON）</span><textarea rows="6" spellcheck="false" data-img-config-json="sd.${op}"${disable ? " disabled" : ""}>${esc(i.configText?.[`sd.${op}`] || "{}")}</textarea><small>只覆盖当前功能的参数；改图队列同时用于普通改图和蒙版局部改图。</small></label>`;
-    return `<article class="model-img-route"><header><span class="model-img-priority">${index + 1}</span><div class="model-img-route-title"><strong>${name}</strong><small>${esc(item.base_url || "尚未配置连接地址")}</small></div><span class="model-img-route-support">${esc(imageRouteAvailable(config, ref, op))}</span>${controls}</header><div class="model-img-route-grid">${imageConfigField("API 地址", `${ref}.base_url`, item.base_url, "url", 'placeholder="http://127.0.0.1:8188"', "")}${imageConfigField("超时秒数", `${ref}.timeout_seconds`, item.timeout_seconds || 300, "number", 'min="1" max="1800" step="1"', "")}${imageConfigField("API Key", `${ref}.api_key`, "", "password", `autocomplete="new-password" placeholder="${item.api_key_set ? "已保存 · 留空保留" : "可选"}"`, item.api_key_set ? "输入新密钥会替换当前密钥。" : "", disabled)}${item.api_key_set ? `<label class="model-img-field model-img-inline"><span>密钥</span><span><input type="checkbox" data-img-config-field="${ref}.clear_api_key"${item.clear_api_key ? " checked" : ""}${disabled ? " disabled" : ""}>清除已保存密钥</span></label>` : ""}${flowFields}</div></article>`;
+      const flow = workflows[operation], nodes = flow?.workflow && typeof flow.workflow === "object" ? Object.keys(flow.workflow).length : 0;
+      const summary = nodes ? `已绑定 · ${nodes} 个节点` : "未绑定";
+      return `<details class="model-img-workflow"><summary><span>${title}</span><small>${summary}</small></summary><label class="model-img-field model-img-json"><span>工作流图与输入映射（JSON）</span><textarea rows="8" spellcheck="false" data-img-config-json="${key}"${disable ? " disabled" : ""}>${esc(i.configText?.[key] || JSON.stringify(flow || {}, null, 2))}</textarea></label></details>`;
+    }).join("") : `<details class="model-img-field model-img-json model-img-advanced"><summary>高级 JSON 参数</summary><textarea rows="6" spellcheck="false" data-img-config-json="sd.${op}"${disable ? " disabled" : ""}>${esc(i.configText?.[`sd.${op}`] || "{}")}</textarea></details>`;
+    const connectionFields = `${imageConfigField("API 地址", `${ref}.base_url`, item.base_url, "url", 'placeholder="http://127.0.0.1:8188"', "")}${imageConfigField("超时秒数", `${ref}.timeout_seconds`, item.timeout_seconds || 300, "number", 'min="1" max="1800" step="1"', "")}${imageConfigField("API Key", `${ref}.api_key`, "", "password", `autocomplete="new-password" placeholder="${item.api_key_set ? "已保存 · 留空保留" : "可选"}"`, item.api_key_set ? "输入新密钥会替换当前密钥。" : "", disabled)}${item.api_key_set ? `<label class="model-img-field model-img-inline"><span>密钥</span><span><input type="checkbox" data-img-config-field="${ref}.clear_api_key"${item.clear_api_key ? " checked" : ""}${disabled ? " disabled" : ""}>清除已保存密钥</span></label>` : ""}`;
+    const workflowSection = ref === "comfyui"
+      ? `<fieldset class="model-schema-group"><legend>工作流</legend><div class="model-img-route-grid">${flowFields}</div></fieldset>`
+      : flowFields;
+    const tone = IMAGE_ROUTE_TONES[index % IMAGE_ROUTE_TONES.length];
+    const support = imageRouteAvailable(config, ref, op);
+    return `<article class="model-img-route" data-img-route-card="${esc(ref)}" style="--route-tone:${tone}"><header><span class="model-img-priority">${index + 1}</span><div class="model-img-route-title"><strong>${name}</strong><div class="model-img-route-meta"><span class="model-img-route-kind">${ref === "comfyui" ? "ComfyUI" : "SD WebUI"}</span><span class="model-img-route-host" title="${esc(item.base_url || "")}">${esc(imageRouteHost(item.base_url))}</span></div></div><span class="model-img-route-support ${imageRouteSupportTone(support)}">${esc(support)}</span>${controls}</header><details class="model-img-route-details"${expanded ? " open" : ""}>${imageRouteToggle(ref, expanded, "连接与工作流")}<fieldset class="model-schema-group"><legend>连接</legend><div class="model-img-route-grid">${connectionFields}</div></fieldset>${workflowSection}</details></article>`;
   }
   function imageConfigEditor(s) {
     const i = s.image, config = i.configDraft;
     if (i.configLoading) return '<div class="model-img-loading" role="status">正在读取文生图与改图配置…</div>';
     if (!config) return `<div class="model-img-loading" role="status">${esc(i.configNotice || "尚未读取生图模型配置。")}<button type="button" class="button small" data-img-config-refresh>读取模型配置</button></div>`;
     const operation = imageCurrentOperation(i), routes = config.operation_routes[operation] || [], current = new Set(routes);
-    const choices = [...config.endpoints.filter(item => !current.has(`online:${item.id}`)).map(item => [`online:${item.id}`, `${item.name || item.model || "图片模型"} · ${item.model || item.id}`]),
+    const choices = [...config.endpoints.filter(item => !current.has(`online:${item.id}`)).map(item => [`online:${item.id}`, `${imageEndpointLabel(item, "图片模型")} · ${item.model || item.id}`]),
       ...Object.entries(IMAGE_LOCAL_LABELS).filter(([key]) => !current.has(key)).map(([key, label]) => [key, label])];
     const dirty = imageConfigDirty(i), locked = i.configSaving || i.configLoading || !!i.endpointTesting;
+    const legacyOptions = config.legacy_options || {}, selectedWorkflows = legacyOptions.image_companion_selected_workflows || {};
+    const extraWorkflows = legacyOptions.image_companion_extra_workflows || [];
+    const workflowLabels = {generate: "文生图", edit: "改图", mask_edit: "蒙版局部改图"};
+    const legacyWorkflows = Object.entries(selectedWorkflows).map(([key, name]) =>
+      `<span><b>${workflowLabels[key] || esc(key)}</b>${esc(name)}</span>`).join("");
+    const legacySummary = legacyWorkflows || extraWorkflows.length
+      ? `<div class="model-img-legacy-list">${legacyWorkflows}${extraWorkflows.length ? `<span><b>其他工作流</b>${esc(extraWorkflows.join("、"))}</span>` : ""}</div>` : "";
+    const legacyLabels = {sdgen: "SDGen", tool_call: "自定义工具", nai: "NovelAI", anima_master: "Anima Master"};
+    const legacyLabel = legacyLabels[config.legacy_backend];
+    const migrationBanner = legacyLabel && !config.enabled && !routes.length
+      ? `<div class="model-img-migration" role="status"><strong>${legacyLabel} 方式待接入</strong><span>原配置已保留。请在下方添加可用模型并补齐连接，再启用生图后端。</span></div>`
+      : "";
     return `<section class="model-img-route-editor" aria-label="生图模型与优先级">
+      ${migrationBanner}
       <header class="model-imgconfig-head"><div><span class="model-eb">${operation === "generate" ? "文本提示生成图片" : "参考图片编辑"}</span><h3>${IMAGE_VIEWS[i.view || "generate"].label}模型与优先级</h3><p>${operation === "generate" ? "按列表顺序选择文生图模型；首个成功执行的模型结束本次尝试。" : "普通改图与蒙版局部改图共用模型队列；不支持当前操作的模型会跳过。"}</p></div><label class="model-img-enable"><input type="checkbox" data-img-config-field="enabled"${config.enabled ? " checked" : ""}${locked ? " disabled" : ""}>启用 V2 生图后端</label></header>
       <div class="model-img-main"><div class="model-img-sectionhead"><div><b>当前功能的模型顺序</b><span>数字越小越先尝试 · 使用上下移按钮调整优先级</span></div><span class="model-tag">${routes.length} 个模型</span></div>
         <div class="model-img-routes">${routes.map((route, index) => imageRouteCard(i, route, index, config)).join("") || '<div class="model-img-empty">此功能尚未配置模型。添加在线图片模型或本地后端后，调用会按此列表顺序尝试。</div>'}</div>
         <div class="model-img-addbar"><label><span>添加已配置模型</span><select data-img-route-choice aria-label="选择要加入当前功能的模型"${locked || !choices.length ? " disabled" : ""}><option value="">选择模型或后端</option>${choices.map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="button small" data-img-route-add${locked || !choices.length ? " disabled" : ""}>添加</button><button type="button" class="button small primary" data-img-model-add${locked || config.endpoints.length >= (i.config.limits?.max_endpoints || 24) ? " disabled" : ""}>新增在线模型</button></div>
+        <details class="model-img-advanced"><summary>工作流与网络选项</summary>${legacySummary}<div class="model-img-route-grid"><label class="model-img-field"><span>图片下载代理</span><input type="url" data-img-config-field="network.download_proxy" value="" placeholder="${config.network?.download_proxy_set ? "已保存 · 留空保留" : "可选，例如 http://127.0.0.1:7890"}"${locked ? " disabled" : ""}><small>留空保留已保存代理</small></label><label class="model-img-field model-img-inline"><span>继承环境代理</span><input type="checkbox" data-img-config-field="network.use_environment_proxy"${config.network?.use_environment_proxy ? " checked" : ""}${locked ? " disabled" : ""}></label>${config.network?.download_proxy_set ? `<label class="model-img-field model-img-inline"><span>代理</span><span><input type="checkbox" data-img-config-field="network.clear_download_proxy"${config.network?.clear_download_proxy ? " checked" : ""}${locked ? " disabled" : ""}>清除已保存代理</span></label>` : ""}</div>${config.legacy_backend ? `<p class="model-note">已保存的生图方式：${esc(config.legacy_backend)}</p>` : ""}${Object.keys(legacyOptions).length ? `<details class="model-img-workflow model-img-legacy-raw"><summary><span>查看兼容参数</span></summary><pre>${esc(JSON.stringify(legacyOptions, null, 2))}</pre></details>` : ""}</details>
         <div class="model-img-savebar"><span role="status" class="${i.configBad ? "is-error" : ""}">${esc(i.configNotice || (dirty ? "有未保存的改动" : "已保存"))}</span><div><button type="button" class="button small" data-img-config-refresh${locked || dirty ? " disabled" : ""}>重新读取</button><button type="button" class="button small primary" data-img-config-save${locked || !dirty ? " disabled" : ""}>${i.configSaving ? "保存中…" : "保存模型配置"}</button></div></div>
-        <p class="model-note">普通改图与蒙版局部改图共用此模型顺序；不支持当前操作的模型会跳过。密钥留空保留原值。测试会发送真实文生图请求，可能产生费用；结果只显示状态，不会发到聊天。</p></div></section>`;
+        <p class="model-note">普通改图与蒙版局部改图共用此模型顺序；不支持当前操作的模型会跳过。密钥留空保留原值。测试会发送真实文生图请求，可能产生费用；结果只显示状态，不会发到聊天。</p>${imageSchemaBlock(i, i.configDraft)}</div></section>`;
   }
   function imageActionRow(i, action, index) {
     const item = i.data.actions.find(value => value.action === action);
@@ -1220,8 +1652,17 @@ window.CompanionModelsPage = (() => {
     if (!i.data) return '<p class="model-empty">正在读取生图模型配置…</p>';
     const actions = i.data.actions, loaded = actions.filter(item => item.loaded).length, ready = actions.filter(item => item.state === "ready").length;
     const view = i.view || "generate", active = IMAGE_VIEWS[view];
-    return `<div class="model-image"><div class="model-card model-img-status"><div class="model-phead"><div class="model-grow"><span class="model-eb">模型与连接</span><h3>生图模型配置</h3></div><button type="button" class="button small" data-img-refresh${i.loading || i.busy ? " disabled" : ""}>刷新状态</button></div><div class="model-kpis">${kpi(actions.length, "内置动作")}${kpi(`${loaded}/${actions.length}`, "已加载")}${kpi(`${ready}/${actions.length}`, "当前可调用", ready ? "g" : "a")}${kpi(i.data.authorization === "checked_for_each_invocation" ? "逐次校验" : "未确认", "调用授权")}</div>${imageModuleNotice(i.data) ? `<p class="model-img-module-note" role="status">${esc(imageModuleNotice(i.data))}</p>` : ""}</div>
-      <section class="model-imgconfig"><header class="model-imgconfig-head"><div><span class="model-eb">按功能独立设置模型</span><h3>文生图与改图</h3><p>两个功能分别维护模型、连接参数与优先级；改图包含普通改图和蒙版局部改图。</p></div></header><div class="model-img-workbench"><nav class="model-img-nav" role="tablist" aria-label="生图功能">${Object.entries(IMAGE_VIEWS).map(([id, item], index) => `<button type="button" role="tab" data-img-view="${id}" aria-selected="${view === id}" class="${view === id ? "on" : ""}"><span class="model-img-nav-no">0${index + 1}</span><span><b>${item.label}</b><small>${id === "generate" ? "文本生成图片" : "普通与局部改图 · 共用模型顺序"}</small></span><i>›</i></button>`).join("")}</nav><div class="model-img-main"><section class="model-img-view"><div class="model-img-sectionhead"><div><b>${active.label}能力</b><span>${view === "generate" ? "检查文生图动作是否已注册并开启。" : "参考图改图与蒙版局部改图分别检查能力，模型队列共用。"}</span></div></div><ul class="model-pvl">${active.actions.map((action, index) => imageActionRow(i, action, index)).join("")}</ul><div class="model-editor-actions"><button type="button" class="button primary" data-img-save${i.busy || i.loading || !imageDirty(i) ? " disabled" : ""}>保存能力开关</button></div>${imageConfigEditor(s)}</section></div></div></section>${i.bad ? `<div class="model-notice error" role="status">${esc(i.notice)}</div>` : i.notice ? `<div class="model-notice" role="status">${esc(i.notice)}</div>` : ""}</div>`;
+    const configState = i.configLoading ? "读取配置中" : i.configDraft ? (i.configDraft.enabled ? "生图后端已启用" : "生图后端未启用") : "配置未读取";
+    const configTone = i.configDraft?.enabled ? "is-ready" : "is-off";
+    return `<div class="model-image">
+      <section class="model-img-overview" aria-label="生图模型概览">
+        <div class="model-img-overview-copy"><span class="model-eb">模型与连接</span><div class="model-img-overview-title"><h3>生图模型</h3><span class="model-img-backend-state ${configTone}">${configState}</span></div><p>文生图与改图各自维护模型队列。队列顺序决定优先尝试的模型，失败时按顺序继续。</p></div>
+        <div class="model-img-overview-side"><div class="model-img-statusline"><span><b>${actions.length}</b>内置动作</span><span><b>${loaded}/${actions.length}</b>已加载</span><span><b>${ready}/${actions.length}</b>可调用</span><span><b>${i.data.authorization === "checked_for_each_invocation" ? "逐次" : "待确认"}</b>调用授权</span></div><button type="button" class="button small" data-img-refresh${i.loading || i.busy ? " disabled" : ""}>刷新状态</button></div>
+      </section>
+      ${imageModuleNotice(i.data) ? `<p class="model-img-module-note" role="status">${esc(imageModuleNotice(i.data))}</p>` : ""}
+      <section class="model-imgconfig"><header class="model-imgconfig-head"><div><span class="model-eb">按功能独立设置模型</span><h3>文生图与改图</h3><p>两个功能分别维护模型、连接参数与优先级；改图包含普通改图和蒙版局部改图。</p></div><span class="model-tag">${active.label}</span></header><div class="model-img-workbench"><nav class="model-img-nav" role="tablist" aria-label="生图功能">${Object.entries(IMAGE_VIEWS).map(([id, item], index) => `<button type="button" role="tab" data-img-view="${id}" aria-selected="${view === id}" class="${view === id ? "on" : ""}"><span class="model-img-nav-no">0${index + 1}</span><span><b>${item.label}</b><small>${id === "generate" ? "文本生成图片" : "普通与局部改图 · 共用模型顺序"}</small></span><i>›</i></button>`).join("")}</nav><div class="model-img-main"><section class="model-img-view model-img-capabilities"><div class="model-img-sectionhead"><div><b>${active.label}能力</b><span>${view === "generate" ? "检查文生图动作是否已注册并开启。" : "参考图改图与蒙版局部改图分别检查能力，模型队列共用。"}</span></div><span class="model-tag">${active.actions.length} 个动作</span></div><ul class="model-pvl">${active.actions.map((action, index) => imageActionRow(i, action, index)).join("")}</ul><div class="model-editor-actions"><button type="button" class="button primary" data-img-save${i.busy || i.loading || !imageDirty(i) ? " disabled" : ""}>保存能力开关</button></div>${imageConfigEditor(s)}</section></div></div></section>
+      ${i.bad ? `<div class="model-notice error" role="status">${esc(i.notice)}</div>` : i.notice ? `<div class="model-notice" role="status">${esc(i.notice)}</div>` : ""}
+    </div>`;
   }
   function imageInput(s, event) {
     const i = s.image, t = event.target;
@@ -1233,13 +1674,17 @@ window.CompanionModelsPage = (() => {
       for (const key of keys.slice(0, -1)) { target[key] ??= {}; target = target[key]; }
       const key = keys.at(-1), value = t.type === "checkbox" ? t.checked : t.type === "number" ? (t.value === "" ? "" : Number(t.value)) : t.value;
       target[key] = value;
+      i.configBad = false; i.configNotice = "";
       if (key === "clear_api_key" && value) target.api_key = "";
       if (key === "api_key" && value) target.clear_api_key = false;
+      if (key === "clear_download_proxy" && value) target.download_proxy = "";
+      if (key === "download_proxy" && value) target.clear_download_proxy = false;
       if (event.type === "change") render(); else imageConfigSaveState(i);
       return;
     }
     if (t.matches("[data-img-config-json]") && i.configText && !i.configSaving) {
-      i.configText[t.dataset.imgConfigJson] = t.value; imageConfigSaveState(i);
+      i.configText[t.dataset.imgConfigJson] = t.value;
+      i.configBad = false; i.configNotice = ""; imageConfigSaveState(i);
     }
   }
   function imageConfigSaveState(i) {
@@ -1247,10 +1692,77 @@ window.CompanionModelsPage = (() => {
     root?.querySelectorAll("[data-img-config-save]").forEach(button => { button.disabled = i.configSaving || !dirty; });
     root?.querySelectorAll(".model-img-savebar [role=status]").forEach(node => { node.textContent = i.configNotice || (dirty ? "有未保存的改动" : "已保存"); });
   }
+  let imageSchema = null, imageSchemaState = "idle";
+  async function loadImageSchema(s) {
+    if (imageSchemaState !== "idle") return;
+    imageSchemaState = "loading";
+    try {
+      const data = await api("GET", path + "/image-schema");
+      imageSchema = data?.image_provider_group || null;
+    } catch { imageSchema = null; }
+    imageSchemaState = imageSchema ? "done" : "failed";
+    if (imageSchema && s) render();
+  }
+
+  /* 生图参数表单直接写入已有配置草稿；高级 JSON 用于声明外参数。 */
+  function imageSchemaKinds(i) {
+    const config = i?.configDraft;
+    if (!config) return [];
+    const operation = imageCurrentOperation(i);
+    const routes = config.operation_routes?.[operation] || [];
+    const kinds = [];
+    for (const ref of routes) {
+      if (IMAGE_LOCAL_LABELS[ref]) kinds.push(ref);
+      else if (ref.startsWith("online:")) kinds.push("openai_images");
+    }
+    return [...new Set(kinds)];
+  }
+  function imageSchemaBlock(i, config = null) {
+    if (!imageSchema?.sd_webui || !config?.sd_webui) return "";
+    const active = imageSchemaKinds(i);
+    const ordered = active.includes("sd_webui") ? ["sd_webui"] : [];
+    const rows = ordered.map(kind => {
+      const entry = imageSchema[kind];
+      const groups = new Map();
+      for (const [name, spec] of Object.entries(entry.fields || {})) {
+        if (spec.storage !== "parameters" || !["integer", "number", "text", "select"].includes(spec.kind)) continue;
+        const group = spec.group || "sampling";
+        if (!groups.has(group)) groups.set(group, []);
+        groups.get(group).push([name, spec]);
+      }
+      const groupLabels = {connection: "连接", workflow: "工作流", sampling: "采样参数"};
+      const operation = imageCurrentOperation(i);
+      const forms = [...groups].map(([group, fields]) => `<fieldset class="model-schema-group"><legend>${groupLabels[group] || esc(group)}</legend>
+        <div class="model-img-route-grid">${fields.map(([name, spec]) => {
+          const path = `sd_webui.parameters.${operation}.${name}`;
+          const current = config.sd_webui.parameters?.[operation]?.[name]
+            ?? config.sd_webui.parameters?.[name] ?? spec.default ?? "";
+          const attrs = `${spec.min !== undefined ? ` min="${spec.min}"` : ""}${spec.max !== undefined ? ` max="${spec.max}"` : ""}${spec.step !== undefined ? ` step="${spec.step}"` : spec.kind === "integer" ? ' step="1"' : ""}`;
+          if (spec.kind === "select") return `<label class="model-img-field"><span>${esc(spec.label || name)}</span><select data-img-config-field="${esc(path)}">${(spec.choices || []).map(choice => `<option value="${esc(choice)}"${current === choice ? " selected" : ""}>${esc(choice)}</option>`).join("")}</select><code>${esc(name)}</code></label>`;
+          const type = spec.kind === "integer" || spec.kind === "number" ? "number" : "text";
+          return imageConfigField(spec.label || name, path, current, type, attrs, `<code>${esc(name)}</code>`);
+        }).join("")}</div></fieldset>`).join("");
+      return forms ? `<section class="model-schema-provider"><h4>${esc(entry.label || kind)}</h4>${forms}</section>` : "";
+    }).join("");
+    return rows ? `<section class="model-schema" aria-label="生图参数">${rows}</section>` : "";
+  }
+
   function imageClick(s, event) {
     const i = s.image, t = event.target;
     const view = t.closest("[data-img-view]");
-    if (view && IMAGE_VIEWS[view.dataset.imgView]) { i.view = view.dataset.imgView; render(); return; }
+    if (view && IMAGE_VIEWS[view.dataset.imgView]) {
+      i.view = view.dataset.imgView;
+      render(); return;
+    }
+    const expand = t.closest("[data-img-route-expand]");
+    if (expand) {
+      event.preventDefault?.();
+      const ref = expand.dataset.imgRouteExpand;
+      const index = i.configDraft?.operation_routes?.[imageCurrentOperation(i)]?.indexOf(ref) ?? -1;
+      i.expandedImageRoutes ||= {};
+      i.expandedImageRoutes[ref] = !(i.expandedImageRoutes[ref] ?? (index === 0));
+      render(); return;
+    }
     if (t.closest("[data-img-refresh]")) { imageRefresh(s); return; }
     if (t.closest("[data-img-save]")) { imageSave(s); return; }
     if (t.closest("[data-img-config-refresh]")) { void imageConfigRefresh(s); return; }
@@ -1283,13 +1795,19 @@ window.CompanionModelsPage = (() => {
       const max = i.config.limits?.max_endpoints || 24;
       if (i.configDraft.endpoints.length >= max) return;
       const id = `image-${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
-      i.configDraft.endpoints.push({id, name: imageCurrentOperation(i) === "generate" ? "文生图模型" : "改图模型", enabled: false,
-        platform: "openai", model: "", width: 1024, height: 1024, base_url: "", api_key_set: false, timeout_seconds: 180});
+      i.configDraft.endpoints.push({id, name: "", enabled: false,
+        platform: "openai", model: "", width: 1024, height: 1024, base_url: "", api_key_set: false,
+        timeout_seconds: 180, quality: "", response_format: ""});
+      i.expandedImageRoutes ||= {};
+      i.expandedImageRoutes["online:" + id] = true;
       i.configDraft.operation_routes[imageCurrentOperation(i)].push(`online:${id}`); render(); return;
     }
     const testBtn = t.closest("[data-img-test]"); if (testBtn) imageTest(s, testBtn.dataset.imgTest);
   }
   /* ---------- top-level render & routing ---------- */
+  function semanticBanner() {
+    return `<div class="model-note cfg"><span>向量嵌入、候选重排和视觉分析不在任务路由里，而在「学习与反思 → 语义目录」统一配置；列表为空时先在 AstrBot 模型服务中加载对应模型。</span><button type="button" class="button small" data-go="manage" data-manage="learning" data-manage-subtab="semantic">打开向量模型配置</button></div>`;
+  }
   function tabBar(s) { const tabs = [["fn", "功能模型", ICONS.fn, snapshot(s).length],
       ["voice", "语音模型", ICONS.voice, s.voice.data ? s.voice.data.providers.length : ""],
       ["image", "生图模型", ICONS.image, s.image.data ? s.image.data.actions.length : ""],
@@ -1298,8 +1816,12 @@ window.CompanionModelsPage = (() => {
     return `<div class="model-tabs" role="tablist" aria-label="模型配置分类">${tabs.map(([id, label, ic, count]) =>
       `<button type="button" role="tab" data-model-tab="${id}" aria-selected="${s.tab === id}" class="${s.tab === id ? "on" : ""}">${icon(ic)}${label}${count !== "" ? `<span class="c">${count}</span>` : ""}</button>`).join("")}</div>`; }
   /* ---------- functional subtabs (design migration) ---------- */
-  function subtabBar(s) { const tabs = [["map", "态势图"], ["cfg", "模型配置"], ["pol", "替换策略"]];
-    return `<div class="model-subtabs" role="tablist" aria-label="功能模型视图">${tabs.map(([id, label]) => `<button type="button" role="tab" data-model-sub="${id}" aria-selected="${s.sub === id}" class="${s.sub === id ? "on" : ""}">${label}</button>`).join("")}</div>`; }
+  function subtabBar(s) { const tabs = [
+      ["map", "态势图", "map", "查看任务当前路由、备用与风险"],
+      ["cfg", "模型配置", "cfg", "逐项编辑主模型、备用链与提示"],
+      ["pol", "替换策略", "pol", "统一管理回退、拒答替代与窗口"],
+    ];
+    return `<div class="model-subtabs" role="tablist" aria-label="功能模型视图">${tabs.map(([id, label, ic, desc]) => `<button type="button" role="tab" data-model-sub="${id}" aria-selected="${s.sub === id}" class="${s.sub === id ? "on" : ""}"><span class="model-subtab-icon">${icon(ICONS[ic])}</span><span class="model-subtab-copy"><b>${label}</b><small>${desc}</small></span></button>`).join("")}</div>`; }
   function kpi(n, label, tone = "") { return `<div class="model-kpi ${tone}"><b>${n}</b><span>${esc(label)}</span></div>`; }
   function fnKpis(s) { const tasks = snapshot(s); const total = tasks.length; const providers = s.status?.providers.length || 0;
     const withFb = tasks.filter(fallbackFor).length; const own = tasks.filter(t => taskFields(t).some(nm => t.fields[nm]?.explicit)).length;
@@ -1745,7 +2267,7 @@ window.CompanionModelsPage = (() => {
       <div class="model-sec"><h4>作为备用 · ${asFb.length} 项</h4>${asFb.map(t => `<div class="li">${esc(taskName(t.kind).label)}<span>${esc(taskName(t.kind).description)}</span></div>`).join("") || '<span class="model-mono">无</span>'}</div>
       <div class="model-sec"><button type="button" class="button primary" style="width:100%" data-drawer-goto="${esc(id)}">在精确配置中调整</button></div></aside>`; }
   function render() { if (!root || !state) return; const s = state;
-    root.innerHTML = `<div class="model-workspace">${tabBar(s)}${pane(s)}${drawer(s)}</div>`;
+    root.innerHTML = `<div class="model-workspace">${s.tab === "fn" ? semanticBanner() : ""}${tabBar(s)}${(s.bad || s.denied) ? notice(s) : ""}${pane(s)}${drawer(s)}</div>`;
     window.lucide?.createIcons?.({attrs: {"aria-hidden": "true"}}); }
   function input(event) { const s = state; if (!s || !root?.isConnected) return;
     if (s.tab === "voice") { voiceInput(s, event); return; }
@@ -1782,45 +2304,154 @@ window.CompanionModelsPage = (() => {
   function unmount() { version++; if (root) { root.removeEventListener("input", input); root.removeEventListener("change", input); root.removeEventListener("click", click); root.removeEventListener("pointerover", providerHover); root.removeEventListener("pointerout", providerHover); }
     if (state) { state.loading = false; state.busy = false; }
     root = null; state = null; path = key = null; }
-  function mount(element) { unmount(); root = element; if (!root) return; const product = window.CompanionProduct;
+  function mount(element, options = {}) { unmount(); root = element; if (!root) return; const product = window.CompanionProduct;
     /* 这里原先先判断 hosted()，桥还没注入时直接写「从 AstrBot 管理界面打开陪伴小屋后…」。
        桥的注入晚于脚本执行是正常时序，所以那句话在正经的拓展页里也出现过。
        现在改成读不到就说读不到，并给一个重新读取的入口——刷新之后桥通常就在了。 */
     const identity = product.identity();
-    const endpoint = product.role()?.model_api;
-    if (!product.hosted() || typeof endpoint !== "string" || !endpoint.startsWith(PREFIX) || /[?#%\\:]/.test(endpoint) || endpoint.split("/").slice(1).some(p => !p || p === "." || p === "..") || !identity.operator_id) { root.innerHTML = `<div class="model-empty">${product.hosted()?'当前对象没有模型配置工作区。请选择已关联角色的私聊窗口。':'角色与会话目录暂未读到，请稍后重新读取。'}<div class="dialog-actions"><button class="button small" type="button" data-workspace-retry>重新读取</button><button class="button small" type="button" data-go="manage" data-manage="host">账号与会话</button></div></div>`; return; }
+    const endpoint = Object.hasOwn(options, "endpoint") ? options.endpoint : product.role()?.model_api;
+    if (!product.hosted() || typeof endpoint !== "string" || !endpoint.startsWith(PREFIX) || /[?#%\\:]/.test(endpoint) || endpoint.split("/").slice(1).some(p => !p || p === "." || p === "..") || !identity.operator_id) {
+      const hint = product.workspaceHint?.() || "";
+      const message = product.hosted() ? (hint || "当前对象没有模型配置工作区。请选择已关联角色的私聊窗口。")
+        : "角色与会话目录暂未读到，请稍后重新读取。";
+      root.innerHTML = `<div class="model-empty">${message}<div class="dialog-actions"><button class="button small" type="button" data-workspace-retry>重新读取</button><button class="button small" type="button" data-go="manage" data-manage="host">账号与会话</button></div></div>`; return;
+    }
     /* path 是每一次请求的基址（model_api + /configure、/voice、/tts/providers…），
        也是 localStorage 键的一部分。桥要插件相对路径，所以切掉插件目录名。 */
     path = endpoint.slice(PREFIX.length); key = "companion-model-edit.v2:" + JSON.stringify([identity.installation_id, identity.operator_id, path]);
-    state = states.get(key) || { status: null, drafts: new Map(), selection: [], expanded: null, layer: "role", view: "tasks", custom: null, lane: "all", providerFilter: null, query: "", sub: "cfg", cm: "precise", av: "slot", af: "all", pm: "kw", slotDraft: {}, providerTests: {}, testing: new Set(),
+    state = states.get(key) || { status: null, drafts: new Map(), selection: [], expanded: null, layer: "role", view: "tasks", custom: null, lane: "all", providerFilter: null, query: "", sub: "map", cm: "precise", av: "slot", af: "all", pm: "kw", slotDraft: {}, providerTests: {}, testing: new Set(),
       drawer: null, expOpen: {}, pol: null, rule: { query: "", picked: [], report: null, testing: false }, peak: { on: true, provider: "", start: "09:00", end: "12:00", windows: "09:00-12:00\n14:00-18:00" },
       tab: "fn",
       voice: { data: null, draft: null, loaded: false, loading: false, busy: false, testing: false, bad: false, notice: "", ui: { lang: "ja" },
         editorOpen: false, catalog: null, catalogLoading: false, editorId: null, editorValues: {}, creating: false, ttsBusy: false, ttsTesting: false, ttsTestResults: {}, createDraft: { type: "", id: "" } },
-      image: { data: null, draft: null, loaded: false, loading: false, busy: false, testing: null, endpointTesting: null, endpointTests: {}, bad: false, notice: "",
+      image: { data: null, draft: null, loaded: false, loading: false, busy: false, testing: null, endpointTesting: null, endpointTests: {}, endpointTestKeys: {}, bad: false, notice: "",
         view: "generate", config: null, configBase: null, configDraft: null, configText: null, configTextBase: null,
         configLoading: false, configSaving: false, configBad: false, configNotice: "",
       },
       laya: { data: null, draft: null, logs: [], loaded: false, loading: false, busy: false, stale: false, bad: false, notice: "", test: null, preview: null, previewText: "" },
       search: { data: null, draft: null, loaded: false, loading: false, busy: false, stale: false, bad: false, notice: "" },
       loading: false, busy: false, bad: false, denied: false, notice: "" };
-    state.layer ||= "role"; state.providerTests ||= {}; state.testing ||= new Set(); state.expOpen ||= {}; state.voice.lastTest ||= null; state.voice.editorValues ||= {}; state.voice.ttsTestResults ||= {}; state.voice.ttsTesting ||= false; state.voice.createDraft ||= { type: "", id: "" }; state.image.endpointTests ||= {}; state.image.endpointTesting ||= null; state.configDraft ||= null; state.peak ||= { on: true, provider: "", start: "09:00", end: "12:00" }; state.testing ||= new Set(); state.peak.windows ||= "09:00-12:00\n14:00-18:00"; state.laya ||= { data: null, draft: null, loaded: false, loading: false, busy: false, stale: false, bad: false, notice: "", test: null, preview: null, previewText: "" }; state.search ||= { data: null, draft: null, loaded: false, loading: false, busy: false, stale: false, bad: false, notice: "" }; state.hoverProvider = "";
+    state.layer ||= "role"; state.providerTests ||= {}; state.testing ||= new Set();
+    /* 展开状态按对象保存：刷新、切任务、切页回来都保持上次展开的分组，
+       不再每次回到“全收起”或“全展开”。 */
+    state.expOpen = { ...restoreExpanded(key), ...(state.expOpen || {}) }; state.voice.lastTest ||= null; state.voice.editorValues ||= {}; state.voice.ttsTestResults ||= {}; state.voice.ttsTesting ||= false; state.voice.createDraft ||= { type: "", id: "" }; state.image.endpointTests ||= {}; state.image.endpointTestKeys ||= {}; state.image.endpointTesting ||= null; state.configDraft ||= null; state.peak ||= { on: true, provider: "", start: "09:00", end: "12:00" }; state.testing ||= new Set(); state.peak.windows ||= "09:00-12:00\n14:00-18:00"; state.laya ||= { data: null, draft: null, loaded: false, loading: false, busy: false, stale: false, bad: false, notice: "", test: null, preview: null, previewText: "" }; state.search ||= { data: null, draft: null, loaded: false, loading: false, busy: false, stale: false, bad: false, notice: "" }; state.hoverProvider = "";
     states.set(key, state);
+    state.sub = ["map", "cfg", "pol"].includes(options.sub) ? options.sub : "map";
     root.addEventListener("input", input); root.addEventListener("change", input); root.addEventListener("click", click); root.addEventListener("pointerover", providerHover); root.addEventListener("pointerout", providerHover); render();
     if (state.tab && state.tab !== "fn") { if (state.tab === "voice" && !state.voice.loaded) voiceRefresh(state); else if (state.tab === "image" && !state.image.loaded) imageRefresh(state); else if (state.tab === "search" && !state.search.loaded) searchRefresh(state); else if (state.tab === "laya" && !state.laya.loaded) layaRefresh(state); }
     else { refresh().catch(() => {}); } }
-  /* 页面级未保存守卫（page-guards.js）：模型页的草稿分散在任务草稿表、
-     语音配置、识图配置、Laya 配置里，逐个用页面自己的脏判定。
-     任何一项算不出来就跳过这一项，不让守卫本身把页面卡住。 */
-  function isDirty() {
-    for (const s of states.values()) {
-      if (!s) continue;
-      try { if (pendingCount(s) > 0) return true; } catch { }
-      try { if (s.voice && voiceDirty(s.voice)) return true; } catch { }
-      try { if (s.image && imageConfigDirty(s.image)) return true; } catch { }
-      try { if (s.laya && layaDirty(s.laya)) return true; } catch { }
+  /* Only the mounted scope can block navigation. Retained drafts belonging to
+     another role or a closed page must not trigger a warning on every route. */
+  function imageChangedFields(i) {
+    const changed = [], same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    const labels = {enabled:'启用开关', backend:'后端模式', base_url:'API 地址', model:'模型 ID', name:'自定义名称',
+      platform:'协议', timeout_seconds:'超时秒数', api_key:'API Key', clear_api_key:'清除已保存密钥',
+      custom_headers:'自定义请求头', clear_custom_headers:'清除已保存请求头', quality:'图片质量',
+      response_format:'返回格式',
+      size_label:'尺寸标签', width:'宽度', height:'高度', max_reference_images:'最多参考图',
+      comfyui:'ComfyUI', sd_webui:'SD WebUI', network:'下载网络', download_proxy:'下载代理',
+      clear_download_proxy:'清除已保存代理', use_environment_proxy:'使用系统代理',
+      parameters:'生图参数', operation_routes:'调用顺序', generate:'文生图', edit:'改图',
+      mask_edit:'蒙版局部改图', workflows:'工作流', legacy_options:'兼容参数'};
+    const compare = (base, draft, prefix) => {
+      for (const name of new Set([...Object.keys(base || {}), ...Object.keys(draft || {})])) {
+        if (same(base?.[name], draft?.[name])) continue;
+        const label = `${prefix} · ${labels[name] || imageSchema?.sd_webui?.fields?.[name]?.label || name}`;
+        if (['network','comfyui','sd_webui','parameters','operation_routes','generate','edit'].includes(name)
+            && !Array.isArray(base?.[name]) && !Array.isArray(draft?.[name])) compare(base?.[name], draft?.[name], label);
+        else changed.push(label);
+      }
+    };
+    const {endpoints: before = [], ...base} = i.configBase;
+    const {endpoints: after = [], ...draft} = i.configDraft;
+    compare(base, draft, '生图模型');
+    for (const id of new Set([...before.map(item => item.id), ...after.map(item => item.id)])) {
+      const old = before.find(item => item.id === id), value = after.find(item => item.id === id);
+      const label = `生图模型 · ${imageEndpointLabel(value || old, '图片模型')}`;
+      if (!old || !value) changed.push(`${label}（${value ? '新增' : '删除'}）`);
+      else compare(old, value, label);
     }
-    return false;
+    const textLabels = {'sd.generate':'SD WebUI · 文生图高级参数', 'sd.edit':'SD WebUI · 改图高级参数',
+      'comfy.generate':'ComfyUI · 文生图工作流', 'comfy.edit':'ComfyUI · 改图工作流',
+      'comfy.mask_edit':'ComfyUI · 蒙版局部改图工作流', 'legacy.options':'兼容参数'};
+    for (const name of new Set([...Object.keys(i.configTextBase || {}), ...Object.keys(i.configText || {})])) {
+      if (same(i.configTextBase?.[name], i.configText?.[name])) continue;
+      const endpoint = name.startsWith('headers.') && [...after, ...before].find(item => item.id === name.slice(8));
+      if (endpoint && !after.some(item => item.id === endpoint.id)) continue;
+      changed.push(`生图模型 · ${endpoint ? `${imageEndpointLabel(endpoint, '图片模型')} · 自定义请求头` : textLabels[name] || name}`);
+    }
+    return [...new Set(changed)];
   }
-  return { mount, unmount, isDirty };
+  function changedFields() {
+    const s = state;
+    if (!root || !s) return [];
+    const changed = [];
+    for (const task of snapshot(s)) {
+      const draft = s.drafts.get(task.kind);
+      if (!draft) continue;
+      const patch = patchFor(task, draft);
+      for (const field of new Set([...Object.keys(patch.changes), ...patch.reset]))
+        changed.push(`${taskName(task.kind).label} · ${fieldLabel[field] || field}`);
+      if (draft.pending) changed.push(`${taskName(task.kind).label} · 保存结果待核对`);
+    }
+    if (s.voice && voiceDirty(s.voice)) {
+      const labels = {voice_timeout_seconds:'语音合成超时'};
+      for (const lang of s.voice.data?.languages || []) labels[`voice_${lang.k}_provider_id`] = `${lang.label || lang.k}语音模型`;
+      changed.push(...Object.keys(voiceChanges(s.voice)).map(name => labels[name] || name));
+    }
+    if (s.image && imageDirty(s.image)) for (const [action, label] of Object.entries(IMAGE_LABELS)) {
+      if (s.image.draft[action] !== s.image.data.enabled[action]) changed.push(`${label}能力开关`);
+    }
+    if (s.image && imageConfigDirty(s.image)) changed.push(...imageChangedFields(s.image));
+    if (s.laya && layaDirty(s.laya)) {
+      const labels = {enabled:'启用决策', mode:'运行方式', endpoint:'服务地址', local_model_path:'本地模型路径',
+        remote_model:'判断模型名', api_key:'API Key', timeout_seconds:'请求超时', followup_confidence_threshold:'连续接话置信阈值'};
+      for (const name of Object.keys(layaChanges(s.laya))) {
+        if (name === 'decision_fields') changed.push(...LAYA_DECISION_FIELDS.filter(([key]) =>
+          s.laya.draft.decision_fields[key] !== (s.laya.data.decision_fields?.[key] !== false)).map(([, label]) => `Laya · ${label}`));
+        else changed.push(`Laya · ${labels[name] || name}`);
+      }
+    }
+    if (s.search && searchDirty(s.search)) changed.push('联网搜索凭据来源');
+    return changed;
+  }
+  function isDirty() {
+    return changedFields().length > 0;
+  }
+  async function saveBeforeLeave() {
+    const s = state;
+    if (!s || !root) return true;
+    if (s.busy || s.loading || s.voice?.busy || s.image?.busy || s.image?.configSaving || s.laya?.busy || s.search?.busy)
+      return {error:'模型配置正在处理，请稍后保存。'};
+    if ([...s.drafts.values()].some(draft => draft.pending) || s.voice?.pending)
+      return {error:'上次保存结果待核对，请回到模型配置中核对原请求。'};
+    const kinds = snapshot(s).filter(task => {const draft = s.drafts.get(task.kind); return draft && dirty(task, draft);}).map(task => task.kind);
+    if (kinds.length) {
+      await saveTasks(s, kinds);
+      if (kinds.some(kind => dirty(taskOf(s, kind), s.drafts.get(kind)))) return {error:s.notice || '任务路由尚未保存。'};
+    }
+    for (const [needed, action, remaining, message] of [
+      [s.voice && voiceDirty(s.voice), voiceSave, () => voiceDirty(s.voice) || s.voice.pending, () => s.voice.notice],
+      [s.image && imageDirty(s.image), imageSave, () => imageDirty(s.image), () => s.image.notice],
+      [s.image && imageConfigDirty(s.image), imageConfigSave, () => imageConfigDirty(s.image), () => s.image.configNotice],
+      [s.laya && layaDirty(s.laya), layaSave, () => layaDirty(s.laya), () => s.laya.notice],
+      [s.search && searchDirty(s.search), searchSave, () => searchDirty(s.search), () => s.search.notice],
+    ]) {
+      if (!needed) continue;
+      await action(s);
+      if (remaining())
+        return {error:message() || '保存尚未确认，请回到配置中检查。'};
+    }
+    return !isDirty() ? true : {error:'还有配置未保存，改动仍保留。'};
+  }
+  function discardChanges() {
+    if (state?.busy || state?.voice?.busy || state?.image?.busy || state?.image?.configSaving || state?.laya?.busy || state?.search?.busy)
+      return {error:'正在保存，请等待结果后再切换。'};
+    if (key) states.delete(key);
+    unmount();
+    return true;
+  }
+  const isBusy = () => Boolean(state && (state.busy || state.voice?.busy || state.voice?.ttsBusy
+    || state.voice?.ttsTesting || state.image?.busy || state.image?.configSaving || state.laya?.busy || state.search?.busy));
+  return { mount, unmount, isDirty, isBusy, changedFields, saveBeforeLeave, discardChanges };
 })();

@@ -101,10 +101,18 @@ class EventIdentityTests(unittest.TestCase):
         self.assertIsNone(event_identity(event(self_id=10002, user_id=10002)))
 
     def test_an_event_without_identity_is_ignored_rather_than_guessed(self):
-        for kwargs in ({"self_id": None}, {"user_id": None}, {"user_id": "alice"},
+        for kwargs in ({"self_id": None}, {"user_id": None}, {"user_id": "bad/id"},
                        {"platform": None}):
             with self.subTest(**kwargs):
                 self.assertIsNone(event_identity(event(**kwargs)))
+
+    def test_qq_official_openids_bind_with_the_platform_instance_as_account(self):
+        value = event_identity(event(platform="qq_official-main", self_id="unknown_selfid",
+            user_id="607097777B7E7FE3E162A8F56825F8521",
+            origin="qq_official-main:FriendMessage:607097777B7E7FE3E162A8F56825F8521"))
+        self.assertEqual(value["platform_id"], "qq_official-main")
+        self.assertEqual(value["account_id"], "qq_official-main")
+        self.assertEqual(value["participant_id"], "607097777B7E7FE3E162A8F56825F8521")
 
     def test_binding_yields_the_derived_identity(self):
         value = event_identity(event())

@@ -33,7 +33,7 @@ class NewEditorDeclarationTests(unittest.TestCase):
             # person registers no owner of its own: its fields carry the default
             # ``configuration`` owner that ConfigurationService always installs.
             AcquaintanceManagement: (PERSON_GROUP, "configuration",
-                                     (ConfigLayer.INSTALLATION, ConfigLayer.ROLE, ConfigLayer.WINDOW), "person"),
+                                     (ConfigLayer.ROLE,), "person"),
             RoleGrowthManagement: (GROWTH_GROUP, "role.growth.access", (ConfigLayer.WINDOW,), "role_growth"),
         }
         for editor, (group, owner, layers, prefix) in expected.items():

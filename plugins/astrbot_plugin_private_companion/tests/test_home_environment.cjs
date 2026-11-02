@@ -24,7 +24,7 @@ test("the top bar shows the configured location, live observation, role time, an
   await new Promise(resolve=>setImmediate(resolve));
   assert.match(root.innerHTML,/东莞市 · 多云 · 32°C/);
   assert.match(root.innerHTML,/实况天气/);
-  const today=new Intl.DateTimeFormat("zh-CN",{timeZone:"Asia/Shanghai",month:"long",day:"numeric",weekday:"long"}).format(new Date());
+  const today=new Intl.DateTimeFormat("zh-CN",{timeZone:"Asia/Shanghai",month:"long",day:"numeric",weekday:"short"}).format(new Date());
   assert.ok(root.innerHTML.includes(`class="home-environment-date">${today}</small>`));
   assert.match(root.innerHTML,/Asia\/Shanghai/);
   assert.match(root.innerHTML,/data-home-weather-refresh/);

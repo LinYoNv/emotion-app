@@ -7,6 +7,98 @@ class RealityModelMethods:
     def _provider_supports_image(self, provider: Any) -> bool:
         return provider is not None and callable(getattr(provider, 'text_chat', None))
 
+    @staticmethod
+    def _provider_runtime_id(provider: Any) -> str:
+        config = getattr(provider, 'provider_config', None) or getattr(provider, 'config', None) or {}
+        for value in (
+            config.get('id') if isinstance(config, dict) else getattr(config, 'id', ''),
+            config.get('provider_id') if isinstance(config, dict) else getattr(config, 'provider_id', ''),
+            getattr(provider, 'provider_id', ''),
+            getattr(provider, 'id', ''),
+        ):
+            cleaned = _single_line(value, 160)
+            if cleaned:
+                return cleaned
+        return ''
+
+    @staticmethod
+    def _provider_label(provider: Any) -> str:
+        try:
+            meta = provider.meta() if callable(getattr(provider, 'meta', None)) else None
+        except Exception:
+            meta = None
+        for source in (meta, getattr(provider, 'provider_config', None), getattr(provider, 'config', None)):
+            if isinstance(source, dict):
+                label = _single_line(source.get('model') or source.get('name') or source.get('id') or source.get('type'), 100)
+            else:
+                label = _single_line(getattr(source, 'model', '') or getattr(source, 'name', '') or
+                                     getattr(source, 'id', '') or getattr(source, 'type', ''), 100)
+            if label:
+                return label
+        return _single_line(provider.__class__.__name__, 100)
+
+    @staticmethod
+    def _provider_declared_image_capability(provider: Any) -> bool | None:
+        config = getattr(provider, 'provider_config', None) or getattr(provider, 'config', None) or {}
+        sources = (provider, config)
+        for source in sources:
+            modalities = source.get('modalities') if isinstance(source, dict) else getattr(source, 'modalities', None)
+            if isinstance(modalities, (list, tuple, set)):
+                normalized = {str(item or '').strip().lower() for item in modalities}
+                if not normalized:
+                    return True
+                return 'image' in normalized or 'vision' in normalized
+            for key in ('supports_image', 'support_image', 'is_multimodal', 'multimodal'):
+                value = source.get(key) if isinstance(source, dict) else getattr(source, key, None)
+                if isinstance(value, bool):
+                    return value
+        try:
+            meta = provider.meta() if callable(getattr(provider, 'meta', None)) else None
+        except Exception:
+            meta = None
+        modalities = meta.get('modalities') if isinstance(meta, dict) else getattr(meta, 'modalities', None)
+        if isinstance(modalities, (list, tuple, set)):
+            normalized = {str(item or '').strip().lower() for item in modalities}
+            return 'image' in normalized or 'vision' in normalized
+        return None
+
+    def _vision_provider_options(self) -> list[dict[str, str]]:
+        providers: list[Any] = []
+        seen_objects: set[int] = set()
+        for getter_name in ('get_all_providers',):
+            getter = getattr(self.context, getter_name, None)
+            if not callable(getter):
+                continue
+            try:
+                result = getter()
+                if not inspect.isawaitable(result):
+                    providers.extend(list(result or []))
+            except Exception as exc:
+                logger.debug('[RealityCompanion] 读取视觉模型列表失败: getter=%s error_type=%s',
+                             getter_name, type(exc).__name__)
+        manager = getattr(self.context, 'provider_manager', None)
+        inst_map = getattr(manager, 'inst_map', None)
+        if isinstance(inst_map, dict):
+            providers.extend(inst_map.values())
+
+        options: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for provider in providers:
+            if id(provider) in seen_objects:
+                continue
+            seen_objects.add(id(provider))
+            if not self._provider_supports_image(provider):
+                continue
+            if self._provider_declared_image_capability(provider) is False:
+                continue
+            provider_id = self._provider_runtime_id(provider)
+            if not provider_id or provider_id in seen:
+                continue
+            seen.add(provider_id)
+            label = self._provider_label(provider)
+            options.append({'id': provider_id, 'label': f'{label} · {provider_id}' if label != provider_id else provider_id})
+        return sorted(options, key=lambda item: (item['label'].casefold(), item['id'].casefold()))
+
     def _record_llm_usage(self, *, provider_id='', task='', prompt='', completion='', elapsed_ms=0,
                           success=False, error='', resp=None, response=None) -> None:
         tracker = getattr(self, 'token_usage', None)

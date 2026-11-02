@@ -17,6 +17,8 @@ import uuid
 SCHEMA = "companion.legacy-v1-archive.v1"
 REPARSE_POINT = 0x400
 COPY_CHUNK_BYTES = 1024 * 1024
+# Windows 未开启 LongPathsEnabled 时，路径（含目录）超过 259 字符就会失败。
+MAX_WINDOWS_ARCHIVE_PATH = 250
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,7 @@ class V1ArchivePlan:
     files: tuple[ArchiveFile, ...]
     issues: tuple[tuple[str, str], ...]
     fingerprint: str
+    excluded_directories: tuple[str, ...] = ()
 
     @property
     def total_bytes(self):
@@ -80,7 +83,7 @@ def _file_key(path: Path):
     return (int(info.st_size), int(info.st_mtime_ns), int(info.st_dev), int(info.st_ino))
 
 
-def build_v1_archive_plan(v1_root: str | Path) -> V1ArchivePlan:
+def build_v1_archive_plan(v1_root: str | Path, *, exclude_roots=()) -> V1ArchivePlan:
     candidate = Path(v1_root).expanduser()
     try:
         root_info = candidate.lstat()
@@ -89,6 +92,16 @@ def build_v1_archive_plan(v1_root: str | Path) -> V1ArchivePlan:
     if not stat.S_ISDIR(root_info.st_mode) or _is_reparse(root_info):
         raise ValueError("archive_source_not_directory")
     root = candidate.resolve(strict=True)
+    excluded = set()
+    for value in exclude_roots:
+        try:
+            path = Path(value).expanduser().resolve(strict=True)
+            if path != root and path.is_relative_to(root):
+                excluded.add(path)
+        except (OSError, RuntimeError, ValueError):
+            continue
+    excluded_relative = tuple(sorted(str(path.relative_to(root)).replace("\\", "/")
+                                     for path in excluded))
     files, issues = [], []
     pending = [(root, "")]
     while pending:
@@ -109,7 +122,8 @@ def build_v1_archive_plan(v1_root: str | Path) -> V1ArchivePlan:
             if entry.is_symlink() or _is_reparse(info):
                 issues.append((relative, "reparse_point"))
             elif stat.S_ISDIR(info.st_mode):
-                pending.append((Path(entry.path), relative))
+                if Path(entry.path).resolve() not in excluded:
+                    pending.append((Path(entry.path), relative))
             elif stat.S_ISREG(info.st_mode):
                 try:
                     info = os.stat(entry.path, follow_symlinks=False)
@@ -127,12 +141,13 @@ def build_v1_archive_plan(v1_root: str | Path) -> V1ArchivePlan:
     issues.sort()
     material = {
         "schema": SCHEMA,
+        "excluded_directories": list(excluded_relative),
         "files": [item.fingerprint_item() for item in files],
         "issues": [[path, reason] for path, reason in issues],
     }
     fingerprint = hashlib.sha256(json.dumps(material, ensure_ascii=False, sort_keys=True,
         separators=(",", ":")).encode("utf-8")).hexdigest()
-    return V1ArchivePlan(root, tuple(files), tuple(issues), fingerprint)
+    return V1ArchivePlan(root, tuple(files), tuple(issues), fingerprint, excluded_relative)
 
 
 def _safe_relative_path(root: Path, relative_path: str) -> Path:
@@ -214,7 +229,11 @@ def copy_v1_archive(plan: V1ArchivePlan, archive_root: str | Path, *, archive_id
             or (metadata is not None and not isinstance(metadata, dict))):
         raise ValueError("archive_identity_invalid")
     root = Path(archive_root).expanduser().resolve(strict=False)
-    if root == plan.root or plan.root in root.parents:
+    # 覆盖升级布局下 V2 数据根本身就在 V1 来源目录里面；归档目录落在被计划
+    # 显式排除的子树里是安全的，不能再按原始祖先关系一刀切拒绝。
+    excluded_roots = tuple((plan.root / Path(relative) for relative in plan.excluded_directories))
+    inside_excluded = any(root == excluded or excluded in root.parents for excluded in excluded_roots)
+    if (root == plan.root or plan.root in root.parents) and not inside_excluded:
         raise ValueError("archive_destination_inside_source")
     root.mkdir(parents=True, exist_ok=True)
     root_info = root.lstat()
@@ -234,7 +253,7 @@ def copy_v1_archive(plan: V1ArchivePlan, archive_root: str | Path, *, archive_id
     if shutil.disk_usage(root).free < plan.total_bytes + 1024 * 1024:
         raise OSError("archive_space_insufficient")
 
-    stage = root / (".staging-" + uuid.uuid4().hex)
+    stage = root / (".staging-" + uuid.uuid4().hex[:16])
     stage.mkdir()
     entries = []
     try:
@@ -243,6 +262,9 @@ def copy_v1_archive(plan: V1ArchivePlan, archive_root: str | Path, *, archive_id
             if _file_key(source) != (item.size, item.modified_ns, item.device, item.inode):
                 raise ValueError("archive_source_changed")
             destination = stage / "files" / Path(*PurePosixPath(item.relative_path).parts)
+            if os.name == "nt" and len(str(destination)) > MAX_WINDOWS_ARCHIVE_PATH:
+                # 没有开长路径支持时，写入会在 259 字符处失败；提前给出可定位的错误码。
+                raise OSError("archive_path_too_long")
             destination.parent.mkdir(parents=True, exist_ok=True)
             digest = hashlib.sha256()
             size = 0
@@ -260,7 +282,10 @@ def copy_v1_archive(plan: V1ArchivePlan, archive_root: str | Path, *, archive_id
                 raise ValueError("archive_source_changed")
             entries.append({"path": item.relative_path, "size": size, "sha256": digest.hexdigest()})
 
-        current = build_v1_archive_plan(plan.root)
+        current = build_v1_archive_plan(
+            plan.root,
+            exclude_roots=tuple(plan.root / relative for relative in plan.excluded_directories),
+        )
         if current.fingerprint != plan.fingerprint or current.issues != plan.issues:
             raise ValueError("archive_source_changed")
         manifest = {

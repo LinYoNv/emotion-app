@@ -72,12 +72,26 @@ _WORLD_KNOWLEDGE_FIELDS = {
     "特殊图像身份线索": "image_identity_hint",
     "其他补充信息": "character_extra",
     "其它补充信息": "character_extra",
+    # 世界蓝图：旧版「世界知识」表单里的这几段原本被当成关系内容排除，
+    # 结果迁过来只剩角色本体，世界设定全丢。
+    "所处世界": "world_name",
+    "世界": "world_name",
+    "时代背景": "era",
+    "时代": "era",
+    "基本法则/基调": "tone",
+    "基本法则": "tone",
+    "基调": "tone",
+    "特殊规则": "rules",
+    "规则": "rules",
+    "主要活动场景": "scenes",
+    "活动场景": "scenes",
+    "世界观关系网": "network",
+    "关系网": "network",
 }
 _EXCLUDED_LABELS = frozenset({
     "用户", "用户资料", "用户补充", "用户关系", "关系资料", "用户与关系",
     "对用户的称呼", "用户性别", "用户生日", "用户职业", "与用户关系",
-    "是角色的xx", "是角色的XX", "相处方式", "所处世界", "时代背景",
-    "基本法则/基调", "特殊规则", "主要活动场景", "世界观关系网",
+    "是角色的xx", "是角色的XX", "相处方式",
 })
 _DAILY_HABIT_MARKERS = (
     "每天", "工作日", "周一", "周二", "周三", "周四", "周五", "周末",
@@ -161,13 +175,8 @@ def map_persona_role_profile(persona_text: str) -> dict:
     }
 
 
-def map_v1_world_knowledge_role_profile(persona_text: str, image_identity_hint: str = "", *,
-                                        configuration_fingerprint: str = "") -> dict:
-    """Map the V1 World Knowledge role form into explicit V2 role fields."""
-    if (type(persona_text) is not str or type(image_identity_hint) is not str
-            or len(persona_text) > MAX_PERSONA_CHARS or len(image_identity_hint) > FIELD_LIMITS["image_identity_hint"] * 8):
-        raise RoleProfileMigrationError("role_profile_source_invalid")
-
+def _labeled_sections(text: str, allowed: dict[str, str], *, count_excluded: bool = True):
+    """按标题切段；只保留 allowed 里的标签，返回 (段落, 被排除的段数)。"""
     sections: list[tuple[str, str]] = []
     current_label = ""
     current_lines: list[str] = []
@@ -179,7 +188,7 @@ def map_v1_world_knowledge_role_profile(persona_text: str, image_identity_hint: 
             if value:
                 sections.append((current_label, value))
 
-    for line in persona_text.splitlines():
+    for line in text.splitlines():
         if _USER_HEADER.match(line):
             finish()
             current_label, current_lines = "", []
@@ -188,19 +197,41 @@ def map_v1_world_knowledge_role_profile(persona_text: str, image_identity_hint: 
         match = _BOLD_HEADER.match(line) or _PLAIN_HEADER.match(line) or _STANDALONE_HEADER.match(line)
         if match:
             label = match.group("label").strip().strip("*# ")
-            if label in _WORLD_KNOWLEDGE_FIELDS:
+            if label in allowed:
                 finish()
                 current_label = label
                 current_lines = [match.groupdict().get("value", "").strip()]
                 continue
             finish()
             current_label, current_lines = "", []
-            if label in _EXCLUDED_LABELS or label.startswith("用户"):
+            if count_excluded and (label in _EXCLUDED_LABELS or label.startswith("用户")):
                 excluded += 1
             continue
         if current_label:
             current_lines.append(line.strip())
     finish()
+    return sections, excluded
+
+
+def map_v1_world_knowledge_role_profile(persona_text: str, image_identity_hint: str = "", *,
+                                        worldview_text: str = "",
+                                        configuration_fingerprint: str = "") -> dict:
+    """Map the V1 World Knowledge role form into explicit V2 role fields.
+
+    ``worldview_text`` 是旧版单独存放的「世界蓝图」（所处世界 / 时代背景 /
+    基本法则 / 特殊规则 / 主要活动场景 / 世界观关系网）。旧版把它和角色本体分开
+    存，迁移时只读角色那一段就会让世界设定整块丢失。
+    """
+    if (type(persona_text) is not str or type(image_identity_hint) is not str
+            or type(worldview_text) is not str
+            or len(persona_text) > MAX_PERSONA_CHARS or len(worldview_text) > MAX_PERSONA_CHARS
+            or len(image_identity_hint) > FIELD_LIMITS["image_identity_hint"] * 8):
+        raise RoleProfileMigrationError("role_profile_source_invalid")
+
+    sections, excluded = _labeled_sections(persona_text, _WORLD_KNOWLEDGE_FIELDS)
+    world_sections, _ignored = _labeled_sections(worldview_text, _WORLD_KNOWLEDGE_FIELDS,
+                                                 count_excluded=False)
+    sections.extend(world_sections)
 
     if image_identity_hint.strip():
         sections.append(("特殊图像身份线索", image_identity_hint.strip()))

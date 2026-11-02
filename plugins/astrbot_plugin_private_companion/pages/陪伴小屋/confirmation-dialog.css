@@ -21,9 +21,19 @@
 .confirmation-copy h2 { margin: 1px 0 var(--sp-2); color: var(--t-text-strong); font-size: var(--fs-title); line-height: 1.45; }
 .confirmation-copy p { color: var(--t-text-soft); font-size: var(--fs-body); line-height: 1.8; overflow-wrap: anywhere; }
 .confirmation-actions { display: flex; justify-content: flex-end; gap: var(--sp-2); padding: var(--sp-4) var(--sp-6); border-top: 1px solid var(--t-line); background: var(--t-surface-soft); }
+.confirmation-actions { flex-wrap: wrap; position: sticky; bottom: 0; }
+.confirmation-details { margin-top: var(--sp-4); max-height: 240px; overflow-y: auto; overflow-wrap: anywhere; }
+.confirmation-details h3 { margin: var(--sp-3) 0 var(--sp-1); font-size: var(--fs-body); color: var(--t-text-strong); }
+.confirmation-details h3:first-child { margin-top: 0; }
+.confirmation-details ul { margin: 0; padding-left: 1.3em; color: var(--t-text-soft); font-size: var(--fs-body); line-height: 1.8; }
+.confirmation-status { margin-top: var(--sp-3); }
+.confirmation-status[data-error="true"] { color: var(--t-risk-ink); }
+.confirmation-actions .button { min-height: 36px; white-space: nowrap; }
+.confirmation-actions .button:disabled { opacity: .6; cursor: wait; }
 .confirmation-dialog[data-intent="danger"] .confirmation-mark { color: var(--t-risk-ink); background: var(--t-risk-quiet); }
 .confirmation-dialog[data-intent="danger"] #confirmationAccept { color: var(--t-text-invert); background: var(--t-risk); border-color: var(--t-risk); }
 .confirmation-dialog[data-intent="danger"] #confirmationAccept:hover { filter: brightness(.94); }
+.confirmation-dialog[data-has-save="true"] #confirmationAccept { color: var(--t-risk-ink); background: transparent; border-color: var(--t-line-firm); }
 @keyframes confirmation-enter { from { opacity: 0; transform: translateY(7px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
 @keyframes confirmation-fade { from { opacity: 0; } to { opacity: 1; } }
 @media (max-width: 560px) {

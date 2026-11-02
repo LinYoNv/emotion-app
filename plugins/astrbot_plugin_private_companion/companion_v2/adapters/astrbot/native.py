@@ -10,7 +10,7 @@ import asyncio
 import inspect
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 from companion_v2.execution.models import TaskError, digest, encode, require
@@ -26,7 +26,18 @@ from companion_v2.conversation.media.video.models import CapturedVideo, MAX_VIDE
 from .files import file_locator, prepare_file_text, MAX_FILES
 
 
-SUPPORTED_VERSIONS = frozenset(("4.27.2", "4.28.2"))
+SUPPORTED_VERSIONS = frozenset(("4.27.2", "4.28.2", "4.29.0", "4.29.1"))
+# Each entry above was exercised against that release's source. The version is
+# never a gate: every host is allowed to start, the native symbols are imported
+# eagerly, and a real surface change fails loudly at import instead of being
+# guessed from a version string. An unreviewed host only earns one warning.
+VERIFIED_SERIES = frozenset(("4.27", "4.28", "4.29"))
+# Native routing is verified for the OneBot reverse-WS adapter and the two
+# QQ Official adapter names AstrBot exposes.  Keeping the allow-list here
+# prevents an arbitrary adapter from inheriting route privileges by accident.
+SUPPORTED_PLATFORM_NAMES = frozenset(("aiocqhttp", "qq_official", "qq_official_webhook"))
+OFFICIAL_PLATFORM_NAMES = frozenset(("qq_official", "qq_official_webhook"))
+_REPORTED_UNVERIFIED = set()
 NATIVE_LOOKUP_TIMEOUT_SECONDS = 20
 NATIVE_LOOKUP_SLOW_SECONDS = 2
 NATIVE_LOOKUP_SLOW_LOG_INTERVAL_SECONDS = 60
@@ -93,10 +104,39 @@ async def bounded_native_lookup(awaitable, *, operation="", report_slow=True):
 MEDIA_PREPARE_TIMEOUT = 25
 
 
+def _release_tuple(value):
+    """Read major.minor[.patch] from a host version, ignoring pre-release tails."""
+    parts = value.split("-", 1)[0].split("+", 1)[0].split(".")
+    if len(parts) not in (2, 3) or any(not part.isdigit() or len(part) > 3 for part in parts):
+        return None
+    numbers = [int(part) for part in parts]
+    if len(numbers) == 2:
+        numbers.append(0)
+    return tuple(numbers)
+
+
 def check_version(version):
-    if type(version) is not str or version not in SUPPORTED_VERSIONS:
-        supported = ", ".join(sorted(SUPPORTED_VERSIONS))
-        raise ValueError("AstrBot native adapters require a verified contract (supported: " + supported + ")")
+    """Report an unreviewed host; never refuse to start one.
+
+    The review list below only decides whether a warning is worth writing. A
+    version string cannot prove the private surface still matches, and a wrong
+    guess must not make an otherwise working install unusable: the native
+    classes are imported eagerly, so a genuine API change fails at import with
+    the exact missing symbol. Old, new and unparsable versions all continue.
+    """
+    if type(version) is str and version:
+        release = _release_tuple(version)
+        if version in SUPPORTED_VERSIONS or release is not None and "%d.%d" % release[:2] in VERIFIED_SERIES:
+            return
+        label = version
+    else:
+        label = "unknown"
+    if label in _REPORTED_UNVERIFIED:
+        return
+    _REPORTED_UNVERIFIED.add(label)
+    logger.warning("AstrBot %s is outside the reviewed native contract (%s); loading anyway, "
+                   "the native imports decide whether this host still matches", label,
+                   ", ".join(sorted(SUPPORTED_VERSIONS)))
 
 
 def native_id(value):
@@ -112,6 +152,98 @@ def account_number(value):
     return value
 
 
+def route_id(value):
+    """Validate one opaque platform route identifier.
+
+    OneBot uses decimal QQ numbers, while QQ Official uses openids and the
+    configured platform-instance id as its account key.  Route ids are stored
+    in the ``platform:type:session`` origin, so colon, control and whitespace
+    characters remain forbidden even though the value need not be numeric.
+    """
+    value = native_id(value)
+    if len(value) > 128 or ":" in value or any(
+            char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("native route identifiers must be bounded opaque ids without separators")
+    if value.isascii() and value.isdecimal() and int(value) <= 0:
+        raise ValueError("numeric route identifiers must be positive numbers")
+    return value
+
+
+def supported_platform_name(value):
+    return type(value) is str and value in SUPPORTED_PLATFORM_NAMES
+
+
+def official_platform_name(value):
+    return type(value) is str and value in OFFICIAL_PLATFORM_NAMES
+
+
+def event_platform_name(event):
+    return str(getattr(getattr(event, "platform_meta", None), "name", "") or "")
+
+
+def event_platform_id(event):
+    return str(getattr(getattr(event, "platform_meta", None), "id", "") or "")
+
+
+def event_account_id(event):
+    """Return the stable account key for one admitted native event.
+
+    OneBot identifies a login by ``message.self_id``.  QQ Official exposes a
+    synthetic self id on C2C/direct events, so the configured platform
+    instance id is the stable account projection there.
+    """
+    message = getattr(event, "message_obj", None)
+    name = event_platform_name(event)
+    if official_platform_name(name):
+        return route_id(event_platform_id(event))
+    if name == "aiocqhttp":
+        return account_number(getattr(message, "self_id", None))
+    raise ValueError("unsupported native event platform")
+
+
+def event_peer_id(event):
+    sender = getattr(getattr(event, "message_obj", None), "sender", None)
+    return route_id(getattr(sender, "user_id", None))
+
+
+def event_group_id(event):
+    return route_id(getattr(getattr(event, "message_obj", None), "group_id", None))
+
+
+def native_user_subject_id(platform_name, sender_id):
+    sender_id = route_id(sender_id)
+    if platform_name == "aiocqhttp":
+        return "onebot-user:" + sender_id
+    if official_platform_name(platform_name):
+        return "qq-official-user:" + sender_id
+    raise ValueError("unsupported native user platform")
+
+
+def native_client_connected(platform, account_id, client=None):
+    """Whether one configured account currently has a usable native client."""
+    if platform is None:
+        return False
+    try:
+        meta = platform.meta()
+        client = client if client is not None else platform.get_client()
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if client is None or not supported_platform_name(getattr(meta, "name", None)):
+        return False
+    if meta.name == "aiocqhttp":
+        clients = getattr(client, "_wsr_api_clients", None)
+        return isinstance(clients, dict) and bool(clients.get(str(account_id)))
+    if getattr(client, "is_shutting_down", False):
+        return False
+    try:
+        closed = getattr(client, "is_closed", None)
+        if callable(closed) and closed():
+            return False
+    except Exception:
+        return False
+    return True
+
+
 def persona_instruction(persona):
     """Retain the exact prompt and optional host-processed persona examples."""
     if persona is None:
@@ -120,13 +252,18 @@ def persona_instruction(persona):
     if not isinstance(prompt, str):
         raise TaskError("host_persona_invalid", "selected host persona has no text prompt")
     dialogs = persona.get("_begin_dialogs_processed") or []
+    # AstrBot 4.29 给每条示例附了 ``_no_save`` 这类内部标记，宿主自己也不把它写回
+    # 人格。按"必须恰好只有 role/content"判会把这些正常人格判成格式无法读取
+    # （4.29.1 的现场就是保存映射失败、提示人格提示词或对话示例格式无法读取）。
+    # 这里只要求 role/content 存在且可用，注入前再把多余字段剥掉。
     if not isinstance(dialogs, list) or any(
-        not isinstance(d, dict) or set(d) != {"role", "content"}
-        or d["role"] not in ("user", "assistant") or not isinstance(d["content"], str) for d in dialogs
+        not isinstance(d, dict) or d.get("role") not in ("user", "assistant")
+        or not isinstance(d.get("content"), str) for d in dialogs
     ):
         raise TaskError("host_persona_invalid", "persona examples require the verified text format")
-    if dialogs:
-        prompt += "\n\n以下为人格的对话示例，用于保持说话风格，不代表本会话发生过的事情：\n" + encode(dialogs)
+    cleaned = [{"role": d["role"], "content": d["content"]} for d in dialogs]
+    if cleaned:
+        prompt += "\n\n以下为人格的对话示例，用于保持说话风格，不代表本会话发生过的事情：\n" + encode(cleaned)
     return prompt
 
 
@@ -159,7 +296,7 @@ class HostAccount:
     def __post_init__(self):
         _opaque(self.platform_id, field="platform instance")
         _opaque(self.bot_id, field="logical bot")
-        if ":" in self.platform_id or account_number(self.self_id) != self.self_id:
+        if ":" in self.platform_id or route_id(self.self_id) != self.self_id:
             raise ValueError("account projection requires canonical host IDs")
 
 
@@ -321,10 +458,10 @@ class NativePrivateBridge:
         for account in accounts:
             platform = context.get_platform_inst(account.platform_id)
             if platform is None:
-                raise TaskError("host_platform_unavailable", "the configured OneBot platform has not loaded")
+                raise TaskError("host_platform_unavailable", "the configured native platform has not loaded")
             meta = platform.meta()
-            if meta.name != "aiocqhttp" or meta.id != account.platform_id:
-                raise TaskError("host_platform_changed", "the configured platform no longer matches its OneBot account")
+            if not supported_platform_name(meta.name) or meta.id != account.platform_id:
+                raise TaskError("host_platform_changed", "the configured platform does not match its native account")
             self.platforms[account.platform_id] = (platform, platform.get_client())
         self.ports = NativeInputPorts()
 
@@ -336,12 +473,31 @@ class NativePrivateBridge:
             raise TaskError("host_account_changed", "original host account projection is unavailable")
         return account
 
-    def client(self, scope):
+    def platform(self, scope):
         account = self.account(scope)
         platform, client = self.platforms[account.platform_id]
-        if (self.context.get_platform_inst(account.platform_id) is not platform or platform.get_client() is not client
-                or platform.meta().id != account.platform_id or platform.meta().name != "aiocqhttp"):
+        meta = platform.meta()
+        if (self.context.get_platform_inst(account.platform_id) is not platform
+                or platform.get_client() is not client or meta.id != account.platform_id
+                or not supported_platform_name(meta.name)):
             raise TaskError("host_account_changed", "original platform/client was replaced")
+        return platform
+
+    def platform_name(self, scope_or_account):
+        platform_id = getattr(scope_or_account, "platform_id", None) or getattr(scope_or_account, "platform", None)
+        platform = self.platforms.get(platform_id, (None, None))[0]
+        return str(platform.meta().name) if platform is not None else ""
+
+    def account_connected(self, account, client=None):
+        platform = self.platforms.get(account.platform_id, (None, None))[0]
+        return native_client_connected(platform, account.self_id, client)
+
+    def client(self, scope):
+        platform = self.platform(scope)
+        account = self.account(scope)
+        client = platform.get_client()
+        if not self.account_connected(account, client):
+            raise TaskError("host_account_changed", "original native account is no longer connected")
         return client
 
     @staticmethod
@@ -356,18 +512,32 @@ class NativePrivateBridge:
     def _role_conversation_id(conversation_id, role):
         return conversation_id
 
+    def _persona_projection(self, account, persona_id):
+        if persona_id is not None and type(persona_id) is not str:
+            return None
+        projection = self.personas.get((account.bot_id, persona_id))
+        if projection is not None:
+            return projection
+        mappings = [item for (bot_id, _), item in self.personas.items() if bot_id == account.bot_id]
+        if len(mappings) == 1 and mappings[0].persona_id == "[%None]":
+            projection = mappings[0]
+            return (projection if persona_id in (None, "[%None]")
+                    else replace(projection, persona_id=persona_id))
+        return None
+
     async def _role(self, account, sender_id):
         umo = self._umo(account.platform_id, sender_id)
         conversation_id, role, instruction = await self._role_for_umo(account, umo)
         return self._role_conversation_id(conversation_id, role), role, instruction
 
-    async def _selected_persona(self, account, umo):
+    async def _selected_persona(self, account, umo, *, fresh_selection=False):
         """Resolve the V2 override or AstrBot's active persona through a trusted mapping."""
         manager = self.context.conversation_manager
         cid = await bounded_native_lookup(manager.get_curr_conversation_id(umo), operation="conversation_id")
         projected_ids = tuple(persona_id for bot_id, persona_id in self.personas if bot_id == account.bot_id)
         if not projected_ids:
             raise TaskError("host_persona_unmapped", "this Bot has no V2 persona mapping")
+        follows_window_persona = len(projected_ids) == 1 and projected_ids[0] == "[%None]"
 
         snapshot = None
         if self.persona_window_snapshot_lookup is not None:
@@ -375,11 +545,18 @@ class NativePrivateBridge:
             if inspect.isawaitable(snapshot):
                 snapshot = await bounded_native_lookup(snapshot, operation="persona_snapshot", report_slow=False)
         snapshot_persona = (snapshot.get("persona_id") if isinstance(snapshot, dict)
-            and snapshot.get("bot_id") == account.bot_id and snapshot.get("persona_id") in projected_ids else None)
-        window_snapshot_used = snapshot_persona is not None
+            and snapshot.get("bot_id") == account.bot_id
+            and self._persona_projection(account, snapshot.get("persona_id")) is not None
+            and (snapshot.get("conversation_id") == cid
+                 or snapshot.get("selection_source") == "verified")
+            else None)
+        window_snapshot_used = snapshot_persona is not None and not fresh_selection
+        used_override = False
         if window_snapshot_used:
-            # The installed window mapping survives /reset and persona edits. Its
-            # current V2 role comes from the active manifest, not a stale snapshot field.
+            # A verified window binding belongs to the UMO, not to AstrBot's
+            # replaceable conversation row. Conversation reset/recreation must
+            # keep the window's role until an explicit refresh rechecks the
+            # native persona selection.
             selected = snapshot_persona
         else:
             override = None
@@ -391,8 +568,7 @@ class NativePrivateBridge:
                         or any(ord(char) < 32 for char in override)):
                     raise TaskError("host_persona_invalid", "the V2 window persona override is invalid")
                 selected = override
-            elif len(projected_ids) == 1:
-                selected = projected_ids[0]
+                used_override = True
             else:
                 if self.persona_snapshot_lookup is not None:
                     conversation_persona_id = await bounded_native_lookup(
@@ -417,7 +593,7 @@ class NativePrivateBridge:
                     selected = conversation_persona_id
                     if selected != "[%None]" and not selected:
                         selected = configured_default_persona_id(self.context, umo)
-            if selected not in projected_ids:
+            if selected not in projected_ids and not (follows_window_persona and selected not in (None, "[%None]")):
                 raise TaskError(
                     "host_persona_window_unbound",
                     "AstrBot's selected persona is not mapped to this V2 Bot; refresh the window snapshot",
@@ -438,8 +614,9 @@ class NativePrivateBridge:
                 raise TaskError("host_persona_unavailable", "the V2 persona mapping no longer exists in AstrBot")
             if persona.get("name") != selected:
                 raise TaskError("host_persona_invalid", "AstrBot returned a different persona than the V2 mapping")
-        projection = self.personas.get((account.bot_id, selected))
-        if projection is not None and self.persona_window_snapshot_update is not None:
+        projection = self._persona_projection(account, selected)
+        if (projection is not None and self.persona_window_snapshot_update is not None
+                and not used_override):
             self.persona_window_snapshot_update(
                 umo, account.self_id, account.bot_id, selected, projection.role.subject_id, cid)
         special = False
@@ -451,7 +628,7 @@ class NativePrivateBridge:
 
     async def _selected_role_snapshot(self, account, umo):
         cid, selected, persona, special = await self._selected_persona(account, umo)
-        projection = self.personas.get((account.bot_id, selected))
+        projection = self._persona_projection(account, selected)
         if special or projection is None or (persona is None and selected not in (None, "[%None]")):
             raise TaskError("host_persona_unmapped", "selected persona needs an explicit V2 projection")
         if persona is not None and persona.get("name") != selected:
@@ -462,8 +639,12 @@ class NativePrivateBridge:
     def _confirm_persona_projection(self, account, selected, projection, instruction):
         if self.persona_window_snapshot_lookup is not None:
             return projection
-        if digest(instruction) != projection.instruction_hash:
-            raise TaskError("host_persona_changed", "persona prompt/examples changed; refresh the trusted projection")
+        fingerprint = digest(instruction)
+        if fingerprint != projection.instruction_hash:
+            projection = replace(projection, instruction_hash=fingerprint)
+            if ((account.bot_id, selected) in self.personas
+                    or (account.bot_id, "[%None]") not in self.personas):
+                self.personas[(account.bot_id, selected)] = projection
         return projection
 
     async def _role_for_umo(self, account, umo):
@@ -488,7 +669,7 @@ class NativePrivateBridge:
         renders as a state rather than as a failure.
         """
         account = self.account(scope)
-        sender = account_number(scope.native_scope_id)
+        sender = route_id(scope.native_scope_id)
         umo = self._umo(account.platform_id, sender)
         conversation_manager = self.context.conversation_manager
         conversation_id = await bounded_native_lookup(
@@ -532,7 +713,7 @@ class NativePrivateBridge:
                 if callable(resolver):
                     selected, persona, _, special = await bounded_native_lookup(resolver(
                         umo=umo, conversation_persona_id=conversation_persona_id,
-                        platform_name="aiocqhttp", provider_settings=settings), operation="persona")
+                        platform_name=self.platform_name(account), provider_settings=settings), operation="persona")
                     if special:
                         selected, persona = None, None
                 else:
@@ -567,17 +748,17 @@ class NativePrivateBridge:
 
     async def verify_role(self, scope, binding, instruction=None):
         self.client(scope)
-        sender = account_number(scope.native_scope_id)
+        sender = route_id(scope.native_scope_id)
         if scope.session_id != sender or binding.scope != scope:
             raise TaskError("host_route_changed", "original private session is inconsistent")
         cid, role, prompt = await self._role(self.accounts[(scope.platform, scope.account_id)], sender)
         self.client(scope)
-        if cid != scope.conversation_id or role != binding.role or (instruction is not None and prompt != instruction):
-            raise TaskError("host_persona_changed", "host conversation/persona differs from the original turn")
+        if role != binding.role:
+            raise TaskError("host_persona_changed", "host role differs from the original turn")
         return prompt
 
     def _verified_persona_umo(self, scope, binding, account):
-        sender = account_number(scope.native_scope_id)
+        sender = route_id(scope.native_scope_id)
         if scope.session_id != sender or binding.scope != scope:
             raise TaskError("host_route_changed", "original private session is inconsistent")
         return self._umo(account.platform_id, sender)
@@ -588,9 +769,8 @@ class NativePrivateBridge:
         umo = self._verified_persona_umo(scope, binding, account)
         cid, selected, _, projection, prompt = await self._selected_role_snapshot(account, umo)
         projection = self._confirm_persona_projection(account, selected, projection, prompt)
-        conversation_id = self._role_conversation_id(self._conversation_key(umo, cid), projection.role)
-        if projection.role != binding.role or conversation_id != scope.conversation_id:
-            raise TaskError("host_persona_changed", "selected host persona differs from the verified conversation")
+        if projection.role != binding.role:
+            raise TaskError("host_persona_changed", "selected host persona differs from the verified role")
         self.client(scope)
         return {"persona_id": projection.persona_id, "prompt": prompt,
                 "bot_id": scope.bot_id, "account_id": scope.account_id}
@@ -611,16 +791,16 @@ class NativePrivateBridge:
             from .quotes import NativeQuoteLocator, image_locator
             from .forwards import NativeForwardLocator, resource_id
             from companion_v2.conversation.quotes.models import event_audios, event_videos
-            if type(event) is not self.event_type:
-                raise TaskError("host_event_unsupported", "this profile accepts native OneBot private events")
+            if not isinstance(event, self.event_type):
+                raise TaskError("host_event_unsupported", "this profile accepts native private events")
             message, meta, session = event.message_obj, event.platform_meta, event.session
             platform_id = meta.id
             if (getattr(message.type, "value", None) != "FriendMessage"
                     or getattr(session.message_type, "value", None) != "FriendMessage" or message.group_id):
                 raise TaskError("host_scene_unsupported", "group and thread adapters are not installed")
-            sender, login = account_number(message.sender.user_id), account_number(message.self_id)
+            sender, login = event_peer_id(event), event_account_id(event)
             account = self.accounts.get((platform_id, login))
-            if (account is None or meta.name != "aiocqhttp" or session.platform_id != platform_id
+            if (account is None or not supported_platform_name(meta.name) or session.platform_id != platform_id
                     or session.platform_name != platform_id or session.session_id != sender
                     or event.unified_msg_origin != self._umo(platform_id, sender)):
                 raise TaskError("host_route_mismatch", "event fields do not identify one registered private route")
@@ -629,18 +809,25 @@ class NativePrivateBridge:
                 raise TaskError("host_media_unsupported", "message components are empty or exceed the intake budget")
             text_parts, locators, quote_locators, forward_locators, audio_locators, video_locators = [], [], [], [], [], []
             file_locators = []
+            onebot = meta.name == "aiocqhttp"
             for position, part in enumerate(parts):
                 kind = getattr(part.type, "value", part.type)
                 if kind == "Plain" and isinstance(part.text, str):
                     text_parts.append(part.text)
+                elif kind == "At":
+                    # QQ Official prepends a synthetic At for C2C events. It is
+                    # routing metadata, not user-visible text.
+                    continue
                 elif kind == "Image" and self.image_type is not None and type(part) is self.image_type:
                     locators.append(image_locator(position, part.file, part.url))
                     text_parts.append("\n[图片 " + str(len(locators)) + "]\n")
                 elif kind == "Reply" and self.reply_type is not None and type(part) is self.reply_type:
-                    quote_locators.append(NativeQuoteLocator(position, message_number(part.id)))
+                    if onebot:
+                        quote_locators.append(NativeQuoteLocator(position, message_number(part.id)))
                     text_parts.append("\n[引用消息]\n")
                 elif kind == "Forward" and self.forward_type is not None and type(part) is self.forward_type:
-                    forward_locators.append(NativeForwardLocator(position, resource_id(part.id)))
+                    if onebot:
+                        forward_locators.append(NativeForwardLocator(position, resource_id(part.id)))
                     text_parts.append("\n[合并转发 " + str(len(forward_locators)) + "]\n")
                 elif kind == "Record" and self.audio_type is not None and type(part) is self.audio_type:
                     value = part.file if type(part.file) is str and part.file.startswith("base64://") else part.url or part.file
@@ -751,10 +938,10 @@ class NativePrivateBridge:
                     client=event_client, scope=scope, payload_budget=65536 - sum(map(len, text_parts)))
                 text = "".join(file_text.get(position, part) for position, part in enumerate(text_parts))
             if images or quotes or forwards or audios or videos or frozen_files:
-                # Network/image preparation is outside SQLite; host changes during
-                # that await must not let a stale role or revoked human be admitted.
+                # Network/media preparation is outside SQLite; recheck the role,
+                # authenticated sender and client before admitting the captured input.
                 fresh_cid, fresh_role, fresh_instruction = await self._role(account, sender)
-                if (fresh_cid, fresh_role, fresh_instruction) != (cid, role, instruction):
+                if fresh_role != role:
                     raise TaskError("host_persona_changed", "host role changed while preparing attachments")
                 fresh_actor = require(self.identities.resolve_authenticated(principal, observed_at=self.now()))
                 if (fresh_actor.subject, fresh_actor.binding_id, fresh_actor.binding_revision) != (

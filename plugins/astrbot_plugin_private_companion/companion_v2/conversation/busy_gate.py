@@ -40,9 +40,9 @@ GROUP = "conversation.busy_gate"
 OWNER = "conversation.busy_gate"
 LAYERS = (ConfigLayer.ROLE, ConfigLayer.WINDOW)
 BUSY_DELAY_INSTRUCTION = (
-    "本轮消息是在忙碌日程中抽空回复（已过短暂延迟才接起对话）。"
-    "若已注入的角色状态或日程材料体现了手头事务，可在回应用户时顺手自然带出一点"
-    "“刚忙完手头这截/忙里抽空看手机”的轻量呼吸感，但不要每次生硬套用固定抱歉模板，"
+    "本轮按忙碌日程规则经过了短暂延迟；规则命中只说明调度原因，不证明角色刚忙完、正在忙或用户在忙。"
+    "若已注入的角色状态或日程材料体现了手头事务，可在回应用户时顺手自然带出一点刚腾出手、边做事边看手机的"
+    "轻量呼吸感，但不要每次生硬套用固定抱歉模板，"
     "不要编造材料中未记录的具体进度或结果，也不要据此敷衍或拒绝回应。"
 )
 # V1 hard-coded ``min(12, ...)`` for group chats and capped both delays at 900.

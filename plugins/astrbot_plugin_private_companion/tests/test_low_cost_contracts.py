@@ -95,6 +95,8 @@ def test_expression_learning_and_content_drafts_require_known_evidence() -> None
             "dimension": "sentence_rhythm",
             "observation": "两条消息使用短句",
             "proposal": "可观察是否偏好短句",
+            "expression": {"kind": "grammar", "situation": "确认安排时",
+                "pattern": "先用短句确认，再补充一句", "avoid": "复杂说明时"},
             "confidence": 0.5,
             "evidence_handles": ["m1", "m2"],
         }],
@@ -105,6 +107,7 @@ def test_expression_learning_and_content_drafts_require_known_evidence() -> None
         parse_learning({
             "summary": "", "signals": [{
                 "dimension": "emoji", "observation": "一次", "proposal": "长期使用",
+                "expression": {"kind": "style", "situation": "闲聊时", "pattern": "嘿嘿", "avoid": "严肃讨论时"},
                 "confidence": 1, "evidence_handles": ["unknown"],
             }],
         }, allowed_evidence={"m1"})

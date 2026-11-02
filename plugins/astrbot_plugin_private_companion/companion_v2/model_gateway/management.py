@@ -8,11 +8,13 @@ import json
 from companion_v2.configuration.models import ConfigLayer, ConfigTarget, EffectiveValue
 from companion_v2.execution.models import TaskError, digest, require
 from companion_v2.execution.service import outcome
-from companion_v2.foundation.refs import OperationRef, VersionRef
+from companion_v2.foundation.refs import OperationRef, ScopeKind, VersionRef
+from companion_v2.identity_policy.object_access import ObjectAccessPolicy
 from companion_v2.role_work.life.management import RoleLifeManagement
 from .budget import effective_soft
 from .cache_diagnostics import checked_signature, event_severity, signature_changes, signature_snapshot
 from .core_observations import availability_summary, observations_for_role, request_rows
+from .models import MAX_MODEL_OUTPUT_TOKENS
 from .reply_efficiency import reply_efficiency_report
 from .refusal import canonical_refusal_terms
 from .replacement_rules import checked_rules, validate_targets
@@ -308,7 +310,21 @@ def _cache_diagnostic_summary(runtime, role_accounts, all_days, origin_key, *, c
 class ModelManagement:
     def __init__(self, app, context):
         self.app, self.context = app, context
-        self.access = RoleLifeManagement(app, context)
+        self.access = (RoleLifeManagement(app, context)
+                       if context.scope.kind is ScopeKind.PRIVATE else None)
+        self.scope_access = ObjectAccessPolicy(app.runtime)
+
+    def _authorize(self, operator, *, write=False):
+        if self.access is not None:
+            return self.access.authorize(operator)
+        return require(self.scope_access.scope_access(operator, scope=self.context.scope,
+            action="configuration.write" if write else "configuration.read",
+            observed_at=self.app.now(), core_only=True))
+
+    @outcome
+    def authorize(self, operator, *, write=False):
+        """Validate Dashboard access without building the full task projection."""
+        return self._authorize(operator, write=write)
 
     def _profile(self, kind):
         if type(kind) is not str or kind not in self.app.router.profiles:
@@ -330,7 +346,8 @@ class ModelManagement:
         definitions = self.app.configuration.registry.group(section.config_group)
         if layer not in (ConfigLayer.ROLE, ConfigLayer.WINDOW) or layer not in definitions[0].layers:
             raise TaskError("model_configuration_invalid", "the prompt section does not support this configuration scope")
-        if ConfigLayer.RELATIONSHIP in definitions[0].layers:
+        if (ConfigLayer.RELATIONSHIP in definitions[0].layers
+                and self.context.scope.kind is ScopeKind.PRIVATE):
             scope = self.context.scope
             target = ConfigTarget(scope.installation_id, ConfigLayer.WINDOW,
                 self.context.role_binding.role, scope, bot_id=scope.bot_id,
@@ -355,9 +372,18 @@ class ModelManagement:
                     "default_prompt": section.default_prompt, "editable": section.editable,
                     "variables": list(section.variables)}
             if section.editable:
-                if section.config_group not in snapshots:
-                    snapshots[section.config_group] = self._section_snapshots(operator, section, layer)
-                current, inherited = snapshots[section.config_group]
+                definitions = self.app.configuration.registry.group(section.config_group)
+                section_layer = layer
+                group_window_inherits = (layer is ConfigLayer.WINDOW
+                    and self.context.scope.kind is ScopeKind.GROUP
+                    and ConfigLayer.RELATIONSHIP in definitions[0].layers)
+                if group_window_inherits:
+                    section_layer = ConfigLayer.ROLE
+                    item["editable"] = False
+                snapshot_key = section.config_group, section_layer
+                if snapshot_key not in snapshots:
+                    snapshots[snapshot_key] = self._section_snapshots(operator, section, section_layer)
+                current, inherited = snapshots[snapshot_key]
                 field_id = section.config_group + "." + section.field
                 field = _field(current.fields[field_id], inherited.fields[field_id])
                 item.update(field=field, edit_token=current.edit_token, config_field=field_id,
@@ -514,10 +540,10 @@ class ModelManagement:
     @outcome
     def status(self, operator, *, layer="role"):
         if layer not in (ConfigLayer.ROLE.value, ConfigLayer.WINDOW.value):
-            raise TaskError("model_configuration_invalid", "select role defaults or this private window")
+            raise TaskError("model_configuration_invalid", "select role defaults or this conversation window")
         selected_layer = ConfigLayer(layer)
         with self.app.runtime.read_snapshot():
-            self.access.authorize(operator)
+            self._authorize(operator)
             return {"configuration_layer": selected_layer.value,
                     "tasks": [self._project(operator, profile, selected_layer)
                               for profile in self.app.router.profiles.values()],
@@ -532,7 +558,7 @@ class ModelManagement:
     def maintenance(self, operator):
         """Read role-scoped model usage and diagnostics without exposing prompt material."""
         with self.app.runtime.read_snapshot():
-            self.access.authorize(operator)
+            self._authorize(operator)
             now = self.app.now()
             runtime_diagnostics = self._runtime_diagnostics()
             scope = self.context.scope
@@ -627,6 +653,7 @@ class ModelManagement:
                         reports[key].add_hour(row)
                 recent_rows = self.app.runtime.read_all(f"""WITH samples AS (
                     SELECT c.state, c.position, c.actual_tokens, c.reserved_tokens,
+                        c.receipt_ref,
                         c.actual_cost, c.input_tokens, c.cached_input_tokens, c.cache_creation_tokens, c.output_tokens,
                         c.latency_ms, c.finished_at, c.started_at, r.created_at, t.kind, c.provider_json,
                         f.code AS failure_code, d.summary_json AS response_summary_json,
@@ -679,10 +706,15 @@ class ModelManagement:
                       "spent_tokens": plugin_usage["spent_tokens"],
                       "held_tokens": plugin_usage["held_tokens"]}
             reservations = self.app.gateway.ledger.reservation_sources(today_account)
+            released = self.app.gateway.ledger.released_usage(today_account)
             pending = [item for item in reservations if item["state"] not in ("reserved", "dispatched")]
             budget.update(reservation_sources=reservations,
                           pending_usage_calls=sum(item["calls"] for item in pending),
                           pending_usage_tokens=sum(item["held_tokens"] for item in pending),
+                          released_calls=released["calls"],
+                          released_tokens=released["tokens"],
+                          released_cost_microusd=released["cost_microusd"],
+                          reclaim=self.app.gateway.ledger.reclaim_audit(),
                           remaining_tokens=(max(0, budget["limit_tokens"] - budget["spent_tokens"] - budget["held_tokens"])
                                             if policy.enabled else None))
             soft = effective_soft(self.app.runtime, self.context, self.app.gateway.ledger.soft)
@@ -700,7 +732,7 @@ class ModelManagement:
     def check_storage(self, operator):
         """Run explicit read-only SQLite integrity and foreign-key checks."""
         with self.app.runtime.read_only_snapshot() as connection:
-            self.access.authorize(operator)
+            self._authorize(operator)
             integrity = [row[0] for row in connection.execute("PRAGMA quick_check")]
             foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchmany(20)
             return {"status": "ok" if integrity == ["ok"] and not foreign_keys else "failed",
@@ -742,7 +774,7 @@ class ModelManagement:
                 or type(values["prompt"]) is not str
                 or len(values["prompt"]) > 8000 or type(values["max_output_tokens"]) is not int
                 or type(values["fallback_on_refusal"]) is not bool
-                or not 1 <= values["max_output_tokens"] <= 32768
+                or not 1 <= values["max_output_tokens"] <= MAX_MODEL_OUTPUT_TOKENS
                 or type(values["timeout_seconds"]) is not int or not 1 <= values["timeout_seconds"] <= 600
                 or values["replacement_scope"] not in ("all", "plugin", "conversation")):
             raise TaskError("model_configuration_invalid", "check task prompt and output token limit")
@@ -758,7 +790,12 @@ class ModelManagement:
             if not set(profile.capabilities).issubset(provider.capabilities):
                 raise TaskError("model_capability_mismatch", "the provider lacks task capabilities")
             if values["max_output_tokens"] > provider.maximum_output_tokens:
-                raise TaskError("model_output_limit", "output limit exceeds the selected provider")
+                # Only a provider ceiling can refuse a task limit, so the message names
+                # the field, the provider and that ceiling; the rejected value stays out
+                # of the text, and an undeclared provider never produces this error.
+                raise TaskError("model_output_limit",
+                                f"max_output_tokens is limited to {provider.maximum_output_tokens}"
+                                " by provider " + provider_id)
         try:
             validate_targets(checked_rules(values["replacement_rules"]), self.app.router.providers,
                              capabilities=profile.capabilities, max_output_tokens=values["max_output_tokens"])
@@ -781,7 +818,7 @@ class ModelManagement:
             raise TaskError("model_configuration_invalid", "provide a stable operation key and edit token")
         selected_layer = ConfigLayer(layer)
         with self.app.runtime.transaction():
-            self.access.authorize(operator)
+            self._authorize(operator, write=True)
             profile = self._profile(kind)
             if "section" in data:
                 return self._configure_section(operator, profile, data, selected_layer)

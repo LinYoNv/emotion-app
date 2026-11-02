@@ -47,7 +47,9 @@ ADMIN_NAME_PATH = PREFIX + "/admin-name"
 IDENTITY_PATH = PREFIX + "/identity"
 SETTINGS_PATH = PREFIX + "/settings"
 OPEN_LOOPS_PATH = PREFIX + "/open-loops"
+STRANGERS_PATH = PREFIX + "/strangers"
 MAX_AUTHORIZATION_BODY = 8192
+MAX_STRANGER_ROWS = 100
 logger = logging.getLogger(__name__)
 
 
@@ -313,7 +315,9 @@ class AcquaintanceWebAPI:
                 (SETTINGS_PATH, self.member_settings, ["GET"], "Read one private member's settings"),
                 (SETTINGS_PATH, self.configure_member, ["POST"], "Save one private member's settings"),
                 (OPEN_LOOPS_PATH, self.open_loops, ["GET"], "Read one person's open conversation threads"),
-                (OPEN_LOOPS_PATH, self.change_open_loop, ["POST"], "Manage one person's open conversation thread")]
+                (OPEN_LOOPS_PATH, self.change_open_loop, ["POST"], "Manage one person's open conversation thread"),
+                (STRANGERS_PATH, self.strangers, ["GET"],
+                 "Read private accounts refused by the stranger boundary")]
 
     def _settings(self):
         settings = self.controller.settings
@@ -542,6 +546,36 @@ class AcquaintanceWebAPI:
             reason = f"{type(error).__name__}: {detail[:512]}" if detail else type(error).__name__
             return outcome_response(Outcome.failed("acquaintance_directory_read_failed", reason))
 
+    async def strangers(self):
+        """Private accounts the stranger boundary has seen, newest first.
+
+        Read-only and bounded: the ledger holds the account and time, never a
+        subject binding, conversation or capability grant.
+        """
+        from .stranger_notice import CONTACT_KIND
+        from .web_api import outcome_response
+        controller = self.controller
+        try:
+            async with controller._control_lock:
+                await self._operator()
+                rows = controller.runtime.read_all(
+                    "SELECT document_json FROM memory_views WHERE kind = ? "
+                    "ORDER BY updated_at DESC LIMIT ?", (CONTACT_KIND, MAX_STRANGER_ROWS))
+                items = []
+                for row in rows:
+                    try:
+                        document = json.loads(row["document_json"])
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(document, dict):
+                        continue
+                    items.append({key: document.get(key) for key in (
+                        "platform_id", "login", "peer", "first_seen_at", "last_seen_at",
+                        "attempts", "last_outcome")})
+                return outcome_response(Outcome.success({"items": items}))
+        except TaskError as error:
+            return outcome_response(Outcome.failed(error.code, str(error)))
+
     async def authorization(self):
         """Read the real state of every capability one person holds."""
         from .web_api import outcome_response
@@ -687,6 +721,9 @@ class AcquaintanceWebAPI:
                 editor = PrivateMemberSettings(session.application, context)
                 result = (editor.configure(operator, {key: command[key] for key in ("operation_key", "sections")})
                           if write else editor.status(operator))
+                if not write and result.is_success and isinstance(result.value, dict):
+                    from .voice import tts_provider_catalog
+                    result.value["tts"] = tts_provider_catalog(self.controller.context)
                 return outcome_response(result)
         except TaskError as error:
             return outcome_response(Outcome.failed(error.code, str(error)))

@@ -3,6 +3,7 @@
 import json
 import unittest
 
+from tests import astrbot_data_root  # Isolate the SDK before importing the host.
 from astrbot.core.message.components import Image, Plain, Record
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
@@ -34,6 +35,10 @@ class ReplyIntentTests(unittest.TestCase):
         self.assertEqual(extract_reply_intent(text), ("你好！", "友好问候；挥手"))
         self.assertEqual(extract_reply_intent('你好<pc_reaction_expression>{bad}</pc_reaction_expression>'), ("你好", ""))
         self.assertEqual(extract_reply_intent('你好<pc_reaction_expression>{"intent":"挥手"'), ("你好", ""))
+
+    def test_reaction_metadata_tolerates_case_spacing_and_typo_variants(self):
+        text = '晚安。<PC-reaction-expression>{"intent":"温柔道晚安"}</pcc reaction_expression>'
+        self.assertEqual(extract_reply_intent(text), ("晚安。", "温柔道晚安"))
 
 
 class CoreReplyReactionDeliveryTests(MultiFixture, unittest.IsolatedAsyncioTestCase):
@@ -183,6 +188,15 @@ class CoreReplyReactionDeliveryTests(MultiFixture, unittest.IsolatedAsyncioTestC
         self.assertEqual(len(self.queued), 1)
         wire = await AiocqhttpMessageEvent._parse_onebot_json(event.sent[-1])
         self.assertEqual(wire[0]["data"]["sub_type"], 1)
+
+    async def test_an_already_attempted_reaction_keeps_authored_intent_without_reason(self):
+        event, _ = await self.prepare()
+        core = event.get_extra(CORE_REPLY_CONTEXT_EXTRA)
+        core["_reaction_reply"]["attempted"] = True
+        response = NS(role="assistant", is_chunk=False, tools_call_name=[],
+            completion_text='先不要表情。<pc_reaction_expression>{"intent":"这次已经查过了"}</pc_reaction_expression>')
+        observe_core_reaction_response(event, response)
+        self.assertEqual(response.completion_text, "先不要表情。")
 
     async def test_ordinary_reply_without_protocol_uses_role_reply_context_and_reviews_original(self):
         event, _ = await self.prepare(text="很难受")

@@ -13,6 +13,7 @@ from typing import Any
 from aiocqhttp.api_impl import WebSocketReverseApi
 from astrbot import __version__ as ASTRBOT_VERSION
 from astrbot.core import sp
+from astrbot.api.event import AstrMessageEvent
 from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
@@ -23,9 +24,10 @@ from sqlmodel import select
 
 from companion_v2.adapters.astrbot.native import (
     NATIVE_LOOKUP_SLOW_SECONDS, HostPersona, NativePrivateBridge, account_number, bounded_native_lookup,
-    configured_default_persona_id, persona_instruction, report_slow_native_lookup,
+    configured_default_persona_id, native_client_connected, persona_instruction, report_slow_native_lookup,
+    supported_platform_name,
 )
-from companion_v2.adapters.astrbot.provider import provider_fingerprint
+from companion_v2.adapters.astrbot.provider import looks_like_text_provider, provider_fingerprint
 from companion_v2.adapters.astrbot.provider_catalog import TextProviderSettings, assemble_providers
 from companion_v2.adapters.astrbot.staging import NativeAdapterTypes
 from companion_v2.adapters.astrbot.staging_config import REQUIRED_CAPABILITIES, StagingConfiguration
@@ -51,6 +53,14 @@ SESSION_SETTINGS_LOOKUP_BUDGET_SECONDS = 1.0
 _session_settings_cache = {}
 _session_settings_reads = {}
 _session_settings_versions = {}
+
+
+def native_text_provider(native_types, provider):
+    """Registered text class, or any provider exposing the AstrBot text surface."""
+    checker = getattr(native_types, "is_text_provider", None)
+    if callable(checker):
+        return bool(checker(provider))
+    return isinstance(provider, getattr(native_types, "provider", ()) or ()) or looks_like_text_provider(provider)
 
 
 def _native_video_provider(context, bridge, native_types, native, settings):
@@ -260,7 +270,7 @@ def remember_session_settings(umo, services):
 def installed_native_types() -> NativeAdapterTypes:
     return NativeAdapterTypes(
         ASTRBOT_VERSION,
-        AiocqhttpMessageEvent,
+        AstrMessageEvent,
         ProviderOpenAIOfficial,
         FunctionTool,
         ToolSet,
@@ -283,6 +293,9 @@ def installed_native_types() -> NativeAdapterTypes:
         file_loader=load_native_file,
         video_provider_type=ProviderGoogleGenAI,
         video_provider_factory=_native_video_provider,
+        # AstrBot's native Google GenAI provider also speaks text; the V2 text
+        # adapter translates its OpenAI-shaped payload onto generate_content.
+        text_provider_types=(ProviderGoogleGenAI,),
         session_persona_override_lookup=load_session_persona_override,
         persona_snapshot_lookup=load_persona_snapshot_selection,
         persona_selection_lookup=resolve_native_persona_selection,
@@ -346,7 +359,7 @@ class NativeProbeService:
         self.now = now
 
     def _streaming_report(self, settings: HostSettings, provider) -> dict[str, Any]:
-        available = type(provider) is self.native_types.provider and callable(
+        available = native_text_provider(self.native_types, provider) and callable(
             getattr(provider, "_query_stream", None)
         )
         return {
@@ -360,21 +373,25 @@ class NativeProbeService:
     def discover(self, settings: HostSettings) -> dict[str, Any]:
         platform = self.context.get_platform_inst(settings.platform_id)
         if platform is None:
-            raise HostControlError("staging_platform_unavailable", "the configured OneBot platform is unavailable")
+            raise HostControlError("staging_platform_unavailable", "the configured native platform is unavailable")
         metadata = platform.meta()
-        if metadata.name != "aiocqhttp" or metadata.id != settings.platform_id:
-            raise HostControlError("staging_platform_unsupported", "the configured platform is not the selected OneBot instance")
+        if not supported_platform_name(metadata.name) or metadata.id != settings.platform_id:
+            raise HostControlError("staging_platform_unsupported", "the configured platform is not a supported selected instance")
         client = platform.get_client()
-        clients = getattr(client, "_wsr_api_clients", {})
-        if not isinstance(clients, dict):
-            clients = {}
-        connected_accounts = []
-        for value in clients:
-            try:
-                connected_accounts.append(account_number(value))
-            except (TypeError, ValueError):
-                continue
-        connected_accounts = sorted(set(connected_accounts), key=int)
+        if metadata.name == "aiocqhttp":
+            clients = getattr(client, "_wsr_api_clients", {})
+            if not isinstance(clients, dict):
+                clients = {}
+            connected_accounts = []
+            for value in clients:
+                try:
+                    connected_accounts.append(account_number(value))
+                except (TypeError, ValueError):
+                    continue
+            connected_accounts = sorted(set(connected_accounts), key=int)
+        else:
+            connected_accounts = ([settings.account_id]
+                                  if native_client_connected(platform, settings.account_id, client) else [])
 
         provider = self.context.get_provider_by_id(settings.provider_id) if settings.provider_id else None
         if provider is None and not settings.provider_id:
@@ -385,7 +402,7 @@ class NativeProbeService:
             native_config = getattr(provider, "provider_config", {})
             candidate = native_config.get("id") if isinstance(native_config, dict) else None
             provider_id = candidate if isinstance(candidate, str) else ""
-            if type(provider) is self.native_types.provider:
+            if native_text_provider(self.native_types, provider):
                 provider_hash = provider_fingerprint(provider)
         return {
             "platform_id": metadata.id,
@@ -397,7 +414,7 @@ class NativeProbeService:
             "resolved_provider_id": provider_id or None,
             "provider_type": type(provider).__module__ + "." + type(provider).__qualname__ if provider else None,
             "provider_fingerprint": provider_hash,
-            "provider_supported": type(provider) is self.native_types.provider,
+            "provider_supported": native_text_provider(self.native_types, provider),
             "streaming": self._streaming_report(settings, provider),
             "target_ready": bool(
                 settings.account_id and settings.participant_id and settings.provider_id
@@ -416,9 +433,8 @@ class NativeProbeService:
         assert platform is not None
         metadata = platform.meta()
         client = platform.get_client()
-        clients = getattr(client, "_wsr_api_clients", {})
-        if not clients.get(settings.account_id):
-            raise HostControlError("staging_account_unavailable", "the configured OneBot account is not connected")
+        if not native_client_connected(platform, settings.account_id, client):
+            raise HostControlError("staging_account_unavailable", "the configured native account is not connected")
 
         umo = f"{settings.platform_id}:FriendMessage:{settings.participant_id}"
         manager = self.context.conversation_manager
@@ -454,7 +470,7 @@ class NativeProbeService:
         instruction = persona_instruction(persona)
 
         provider = self.context.get_provider_by_id(settings.provider_id)
-        if type(provider) is not self.native_types.provider:
+        if not native_text_provider(self.native_types, provider):
             raise HostControlError("staging_provider_unsupported", "the configured provider does not use the verified AstrBot adapter")
         assemble_providers(self.context, bridge=None, native_types=self.native_types,
                            primary_id=settings.provider_id, additional=settings.additional_providers,

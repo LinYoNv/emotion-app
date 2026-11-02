@@ -1,11 +1,19 @@
 # -*- coding: utf-8 -*-
 import base64
+import importlib.util
 import sys
 import logging
 import os
 import stat
 from pathlib import Path
 from urllib import parse
+
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
 
 
 def _prefer_astrbot_runtime_packages() -> None:
@@ -35,7 +43,36 @@ def _prefer_astrbot_runtime_packages() -> None:
         sys.path.insert(0, str(candidate))
 
 
+def _load_arc4_compat():
+    """Load the shared fallback without adding the plugin tree to sys.path."""
+
+    module_path = Path(__file__).resolve().with_name("mihome_arc4_compat.py")
+    spec = importlib.util.spec_from_file_location(
+        "_companion_mihome_arc4_compat",
+        module_path,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("ARC4 compatibility module is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 _prefer_astrbot_runtime_packages()
+try:
+    _ARC4_FORCE_FALLBACK = os.environ.get("ASTRBOT_COMPANION_FORCE_ARC4_FALLBACK") == "1"
+    _ARC4_NATIVE_ERROR = _load_arc4_compat().ensure_arc4_compat(force_fallback=_ARC4_FORCE_FALLBACK)
+except Exception as exc:
+    print(
+        f"ERROR: 内置 ARC4 兼容层初始化失败 ({type(exc).__name__})",
+        flush=True,
+    )
+    sys.exit(1)
+if _ARC4_NATIVE_ERROR:
+    print(
+        f"[WORKER] 原生 ARC4 不可用（{_ARC4_NATIVE_ERROR}），已启用内置兼容实现。",
+        flush=True,
+    )
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("mijiaAPI").setLevel(logging.WARNING)

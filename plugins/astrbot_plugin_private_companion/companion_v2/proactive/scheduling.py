@@ -5,6 +5,7 @@ durable occurrence ledger, so restart never replays a decision or a missed slot.
 """
 
 import asyncio
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta
 import json
@@ -20,11 +21,13 @@ from companion_v2.delivery.history import VERSION as HISTORY_VERSION
 from companion_v2.role_work.life import rest_gate
 
 from .contact_models import ContactIntent
-from .configuration import GROUP, PURPOSES
+from .configuration import GROUP, PURPOSES, hour_activity_curve
 from .calendar_events import CalendarContactEvents
 from .date_events import DateContactEvents
 from .events import ActivityContactEvents
 from .greetings import GreetingContactEvents
+from .health_events import HealthContactEvents
+from .sleep_context import from_health_source
 from .growth_events import GrowthContactEvents
 from .journal_events import JournalContactEvents
 from .meal_events import MealContactEvents
@@ -32,11 +35,12 @@ from .reminiscence_events import ReminiscenceContactEvents
 from .rhythm import SLOT_WINDOW, ContactRhythm
 from .weather_events import WeatherContactEvents
 from .weather_change_events import WeatherChangeContactEvents
-from .official_alert_events import OfficialAlertContactEvents
+from .official_alert_events import NO_CURRENT_ALERT, OfficialAlertContactEvents
 from .balance_events import BalanceContactEvents
 from .news_events import NewsContactEvents
 from .screen_events import ScreenContactEvents
 from .relationship_events import RelationshipContactEvents
+from .wake_events import WakeContactEvents
 from .models import EvidenceSnapshot, Opportunity, Thought, ThoughtKind
 from .persona_judge import KIND as JUDGE_KIND
 from .preferences import ContactPreferences
@@ -61,7 +65,7 @@ SYNTHETIC_DIAGNOSTIC_EVENTS = {
     "followup": "先前聊到如果能有一间自己的小书店会怎样布置，还没展开；角色现在想到自己的布置想法，想分享着接回话题，不催答。",
     "invitation": "角色现在想找对方一起做点事：挑一项具体活动，例如一起玩一局五子棋或海龟汤，或者打个语音电话，主动问对方要不要参加；不假定对方有空，不说成已经开局或拨通。",
     "reminder": "双方先前已接受一项一起听歌的约定，约定即将开始；角色主动提醒这一件事，不声称对方已经赴约或必须参加。",
-    "meal": "角色有一个自己的用餐念头，想在饭点和对方说说；不推断对方是否用餐，不要求报平安。",
+    "meal": "角色自己的饭点到了，但这只是角色生活里的一个时间背景；角色可以分享自己此刻的一点具体日常或接回原对话，也可能决定不打扰。不推断对方是否用餐，不要求报平安，不把饭点写成每日打卡。",
     "life": "角色刚把书桌上散落的纸页整理好，留出一块干净的小角落，想把这点生活变化和自己的感受分享给对方；不增加其他经历。",
     "creation": "角色刚写下一句短句：给普通的一天留一盏小灯。想把这一句和自己的创作想法分享给对方；不杜撰书名或阅读进度。",
     "news": "一则创作工具资讯介绍了把简单手绘变成小动画的功能；角色对这个亮点好奇，想分享自己的想法，不增加产品名、发布机构或未经提供的细节。",
@@ -81,12 +85,18 @@ SYNTHETIC_ENVIRONMENT_EVENTS = {
 class ContactSchedule:
     def __init__(self, contacts, messages, *, notify, role_life=None, role_growth=None, role_journal=None,
                  calendar=None, relationships=None, role_state=None, weather_port=None,
-                 weather_alert_port=None, balance_port=None, news_port=None, screen_peek=None):
+                 weather_alert_port=None, balance_port=None, news_port=None, screen_peek=None,
+                 wake_port=None, health_source=None, health_settings=None):
         self.contacts, self.messages, self.notify = contacts, messages, notify
         self.tasks, self.runtime = contacts.tasks, contacts.runtime
         self.screen_peek = screen_peek
+        self.role_state = role_state
+        self.wake_events = (WakeContactEvents(contacts, role_state, wake_port)
+                            if wake_port is not None else None)
         self._maintenance_contexts = {}
         self._workers, self._cursor, self._native_cursor, self._closed = {}, 0, 0, False
+        self._advancing = False
+        self._planning = None
         self._judges = {}
         self.rhythm = ContactRhythm(contacts.runtime)
         self.events = ActivityContactEvents(contacts, role_life) if role_life is not None else None
@@ -95,8 +105,10 @@ class ContactSchedule:
         self.calendar_events = CalendarContactEvents(contacts, calendar) if calendar is not None else None
         self.reminiscence_events = (ReminiscenceContactEvents(contacts, relationships)
                                     if relationships is not None else None)
-        self.date_events = DateContactEvents(contacts)
-        self.greeting_events = GreetingContactEvents(contacts, role_state)
+        self.date_events = DateContactEvents(contacts, messages)
+        self.greeting_events = GreetingContactEvents(contacts, role_state, health_source)
+        self.health_source = health_source
+        self.health_events = HealthContactEvents(contacts, health_source, health_settings)
         self.meal_events = MealContactEvents(contacts)
         self.weather_events = WeatherContactEvents(contacts, role_state, weather_port) if role_state is not None else None
         self.weather_change_events = WeatherChangeContactEvents(
@@ -204,19 +216,46 @@ class ContactSchedule:
         evaluation = {"outcome": "not_evaluated", "stage": "scheduler",
                       "reason_code": "never_evaluated", "purpose": None,
                       "observed_at": None, "next_at": None}
+        latest = self.latest_conversation(context)
+        latest_ready = self._conversation_ready(latest)
         if window is not None:
             evaluation = {"outcome": window["outcome"], "stage": window["stage"],
                           "reason_code": window["reason_code"],
                           "purpose": PURPOSES.get(window["purpose"], window["purpose"])
                           if window["purpose"] else None,
                           "observed_at": window["observed_at"], "next_at": window["next_at"]}
-            latest = self.latest_conversation(context)
-            if self._conversation_ref(latest) != window["conversation_ref"]:
+            if (self._conversation_ref(latest) != window["conversation_ref"]
+                    or not latest_ready or window["reason_code"] == "contact_conversation_changed"):
+                # 旧一轮被新一轮取代，或最新一轮仍在生成：这是一次等待，不是失败。
+                # 旧版本曾把 contact_conversation_changed 记成 validation/failed，
+                # 这里在读取时纠正，已有的失败记录也不会继续显示成红色故障。
                 evaluation.update(outcome="stale", stage="conversation",
                                   reason_code="newer_conversation_not_evaluated", purpose=None, next_at=None)
+        elif not latest_ready:
+            evaluation.update(outcome="stale", stage="conversation",
+                              reason_code="newer_conversation_not_evaluated", purpose=None, next_at=None)
         return {"scheduler": {"state": scheduler_state, "reason_code": scheduler_reason,
                                "last_seen_at": coordinator["observed_at"] if coordinator else None},
                 "evaluation": evaluation}
+
+    @staticmethod
+    def _conversation_ready(row):
+        """Return whether the selected conversation has finished generating.
+
+        Native turns expose ``generation_state``; legacy batches expose
+        ``flow_state``/``state``. An unfinished latest conversation is a wait
+        condition, not a validation failure.
+        """
+        if row is None:
+            return True
+        keys = row.keys() if hasattr(row, "keys") else ()
+        if "generation_state" in keys:
+            return row["generation_state"] == "completed"
+        if "flow_state" in keys and "state" in keys:
+            return row["flow_state"] == "complete" and row["state"] == "ready"
+        if "state" in keys:
+            return row["state"] == "ready"
+        return True
 
     def bind_context(self, context):
         """Bind the active staging target for source maintenance.
@@ -228,7 +267,36 @@ class ContactSchedule:
         """
         self._maintenance_contexts[context.key] = context
 
+    def _anchor_time(self, context, batch_id):
+        """Return when the stored conversation happened, or ``None``.
+
+        Re-anchoring may only move forward inside the saved window. An
+        unavailable or foreign original turn cannot prove that ordering, so it
+        keeps the caller's existing rejection instead of widening the rule.
+        """
+        from companion_v2.conversation.native_turns import turns_available
+
+        found = []
+        row = self.runtime.read_one(
+            "SELECT created_at, origin_key FROM conversation_batches WHERE batch_id = ?", (batch_id,))
+        if row is not None and row["origin_key"] == context.key:
+            found.append(datetime.fromisoformat(row["created_at"]))
+        if turns_available(self.runtime):
+            row = self.runtime.read_one(
+                "SELECT observed_at, context_key FROM conversation_native_turns WHERE turn_id = ?", (batch_id,))
+            if row is not None and row["context_key"] == context.key:
+                found.append(datetime.fromisoformat(row["observed_at"]))
+        return max(found) if found else None
+
     def _origin(self, context, batch_id, at):
+        """Select the origin conversation, moving forward when it was superseded.
+
+        An automatic opportunity may be admitted just before a newer completed
+        conversation supersedes its anchor. That is a re-anchor, not a lost
+        opportunity: the latest completed conversation in the same window takes
+        over, the original turn is remembered in ``previous_batch_id``, and the
+        caller still runs every safety check against the new row.
+        """
         from companion_v2.conversation.native_turns import input_event, latest_scope
 
         row = self.runtime.read_one("""SELECT f.state AS flow_state, b.* FROM conversation_flows f
@@ -236,32 +304,43 @@ class ContactSchedule:
             ORDER BY f.sequence DESC LIMIT 1""", (context.scope.key,))
         native = latest_scope(self.runtime, context.scope)
         if native is not None and (row is None or native["observed_at"] >= row["created_at"]):
-            if (native["turn_id"] != batch_id or native["context_key"] != context.key
-                    or native["generation_state"] != "completed" or not native["role_instruction"].strip()):
+            if (native["context_key"] != context.key or native["generation_state"] != "completed"
+                    or not native["role_instruction"].strip()):
                 raise TaskError("contact_conversation_changed", "automatic opportunity requires the latest completed native conversation")
             self.messages.authorize(context, at)
             event = input_event(self.messages, native, at)
-            return {"batch_id": batch_id, "event_key": event.scoped_key,
-                    "event_hash": digest([event, context.key, native["role_instruction"]]),
-                    "role_hash": digest(native["role_instruction"])}, native, event
-        if (row is None or row["batch_id"] != batch_id or row["origin_key"] != context.key
-                or row["flow_state"] != "complete" or row["state"] != "ready" or not row["role_instruction"].strip()):
-            raise TaskError("contact_conversation_changed", "automatic opportunity requires the latest completed conversation")
-        self.messages.authorize(context, at)
-        item = self.runtime.read_one("""SELECT * FROM conversation_inputs WHERE batch_id = ? AND withdrawn = 0
-            ORDER BY position DESC LIMIT 1""", (batch_id,))
-        if item is None:
-            raise TaskError("contact_input_unavailable", "automatic opportunity has no active original input")
-        event = event_from_document(json.loads(item["event_json"]), context)
-        if (event.scope != context.scope or event.principal != context.actor.principal
-                or event.scoped_key != item["event_key"] or event.received_at > at):
-            raise TaskError("contact_context_mismatch", "automatic input must retain its original author and window")
-        source = self.messages._read_source(event.source, context, event.capability, at)
-        if source.content_hash != event.input_hash or digest(source.payload) != source.content_hash:
-            raise TaskError("contact_input_changed", "automatic input no longer matches its original evidence")
-        origin = {"batch_id": batch_id, "event_key": item["event_key"], "event_hash": item["event_hash"],
-                  "role_hash": digest(row["role_instruction"])}
-        return origin, row, event
+            origin = {"batch_id": native["turn_id"], "event_key": event.scoped_key,
+                      "event_hash": digest([event, context.key, native["role_instruction"]]),
+                      "role_hash": digest(native["role_instruction"])}
+            latest = native
+        else:
+            if (row is None or row["origin_key"] != context.key
+                    or row["flow_state"] != "complete" or row["state"] != "ready"
+                    or not row["role_instruction"].strip()):
+                raise TaskError("contact_conversation_changed", "automatic opportunity requires the latest completed conversation")
+            self.messages.authorize(context, at)
+            item = self.runtime.read_one("""SELECT * FROM conversation_inputs WHERE batch_id = ? AND withdrawn = 0
+                ORDER BY position DESC LIMIT 1""", (row["batch_id"],))
+            if item is None:
+                raise TaskError("contact_input_unavailable", "automatic opportunity has no active original input")
+            event = event_from_document(json.loads(item["event_json"]), context)
+            if (event.scope != context.scope or event.principal != context.actor.principal
+                    or event.scoped_key != item["event_key"] or event.received_at > at):
+                raise TaskError("contact_context_mismatch", "automatic input must retain its original author and window")
+            source = self.messages._read_source(event.source, context, event.capability, at)
+            if source.content_hash != event.input_hash or digest(source.payload) != source.content_hash:
+                raise TaskError("contact_input_changed", "automatic input no longer matches its original evidence")
+            origin = {"batch_id": row["batch_id"], "event_key": item["event_key"], "event_hash": item["event_hash"],
+                      "role_hash": digest(row["role_instruction"])}
+            latest = row
+        if origin["batch_id"] == batch_id:
+            return origin, latest, event
+        anchor = self._anchor_time(context, batch_id)
+        if anchor is None or datetime.fromisoformat(latest["created_at"]) < anchor:
+            raise TaskError("contact_conversation_changed",
+                            "automatic opportunity cannot move back to an older or foreign conversation")
+        origin.update({"reanchored": True, "previous_batch_id": batch_id})
+        return origin, latest, event
 
     def latest_conversation(self, context):
         """Select the actual latest input; an older completed turn is no fallback."""
@@ -279,9 +358,16 @@ class ContactSchedule:
                          "reminiscence_event", "date_event",
                          "meal_event", "weather_event", "weather_change_event", "official_alert_event",
                          "balance_event", "news_event", "screen_event", "greeting_event", "burst_event",
-                         "relationship_event", "followup_event", "open_loop_event"}
+                         "relationship_event", "followup_event", "open_loop_event", "morning_event",
+                         "health_event"}
         rhythm_event_markers = event_markers - {"relationship_event"}
-        if current != {key: value for key, value in origin.items() if key not in event_markers}:
+        if current.get("reanchored"):
+            # The latest completed conversation took over. Keep the original
+            # event markers so their own checks still run, but replace identity
+            # and time basis with the new row before continuing.
+            origin = {**origin, **current}
+        elif current != {key: value for key, value in origin.items()
+                         if key not in event_markers | {"reanchored", "previous_batch_id"}}:
             raise TaskError("contact_conversation_changed", "automatic opportunity lost its original conversation")
         preferences = require(self.contacts.preferences.read(context, observed_at=at))
         if not preferences.values["automatic_enabled"]:
@@ -291,7 +377,7 @@ class ContactSchedule:
             raise TaskError("contact_conversation_active", "original conversation has not reached its configured idle time")
         interaction = None
         if ("greeting_event" in origin or "burst_event" in origin or "followup_event" in origin
-                or not rhythm_event_markers.intersection(origin)):
+                or "morning_event" in origin or not rhythm_event_markers.intersection(origin)):
             if self.contacts.history is None:
                 raise TaskError("delivery_history_unavailable", "automatic contact requires confirmed communication history")
             interaction = self.contacts.history.interaction(context, at, action=GROUP)
@@ -340,6 +426,8 @@ class ContactSchedule:
             if self.official_alert_events is None:
                 raise TaskError("contact_official_alert_unavailable", "official alert needs its original producer")
             self.official_alert_events.validate(context, origin["official_alert_event"], at)
+        if "health_event" in origin:
+            self.health_events.validate(context, origin["health_event"], at)
         if "balance_event" in origin:
             self.balance_events.validate(context, origin["balance_event"], at)
         if "news_event" in origin:
@@ -350,8 +438,13 @@ class ContactSchedule:
             self.relationship_events.validate(context, event, origin["relationship_event"], at)
         if "followup_event" in origin:
             self._validate_followup(context, event, origin["followup_event"], preferences, at, interaction)
+        if "morning_event" in origin:
+            if self.wake_events is None:
+                raise TaskError("contact_morning_unavailable", "the morning chain is not assembled")
+            self.wake_events.validate(context, origin["morning_event"], at, interaction=interaction)
         if "open_loop_event" in origin:
             self._validate_open_loop(context, origin["open_loop_event"], preferences, at)
+        return current
 
     def _plan(self, row, at):
         context = TaskContext.restore(json.loads(row["context_json"]))
@@ -365,6 +458,11 @@ class ContactSchedule:
         self.contacts._adopt(context, preferences)
         if not preferences.values["automatic_enabled"]:
             self._note_window(context, row, at, "settings", "skipped", "automatic_contact_disabled")
+            return None
+        sleep = from_health_source(self.health_source, at)
+        if sleep is not None and sleep.quiet_until > at:
+            self._note_window(context, row, at, "sleep", "skipped", "sleep_wake_grace",
+                              next_at=sleep.morning_opened_at)
             return None
         origin, batch, event = self._origin(context, row["batch_id"], at)
         first = max(event.received_at, datetime.fromisoformat(batch["created_at"])) + timedelta(
@@ -390,7 +488,13 @@ class ContactSchedule:
         # All discretionary openings share the stable conversation slot. News
         # polling can mint a fresh opportunity on every tick; using that timestamp
         # would keep re-rolling the curve until even a sleeping hour admits it.
-        hour_allowed = self.rhythm.hour_allows(context, preferences, opened, observed_at=at)
+        morning_curve = None
+        if self.wake_events is not None:
+            morning_curve = self.wake_events.adjusted_curve(
+                context, preferences, opened,
+                hour_activity_curve(preferences.values["proactive_hour_activity_curve"]))
+        hour_allowed = self.rhythm.hour_allows(context, preferences, opened, observed_at=at,
+                                                curve=morning_curve)
         if self.calendar_events is not None:
             candidate, more = self.calendar_events.select(context, preferences, at)
             if candidate is not None:
@@ -404,12 +508,45 @@ class ContactSchedule:
         if self._appointment_silence(context, preferences, at):
             self._note_window(context, row, at, "rhythm", "skipped", "appointment_silence")
             return None
+        if self.wake_events is not None:
+            candidate = self.wake_events.select(context, preferences, at, source=event.source,
+                                                 interaction=interaction)
+            if candidate is not None:
+                opportunity, intents, marker = candidate
+                intents = tuple(replace(intent, thought=replace(intent.thought, evidence=EvidenceSnapshot(
+                    context.scope, at, (event.source,)))) for intent in intents)
+                return context, opportunity, intents, batch["role_instruction"], {
+                    **origin, "morning_event": marker}
+            diagnostic = self.wake_events.last_diagnostic
+            if isinstance(diagnostic, Mapping) and diagnostic.get("reason"):
+                reason_code = str(diagnostic["reason"])
+                if diagnostic.get("state"):
+                    reason_code += "@" + str(diagnostic["state"])
+                if diagnostic.get("confidence") is not None:
+                    reason_code += ":" + str(diagnostic["confidence"])
+                self._note_window(context, row, at, "morning", "skipped", reason_code[:96],
+                                  purpose="greeting", next_at=diagnostic.get("next_at"))
+        if (hour_allowed and sleep is not None
+                and sleep.morning_opened_at <= at < sleep.morning_expires_at):
+            candidate = self.health_events.select(context, preferences, at)
+            if candidate is not None:
+                opportunity, intents, marker = candidate
+                intents = tuple(replace(intent, thought=replace(intent.thought, evidence=EvidenceSnapshot(
+                    context.scope, at, (event.source, *intent.thought.evidence.sources)))) for intent in intents)
+                return context, opportunity, intents, batch["role_instruction"], {**origin, "health_event": marker}
         candidate = self.greeting_events.select(context, preferences, at, interaction=interaction)
         if candidate is not None:
             opportunity, intents, marker = candidate
             intents = tuple(replace(intent, thought=replace(intent.thought, evidence=EvidenceSnapshot(
                 context.scope, at, (event.source,)))) for intent in intents)
             return context, opportunity, intents, batch["role_instruction"], {**origin, "greeting_event": marker}
+        if hour_allowed:
+            candidate = self.health_events.select(context, preferences, at)
+            if candidate is not None:
+                opportunity, intents, marker = candidate
+                intents = tuple(replace(intent, thought=replace(intent.thought, evidence=EvidenceSnapshot(
+                    context.scope, at, (event.source, *intent.thought.evidence.sources)))) for intent in intents)
+                return context, opportunity, intents, batch["role_instruction"], {**origin, "health_event": marker}
         if hour_allowed and self.events is not None:
             candidate, more = self.events.select(context, preferences, at)
             candidate = self._share_candidate(context, preferences, candidate)
@@ -541,7 +678,12 @@ class ContactSchedule:
                 EvidenceSnapshot(context.scope, at, (event.source,)), 1.0)
             return (context, opportunity, (ContactIntent("chat", thought),), batch["role_instruction"],
                     {**origin, "burst_event": burst.document()})
-        if self._recent_attempt_blocking(context, at, interval, include_skips=True):
+        # A skipped draft did not contact the recipient. Pace all model attempts
+        # by the base interval, and reserve the unanswered slowdown for attempts
+        # that may actually send. Otherwise a skip near the next slot can consume
+        # that slot's entire short window without any message having left.
+        if (self._recent_attempt_blocking(context, at, base_interval, include_skips=True)
+                or self._recent_attempt_blocking(context, at, interval)):
             self._note_window(context, row, at, "rhythm", "skipped", "recent_attempt_cooldown")
             return None
         expires = opened + min(interval, timedelta(minutes=5))
@@ -564,7 +706,7 @@ class ContactSchedule:
         intents = []
         if chat_reason is None:
             thought = Thought("conversation-check-in", opportunity, ThoughtKind.CONVERSATION,
-                "这是一次低压力的主动联系机会。可以从角色自己的想法、兴趣或真实对话里自然开口；不要求依赖最近某条消息或具体事件。只把来源支持的内容写成事实，不虚构角色刚做过的事、共同经历或用户当前状态。优先写一条简短、无需回复的消息；重复、突兀或会打扰时跳过。",
+                "这是一次低压力的主动联系机会。可以从角色自己的想法、兴趣或真实对话里自然开口；不要求依赖最近某条消息或具体事件。先找一个此刻想分享的小念头、具体感想或轻问题，简短说到位，不要求对方立即回复。自己的主观想法不需要活动完成回执；涉及刚做过的事、共同经历或用户状态时仍以材料为据。候选不贴切时可从人格兴趣换个独立切口；确实无话可说、只是重述旧话或越过明确边界时跳过。",
                 EvidenceSnapshot(context.scope, at, (event.source,)), 1.0)
             intents.append(ContactIntent("chat", thought))
         if relationship_candidate is not None:
@@ -657,7 +799,9 @@ class ContactSchedule:
         preferences = self._diagnostic_preferences(preferences)
 
         def finish(candidate, route):
-            if candidate is None:
+            # 官方预警在「轮询成功但没有生效中的预警」时返回明确的无候选标记，
+            # 与获取失败区分；诊断只关心有没有可用的来源证据。
+            if candidate is None or candidate is NO_CURRENT_ALERT:
                 return None
             opportunity, intents, marker = candidate
             # The environment panel can explicitly probe the external-news
@@ -817,8 +961,9 @@ class ContactSchedule:
         raise TaskError("contact_diagnostic_source_required",
                          f"当前没有可核验的「{PURPOSES[purpose]}」真实生产器契机；本次不会使用空证据或通用文案")
 
-    async def synthetic_diagnostic_candidate(self, context, purpose, *, at=None, test_id, variant=None):
-        """Build a one-shot synthetic scenario without creating chat history or evidence."""
+    async def synthetic_diagnostic_candidate(self, context, purpose, *, at=None, test_id, variant=None,
+                                             role_instruction=None):
+        """Build a one-shot synthetic scenario without requiring chat history."""
         if purpose not in PURPOSES:
             raise TaskError("unknown_contact_purpose", "contact purpose must be registered")
         if variant is not None and (purpose != "environment" or variant not in SYNTHETIC_ENVIRONMENT_EVENTS):
@@ -829,9 +974,12 @@ class ContactSchedule:
             raise TaskError("setup_private_window_required", "the proactive diagnostic requires the confirmed private window")
         at = at or self.tasks.now()
         row = self.latest_conversation(context)
-        if row is None:
-            raise TaskError("contact_diagnostic_source_required", "the selected purpose has no completed conversation source")
-        _origin, batch, event = self._origin(context, row["batch_id"], at)
+        if row is not None:
+            _origin, batch, event = self._origin(context, row["batch_id"], at)
+            role_instruction = batch["role_instruction"]
+        elif not isinstance(role_instruction, str) or not role_instruction.strip():
+            raise TaskError("contact_diagnostic_source_required",
+                            "a current persona instruction is required when no conversation is available")
         scenario = (SYNTHETIC_ENVIRONMENT_EVENTS[variant] if variant is not None
                     else SYNTHETIC_DIAGNOSTIC_EVENTS[purpose])
         opportunity = Opportunity("diagnostic-synthetic-" + digest([context.key, test_id]),
@@ -840,21 +988,31 @@ class ContactSchedule:
             ThoughtKind.CONVERSATION, "本轮联系情境：" + scenario,
             EvidenceSnapshot(context.scope, at), 1.0)
         route = self._diagnostic_route("synthetic_event", "合成测试事件", variant or purpose)
-        diagnostic_origin = {"_diagnostic": {
-            "route_id": "synthetic_event", "purpose": purpose, "batch_id": row["batch_id"],
-            "event_key": event.scoped_key,
-            "event_hash": digest([event, context.key, batch["role_instruction"]]),
-            "role_hash": digest(batch["role_instruction"])},
+        if row is not None:
+            diagnostic = {"route_id": "synthetic_event", "purpose": purpose, "batch_id": row["batch_id"],
+                "event_key": event.scoped_key,
+                "event_hash": digest([event, context.key, role_instruction]),
+                "role_hash": digest(role_instruction)}
+        else:
+            scenario_hash = digest(scenario)
+            diagnostic = {"route_id": "synthetic_event", "purpose": purpose, "batch_id": None,
+                "event_key": "diagnostic-no-conversation-" + digest([context.key, test_id]),
+                "event_hash": digest(["synthetic-diagnostic", context.key, purpose, test_id,
+                                      scenario_hash, digest(role_instruction)]),
+                "role_hash": digest(role_instruction), "source_mode": "no_conversation"}
+        diagnostic_origin = {"_diagnostic": diagnostic,
             "synthetic_event": {"test_id": test_id, "scenario_hash": digest(scenario)}}
         return {"opportunity": opportunity, "intents": (ContactIntent(purpose, thought),),
-                "role_instruction": batch["role_instruction"], "route": route,
+                "role_instruction": role_instruction, "route": route,
                 "diagnostic_origin": diagnostic_origin}
 
-    def validate_diagnostic_origin(self, context, origin, at, *, purpose=None):
+    def validate_diagnostic_origin(self, context, origin, at, *, purpose=None, role_instruction=None):
         if type(origin) is not dict or type(origin.get("_diagnostic")) is not dict:
             raise TaskError("contact_diagnostic_source_changed", "diagnostic contact lost its producer receipt")
         receipt = origin["_diagnostic"]
-        if set(receipt) != {"route_id", "purpose", "batch_id", "event_key", "event_hash", "role_hash"}:
+        required_receipt = {"route_id", "purpose", "batch_id", "event_key", "event_hash", "role_hash"}
+        no_conversation = receipt.get("source_mode") == "no_conversation"
+        if set(receipt) != required_receipt | ({"source_mode"} if no_conversation else set()):
             raise TaskError("contact_diagnostic_source_changed", "diagnostic producer receipt is invalid")
         route_purposes = {
             "synthetic_event": set(PURPOSES),
@@ -873,6 +1031,8 @@ class ContactSchedule:
         if (route_id not in route_purposes or receipt["purpose"] not in route_purposes[route_id]
                 or (purpose is not None and receipt["purpose"] != purpose)):
             raise TaskError("contact_diagnostic_source_changed", "diagnostic producer does not match its selected purpose")
+        if no_conversation and route_id != "synthetic_event":
+            raise TaskError("contact_diagnostic_source_changed", "only synthetic diagnostics may omit conversation history")
         expected_keys = {"_diagnostic"} if route_id == "conversation_scheduler" else {"_diagnostic", route_id}
         if set(origin) != expected_keys:
             raise TaskError("contact_diagnostic_source_changed", "diagnostic producer marker does not match its route")
@@ -882,6 +1042,17 @@ class ContactSchedule:
                     or not isinstance(marker.get("test_id"), str)
                     or not isinstance(marker.get("scenario_hash"), str)):
                 raise TaskError("contact_diagnostic_source_changed", "synthetic test marker is invalid")
+            if no_conversation:
+                if (receipt["batch_id"] is not None or self.latest_conversation(context) is not None
+                        or receipt["event_key"] != "diagnostic-no-conversation-" +
+                            digest([context.key, marker["test_id"]])
+                        or receipt["event_hash"] != digest(["synthetic-diagnostic", context.key,
+                            receipt["purpose"], marker["test_id"], marker["scenario_hash"], receipt["role_hash"]])
+                        or not isinstance(role_instruction, str) or not role_instruction.strip()
+                        or digest(role_instruction) != receipt["role_hash"]):
+                    raise TaskError("contact_conversation_changed",
+                                    "the source-free diagnostic no longer matches its persona or empty conversation")
+                return
         elif route_id == "reality_location_event":
             marker = origin.get(route_id)
             if (type(marker) is not dict
@@ -893,9 +1064,12 @@ class ContactSchedule:
                     or not isinstance(marker.get("place_fingerprint"), str)
                     or not marker["place_fingerprint"]):
                 raise TaskError("contact_diagnostic_source_changed", "mobile location diagnostic receipt is invalid")
-        _, batch, event = self._origin(context, receipt["batch_id"], at)
+        current, batch, event = self._origin(context, receipt["batch_id"], at)
+        expected_event_hash = (digest([event, context.key, batch["role_instruction"]])
+                               if route_id == "synthetic_event" else
+                               current.get("event_hash") or event.input_hash)
         if (event.scoped_key != receipt["event_key"]
-                or digest([event, context.key, batch["role_instruction"]]) != receipt["event_hash"]
+                or expected_event_hash != receipt["event_hash"]
                 or digest(batch["role_instruction"]) != receipt["role_hash"]):
             raise TaskError("contact_conversation_changed", "diagnostic contact lost its original conversation or persona")
 
@@ -1070,11 +1244,11 @@ class ContactSchedule:
     def _recent_attempt_blocking(self, context, at, cooldown, *, include_skips=False):
         """True if a recent contact task ran inside the cooldown window.
 
-        When ``include_skips`` is False, a model ``skip`` retires its own
-        opportunity ID without locking out every subsequent producer; the
-        ordinary conversation slot still waits out its full interval after any
-        attempt so a skipped event does not immediately fall through to a
-        generic conversation slot.
+        When ``include_skips`` is False, a model ``skip`` retires only its own
+        opportunity ID. Ordinary slots check all attempts at the base interval,
+        then use the longer unanswered interval only for non-skipped attempts.
+        This avoids both immediate fallback after a skip and treating silence
+        from an unsent draft as another unanswered contact.
         """
         if include_skips:
             return self.runtime.read_one("""SELECT 1 FROM execution_tasks WHERE origin_key = ? AND kind = ?
@@ -1189,6 +1363,14 @@ class ContactSchedule:
                 origin["weather_change_event"] = marker
             if "official_alert_pending" in origin:
                 prepared = await self.official_alert_events.prepare(context, origin["official_alert_pending"])
+                if prepared is NO_CURRENT_ALERT:
+                    # 本轮轮询成功但没有生效中的预警：这是官方预警的常态，不是
+                    # 来源故障。记成 skipped 让管理端知道轮询正常，避免周期性
+                    # 误报「检查失败／来源不可用」并误导凭据排查。
+                    self._note_window(context, {"batch_id": origin.get("batch_id")}, self.tasks.now(),
+                                      "source_preparation", "skipped", "official_alert_none_current",
+                                      purpose=purpose)
+                    return None
                 if prepared is None:
                     return self._record_worker_result(context, origin,
                         Outcome.failed("contact_official_alert_unavailable", "official alert was not verified"),
@@ -1303,12 +1485,14 @@ class ContactSchedule:
         return self.runtime.read_all("""SELECT f.sequence, b.* FROM conversation_flows f
             JOIN conversation_batches b ON b.batch_id = f.batch_id WHERE f.sequence > ?
             AND json_extract(b.context_json, '$.audience.scope.kind') = 'private'
+            AND f.state = 'complete' AND b.state = 'ready'
             AND NOT EXISTS (SELECT 1 FROM conversation_flows newer WHERE newer.route_key = f.route_key AND newer.sequence > f.sequence)
             ORDER BY f.sequence LIMIT 16""", (cursor,))
 
-    def advance(self):
+    def _begin_tick(self):
+        """Read the tick's bounded input set; no candidate source is evaluated here."""
         if self._closed:
-            return
+            return None
         now = self.tasks.now()
         for context in tuple(self._maintenance_contexts.values()):
             try:
@@ -1331,7 +1515,7 @@ class ContactSchedule:
         require(self.tasks.check_generation())
         if CONTACT_KIND not in self.contacts.gateway.router.profiles:
             self._note_coordinator(self.tasks.now(), "blocked", "contact_model_unregistered")
-            return
+            return None
         held = self.runtime.read_one("SELECT COUNT(*) FROM execution_attempts WHERE lane = 'background' AND slot_held = 1", ())[0]
         available = self.tasks.limits.background_slots - held - len(self._workers) - len(self._judges)
         self._advance_judges(self.tasks.now(), max(0, available))
@@ -1339,85 +1523,145 @@ class ContactSchedule:
         available = self.tasks.limits.background_slots - held - len(self._workers) - len(self._judges)
         if available <= 0:
             self._note_coordinator(self.tasks.now(), "blocked", "background_capacity_exhausted")
-            return
+            return None
         retained = self.runtime.read_one("SELECT COUNT(*) FROM execution_tasks", ())[0]
         if retained >= self.tasks.limits.retained_tasks:
             self._note_coordinator(self.tasks.now(), "blocked", "task_storage_full")
-            return
-        rows = self._legacy_rows(self._cursor)
-        legacy_count = len(rows)
+            return None
+        legacy_rows = self._legacy_rows(self._cursor)
         from companion_v2.conversation.native_turns import project, turns_available
         native_rows = self.runtime.read_all("""SELECT n.rowid AS sequence, n.* FROM conversation_native_turns n
             WHERE n.rowid > ? AND json_extract(n.context_json, '$.audience.scope.kind') = 'private'
+            AND n.generation_state = 'completed'
             AND NOT EXISTS (SELECT 1 FROM conversation_native_turns newer
                 WHERE newer.context_key = n.context_key
                 AND (newer.observed_at > n.observed_at OR newer.observed_at = n.observed_at AND newer.rowid > n.rowid))
             ORDER BY n.rowid LIMIT 16""", (self._native_cursor,)) if turns_available(self.runtime) else ()
-        rows = (*rows, *(project(row) for row in native_rows))
+        rows = (*legacy_rows, *(project(row) for row in native_rows))
+        return now, rows, available, len(legacy_rows), len(native_rows)
+
+    def _plan_one(self, row, now):
+        """Evaluate one candidate off the write transaction."""
+        if self._closed or row["origin_key"] in self._workers:
+            return None
+        if self._peek(row, now):
+            context = TaskContext.restore(json.loads(row["context_json"]))
+            self._note_window(context, row, now, "sources", "pending", "screen_observation_pending")
+            return None
+        return self._plan(row, now)
+
+    def _note_plan_error(self, row, now, error):
+        context = TaskContext.restore(json.loads(row["context_json"]))
+        if error.code == "contact_conversation_changed":
+            return
+        self._note_window(context, row, now, "validation", "failed", error.code)
+        if error.code in ("supervisor_fenced", "supervisor_generation_conflict"):
+            raise error
+
+    def _activate_plan(self, row, plan, available, now):
+        context, _, intents, _, origin = plan
+        purpose = intents[0].purpose if intents else None
+        circuit_until = self.contacts.platform_circuit.cooldown_until(context, at=now)
+        if circuit_until is not None:
+            self._note_window(context, row, now, "delivery_admission", "skipped", "platform_circuit_open",
+                              purpose=purpose, next_at=circuit_until)
+            return available
+        busy_until = self._busy_hold(context, origin, now)
+        if busy_until is not None:
+            self._note_window(context, row, now, "busy_gate", "skipped", "conversation_busy",
+                              purpose=purpose, next_at=busy_until)
+            return available
+        sleep_until = self._sleep_hold(context, origin, now)
+        if sleep_until is not None:
+            self._note_window(context, row, now, "rest_gate", "skipped", "role_sleeping",
+                              purpose=purpose, next_at=sleep_until)
+            return available
+        if row["origin_key"] in self._workers:
+            return available
+        worker = asyncio.create_task(self._run(plan), name="companion:automatic-contact:" + row["origin_key"])
+        self._workers[row["origin_key"]] = worker
+        self._note_window(context, row, now, "task_queue", "queued", "candidate_queued", purpose=purpose)
+        worker.add_done_callback(lambda done: self.notify())
+        return available - 1
+
+    def _row_cursor(self, row):
+        if isinstance(row, dict) and row.get("execution_path") == "astrbot_core":
+            self._native_cursor = row["sequence"]
+        else:
+            self._cursor = row["sequence"]
+
+    def advance(self):
+        # Compatibility path for tests and synchronous host recovery.
+        prepared = self._begin_tick()
+        if prepared is None:
+            return
+        now, rows, available, legacy_count, native_count = prepared
         for row in rows:
-            if isinstance(row, dict) and row.get("execution_path") == "astrbot_core":
-                self._native_cursor = row["sequence"]
-            else:
-                self._cursor = row["sequence"]
-            if row["origin_key"] in self._workers:
-                continue
-            now = self.tasks.now()
-            if self._peek(row, now):
-                context = TaskContext.restore(json.loads(row["context_json"]))
-                self._note_window(context, row, now, "sources", "pending", "screen_observation_pending")
-                continue
+            if self._closed or available <= 0:
+                break
+            self._row_cursor(row)
             try:
-                with self.runtime.transaction():
-                    plan = self._plan(row, now)
+                plan = self._plan_one(row, now)
             except TaskError as error:
-                context = TaskContext.restore(json.loads(row["context_json"]))
-                self._note_window(context, row, now, "validation", "failed", error.code)
-                if error.code in ("supervisor_fenced", "supervisor_generation_conflict"):
-                    raise
+                self._note_plan_error(row, now, error)
                 continue
             if plan is not None:
-                context, _, intents, _, origin = plan
-                purpose = intents[0].purpose if intents else None
-                circuit_until = self.contacts.platform_circuit.cooldown_until(context, at=now)
-                if circuit_until is not None:
-                    self._note_window(context, row, now, "delivery_admission", "skipped", "platform_circuit_open",
-                                      purpose=purpose, next_at=circuit_until)
-                    continue
-                busy_until = self._busy_hold(context, origin, now)
-                if busy_until is not None:
-                    self._note_window(context, row, now, "busy_gate", "skipped", "conversation_busy",
-                                      purpose=purpose, next_at=busy_until)
-                    continue
-                sleep_until = self._sleep_hold(context, origin, now)
-                if sleep_until is not None:
-                    self._note_window(context, row, now, "rest_gate", "skipped", "role_sleeping",
-                                      purpose=purpose, next_at=sleep_until)
-                    continue
-                worker = asyncio.create_task(self._run(plan), name="companion:automatic-contact:" + row["origin_key"])
-                self._workers[row["origin_key"]] = worker
-                self._note_window(context, row, now, "task_queue", "queued", "candidate_queued", purpose=purpose)
-                worker.add_done_callback(lambda done: self.notify())
-                available -= 1
-                if available == 0:
-                    self._note_coordinator(self.tasks.now(), "running", "contact_schedule_running")
-                    return
+                available = self._activate_plan(row, plan, available, now)
         if legacy_count < 16:
             self._cursor = 0
-        if len(native_rows) < 16:
+        if native_count < 16:
             self._native_cursor = 0
         self._note_coordinator(self.tasks.now(), "running", "contact_schedule_running")
+
+    async def advance_async(self):
+        """Keep each source scan off AstrBot's event loop; activation stays on it."""
+        if self._closed or self._advancing:
+            return
+        self._advancing = True
+        try:
+            prepared = self._begin_tick()
+            if prepared is None:
+                return
+            now, rows, available, legacy_count, native_count = prepared
+            for row in rows:
+                if self._closed or available <= 0:
+                    break
+                self._row_cursor(row)
+                planning = asyncio.create_task(asyncio.to_thread(self._plan_one, row, now))
+                self._planning = planning
+                try:
+                    plan = await asyncio.shield(planning)
+                except TaskError as error:
+                    self._note_plan_error(row, now, error)
+                    continue
+                finally:
+                    if self._planning is planning and planning.done():
+                        self._planning = None
+                if self._closed:
+                    break
+                if plan is not None:
+                    available = self._activate_plan(row, plan, available, now)
+            if legacy_count < 16:
+                self._cursor = 0
+            if native_count < 16:
+                self._native_cursor = 0
+            self._note_coordinator(self.tasks.now(), "running", "contact_schedule_running")
+        finally:
+            self._advancing = False
+        self._planning = None
 
     @property
     def active_handles(self):
         return tuple("automatic-contact-" + key for key in self._workers) + tuple(
             "contact-judge-" + key for key in self._judges)
 
-    def cancel_running(self):
-        self._closed = True
-        for worker in tuple(self._workers.values()):
-            worker.cancel()
-        for worker in tuple(self._judges.values()):
-            worker.cancel()
+    def bind_health_source(self, source):
+        self.health_source = source
+        self.health_events.update_source(source)
+        if getattr(self, "greeting_events", None) is not None:
+            self.greeting_events.health_source = source
+
+    def _close_sources(self):
         if self.events is not None:
             self.events.close()
         if self.growth_events is not None:
@@ -1434,12 +1678,35 @@ class ContactSchedule:
             self.weather_change_events.close()
         if self.official_alert_events is not None:
             self.official_alert_events.close()
+        if getattr(self, "health_events", None) is not None:
+            self.health_events.close()
         self.balance_events.close()
         self.news_events.close()
         self.screen_events.close()
 
+    def cancel_running(self, *, close_sources=True):
+        self._closed = True
+        for worker in tuple(self._workers.values()):
+            worker.cancel()
+        for worker in tuple(self._judges.values()):
+            worker.cancel()
+        if close_sources:
+            self._close_sources()
+
     async def close(self):
-        self.cancel_running()
+        # Stop accepting work and cancel live tasks, but keep sources open until
+        # the in-flight planner has returned; a planning thread must never read a
+        # closed event source or storage connection.
+        self.cancel_running(close_sources=False)
+        planning = self._planning
+        if planning is not None and not planning.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(planning), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                pass
+        self._close_sources()
         workers = tuple(self._workers.values()) + tuple(self._judges.values())
         if workers:
             await asyncio.wait(workers, timeout=0.25)

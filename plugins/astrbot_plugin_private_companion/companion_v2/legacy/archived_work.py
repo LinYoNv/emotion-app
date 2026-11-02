@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 
 from .archive import SCHEMA, _safe_relative_path as _safe_relative
+from .sqlite_snapshot import open_readonly_sqlite_snapshot
 
 
 TABLES = {
@@ -28,7 +29,7 @@ def archived_work_inventory(archive_root):
                 if relative not in files:
                     continue
                 database = _safe_relative(path.parent / "files", relative)
-                with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
+                with closing(open_readonly_sqlite_snapshot(database)) as connection:
                     connection.execute("PRAGMA query_only=ON")
                     actual = {r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                     areas[area] = {table: connection.execute('SELECT COUNT(*) FROM "' + table + '"').fetchone()[0]
@@ -55,7 +56,7 @@ def archived_work_rows(archive_root, archive_id, area, table, offset=0):
             or relative not in {row["path"] for row in manifest.get("files", ())}):
         raise ValueError("legacy_archive_source_unavailable")
     database = _safe_relative(directory / "files", relative)
-    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
+    with closing(open_readonly_sqlite_snapshot(database)) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only=ON")
         rows = connection.execute('SELECT * FROM "' + table + '" LIMIT ? OFFSET ?', (11, offset)).fetchall()

@@ -103,7 +103,7 @@ class RealityMiHomeExtensionAPI:
         web_api = self._plugin.mihome_web_api
         if web_api is None:
             raise ValueError(self._plugin.mihome_unavailable_reason())
-        handlers = {'start_login': lambda: web_api.extension_start_login(), 'login_status': lambda: web_api.extension_login_status((payload or {}).get('qr_revision', '')), 'sync_devices': web_api.extension_sync_devices, 'logout': web_api.extension_logout, 'save_mappings': lambda: web_api.extension_save_mappings((payload or {}).get('mappings', [])), 'control_power': lambda: web_api.extension_control_power(str((payload or {}).get('alias') or ''), bool((payload or {}).get('is_on')))}
+        handlers = {'start_login': lambda: web_api.extension_start_login(), 'login_status': lambda: web_api.extension_login_status((payload or {}).get('qr_revision', '')), 'sync_devices': web_api.extension_sync_devices, 'logout': web_api.extension_logout, 'save_mappings': lambda: web_api.extension_save_mappings((payload or {}).get('mappings', [])), 'device_status': lambda: web_api.extension_read_device_status(str((payload or {}).get('alias') or '')), 'control_power': lambda: web_api.extension_control_power(str((payload or {}).get('alias') or ''), bool((payload or {}).get('is_on')))}
         handler = handlers.get(action)
         if handler is None:
             raise ValueError('不支持的米家页面操作')
@@ -139,7 +139,26 @@ class RealityExtensionAPI:
         settings = plugin._reality_touch_configuration_snapshot()
         camera = plugin._reality_touch_camera_page_snapshot()
         camera['camera_enabled'] = camera.pop('global_enabled')
-        return {'schema': 'companion.perception-settings.v1', 'plugin_id': PLUGIN_NAME, 'global': {key: settings[key] for key in _V2_PERCEPTION_FIELDS['global']}, 'camera': {key: camera[key] for key in _V2_PERCEPTION_FIELDS['camera']}, 'mobile': {key: settings['mobile'].get(key, '') for key in _V2_PERCEPTION_FIELDS['mobile'] if key not in {'pairing_token', 'amap_api_key'}}, 'health': {key: settings['health'][key] for key in _V2_PERCEPTION_FIELDS['health']}, 'secrets': {'pairing_token_configured': settings['mobile']['pairing_token_configured'], 'amap_api_key_configured': settings['mobile']['amap_api_key_configured']}}
+        vision_options = plugin._vision_provider_options()
+        return {'schema': 'companion.perception-settings.v1', 'plugin_id': PLUGIN_NAME, 'global': {key: settings[key] for key in _V2_PERCEPTION_FIELDS['global']}, 'vision_providers': vision_options, 'camera': {key: camera[key] for key in _V2_PERCEPTION_FIELDS['camera']}, 'mobile': {key: settings['mobile'].get(key, '') for key in _V2_PERCEPTION_FIELDS['mobile'] if key not in {'pairing_token', 'amap_api_key'}}, 'health': {key: settings['health'][key] for key in _V2_PERCEPTION_FIELDS['health']}, 'secrets': {'pairing_token_configured': settings['mobile']['pairing_token_configured'], 'amap_api_key_configured': settings['mobile']['amap_api_key_configured']}}
+
+    def companion_v2_set_health_source_enabled(self, enabled: bool) -> dict[str, Any]:
+        """Toggle only the health ingestion source without rebuilding Reality.
+
+        The perception page owns the single user-facing health switch.  A full
+        ``configure_service`` would replace the phone gateway and discard its
+        in-memory pairing sessions, so this narrow update changes the persisted
+        health flag and refreshes the runtime fields in place.
+        """
+        if type(enabled) is not bool:
+            raise ValueError('健康感知开关必须是布尔值')
+        plugin = self._plugin
+        plugin._set_group_config_field('health', 'enabled', enabled)
+        saver = getattr(plugin.config, 'save_config', None)
+        if callable(saver) and saver() is False:
+            raise RuntimeError('健康感知设置保存失败')
+        plugin._sync_runtime_config()
+        return {'enabled': bool(plugin.health_enabled), 'ttl_seconds': int(plugin.health_ttl_seconds)}
 
     async def companion_v2_update_perception_settings(self, section: str, updates: dict[str, Any]) -> dict[str, Any]:
         rules = _V2_PERCEPTION_FIELDS.get(section)
@@ -223,6 +242,44 @@ class RealityExtensionAPI:
 
     def mobile_context(self, user_id: str='') -> dict[str, Any]:
         return self._plugin.mobile_context(user_id)
+
+    def wakeup_snapshot(self, user_id: str='') -> dict[str, Any]:
+        """Return only the wake session state; never message bodies or feedback text."""
+        user = self._plugin._user(user_id, create=False)
+        if not isinstance(user, dict):
+            return {}
+        alarm = user.get('wakeup_alarm')
+        alarm = alarm if isinstance(alarm, dict) else {}
+        session = alarm.get('contact_session')
+        session = session if isinstance(session, dict) else {}
+        safe = {}
+        for key in ('id', 'status', 'attempt', 'max_attempts', 'triggered_at',
+                    'feedback_at', 'completed_at', 'next_attempt_at'):
+            value = session.get(key)
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                safe[key] = value
+        return {'enabled': bool(alarm.get('enabled')),
+                'time': _single_line(alarm.get('time'), 8),
+                'contact_session': safe}
+
+    def wakeup_snapshot(self, user_id: str='') -> dict[str, Any]:
+        """Return only the wake session state; never message bodies or feedback text."""
+        user = self._plugin._user(user_id, create=False)
+        if not isinstance(user, dict):
+            return {}
+        alarm = user.get('wakeup_alarm')
+        alarm = alarm if isinstance(alarm, dict) else {}
+        session = alarm.get('contact_session')
+        session = session if isinstance(session, dict) else {}
+        safe = {}
+        for key in ('id', 'status', 'attempt', 'max_attempts', 'triggered_at',
+                    'feedback_at', 'completed_at', 'next_attempt_at'):
+            value = session.get(key)
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                safe[key] = value
+        return {'enabled': bool(alarm.get('enabled')),
+                'time': _single_line(alarm.get('time'), 8),
+                'contact_session': safe}
 
     def snapshot_owner(self, host_api: Any) -> Any:
         """Bind the native RV-1 owner to the current trusted host authority."""

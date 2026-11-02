@@ -55,8 +55,14 @@ window.CompanionWorkbench = (() => {
     core_access_required: "当前账号没有管理权限。",
     staging_not_initialized: "角色数据尚未加载，请重新读取。",
     staging_host_terminated: "插件已停止，请重新进入插件。",
+    host_context_unavailable: "这个角色还没有可读取的私聊上下文；请先在该窗口收到一条消息，或在「账号与会话」中启用它。",
+    host_target_mismatch: "当前窗口与角色映射不一致，请刷新「账号与会话」后重试。",
+    host_binding_changed: "当前角色绑定已变化，请重新读取角色状态。",
+    host_persona_changed: "角色人格已变化，请重新读取角色状态。",
     bridge_timeout: "连接超时，请核对连接后重试。",
     invalid_response: "返回数据不完整，请刷新核对。",
+    route_not_found: "当前页面请求的功能路由未注册；请把插件升级到最新版并重启 AstrBot 后重新打开。",
+    "未找到该路由": "当前页面请求的功能路由未注册；请把插件升级到最新版并重启 AstrBot 后重新打开。",
     /* 表达学习分区（expression-page.js）走这个内核渲染，它的域内码放在这里，
        避免分区再自带一张会与内核漂移的第二份表。 */
     expression_settings_invalid: "组合不合法：单批取样条数不能小于最低样本数，候选池不能小于每轮注入规则数；也请核对各项数值范围。",
@@ -152,6 +158,22 @@ window.CompanionWorkbench = (() => {
     || fallback;
   const icon = name => `<i data-lucide="${name}" aria-hidden="true"></i>`;
   let instanceSequence = 0;
+  /* Short-lived stale-while-revalidate cache for workbench reads.  Page
+     navigation often remounts the same configuration section; painting the
+     last successful snapshot immediately makes tab switches feel instant while
+     the background refresh still reconciles the edit token. */
+  const READ_CACHE = new Map();
+  const READ_CACHE_MS = 15000;
+  const readCache = key => {
+    const item = READ_CACHE.get(key);
+    if (!item || Date.now() - item.at > READ_CACHE_MS) { READ_CACHE.delete(key); return null; }
+    return JSON.parse(JSON.stringify(item.payload));
+  };
+  const writeCache = (key, payload) => {
+    if (READ_CACHE.size > 256) READ_CACHE.clear();
+    try { READ_CACHE.set(key, {at: Date.now(), payload: JSON.parse(JSON.stringify(payload))}); } catch {}
+  };
+  const clearReadCache = () => READ_CACHE.clear();
 
   /* === 字段契约：把后端 FieldDefinition 收敛成渲染所需的最小形状 === */
   function contract(name, definition, choices = null) {
@@ -174,11 +196,20 @@ window.CompanionWorkbench = (() => {
   }
 
   const choiceText = (item, value) => (item.choices && item.choices[value]) || value;
+  /* 词条/顺序列表在网线上有两种历史写法：编辑器写出的 JSON 数组串，以及后端
+     注册默认值那种用换行、中英文逗号或分号分隔的纯文本。只认 JSON 会把默认值
+     读成 0 个词条、让整张卡判为非法；非 JSON 文本按同一组分隔符回退。 */
+  const WORD_LIST_SPLIT = /[\r\n,，;；]+/;
   const parseStringList = value => {
-    try {
-      const parsed = JSON.parse(String(value ?? ""));
-      return Array.isArray(parsed) && parsed.every(item => typeof item === "string") ? parsed : null;
-    } catch { return null; }
+    const text = String(value ?? "").trim();
+    if (!text) return [];
+    if (text.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(text);
+        return Array.isArray(parsed) && parsed.every(item => typeof item === "string") ? parsed : null;
+      } catch {}
+    }
+    return text.split(WORD_LIST_SPLIT).map(item => item.trim()).filter(Boolean);
   };
   const parseLineList = value => String(value ?? "").split(/\r\n|\n|\r/)
     .map(line => line.trim()).filter(Boolean).map(line => {
@@ -217,6 +248,74 @@ window.CompanionWorkbench = (() => {
     if (value === " " || folded === "<space>") return "空格";
     return value;
   };
+  /* 世界知识来源令牌：`kb:<kbId>` 是整库引用，`doc:<kbId>:<docId>` 是逐篇引用。
+     后端对同一个库只认一种：kb: 在就忽略同库的 doc:。所以页面写值时两者必须互斥，
+     否则会出现「界面上库已取消，运行时仍在按 doc: 读这个库」的错觉。
+     逐篇选满也不折叠成 kb:——折叠会把以后新增的文档一并纳入，改变覆盖率。 */
+  const SOURCE_TOKEN_SPLIT = /[\r\n,;，；]+/;
+  const parseSourceTokens = value => String(value ?? "").split(SOURCE_TOKEN_SPLIT)
+    .map(token => token.trim()).filter(Boolean);
+  const sourceTokenKbId = token => {
+    const text = String(token ?? "");
+    return text.startsWith("kb:") ? text.slice(3)
+      : text.startsWith("doc:") ? text.slice(4).split(":")[0] : "";
+  };
+  const sourceDocToken = (kbId, docId) => {
+    const text = String(docId ?? "");
+    return text.startsWith("doc:") ? text : `doc:${String(kbId ?? "")}:${text}`;
+  };
+  /* 一个库在清单里的四种状态：整库引用、逐篇选满、逐篇选了一部分、没选。
+     `docIds` 传目录里的文档令牌（或裸 docId），两种写法都能识别。 */
+  const sourceGroupState = (rawValue, {kbId, docIds = []} = {}) => {
+    const key = String(kbId ?? "");
+    const tokens = new Set(parseSourceTokens(rawValue));
+    if (tokens.has(`kb:${key}`)) return "whole";
+    const docs = (Array.isArray(docIds) ? docIds : []).map(id => sourceDocToken(key, id));
+    if (!docs.length) return "none";
+    const chosen = docs.filter(token => tokens.has(token)).length;
+    return chosen === 0 ? "none" : chosen === docs.length ? "full" : "partial";
+  };
+  /* 半选（indeterminate）只有 JS 属性表达得了，HTML 属性做不到。
+     重绘后与就地更新后都要调用一次，否则用户会看到「部分选中」被画成未选中。 */
+  const syncSourceIndeterminate = root => {
+    const inputs = root?.querySelectorAll?.('input[data-wb-source-state="partial"]') || [];
+    for (const input of inputs) input.indeterminate = true;
+  };
+  /* 把一次复选框点击换算成新的 source_ids 文本。纯函数：不读 DOM、不改状态，
+     事件处理器与测试共用同一份裁决，避免界面显示与写回值各算一套。
+     返回 accepted=false 时 value 原样返回，调用方据此回滚这一次勾选。 */
+  function resolveSourceToggle(rawValue, {kbId, docId, checked, docIds = [], limit = 16} = {}) {
+    const key = String(kbId ?? "");
+    const original = String(rawValue ?? "");
+    const tokens = parseSourceTokens(original);
+    const docTokens = new Set((Array.isArray(docIds) ? docIds : [])
+      .map(id => sourceDocToken(key, id)).filter(Boolean));
+    /* 目录里已消失的旧文档令牌也算这个库的逐篇引用，取消时要一并清掉。 */
+    const sameKbDoc = token => docTokens.has(token)
+      || (token.startsWith("doc:") && sourceTokenKbId(token) === key);
+    const wholeToken = `kb:${key}`;
+    let next;
+    if (docId) {
+      const token = sourceDocToken(key, docId);
+      next = tokens.filter(item => item !== token && item !== wholeToken);
+      if (checked) next.push(token);
+    } else if (checked) {
+      /* 勾父级 = 整库引用：同库逐篇换成一条 kb:，避免后端忽略它们却仍留在值里。 */
+      next = tokens.filter(item => item !== wholeToken && !sameKbDoc(item));
+      next.push(wholeToken);
+    } else {
+      /* 取消父级 = 这个库彻底不引用：整库与同库逐篇都要删。
+         只删 kb: 会让「界面已取消、运行时仍按 doc: 读」的问题复现。 */
+      next = tokens.filter(item => item !== wholeToken && !sameKbDoc(item));
+    }
+    /* 重复令牌不增加含义，后端也按首次出现去重；写回时收敛。 */
+    next = [...new Set(next)];
+    const maximum = Number(limit || 16);
+    if (next.length > maximum) {
+      return {value: original, accepted: false, notice: `最多读取 ${maximum} 个来源。`};
+    }
+    return {value: next.join("\n"), accepted: true, notice: ""};
+  }
   /* 自我页的三种「轻结构」文本：生日（年份可省、可标农历）、口吻示例（一句一行）
      与词条（顿号分隔的自由文本）。它们在注册表里仍是 TEXT，值按原样保存；
      控件只负责把结构化编辑翻译回字符串，真源始终是 data-wb-field 那一个控件。 */
@@ -376,6 +475,12 @@ window.CompanionWorkbench = (() => {
       if (policy.numericIds && words.some(word => !/^[0-9]+$/.test(word) || word.startsWith("0"))) return false;
       return true;
     }
+    if (item.input === "chips" && item.chipOptions?.mode === "multi") {
+      const options = item.chipOptions.options || [];
+      const parts = parseTagList(value);
+      return parts.length > 0 && parts.every(part => options.includes(part))
+        && new Set(parts).size === parts.length;
+    }
     if (item.input === "replacement-list") {
       const pairs = parseReplacementList(value);
       const policy = item.listPolicy || {};
@@ -448,7 +553,7 @@ window.CompanionWorkbench = (() => {
       return "<div class=\"wb-segmented\" role=\"radiogroup\" aria-label=\""
         + e(item.label || item.name) + "\">" + choices + "</div>";
     }
-    if (item.choices) {
+    if (item.choices && item.input !== "chips") {
       /* 枚举：空值是合法的「跟随上级」，所以不自动补一个选中项。
          草稿可能是数字（整数档位字段），选项键一定是字符串，比较前先归一。 */
       const selected = choiceKey(item, value);
@@ -457,13 +562,12 @@ window.CompanionWorkbench = (() => {
       return `<select data-wb-field="${e(item.name)}"${dis}>${options}</select>`;
     }
     if (item.kind === "text" && item.input === "source-checklist") {
-      const selected = new Set(String(value ?? "").split(/[\r\n,;，；]+/)
-        .map(identifier => identifier.trim()).filter(Boolean));
+      const selected = new Set(parseSourceTokens(value));
       const sources = item.catalog?.(state.status) || [];
       const selectedLimit = Number(state.draft?.source_limit || 16);
-      const option = (id, label, detail, attributes = "") =>
-        `<label class="wb-source-option"><input type="checkbox" data-wb-field="${e(item.name)}"`
-        + ` data-wb-source-id="${e(id)}"${attributes} ${selected.has(id) ? "checked" : ""}${dis}>`
+      const option = (id, label, detail, attributes = "", {checked = selected.has(id), muted = false} = {}) =>
+        `<label class="wb-source-option${muted ? " is-disabled" : ""}"><input type="checkbox" data-wb-field="${e(item.name)}"`
+        + ` data-wb-source-id="${e(id)}"${attributes} ${checked ? "checked" : ""}${muted || locked ? " disabled" : ""}>`
         + `<span><b>${e(label)}</b>${detail ? `<small>${e(detail)}</small>` : ""}</span></label>`;
       const rows = sources.map(source => {
         if (source.type === "missing") {
@@ -472,14 +576,32 @@ window.CompanionWorkbench = (() => {
         }
         const kbId = String(source.kb_id || "");
         const docs = Array.isArray(source.documents) ? source.documents : [];
+        const docIds = docs.map(doc => doc.id);
+        /* 父级代表整库：整库令牌在、或逐篇已选满，才显示为已勾选；
+           只选了一部分时父级不勾选，改用半选表达「本库只引用一部分」。 */
+        const groupState = sourceGroupState(value, {kbId, docIds});
+        const chosenDocs = docIds.filter(id => selected.has(id)).length;
+        const plainDetail = `${Number(source.doc_count || docs.length)} 篇文档 · ${Number(source.chunk_count || 0)} 段`;
+        const detail = groupState === "full" || groupState === "partial"
+          ? `逐篇引用 · 已选 ${chosenDocs}/${docs.length} 篇` : plainDetail;
         const base = option(source.id, `${source.emoji ? source.emoji + " " : ""}${source.name || kbId}`,
-          `${Number(source.doc_count || docs.length)} 篇文档 · ${Number(source.chunk_count || 0)} 段`,
-          ` data-wb-source-base="${e(kbId)}"`);
+          detail,
+          ` data-wb-source-base="${e(kbId)}" data-wb-source-detail="${e(plainDetail)}"`
+          + (groupState === "partial" ? ` aria-checked="mixed" data-wb-source-state="partial"` : ""),
+          {checked: groupState === "whole" || groupState === "full"});
         const docRows = docs.map(doc => option(doc.id, doc.name || doc.doc_id,
           `${doc.file_type || "文档"} · ${Number(doc.chunk_count || 0)} 段`,
-          ` data-wb-source-document="${e(kbId)}"`)).join("");
-        return `<section class="wb-source-group">${base}${source.description
-          ? `<p>${e(source.description)}</p>` : ""}${docRows ? `<div class="wb-source-documents">${docRows}</div>` : ""}</section>`;
+          ` data-wb-source-document="${e(kbId)}"`,
+          /* 整库引用时逐篇令牌即便残留在值里也不生效，界面不再同时显示勾选。 */
+          {muted: groupState === "whole",
+            checked: groupState === "whole" ? false : selected.has(doc.id)})).join("");
+        /* 整库模式下单篇选择不生效，先说明再置灰，否则用户会以为勾不动是坏了。 */
+        const hint = groupState === "whole" && docs.length
+          ? `<p class="wb-source-whole-hint">整库引用中：本库 ${docs.length} 篇文档整体参与引用。需要逐篇选择时，请先取消整库。</p>`
+          : "";
+        return `<section class="wb-source-group" data-wb-source-state="${groupState}">${base}${hint}`
+          + `${source.description ? `<p>${e(source.description)}</p>` : ""}`
+          + `${docRows ? `<div class="wb-source-documents">${docRows}</div>` : ""}</section>`;
       }).join("");
       const empty = state.status?.knowledge_sources_available === false
         ? "AstrBot 知识库暂不可用" : "暂无 AstrBot 知识库";
@@ -679,17 +801,20 @@ window.CompanionWorkbench = (() => {
     if (item.kind === "text" && item.input === "chips") {
       const options = item.chipOptions?.options || [];
       const multi = item.chipOptions?.mode === "multi";
+      const labels = item.chipOptions?.labels || {};
       const current = String(value ?? "").trim();
       const parts = parseTagList(current);
       const chips = options.map(option => {
         const on = multi ? parts.includes(option) : current === option;
         return `<button type="button" class="wb-chip-opt${on ? " is-on" : ""}"`
-          + ` data-wb-chip="${e(item.name)}" data-wb-chip-value="${e(option)}"${dis}>${e(option)}</button>`;
+          + ` data-wb-chip="${e(item.name)}" data-wb-chip-value="${e(option)}"${dis}>${e(labels[option] || option)}</button>`;
       }).join("");
+      const field = item.chipOptions?.hideInput
+        ? `<input type="hidden" data-wb-field="${e(item.name)}" value="${e(value)}">`
+        : `<input type="text" data-wb-field="${e(item.name)}" value="${e(value)}"`
+          + ` aria-label="${e(item.label || item.name)}" placeholder="${e(item.chipOptions?.placeholder || "自定义…")}"${dis}>`;
       return `<div class="wb-chipset" data-wb-chipset="${e(item.name)}">`
-        + (chips ? `<div class="wb-chip-opts">${chips}</div>` : "")
-        + `<input type="text" data-wb-field="${e(item.name)}" value="${e(value)}"`
-        + ` aria-label="${e(item.label || item.name)}" placeholder="${e(item.chipOptions?.placeholder || "自定义…")}"${dis}></div>`;
+        + (chips ? `<div class="wb-chip-opts">${chips}</div>` : "") + field + `</div>`;
     }
     /* 词条小片：从顿号清单里逐项增删（爱好、标志性表达这类自由清单）。 */
     if (item.kind === "text" && item.input === "tags") {
@@ -718,7 +843,7 @@ window.CompanionWorkbench = (() => {
       const lines = parseQuoteLines(value).map(line => line.trim()).filter(Boolean);
       const count = Array.from(String(value ?? "")).length;
       const bubbles = lines.map((line, index) =>
-        `<div class="wb-quote"><span class="wb-quote-no" aria-hidden="true">${index + 1}</span>`
+        `<div class="wb-quote" data-wb-quote><span class="wb-quote-no" aria-hidden="true">${index + 1}</span>`
         + `<textarea data-wb-quote-line="${e(item.name)}" rows="1" aria-label="${e(item.label || item.name)} 第 ${index + 1} 句"${dis}>${e(line)}</textarea>`
         + `<button type="button" class="wb-quote-remove" data-wb-quote-remove="${e(item.name)}"`
         + ` data-wb-quote-index="${index}" aria-label="删除第 ${index + 1} 句" title="删除这句"${dis}>${icon("x")}</button></div>`).join("");
@@ -915,8 +1040,8 @@ window.CompanionWorkbench = (() => {
       + legend + body
       + `<div class="wb-actions">`
       + `<button type="button" class="wb-save${s.busy ? " is-busy" : ""}${s.savedState || ""}"`
-      + ` data-wb-action="save"${s.locked() ? " disabled" : ""}>`
-      + `<span class="wb-save-label">${e(s.busy ? "保存中…" : "保存")}</span>`
+      + ` data-wb-action="save"${s.locked() || Object.keys(s.conflicts).length ? " disabled" : ""}>`
+      + `<span class="wb-save-label">${e(s.busy ? "保存中…" : s.stale ? "核对最新配置" : "保存")}</span>`
       + `<svg class="wb-ring" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="7"></circle></svg>`
       + `<svg class="wb-check" viewBox="0 0 19 19" aria-hidden="true"><path d="M4 10l4 4 7-9"></path></svg>`
       + `</button>`
@@ -924,7 +1049,7 @@ window.CompanionWorkbench = (() => {
       + (container.resettable
         ? `<button type="button" class="button" data-wb-action="inherit"${s.locked() ? " disabled" : ""}>全部恢复继承</button>`
         : "")
-      + `<span class="wb-actions-note">${e(s.dirty() ? "有未保存的改动" : "与已保存一致")}</span>`
+      + `<span class="wb-actions-note">${e(Object.keys(s.conflicts).length ? `${Object.keys(s.conflicts).length} 项修改待核对` : s.stale ? "改动已保留，待核对当前配置" : s.dirty() ? "有未保存的改动" : "与已保存一致")}</span>`
       + (journal && scopeLabel ? `<span class="wb-scope">${e(scopeLabel)}</span>` : "")
       + `</div></div></section>`;
   }
@@ -936,7 +1061,9 @@ window.CompanionWorkbench = (() => {
     const tone = state.bad ? " is-error" : state.ok ? " is-ok" : "";
     return `<div class="wb-notice${tone}" role="status" aria-live="polite">`
       + `${icon(state.bad ? "alert-circle" : state.ok ? "check-circle-2" : "info")}`
-      + `<span>${e(state.notice)}</span></div>`;
+      + `<span>${e(state.notice)}</span>`
+      + (state.stale ? `<button type="button" class="button small" data-wb-action="reconcile"${state.busy || state.loading || state.pending ? " disabled" : ""}>核对最新配置</button>` : "")
+      + `</div>`;
   }
 
   /* === 实例 === */
@@ -947,6 +1074,7 @@ window.CompanionWorkbench = (() => {
       visibility = {}, listFields = {}, chipOptions = {}, navigationLimit = 8,
       presentation = "", sectionTabPrefix = "", initialSection = null,
       mount: mountPoint, endpoint, order = null, pollMs = 0, query = null,
+      prefetch = null,
       audit = null, onStatus = null, scopeKey: scopeKeyOverride = null,
       /* 分组用一层继承链，但「值是谁共享的」不一定等于链上有没有角色层：
          主动联系偏好还有关系层，卡片右上角要说清这一点，所以允许分区声明自己的
@@ -962,15 +1090,33 @@ window.CompanionWorkbench = (() => {
          写长名 `memory.enabled`（后端 `_normalize_patch` 按 field_id 查表，
          而它自己的测试就断言长名）。声明的函数把草稿名翻成网线上的名字。 */
       outbound = null,
+      /* 旧枚举值在进入表单前归一到当前选项，避免已保存的数据被误判为非法。 */
+      normalizeDraft = null,
     } = spec;
     const wireName = outbound || (name => name);
+    /* 读取快照时先把词条字段收敛成编辑器写出的 JSON 数组串，draft 与 base 都从
+       这份值派生。只归一草稿会让默认的换行串永远显示成「有改动」，保存时还会
+       把默认值当成新值重发；只归一默认值又会让快捷添加拿到空列表（5 类变 1 类）。 */
+    const normalizeWordLists = (values, fields = state.container?.fields || {}) => {
+      for (const [name, item] of Object.entries(fields)) {
+        if (item?.input === "word-list" && typeof values?.[name] === "string") {
+          values[name] = JSON.stringify(parseStringList(values[name]));
+        }
+      }
+      return values;
+    };
+    const draftFrom = (settings, status) => {
+      const draft = {...settings};
+      if (normalizeDraft) normalizeDraft(draft, status);
+      return draft;
+    };
     /* 读取侧与发送侧的令牌字段名可以不同：配置分区是 `edit_token` 收发同名，
        记忆分区读 `edit_token`、发 `expected_edit_token`。只声明一个的话，
        总有一侧拼错——读取静默落空（invalid_response），或保存被后端拒掉。 */
     const writeTokenKey = sendTokenKey || tokenKey;
     const state = {
        status: null, draft: null, base: null, pending: null, pendingReason: "",
-      busy: false, loading: false, denied: false, stale: false,
+      busy: false, loading: false, denied: false, stale: false, conflicts: {},
       notice: "", bad: false, ok: false, savedState: "", ticket: 0,
       drawRails: true, container: null, timer: null,
       instanceId: `wb-${++instanceSequence}`, activeGroupId: initialSection, resetFields: [],
@@ -984,7 +1130,8 @@ window.CompanionWorkbench = (() => {
 
     const locked = () => state.busy || state.loading || !!state.pending || !state.status || state.denied;
     const dirty = () => !!state.draft && !!state.base
-      && Object.keys(state.draft).some(name => state.draft[name] !== state.base[name]);
+      && (resets_.length > 0 || Object.keys(state.conflicts).length > 0
+        || Object.keys(state.draft).some(name => state.draft[name] !== state.base[name]));
     state.locked = locked;
     state.dirty = dirty;
 
@@ -1162,6 +1309,7 @@ window.CompanionWorkbench = (() => {
           value = response.data;
         }
         if (!value || typeof value !== "object" || Array.isArray(value)) throw error("invalid_response");
+        if (method !== "GET") clearReadCache();
         return value;
       } finally { clearTimeout(timer); }
     }
@@ -1257,7 +1405,7 @@ window.CompanionWorkbench = (() => {
       }
       const wasDrawing = state.drawRails;
       state.resetFields = resets_;
-      root.innerHTML = `<div class="wb">${noticeMarkup(state)}${cardMarkup(state, state.container, root.closest?.(".console-section, .decision-stage")?.querySelector?.(":scope > header h2")?.textContent?.trim())}</div>`;
+      root.innerHTML = `<div class="wb">${noticeMarkup(state)}${conflictMarkup()}${cardMarkup(state, state.container, root.closest?.(".console-section, .decision-stage")?.querySelector?.(":scope > header h2")?.textContent?.trim())}</div>`;
       /* 层轨绘制只做一次：重绘之后不再重播。 */
       if (wasDrawing && state.status) {
         state.drawRails = false;
@@ -1272,6 +1420,42 @@ window.CompanionWorkbench = (() => {
       wireFieldDescriptions(root);
       /* 台词气泡的 textarea 按内容自动长高；重绘后统一量一次。 */
       growQuotes(root);
+      /* 半选只能靠 DOM 属性设置，刚插入的元素要补一次。 */
+      syncSourceIndeterminate(root);
+    }
+
+    function conflictMarkup() {
+      const names = Object.keys(state.conflicts);
+      if (!names.length) return "";
+      const text = (name, value) => {
+        const item = state.container?.fields[name];
+        if (value === undefined) return "此项已移除";
+        if (typeof value === "boolean") return value ? "已开启" : "已关闭";
+        if (value === "") return "未填写";
+        return String(item?.choices?.[value] ?? value);
+      };
+      return `<section class="wb-conflicts" aria-label="核对同时修改的配置">`
+        + `<p>这些设置也在其他页面改过，请逐项选择要保留的值。</p>`
+        + names.map(name => `<div class="wb-conflict"><strong>${e(labels[name] || name)}</strong>`
+          + `<div class="wb-conflict-values"><span>当前已保存：${e(text(name, state.base[name]))}</span>`
+          + `<span>我的修改：${e(resets_.includes(name) ? "恢复继承" : text(name, state.draft[name]))}</span></div>`
+          + `<div class="wb-conflict-actions"><button type="button" class="button small" data-wb-conflict="${e(name)}" data-wb-choice="current"${locked() ? " disabled" : ""}>使用当前值</button>`
+          + (state.container?.fields[name] ? `<button type="button" class="button small" data-wb-conflict="${e(name)}" data-wb-choice="draft"${locked() ? " disabled" : ""}>保留我的修改</button>` : "")
+          + `</div></div>`).join("") + `</section>`;
+    }
+
+    function resolveConflict(name, choice) {
+      if (locked() || !Object.hasOwn(state.conflicts, name)) return;
+      if (choice === "current") {
+        if (Object.hasOwn(state.base, name)) state.draft[name] = state.base[name];
+        else delete state.draft[name];
+        resets_ = resets_.filter(field => field !== name);
+      } else if (choice !== "draft" || !state.container?.fields[name]) return;
+      delete state.conflicts[name];
+      state.bad = Object.keys(state.conflicts).length > 0;
+      state.notice = state.bad ? "还有同时修改的设置需要核对。"
+        : dirty() ? "核对完成，保存后应用你的修改。" : "核对完成，已使用当前保存的配置。";
+      paint();
     }
 
     function focusSection(id) {
@@ -1435,7 +1619,58 @@ window.CompanionWorkbench = (() => {
       root.removeEventListener("mouseout", onUnhover);
     }
 
-
+    /* 勾选后只更新这一个来源清单：整卡重绘会夺走刚点过的复选框焦点。
+       父级半选与置灰都按「库状态」重算，保证就地更新与整页重绘结果一致。 */
+    function applySourceValue(control, raw) {
+      if (!control) return;
+      const selected = new Set(parseSourceTokens(raw));
+      for (const base of [...(control.querySelectorAll("[data-wb-source-base]") || [])]) {
+        const section = base.closest(".wb-source-group");
+        if (!section) continue;
+        const kbId = base.dataset.wbSourceBase || "";
+        const docs = [...(section.querySelectorAll("[data-wb-source-document]") || [])];
+        const docIds = docs.map(input => input.dataset.wbSourceId);
+        const groupState = sourceGroupState(raw, {kbId, docIds});
+        section.dataset.wbSourceState = groupState;
+        base.checked = groupState === "whole" || groupState === "full";
+        base.indeterminate = groupState === "partial";
+        if (groupState === "partial") {
+          base.setAttribute("aria-checked", "mixed");
+          base.dataset.wbSourceState = "partial";
+        } else {
+          base.removeAttribute("aria-checked");
+          delete base.dataset.wbSourceState;
+        }
+        const baseLabel = base.closest(".wb-source-option");
+        const detail = baseLabel?.querySelector("small");
+        if (detail) {
+          const chosen = docIds.filter(id => selected.has(id)).length;
+          detail.textContent = groupState === "full" || groupState === "partial"
+            ? `逐篇引用 · 已选 ${chosen}/${docIds.length} 篇`
+            : base.dataset.wbSourceDetail || "";
+        }
+        for (const input of docs) {
+          input.checked = groupState === "whole" ? false : selected.has(input.dataset.wbSourceId);
+          input.disabled = groupState === "whole" || locked();
+          input.closest(".wb-source-option")?.classList.toggle("is-disabled", groupState === "whole");
+        }
+        let hint = section.querySelector(".wb-source-whole-hint");
+        if (groupState === "whole" && docs.length) {
+          if (!hint) {
+            hint = document.createElement("p");
+            hint.className = "wb-source-whole-hint";
+            baseLabel?.after?.(hint);
+          }
+          hint.textContent = `整库引用中：本库 ${docs.length} 篇文档整体参与引用。需要逐篇选择时，请先取消整库。`;
+        } else if (hint) {
+          hint.remove();
+        }
+      }
+      const maximum = Number(state.draft?.source_limit || 16);
+      const count = control.querySelector(".wb-source-count");
+      if (count) count.textContent = `已选 ${new Set(parseSourceTokens(raw)).size} / ${maximum} 项`;
+      syncSourceIndeterminate(control);
+    }
 
     function onInput(event) {
       const el = event.target;
@@ -1467,33 +1702,30 @@ window.CompanionWorkbench = (() => {
       const item = state.container.fields[name];
       if (item.input === "source-checklist" && el.type === "checkbox") {
         const control = el.closest(".wb-source-picker");
-        const baseId = el.dataset.wbSourceBase;
-        const docKbId = el.dataset.wbSourceDocument;
-        if (el.checked && baseId) {
-          [...(control?.querySelectorAll("[data-wb-source-document]") || [])]
-            .filter(input => input.dataset.wbSourceDocument === baseId)
-            .forEach(input => { input.checked = false; });
-        } else if (el.checked && docKbId) {
-          const base = [...(control?.querySelectorAll("[data-wb-source-base]") || [])]
-            .find(input => input.dataset.wbSourceBase === docKbId);
-          if (base) base.checked = false;
-        }
-        const options = [...(control?.querySelectorAll("[data-wb-source-id]:checked") || [])];
+        const kbId = el.dataset.wbSourceBase || el.dataset.wbSourceDocument || "";
         const maximum = Number(state.draft.source_limit || 16);
-        if (options.length > maximum) {
-          el.checked = false;
-          state.notice = `最多读取 ${maximum} 个来源。`;
+        /* 文档级复选框带 data-wb-source-document；父级带 data-wb-source-base。 */
+        const docIds = [...(control?.querySelectorAll("[data-wb-source-document]") || [])]
+          .filter(input => input.dataset.wbSourceDocument === kbId)
+          .map(input => input.dataset.wbSourceId);
+        const result = resolveSourceToggle(state.draft[name], {
+          kbId,
+          docId: el.dataset.wbSourceDocument ? el.dataset.wbSourceId : undefined,
+          checked: el.checked, docIds, limit: maximum,
+        });
+        if (!result.accepted) {
+          /* 回滚这一次勾选：草稿没动，重绘会按原值恢复勾选态。 */
+          el.checked = !el.checked;
+          state.notice = result.notice;
           state.bad = true; state.ok = false;
           paint();
           return;
         }
-        const raw = options.map(input => input.dataset.wbSourceId).join("\n");
-        state.draft[name] = raw;
+        state.draft[name] = result.value;
         state.savedState = ""; state.ok = false;
         const row = el.closest(".wb-field");
-        if (row) row.classList.toggle("is-dirty", state.base && raw !== state.base[name]);
-        const count = control?.querySelector(".wb-source-count");
-        if (count) count.textContent = `已选 ${options.length} / ${maximum} 项`;
+        if (row) row.classList.toggle("is-dirty", state.base && result.value !== state.base[name]);
+        applySourceValue(control, result.value);
         return;
       }
       if (item.input === "identity-checklist" && el.type === "checkbox") {
@@ -1577,6 +1809,8 @@ window.CompanionWorkbench = (() => {
     }
 
     function onClick(event) {
+      const conflict = event.target.closest("[data-wb-conflict]");
+      if (conflict) { resolveConflict(conflict.dataset.wbConflict, conflict.dataset.wbChoice); return; }
       const clearDate = event.target.closest("[data-wb-date-clear]");
       if (clearDate) { composeDateField(clearDate.dataset.wbDateClear, true); return; }
       const section = event.target.closest("[data-wb-section]");
@@ -1663,8 +1897,12 @@ window.CompanionWorkbench = (() => {
       if (!action) return;
       if (action === "save") { void save(false); return; }
       if (action === "retry") { void save(true); return; }
+      if (action === "reconcile") { void refresh(); return; }
       if (action === "reset") {
-        state.draft = {...state.status.settings};
+        if (state.stale) { void refresh({discardDraft: true}); return; }
+        state.base = {...state.status.settings};
+        state.draft = draftFrom(state.status.settings, state.status);
+        state.conflicts = {};
         resets_ = [];
         state.notice = "已恢复为当前已保存配置。";
         state.bad = false; state.ok = false;
@@ -2050,6 +2288,7 @@ window.CompanionWorkbench = (() => {
       const list = set.querySelector(".wb-quote-list");
       const node = document.createElement("div");
       node.className = "wb-quote";
+      node.dataset.wbQuote = "";
       const index = list.querySelectorAll("[data-wb-quote-line]").length;
       node.innerHTML = `<span class="wb-quote-no" aria-hidden="true">${index + 1}</span>`
         + `<textarea data-wb-quote-line="${e(name)}" rows="1" aria-label="${e(item.label || item.name)} 第 ${index + 1} 句"></textarea>`
@@ -2085,19 +2324,35 @@ window.CompanionWorkbench = (() => {
       paint();
     }
 
-    async function refresh() {
+    async function refresh(options = {}) {
       /* 已经有一次读取在途时不再叠加：挂载与显式刷新都会走到这里，
          而重复请求既浪费往返，也会让后到的旧快照覆盖新快照。 */
-      if (state.loading) return;
+      if (state.loading || state.busy || (state.pending && state.status)) return;
+      const previousBase = state.base;
+      const previousDraft = state.draft;
+      const previousConflicts = state.conflicts;
+      const keepDraft = !options?.discardDraft && dirty();
+      const cacheKey = JSON.stringify([endpoint, group, query || null,
+        window.CompanionProduct?.scopeKey?.() || "",
+        window.CompanionProduct?.selection?.() || null]);
+      const prefetched = options?.prefetched && typeof options.prefetched === "object" ? options.prefetched : null;
+      const cached = prefetched || (options?.allowCache && !options?.force && !keepDraft && !state.pending
+        ? readCache(cacheKey) : null);
+      const usedCache = Boolean(cached);
       const ticket = ++state.ticket;
       state.loading = true;
       state.notice = state.status ? state.notice : "";
       paint();
       try {
         let payload, retried = false;
-        for (let retries = 0; ; retries += 1) {
+        if (cached) {
+          payload = cached;
+          writeCache(cacheKey, cached);
+        }
+        for (let retries = 0; !cached; retries += 1) {
           try {
             payload = await api("GET", endpoint, null, query || undefined);
+            writeCache(cacheKey, payload);
             break;
           } catch (problem) {
             if (ticket !== state.ticket) return;
@@ -2126,14 +2381,28 @@ window.CompanionWorkbench = (() => {
            统一成 edit_token，后续只读这一个名字；发送时再翻回 writeTokenKey。 */
         if (tokenKey !== "edit_token") value.edit_token = token;
         if (valuesKey !== "settings") value.settings = settings;
+        normalizeWordLists(value.settings, nextContainer.fields);
         const changed = state.status && state.status.edit_token !== value.edit_token;
         state.status = value;
         state.container = nextContainer;
-        if (!state.draft || changed) {
-          state.draft = {...value.settings};
-          state.base = {...value.settings};
-          /* 后端版本变了，之前标记的「恢复继承」所依赖的基线已不成立。 */
-          if (changed) resets_ = resets_.filter(name => name in state.draft);
+        state.base = {...value.settings};
+        state.draft = draftFrom(value.settings, value);
+        state.conflicts = {};
+        if (keepDraft) {
+          for (const [name, draftValue] of Object.entries(previousDraft)) {
+            if (draftValue === previousBase[name] && !resets_.includes(name)
+                && !Object.hasOwn(previousConflicts, name)) continue;
+            const prior = Object.hasOwn(previousConflicts, name)
+              ? previousConflicts[name].base : previousBase[name];
+            const reset = resets_.includes(name);
+            state.draft[name] = reset ? value.settings[name] : draftValue;
+            if (!Object.hasOwn(value.settings, name)
+                || (value.settings[name] !== prior && (reset || value.settings[name] !== draftValue))) {
+              state.conflicts[name] = {base: prior};
+            }
+          }
+        } else {
+          resets_ = [];
         }
         state.stale = false;
         let recoveredConflict = false;
@@ -2151,13 +2420,25 @@ window.CompanionWorkbench = (() => {
         if (recoveredConflict) {
           state.bad = true;
           state.notice = "上次保存遇到配置版本冲突，服务端没有写入；草稿已恢复，请核对后重新保存。";
-        } else if (changed) state.notice = "已读取最新配置。";
+        } else if (Object.keys(state.conflicts).length) {
+          state.bad = true;
+          state.notice = "当前配置已读取，请核对同时修改的设置。";
+        } else if (keepDraft) state.notice = dirty()
+          ? "已读取最新配置，你的改动已保留，保存后生效。" : "改动已与当前配置一致，无需再次保存。";
+        else if (changed) state.notice = "已读取最新配置。";
         else if (retried) state.notice = "";
         state.loading = false;
         paint();
         if (onStatus) onStatus(value);
         if (state.pending) scheduleAutoRecovery(state.pending.operation_key, ticket);
         schedule();
+        if (usedCache && !prefetched) {
+          setTimeout(() => {
+            if (!state.busy && !state.loading && !state.dirty() && !state.pending) {
+              void refresh({...options, force: true});
+            }
+          }, 0);
+        }
       } catch (problem) {
         if (ticket !== state.ticket) return;
         /* 读取失败后不能继续把上一份配置当成当前真实状态展示。保留用户尚未
@@ -2183,7 +2464,10 @@ window.CompanionWorkbench = (() => {
       if (state.busy || state.loading || state.denied) return;
        if (!retry) {
          if (state.pending) { state.notice = ""; state.bad = false; paint(); return; }
-        if (state.stale) { state.notice = "配置已更新，请先核对当前版本。"; paint(); return; }
+        if (state.stale) { await refresh(); return; }
+        if (Object.keys(state.conflicts).length) {
+          state.notice = "请先选择同时修改的设置要保留哪个值。"; state.bad = true; paint(); return;
+        }
         const invalidDate = mountPoint()?.querySelector('[data-wb-date-invalid="true"]');
         if (invalidDate) {
           invalidDate.querySelector("[data-wb-date-error]")?.focus?.();
@@ -2257,6 +2541,7 @@ window.CompanionWorkbench = (() => {
           throw error("invalid_response");
         }
          state.pending = null; state.pendingReason = ""; savePending();
+        resets_ = [];
         clearAutoRecovery(request.operation_key);
         /* 保存确认同样按分区包裹，取本分区那一片；缺失时保留原状态。
            读取侧与发送侧的值字段名可以不同（见 valuesKey），这里也要按同一个名字回填，
@@ -2270,9 +2555,12 @@ window.CompanionWorkbench = (() => {
           }
           state.status = fresh;
           state.container = buildContainer(fresh);
-          state.draft = {...fresh.settings};
+          normalizeWordLists(fresh.settings, state.container.fields);
+          state.draft = draftFrom(fresh.settings, fresh);
           state.base = {...fresh.settings};
           state.stale = false;
+          state.conflicts = {};
+          resets_ = [];
           if (onStatus) onStatus(fresh);
         }
         state.busy = false;
@@ -2299,7 +2587,7 @@ window.CompanionWorkbench = (() => {
         if (problem.confirmed || problemCode === "configuration_revision_conflict") {
            state.pending = null; state.pendingReason = ""; savePending();
            clearAutoRecovery(request.operation_key);
-           state.stale = true;
+           state.stale = problemCode === "configuration_revision_conflict";
            state.notice = localized(problem, "保存未通过。请读取当前设置后核对。");
         } else {
            state.pendingReason = localized(problem, "连接没有返回保存确认。");
@@ -2319,7 +2607,7 @@ window.CompanionWorkbench = (() => {
       if (state.pending) return {state: "unknown", message: state.pendingReason || state.pending.pending_reason || ""};
       if (state.busy || state.loading || state.denied || !state.status) return {state: "unavailable"};
       if (!state.draft || !state.container?.fields[name]) return {state: "unavailable"};
-      if (state.stale) return {state: "conflict", message: state.notice || "配置已更新，请先核对当前版本。"};
+      if (state.stale || Object.keys(state.conflicts).length) return {state: "conflict", message: state.notice || "配置已更新，请先核对当前版本。"};
       const otherChanges = Object.keys(state.draft).some(field => field !== name && state.draft[field] !== state.base?.[field]);
       if (otherChanges || resets_.length) return {state: "dirty"};
       state.draft[name] = value;
@@ -2331,7 +2619,7 @@ window.CompanionWorkbench = (() => {
       await save();
       if (state.ok) return {state: "saved"};
       if (state.pending) return {state: "unknown", message: state.pendingReason || state.pending.pending_reason || ""};
-      if (state.stale) return {state: "conflict", message: state.notice || "配置已更新，请先核对当前版本。"};
+      if (state.stale || Object.keys(state.conflicts).length) return {state: "conflict", message: state.notice || "配置已更新，请先核对当前版本。"};
       if (state.bad) return {state: "rejected", message: state.notice || "设置未通过校验。"};
       return {state: "unchanged", message: state.notice || "设置没有变化。"};
     }
@@ -2340,7 +2628,7 @@ window.CompanionWorkbench = (() => {
       stop();
       if (!pollMs || !state.status || document.hidden) return;
       state.timer = setTimeout(() => {
-        if (!state.busy && !state.loading && !state.dirty()) void refresh();
+        if (!state.busy && !state.loading && !state.dirty()) void refresh({force:true});
         else schedule();
       }, pollMs);
     }
@@ -2364,7 +2652,14 @@ window.CompanionWorkbench = (() => {
           + `<span>当前对象没有可用的配置工作区。请先选择已初始化的私聊对象和角色。</span></p>`;
         return;
       }
-      void refresh();
+      if (typeof prefetch === "function") {
+        Promise.resolve().then(prefetch).then(payload => {
+          const mounted = mountPoint();
+          if (mounted && mounted.isConnected !== false) void refresh({prefetched: payload});
+        }).catch(() => { void refresh({allowCache:true}); });
+      } else {
+        void refresh({allowCache:true});
+      }
     }
 
     /* 宿主页面每次 render() 会整块重写 innerHTML，把本工作台的 DOM 一起冲掉。
@@ -2390,18 +2685,57 @@ window.CompanionWorkbench = (() => {
        state.pendingReason = "";
       state.busy = false; state.loading = false; state.notice = ""; state.bad = false;
       state.ok = false; state.savedState = ""; state.drawRails = true;
+      state.stale = false; state.conflicts = {};
       state.visibleGroupIds = null;
       resets_ = [];
     }
 
+    function changedFields() {
+      return [...new Set([...Object.keys(state.draft || {}), ...Object.keys(state.conflicts)])]
+        .filter(name => state.draft[name] !== state.base?.[name] || Object.hasOwn(state.conflicts, name)
+        || resets_.includes(name)).map(name => (state.container?.fields[name]?.label || labels[name] || name)
+          + (resets_.includes(name) ? '（恢复继承）' : ''));
+    }
+
+    async function saveBeforeLeave() {
+      if (state.pending) return {error: '上次保存结果待核对，请回到这项配置核对原请求。'};
+      if (state.busy || state.loading) return {error: '这项配置正在处理，请稍后再保存。'};
+      await save(false);
+      return !dirty() && !state.pending ? true
+        : {error: state.notice || state.pendingReason || '保存尚未确认，改动已保留，请回到配置中检查。'};
+    }
+
+    function discard() {
+      if (state.busy) return {error: '正在保存，请等待保存结果后再切换。'};
+      state.draft = state.base ? draftFrom(state.base, state.status) : null;
+      resets_ = [];
+      state.conflicts = {}; state.stale = false;
+      // An unanswered request stays in sessionStorage for later reconciliation.
+      state.pending = null;
+      state.notice = ''; state.bad = false;
+      paint();
+      return true;
+    }
+
     /* 句柄不能叫 api：同一作用域里已有一个 async function api（桥调用）。 */
     const handle = {group, title, mount, attach, unmount, refresh, state, save, saveField, stop,
-      start: schedule, selectSection, setVisibleGroups, dirty};
+      start: schedule, selectSection, setVisibleGroups, dirty, changedFields, saveBeforeLeave, discard,
+      connected: () => { const root = mountPoint(); return !!root && root.isConnected !== false; }};
     return handle;
   }
 
   return {create, errors, LAYER_LABELS, contract, valid, toDisplay, fromDisplay, choiceText,
+    /* 来源清单的点击裁决是纯函数，事件处理器与测试共用它，避免界面与写回值各算一套。 */
+    resolveSourceToggle,
+    /* 词条解析也对外：配置覆盖自检要拿它验证注册默认值读得懂，避免审计脚本
+       再写一份解析规则、和页面一起写错。 */
+    parseStringList,
     /* 有草稿没保存的实例清单（含分区标题，用于提示语）。 */
-    dirtyEditors: () => [...LIVE].filter(entry => { try { return entry.dirty(); } catch { return false; } })
-      .map(entry => ({group: entry.group, title: entry.title || entry.group}))};
+    dirtyEditors: () => [...LIVE].flatMap(entry => {
+      try {
+        if (!entry.connected()) { entry.unmount(); return []; }
+        return entry.dirty() ? [{group: entry.group, title: entry.title || entry.group,
+          fields: entry.changedFields(), save: entry.saveBeforeLeave, discard: entry.discard}] : [];
+      } catch { return []; }
+    })};
 })();

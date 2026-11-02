@@ -12,7 +12,7 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 const drains = async (times = 8) => { for (let index = 0; index < times; index += 1) await flush(); };
 const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const TOKEN = 'a'.repeat(64);
-const PREFIX = '/astrbot_plugin_private_companion_v2/';
+const PREFIX = '/astrbot_plugin_private_companion/';
 const plain = value => JSON.parse(JSON.stringify(value));
 
 /* The registered group is window-scoped; these are the fields the page edits. */
@@ -26,7 +26,7 @@ const DEFAULTS = {
   group_wakeup_enabled: true, group_wakeup_direct_words: '[]',
   group_wakeup_context_words: '[]', group_wakeup_interest_keywords: '[]',
   group_wakeup_question_enabled: false, group_wakeup_bot_name: '',
-  group_wakeup_primary_member_ids: '[]', group_wakeup_owner_direct_words: '[]',
+  group_wakeup_primary_member_ids: '[]', group_wakeup_owner_direct_words: '[]', group_tool_profile: 'full',
   group_wakeup_interest_probability: 0.18, group_wakeup_question_threshold: 65,
   group_wakeup_cold_group_enabled: false, group_wakeup_cold_group_threshold: 65,
   group_wakeup_cold_group_idle_minutes: 25, group_wakeup_cooldown_seconds: 90,
@@ -34,10 +34,19 @@ const DEFAULTS = {
   group_wakeup_bot_name_enabled: true, group_wakeup_generated_keyword_limit: 24,
   group_wakeup_topic_interest_max_boost: 45, group_wakeup_debounce_pending_penalty: 65,
   group_wakeup_image_enabled: false, group_wakeup_image_weight: 0.2,
+  group_wakeup_image_default_guidance_enabled: true,
   group_wakeup_short_text_wait_ms: 15000, group_wakeup_log_limit: 80,
-  group_air_guard_enabled: true, group_air_guard_window_seconds: 60,
+  group_air_guard_enabled: true, group_high_intensity_enabled: false,
+  group_air_guard_window_seconds: 60,
+  recall_silence_enabled: true,
   group_air_guard_max_bot_replies: 3, group_air_guard_cooldown_seconds: 150,
   group_air_guard_polite_loop_limit: 2,
+  private_closing_guard_enabled: true, private_closing_guard_window_seconds: 1800,
+  private_closing_guard_prompt_enabled: true,
+  private_debounce_enabled: true, private_debounce_min_ms: 1500,
+  private_debounce_max_ms: 4000, private_debounce_total_ms: 8000,
+  group_conversation_followup_enabled: true, group_conversation_followup_seconds: 120,
+  group_conversation_followup_max_turns: 3,
   enable_group_injection_guard: true, enable_group_privacy_guard: true,
   enable_group_reality_promise_guard: true, enable_context_image_captioning: false,
   context_image_caption_max_items: 2, enable_private_image_self_recognition: false,
@@ -54,7 +63,7 @@ const DEFAULTS = {
   file_understanding_max_size_mb: 8, file_understanding_max_chars: 24000,
   file_understanding_timeout_seconds: 15, file_understanding_prompt: '',
   style_prompt: '', prompt_style_mode: 'free', content_cleanup_enabled: true, content_cleanup_mode: 'words',
-  content_cleanup_scope: 'all', content_cleanup_rule: '[\\n]', content_cleanup_words: '["\\n"]',
+  content_cleanup_scope: 'trailing', content_cleanup_rule: '[\\n]', content_cleanup_words: '["\\n"]',
   content_replacement_enabled: false, content_replacements: '[]', framework_error_guard_enabled: true,
   enable_forbidden_word_recall: false, recall_forbidden_words: '[]', recall_forbidden_scope: 'bot_and_group',
   recall_forbidden_word_case_sensitive: false, forward_message_adaptation_enabled: true,
@@ -62,6 +71,7 @@ const DEFAULTS = {
   reply_quote_group_enabled: true, reply_quote_first_part_only: true, reply_quote_skip_chars: 0,
   reply_mention_speaker_enabled: false, reply_diagnostic_limit: 80,
   voice_trigger_mode: 'always', voice_generation_mode: 'plain', voice_segment_mode: 'each',
+  voice_conversion_scope: 'full',
   voice_delivery_mode: 'voice_and_text', voice_position: 'after_media', voice_language: 'zh',
   voice_foreign_text_mode: 'original', voice_probability: 1, voice_cooldown_seconds: 0,
   voice_max_speech_chars: 1800, voice_timeout_seconds: 30, voice_trigger_keywords: '',
@@ -69,6 +79,9 @@ const DEFAULTS = {
   voice_primary_mention_prompt: '',
   voice_provider_id: '', voice_zh_provider_id: '', voice_ja_provider_id: '',
   voice_en_provider_id: '', voice_extra_prompt: '', style_prompt: '',
+  voice_private_zh_provider_id: '', voice_private_ja_provider_id: '',
+  voice_private_en_provider_id: '', voice_group_zh_provider_id: '',
+  voice_group_ja_provider_id: '', voice_group_en_provider_id: '',
   enable_humanized_expression: false, humanized_expression_prompt: '',
 };
 const LIMITS = {
@@ -83,7 +96,11 @@ const LIMITS = {
   group_wakeup_short_text_wait_ms: [0, 30000], group_wakeup_log_limit: [10, 300],
   group_air_guard_window_seconds: [30, 1800], group_air_guard_max_bot_replies: [1, 20],
   group_air_guard_cooldown_seconds: [0, 1800],
+  group_conversation_followup_seconds: [15, 1800], group_conversation_followup_max_turns: [1, 12],
   group_air_guard_polite_loop_limit: [1, 10], context_image_caption_max_items: [0, 8],
+  private_closing_guard_window_seconds: [60, 7200],
+  private_debounce_min_ms: [10, 120000], private_debounce_max_ms: [10, 120000],
+  private_debounce_total_ms: [10, 120000],
   private_image_vision_cache_max_items: [0, 2000], private_image_vision_max_chars: [120, 4000],
   private_image_vision_wait_seconds: [1, 30], private_image_provider_failure_cooldown_seconds: [0, 3600],
   video_understanding_max_chars: [200, 6000], video_understanding_wait_seconds: [1, 60],
@@ -103,6 +120,10 @@ const FIELDS = Object.fromEntries(Object.entries(DEFAULTS).map(([name, value]) =
     'video_understanding_private_enabled', 'video_understanding_group_enabled',
     'file_understanding_private_enabled', 'file_understanding_group_enabled',
     'prompt_style_mode',
+    'private_closing_guard_enabled', 'private_closing_guard_window_seconds',
+    'private_closing_guard_prompt_enabled', 'recall_silence_enabled',
+    'private_debounce_enabled', 'private_debounce_min_ms', 'private_debounce_max_ms',
+    'private_debounce_total_ms',
     ...Object.keys(DEFAULTS).filter(name => name.startsWith('group_wakeup_') && !GROUP_SCOPE_FIELDS.has(name)),
   ]);
   const entry = {kind, default: value, apply_mode: 'immediate',
@@ -126,7 +147,7 @@ function status(changes = {}, token = TOKEN) {
     provenance: Object.fromEntries(Object.keys(settings).map(name =>
       [name, {layer: 'window', explicit: true, revision: 1}])),
     fields: FIELDS, recent: [], participation_recent: [], participation_limit: 80,
-    tts: {state: 'ready', providers: [{id: 'tts-a'}, {id: 'tts-b'}]},
+    tts: {state: 'ready', providers: [{id: 'tts-a', model: 's2.1-pro-free', voice: '高木さん'}, {id: 'tts-b'}]},
   };
 }
 
@@ -148,8 +169,11 @@ function harness() {
       setAttribute(name, value) { attributes[name] = value; }};
   });
   const sectionIds = ['segment', 'style', 'cleanup', 'wakeup_direct', 'wakeup_interest', 'wakeup_members',
-    'wakeup_cold_group', 'wakeup_fatigue', 'group_air_guard', 'group_content_safety',
-    'context_image', 'image_narration', 'video_narration', 'file_understanding', 'forwards', 'voice', 'components', 'checks'];
+    'wakeup_cold_group', 'wakeup_fatigue', 'group_continuation', 'private_debounce',
+    'silence_policy', 'group_air_guard',
+    'private_closing', 'group_content_safety',
+    'context_image', 'image_narration', 'video_narration', 'file_understanding', 'forwards', 'voice',
+    'voice_channels', 'components', 'checks'];
   const sectionTabs = sectionIds.map(id => {
     const tab = {dataset: {wbSection: id}, focus() {}, click() {
       listeners['settings:click']?.({target: {closest: selector => selector === '[data-wb-section]' ? tab : null}});
@@ -260,6 +284,35 @@ test('the settings section reads and saves through the reply route family', asyn
   assert.equal(harnessed.store.size, 0);
 });
 
+test('legacy all cleanup scope migrates to all three positions before validation', async () => {
+  const harnessed = harness();
+  harnessed.page.mount(harnessed.root, {view: 'expression'});
+  await drains();
+  harnessed.requests[0].resolve(status({content_cleanup_scope: 'all'}));
+  await drains();
+  const instance = live(harnessed);
+  const field = instance.state.container.fields.content_cleanup_scope;
+  assert.equal(field.input, 'chips');
+  assert.equal(field.chipOptions.mode, 'multi');
+  assert.deepEqual(plain(field.chipOptions.options), ['leading', 'middle', 'trailing']);
+  assert.deepEqual(plain(field.chipOptions.labels), {leading: '句首', middle: '句中', trailing: '句尾'});
+  assert.equal(instance.state.base.content_cleanup_scope, 'all');
+  assert.equal(instance.state.draft.content_cleanup_scope, 'leading、middle、trailing');
+  assert.equal(harnessed.workbench.valid(field, instance.state.draft.content_cleanup_scope), true);
+  assert.equal(instance.dirty(), true, 'the legacy value remains as a pending migration');
+
+  const saving = instance.save(false);
+  await drains();
+  assert.deepEqual(plain(harnessed.requests[1].body.changes), {content_cleanup_scope: 'leading、middle、trailing'});
+  harnessed.requests[1].resolve({result: {operation_id: 'cleanup-scope', replayed: false},
+    status: status({content_cleanup_scope: 'leading、middle、trailing'}, 'b'.repeat(64))});
+  await saving;
+  await drains();
+  assert.equal(instance.state.base.content_cleanup_scope, 'leading、middle、trailing');
+  assert.equal(instance.state.draft.content_cleanup_scope, 'leading、middle、trailing');
+  harnessed.page.unmount();
+});
+
 test('prompt style offers free, guided, and constraint modes and saves the role preference', async () => {
   const harnessed = await loaded(harness());
   const instance = live(harnessed);
@@ -319,11 +372,11 @@ test('the card is split into labelled groups but keeps one save', async () => {
   const instance = live(harnessed);
   /* vm 上下文里的数组与宿主 realm 不同，比较前先过 plain()。 */
   const ids = plain(instance.state.container.groups.map(group => group.id));
-  assert.deepEqual(ids, ['segment', 'style', 'cleanup', 'voice', 'components', 'checks']);
+  assert.deepEqual(ids, ['segment', 'style', 'cleanup', 'voice', 'voice_channels', 'components', 'checks']);
   assert.ok(plain(instance.state.container.groups.find(group => group.id === 'voice').fields)
     .includes('voice_provider_id'));
   assert.ok(!ids.some(id => ['wakeup_direct', 'wakeup_interest', 'wakeup_members', 'wakeup_cold_group',
-    'wakeup_fatigue', 'group_air_guard', 'group_content_safety'].includes(id)));
+    'wakeup_fatigue', 'silence_policy', 'group_air_guard', 'group_content_safety'].includes(id)));
   assert.deepEqual(Object.keys(plain(instance.state.container.fields.rule_mode.choices)),
     ['words', 'regex', 'sentences', 'paragraphs']);
   assert.equal(instance.state.draft.rule_mode, 'words');
@@ -335,6 +388,7 @@ test('the card is split into labelled groups but keeps one save', async () => {
   assert.equal(instance.state.container.fields.forward_message_adaptation_enabled, undefined);
   /* 段落只是阅读顺序：仍然只有一个 edit_token、一次保存。 */
   assert.equal(instance.state.container.fields.enabled.editable.includes('window'), true);
+  assert.equal(instance.state.container.fields.group_tool_profile, undefined);
   assert.ok(plain(instance.state.container.groups.find(group => group.id === 'segment').fields)
     .includes('part_gap_mode'), 'message spacing is part of the segmentation workspace');
   assert.equal(harnessed.page.selectSection('timing'), true, 'the old timing jump resolves to segmentation');
@@ -389,6 +443,10 @@ test('cleanup mode only shows the control used by the selected mode', async () =
   const instance = live(harnessed);
   let html = harnessed.slots.settings.innerHTML;
   assert.equal(instance.state.draft.content_cleanup_mode, 'words');
+  assert.match(html, /句首/);
+  assert.match(html, /句中/);
+  assert.match(html, /句尾/);
+  assert.doesNotMatch(html, /整段回复/);
   assert.match(html, /data-wb-row="content_cleanup_rule" hidden/);
   assert.doesNotMatch(html, /data-wb-row="content_cleanup_words" hidden/);
 
@@ -511,9 +569,39 @@ test('expression modules render only their own navigation and panels after every
   assert.match(h.slots.scope.innerHTML, /音色与 TTS 合成后端在「模型与连接」中配置/);
   assert.doesNotMatch(h.slots.scope.innerHTML, /核心回复|历史兼容|群唤醒/);
   html = h.slots.settings.innerHTML;
-  assert.doesNotMatch(html, /data-wb-section=|data-wb-section-panel=/);
+  assert.match(html, /data-wb-section="voice"/);
+  assert.match(html, /data-wb-section="voice_channels"/);
+  assert.match(html, /data-wb-section-panel="voice_channels"/);
+  assert.equal(instance.state.activeGroupId, 'voice');
   assert.match(html, /data-wb-row="voice_enabled"/);
+  assert.doesNotMatch(html, /data-wb-section="segment"|data-wb-section="components"|data-wb-section="checks"/);
   assert.doesNotMatch(html, /data-wb-row="reply_quote_enabled"|data-wb-row="enabled"/);
+  h.page.unmount();
+});
+
+test('voice channel overrides are reachable and save from the voice module', async () => {
+  const h = await loaded(harness());
+  h.page.setExpressionModule('expression-voice');
+  assert.equal(h.page.selectSection('voice_channels'), true);
+  const instance = live(h);
+  assert.equal(instance.state.activeGroupId, 'voice_channels');
+  const overrides = ['voice_private_zh_provider_id', 'voice_private_ja_provider_id',
+    'voice_private_en_provider_id', 'voice_group_zh_provider_id',
+    'voice_group_ja_provider_id', 'voice_group_en_provider_id'];
+  for (const name of overrides) {
+    assert.ok(instance.state.container.fields[name], `${name} is editable`);
+    assert.match(h.slots.settings.innerHTML, new RegExp(`data-wb-field="${name}"`));
+    instance.state.draft[name] = 'tts-a';
+  }
+  const saving = instance.save(false);
+  await drains();
+  assert.deepEqual(plain(h.requests[1].body.changes),
+    Object.fromEntries(overrides.map(name => [name, 'tts-a'])));
+  h.requests[1].resolve({result: {operation_id: 'voice-channels', replayed: false},
+    status: status(Object.fromEntries(overrides.map(name => [name, 'tts-a'])), 'f'.repeat(64))});
+  await saving;
+  await drains();
+  assert.equal(instance.state.base.voice_private_ja_provider_id, 'tts-a');
   h.page.unmount();
 });
 
@@ -564,6 +652,56 @@ test('word-list chips add and remove entries while saving the existing wire form
   assert.deepEqual(plain(JSON.parse(instance.state.draft.content_cleanup_words)), original);
 });
 
+test('the registered newline default of the file formats opens as entries and saves clean', async () => {
+  /* 后端注册默认值是多行文本（companion_v2/conversation/media/understanding.py），
+     不是 JSON 数组。编辑器只认 JSON 的话这里会读成 0 个词条、valid=false，
+     整张「文件理解」卡连保存都会被拦。 */
+  const registered = '文本\nPDF\nWord（DOCX）\nExcel（XLSX）\nPowerPoint（PPTX）';
+  const expected = ['文本', 'PDF', 'Word（DOCX）', 'Excel（XLSX）', 'PowerPoint（PPTX）'];
+  const harnessed = harness();
+  harnessed.page.mount(harnessed.root, {view: 'perception', perceptionModule: 'file'});
+  await drains();
+  harnessed.requests[0].resolve(status({file_understanding_format_groups: registered}));
+  await drains();
+  const instance = live(harnessed);
+  const field = instance.state.container.fields.file_understanding_format_groups;
+  assert.equal(field.input, 'word-list');
+  assert.equal(harnessed.workbench.valid(field, instance.state.draft.file_understanding_format_groups),
+    true, 'the registered default must parse into entries the editor can validate');
+  assert.deepEqual(plain(JSON.parse(instance.state.draft.file_understanding_format_groups)), expected);
+  assert.deepEqual(plain(JSON.parse(instance.state.base.file_understanding_format_groups)), expected);
+  assert.equal(instance.dirty(), false, 'reading the backend default is not a pending edit');
+  assert.match(harnessed.slots.settings.innerHTML,
+    /data-wb-word-list="file_understanding_format_groups"/);
+
+  /* 快捷添加从同一份归一化结果起手：删一项再点「文本」加回来，仍是 5 类而不是 1 类。 */
+  const removeFirst = {dataset: {wbWordRemove: 'file_understanding_format_groups', wbWordIndex: '0'}};
+  harnessed.listeners['settings:click']({target: {closest: selector =>
+    selector === '[data-wb-word-remove]' ? removeFirst : null}});
+  assert.deepEqual(plain(JSON.parse(instance.state.draft.file_understanding_format_groups)),
+    expected.slice(1));
+  const quickAdd = {dataset: {wbWordValue: '文本', wbWordField: 'file_understanding_format_groups'}};
+  harnessed.listeners['settings:click']({target: {closest: selector =>
+    selector === '[data-wb-word-value]' ? quickAdd : null}});
+  assert.deepEqual(plain(JSON.parse(instance.state.draft.file_understanding_format_groups)),
+    [...expected.slice(1), '文本']);
+
+  /* 只改同段的其他开关：默认的换行串不能被当成新改动重发。 */
+  instance.state.draft.file_understanding_format_groups =
+    instance.state.base.file_understanding_format_groups;
+  instance.state.draft.file_understanding_enabled = true;
+  const saving = instance.save(false);
+  await drains();
+  assert.deepEqual(plain(harnessed.requests[1].body.changes), {file_understanding_enabled: true});
+  harnessed.requests[1].resolve({result: {operation_id: 'word-list', replayed: false},
+    status: status({file_understanding_format_groups: registered,
+      file_understanding_enabled: true}, 'f'.repeat(64))});
+  await saving;
+  await drains();
+  assert.equal(instance.dirty(), false);
+  harnessed.page.unmount();
+});
+
 test('replacement pairs and component order are edited without JSON controls', async () => {
   const harnessed = await loaded(harness());
   const instance = live(harnessed);
@@ -606,26 +744,25 @@ test('replacement pairs and component order are edited without JSON controls', a
 });
 
 test('reply expression, perception, and decision settings partition every field exactly once', async () => {
-  const harnessed = await loaded(harness());
-  const expression = plain(live(harnessed).state.container.groups.flatMap(group => group.fields));
-  harnessed.page.mount(harnessed.root, {view: 'decision'});
-  await drains();
-  harnessed.requests[1].resolve(status());
-  await drains();
-  const decision = plain(live(harnessed).state.container.groups.flatMap(group => group.fields));
-  assert.deepEqual(plain(live(harnessed).state.container.groups.map(group => group.id)),
+  const expressionHarness = await loaded(harness());
+  const expression = plain(live(expressionHarness).state.container.groups.flatMap(group => group.fields));
+  const decisionHarness = await loaded(harness(), 'decision');
+  const decisionState = live(decisionHarness).state.container;
+  const decision = plain(decisionState.groups.flatMap(group => group.fields));
+  assert.ok(decision.includes('group_tool_profile'));
+  assert.deepEqual(plain(decisionState.fields.group_tool_profile.choices),
+    {full: '完整工具', standard: '常用工具', lean: '精简工具'});
+  assert.deepEqual(plain(decisionState.groups.map(group => group.id)),
     ['wakeup_direct', 'wakeup_interest', 'wakeup_members', 'wakeup_cold_group', 'wakeup_fatigue',
-      'group_air_guard', 'group_content_safety']);
-  harnessed.page.mount(harnessed.root, {view: 'perception'});
-  await drains();
-  harnessed.requests[2].resolve(status());
-  await drains();
-  const perception = plain(live(harnessed).state.container.groups.flatMap(group => group.fields));
+      'group_continuation', 'private_debounce', 'silence_policy', 'group_air_guard', 'private_closing', 'group_content_safety']);
+  const perceptionHarness = await loaded(harness(), 'perception');
+  const perceptionState = live(perceptionHarness).state.container;
+  const perception = plain(perceptionState.groups.flatMap(group => group.fields));
   const exposed = [...expression, ...perception, ...decision];
   assert.equal(exposed.length, new Set(exposed).size, 'a setting must not be duplicated across modules');
   assert.deepEqual([...exposed].sort(), Object.keys(DEFAULTS)
     .filter(name => name !== 'rules_enabled' && name !== 'file_understanding_formats').sort());
-  assert.deepEqual(plain(live(harnessed).state.container.groups.map(group => group.id)),
+  assert.deepEqual(plain(perceptionState.groups.map(group => group.id)),
     ['media_permissions', 'context_image', 'image_narration', 'video_narration', 'file_understanding', 'forwards']);
   assert.deepEqual(perception, ['image_understanding_private_enabled', 'image_understanding_group_enabled',
     'video_understanding_private_enabled', 'video_understanding_group_enabled',
@@ -641,10 +778,10 @@ test('reply expression, perception, and decision settings partition every field 
     'file_understanding_format_groups', 'file_understanding_max_size_mb',
     'file_understanding_max_chars', 'file_understanding_timeout_seconds', 'file_understanding_prompt',
     'forward_message_adaptation_enabled']);
-  assert.equal(harnessed.page.selectSection('segment'), false);
-  assert.equal(harnessed.page.selectSection('context_image'), true);
-  assert.equal(harnessed.page.selectSection('forwards'), true);
-  harnessed.page.unmount();
+  assert.equal(perceptionHarness.page.selectSection('segment'), false);
+  assert.equal(perceptionHarness.page.selectSection('context_image'), true);
+  assert.equal(perceptionHarness.page.selectSection('forwards'), true);
+  perceptionHarness.page.unmount();
 });
 
 test('decision view edits the same reply route and omits expression-only tools', async () => {
@@ -665,6 +802,74 @@ test('decision view edits the same reply route and omits expression-only tools',
   await saving;
   await drains();
   harnessed.page.unmount();
+});
+
+test('decision tempo exposes and saves the follow-up fuse settings', async () => {
+  const h = await loaded(harness(), 'decision');
+  assert.equal(h.page.selectSection('group_continuation'), true);
+  assert.match(h.slots.settings.innerHTML, /连续对话与熔断/);
+  assert.match(h.slots.settings.innerHTML, /每次唤醒最多自动续接轮数/);
+  const instance = live(h);
+  instance.state.draft.group_conversation_followup_max_turns = 2;
+  const saving = instance.save(false);
+  await drains();
+  assert.deepEqual(plain(h.requests[1].body.changes), {group_conversation_followup_max_turns: 2});
+  h.requests[1].resolve({result: {operation_id: 'followup-save', replayed: false},
+    status: status({group_conversation_followup_max_turns: 2}, 'e'.repeat(64))});
+  await saving;
+  h.page.unmount();
+});
+
+test('decision safety exposes silence policy masters and the private closing detail', async () => {
+  const h = await loaded(harness(), 'decision');
+  assert.equal(h.page.selectSection('silence_policy'), true);
+  assert.match(h.slots.settings.innerHTML, /沉默策略/);
+  assert.match(h.slots.settings.innerHTML, /启用私聊收尾沉默/);
+  assert.match(h.slots.settings.innerHTML, /启用撤回沉默/);
+  const instance = live(h);
+  for (const name of ['recall_silence_enabled', 'private_closing_guard_enabled',
+    'group_air_guard_enabled']) {
+    assert.ok(instance.state.container.fields[name], `${name} is available in the decision editor`);
+  }
+  assert.deepEqual(plain(instance.state.container.fields.private_closing_guard_enabled.editable),
+    ['role', 'window']);
+  assert.equal(h.page.selectSection('private_closing'), true);
+  assert.match(h.slots.settings.innerHTML, /私聊收尾 · 细则/);
+  assert.equal(instance.state.container.fields.private_closing_guard_window_seconds.minimum, 60);
+  assert.equal(instance.state.container.fields.private_closing_guard_window_seconds.maximum, 7200);
+  instance.state.draft.private_closing_guard_window_seconds = 600;
+  const saving = instance.save(false);
+  await drains();
+  assert.deepEqual(plain(h.requests[1].body.changes), {private_closing_guard_window_seconds: 600});
+  h.requests[1].resolve({result: {operation_id: 'closing-save', replayed: false},
+    status: status({private_closing_guard_window_seconds: 600}, 'f'.repeat(64))});
+  await saving;
+  h.page.unmount();
+});
+
+test('decision tempo exposes private debounce as a role preference', async () => {
+  const h = await loaded(harness(), 'decision');
+  assert.equal(h.page.selectSection('private_debounce'), true);
+  assert.match(h.slots.settings.innerHTML, /私聊节奏 · 连续输入/);
+  assert.match(h.slots.settings.innerHTML, /启用私聊连续输入防抖/);
+  const instance = live(h);
+  for (const name of ['private_debounce_enabled', 'private_debounce_min_ms',
+    'private_debounce_max_ms', 'private_debounce_total_ms']) {
+    assert.ok(instance.state.container.fields[name], `${name} is available in the decision editor`);
+  }
+  assert.deepEqual(plain(instance.state.container.fields.private_debounce_enabled.editable),
+    ['role', 'window']);
+  assert.equal(instance.state.container.fields.private_debounce_min_ms.minimum, 10);
+  assert.equal(instance.state.container.fields.private_debounce_max_ms.maximum, 120000);
+  assert.equal(instance.state.container.fields.private_debounce_total_ms.maximum, 120000);
+  instance.state.draft.private_debounce_min_ms = 2000;
+  const saving = instance.save(false);
+  await drains();
+  assert.deepEqual(plain(h.requests[1].body.changes), {private_debounce_min_ms: 2000});
+  h.requests[1].resolve({result: {operation_id: 'debounce-save', replayed: false},
+    status: status({private_debounce_min_ms: 2000}, 'e'.repeat(64))});
+  await saving;
+  h.page.unmount();
 });
 
 test('the expression page leaves image and forward understanding to the understanding page', async () => {
@@ -761,9 +966,11 @@ test('expression voice tab hosts the shared reply editor with only TTS settings 
   assert.match(narrowExpressionLayouts, /\.expression-module-nav\{display:grid;grid-template-columns:repeat\(2,minmax\(0,1fr\)\)/);
   assert.match(narrowExpressionLayouts, /\.expression-platform-workspace\{grid-template-columns:minmax\(0,1fr\)\}/);
   assert.match(narrowExpressionLayouts, /\.semantic-providers\{grid-template-columns:minmax\(0,1fr\)\}/);
-  for (const field of ['voice_trigger_mode', 'voice_provider_id', 'voice_delivery_mode']) {
+  for (const field of ['voice_trigger_mode', 'voice_provider_id', 'voice_delivery_mode',
+    'voice_private_ja_provider_id', 'voice_group_ja_provider_id']) {
     assert.ok(adapter.includes(field), `missing TTS setting ${field}`);
   }
+  assert.match(adapter, /私聊 \/ 群聊语音覆盖/);
 });
 
 test('the TTS provider catalog comes from the read result, not a page-local list', async () => {
@@ -773,6 +980,7 @@ test('the TTS provider catalog comes from the read result, not a page-local list
   const entries = item.catalog();
   assert.equal(entries[''], '跟随 AstrBot');
   assert.deepEqual(Object.keys(entries).filter(Boolean).sort(), ['tts-a', 'tts-b']);
+  assert.equal(entries['tts-a'], 'tts-a · s2.1-pro-free · 高木さん');
   const zh = live(harnessed).state.container.fields.voice_zh_provider_id.catalog();
   assert.equal(zh[''], '使用通用扩展');
 });
@@ -793,6 +1001,28 @@ test('offline preview submits the current draft and renders the result', async (
   await drains();
   assert.match(harnessed.slots['preview-result'].innerHTML, /预览结果/);
   assert.match(harnessed.slots['preview-status'].textContent, /使用当前窗口的设置草稿/);
+});
+
+test('preview identifies components that this private session will not send', async () => {
+  const harnessed = await loaded(harness());
+  harnessed.listeners['root:click']({target: {closest: () => ({dataset: {replyAction: 'preview'}})}});
+  await drains();
+  harnessed.requests[1].resolve({...PREVIEW,
+    quote: {enabled: true, group_enabled: true, first_part_only: true, skip_chars: 0,
+      mention_speaker: true},
+    voice: {enabled: false, provider_id: '', instruction: ''}});
+  await drains();
+  const html = harnessed.slots['preview-result'].innerHTML;
+  assert.match(html, /预览会话：私聊/);
+  assert.match(html, /引用：私聊不发送/);
+  assert.match(html, /@：私聊不发送/);
+  assert.match(html, /语音位置：未启用 · 按请求插入/);
+  const sequence = html.match(/aria-label="发送顺序">([\s\S]*?)<\/div>/)[1];
+  assert.match(sequence, /引用 · 私聊不发送/);
+  assert.match(sequence, /@ · 私聊不发送/);
+  assert.match(sequence, /语音 · 未启用 · 按请求插入/);
+  assert.doesNotMatch(sequence, /引用 · 固定第一段/);
+  harnessed.page.unmount();
 });
 
 test('offline preview shows each segment component plan and its attachment rules', async () => {
@@ -821,6 +1051,20 @@ test('offline preview shows each segment component plan and its attachment rules
   assert.match(html, /语音 · 按请求插入/);
   assert.match(html, /网址保护 · 链接整段保留/);
   assert.match(html, /组件挂载 · 预览模拟/);
+  assert.match(html, /预览会话：群聊/);
+  assert.match(html, /reply-preview-position-arrow/);
+  const sequences = [...html.matchAll(/aria-label="发送顺序">([\s\S]*?)<\/div>/g)]
+    .map(match => match[1]);
+  assert.equal(sequences.length, 2);
+  const firstSequence = sequences[0];
+  for (const [before, after] of [['引用 · 固定第一段', '平台表情 · 跟随第一段'],
+    ['平台表情 · 跟随第一段', '语音 · 按请求插入'],
+    ['语音 · 按请求插入', '@ · 跟随第一段']]) {
+    assert.ok(firstSequence.indexOf(before) < firstSequence.indexOf(after),
+      `${before} should precede ${after}: ${firstSequence}`);
+  }
+  assert.ok(sequences[1].indexOf('语音 · 按请求插入') < sequences[1].indexOf('2 张图片 · 文字后'),
+    'the successful voice part should place its image after the voice');
 
   const positionInput = (key, value) => harnessed.listeners['root:input']({target: {
     dataset: {replyPreviewOption: key}, value,
@@ -1009,6 +1253,39 @@ test('reply diagnostics show bounded metadata without batch IDs or prompt text',
   assert.match(rendered, /a{64}/);
   assert.doesNotMatch(rendered, /batch-internal|confirmed_delivery|NEVER-RENDER-PRIVATE-PROMPT/);
   assert.match(rendered, /不含提示词正文与消息原文/);
+});
+
+test('diagnostics put the failing model line, fallback and wait time in the summary', async () => {
+  const harnessed = harness();
+  harnessed.page.mount(harnessed.root);
+  await drains();
+  const failed = {batch_id: 'turn-failed', created_at: '2026-10-24T05:40:36.918433+00:00',
+    execution_path: 'astrbot_core', state: 'completed', response_type: 'no_reply', send_returns: 0,
+    delivery_state: 'not_started', turn_type: 'astrbot.core.reply', current_inputs: 1, rounds: [],
+    injected_materials: [], offered_tools: [], filtered_tools: [], tool_calls: [],
+    calls: [{position: 1, state: 'unknown', provider: 'deepseek/deepseek-v4.1-flash-expires-on-0910',
+      failure_code: 'UnprocessableEntityError', response_diagnostics: null}]};
+  const recovered = {...failed, batch_id: 'turn-recovered', state: 'complete', response_type: 'native_reply',
+    send_returns: 2, delivery_state: 'returned', created_at: '2026-10-24T12:13:32.489373+00:00',
+    calls: [{...failed.calls[0], state: 'returned'}, {position: 2, state: 'returned', provider: 'deepseek/deepseek-v4-flash',
+      failure_code: null, response_diagnostics: null}]};
+  const waiting = {...failed, batch_id: 'turn-waiting', state: 'generating', response_type: 'no_reply',
+    created_at: new Date(Date.now() - 3 * 3600 * 1000).toISOString(), calls: []};
+  const silent = {...failed, batch_id: 'turn-silent', state: 'completed', send_returns: 0, calls: []};
+  harnessed.requests[0].resolve({...status(), recent: [failed, recovered, waiting, silent]});
+  await drains();
+  const rendered = harnessed.slots.diagnostics.innerHTML;
+  /* 摘要行必须自己说明原因，而不是把失败码留在展开后的细节里。 */
+  assert.match(rendered, /生成完成<\/span><span>未发送<\/span><span class="reply-record-note is-warn">模型线路拒绝请求 422/);
+  assert.match(rendered, /首次请求失败 422 · 已回退/);
+  assert.match(rendered, /本轮未发言/);
+  assert.match(rendered, /已等待 3 小时/);
+  /* 时间按本地时区渲染，不再把 UTC 原样当成当地时间。 */
+  assert.match(rendered, /<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}<\/time>/);
+  assert.doesNotMatch(rendered, /\+\d{2}:\d{2}<\/time>|T\d{2}:\d{2}<\/time>/);
+  /* 失败详情保留具体线路，便于对照配置。 */
+  assert.match(rendered, /deepseek\/deepseek-v4\.1-flash-expires-on-0910/);
+  assert.match(rendered, /发送已返回/);
 });
 
 test('a route outside the plugin prefix is refused instead of half-mounting', async () => {

@@ -37,6 +37,29 @@ class ContactSchedulingTests(ContactScheduleFixture, unittest.IsolatedAsyncioTes
         app.contact_schedule.validate_diagnostic_origin(
             context, candidate["diagnostic_origin"], at, purpose="news")
 
+    async def test_synthetic_diagnostic_without_conversation_uses_current_persona(self):
+        host, _batch_id = await self.scheduled(automatic=False)
+        app = host.application
+        context = self.contact_context()
+        at = self.clock.now()
+        role_instruction = "当前角色人格提示"
+
+        with patch.object(app.contact_schedule, "latest_conversation", return_value=None):
+            candidate = await app.contact_schedule.synthetic_diagnostic_candidate(
+                context, "chat", at=at, test_id="attempt-without-history",
+                role_instruction=role_instruction)
+            receipt = candidate["diagnostic_origin"]["_diagnostic"]
+            self.assertEqual(candidate["role_instruction"], role_instruction)
+            self.assertIsNone(receipt["batch_id"])
+            self.assertEqual(receipt["source_mode"], "no_conversation")
+            app.contact_schedule.validate_diagnostic_origin(
+                context, candidate["diagnostic_origin"], at, purpose="chat",
+                role_instruction=role_instruction)
+            with self.assertRaises(TaskError):
+                app.contact_schedule.validate_diagnostic_origin(
+                    context, candidate["diagnostic_origin"], at, purpose="chat",
+                    role_instruction="changed persona")
+
     async def test_legacy_group_flows_are_not_considered_for_private_contact(self):
         host, batch_id = await self.scheduled()
         app = host.application
@@ -96,6 +119,48 @@ class ContactSchedulingTests(ContactScheduleFixture, unittest.IsolatedAsyncioTes
         self.assertEqual(diagnostic["evaluation"]["stage"], "settings")
         self.assertEqual(diagnostic["evaluation"]["reason_code"], "automatic_contact_disabled")
         self.assertNotIn("conversation_ref", diagnostic["evaluation"])
+
+    async def test_scheduler_waits_for_a_completed_conversation_before_planning(self):
+        host, batch = await self.scheduled(automatic=True)
+        app = host.application
+        schedule = app.contact_schedule
+        with app.runtime.transaction() as connection:
+            connection.execute("UPDATE conversation_batches SET state = 'open' WHERE batch_id = ?", (batch,))
+        self.assertEqual(tuple(schedule._legacy_rows(0)), ())
+        with app.runtime.transaction() as connection:
+            connection.execute("UPDATE conversation_batches SET state = 'ready' WHERE batch_id = ?", (batch,))
+        self.assertTrue(tuple(schedule._legacy_rows(0)))
+
+    async def test_persisted_superseded_contact_is_read_as_a_wait(self):
+        host, _ = await self.scheduled(automatic=True)
+        app = host.application
+        context = self.contact_context()
+        schedule = app.contact_schedule
+        latest = schedule.latest_conversation(context)
+        schedule._note_window(context, latest, self.clock.now(), "validation", "failed",
+                              "contact_conversation_changed")
+
+        diagnostic = schedule.diagnostic_for(context, at=self.clock.now(), host_state="running")
+        self.assertEqual(diagnostic["evaluation"]["outcome"], "stale")
+        self.assertEqual(diagnostic["evaluation"]["stage"], "conversation")
+        self.assertEqual(diagnostic["evaluation"]["reason_code"], "newer_conversation_not_evaluated")
+
+    async def test_scheduler_does_not_persist_a_superseded_conversation_as_failure(self):
+        host, _ = await self.scheduled(automatic=True)
+        app = host.application
+        context = self.contact_context()
+        schedule = app.contact_schedule
+        with app.runtime.transaction() as connection:
+            connection.execute("DELETE FROM proactive_schedule_diagnostics")
+        with patch.object(schedule, "_peek", return_value=False), patch.object(
+                schedule, "_plan",
+                side_effect=TaskError("contact_conversation_changed", "a newer turn superseded this row")):
+            schedule.advance()
+
+        failed = app.runtime.read_all("""SELECT stage, outcome, reason_code FROM proactive_schedule_diagnostics
+            WHERE diagnostic_key = ? AND outcome = 'failed'""",
+            (schedule._diagnostic_key("window", context.key),))
+        self.assertEqual(tuple(failed), ())
 
     async def test_scheduler_heartbeat_coalesces_unchanged_diagnostic_writes(self):
         host, _ = await self.scheduled(automatic=False)
@@ -548,3 +613,41 @@ class ContactSchedulingTests(ContactScheduleFixture, unittest.IsolatedAsyncioTes
         self.clock.advance(timedelta(hours=24))
         later = (await self.contact(app, self.opportunity("later"))).unwrap().task
         await self.delivery_state(app, later.task_id, "delivered")
+
+    async def test_superseded_anchor_reanchors_to_latest_completed_conversation(self):
+        host, first = await self.scheduled(automatic=False)
+        app = host.application
+        context = self.contact_context()
+        schedule = app.contact_schedule
+        original, _, _ = schedule._origin(context, first, self.clock.now())
+
+        self.clock.advance(timedelta(seconds=30))
+        second = host.receive(self.event("superseding")).unwrap()
+        await self.done(app, second)
+        self.assertEqual(schedule.latest_conversation(context)["batch_id"], second)
+
+        self.settings(app, {"automatic_enabled": True}).unwrap()
+        self.clock.advance(timedelta(seconds=120))
+        current = schedule.validate_origin(context, original, self.clock.now())
+
+        self.assertEqual(current["batch_id"], second)
+        self.assertTrue(current.get("reanchored"))
+        self.assertEqual(current["previous_batch_id"], first)
+        self.assertEqual(current["role_hash"], original["role_hash"])
+
+    async def test_incomplete_latest_conversation_is_not_reanchored(self):
+        host, first = await self.scheduled(automatic=False)
+        app = host.application
+        context = self.contact_context()
+        schedule = app.contact_schedule
+
+        self.clock.advance(timedelta(seconds=30))
+        second = host.receive(self.event("incomplete")).unwrap()
+        await self.done(app, second)
+        with app.runtime.transaction() as connection:
+            connection.execute("UPDATE conversation_batches SET state = 'open' WHERE batch_id = ?", (second,))
+        self.assertFalse(schedule._conversation_ready(schedule.latest_conversation(context)))
+
+        with self.assertRaises(TaskError) as caught:
+            schedule._origin(context, first, self.clock.now())
+        self.assertEqual(caught.exception.code, "contact_conversation_changed")

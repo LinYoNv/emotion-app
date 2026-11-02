@@ -94,7 +94,9 @@ window.CompanionMemoryPage = (() => {
   const formatErrors = new Set(["invalid_json","duplicate_json_field","nonfinite_json_number","invalid_shape",
     "invalid_summary","invalid_proposals","invalid_decisions","invalid_proposal","invalid_details",
     "invalid_qualifiers","invalid_item_id","duplicate_item_id","related_item_unresolved","invalid_decision",
-    "output_length","output_oversized","missing_repair_item"]);
+    "invalid_anniversaries","unknown_evidence","unknown_target","ambiguous_target","unexpected_repair_item",
+    "conflicting_target","overlapping_pending_decision","output_invalid","output_length","output_oversized",
+    "missing_repair_item"]);
   const denied = new Set(["dashboard_identity_required", "core_access_required", "binding_revoked", "binding_rebound", "staging_host_terminated"]);
   const e = value => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
   const count = value => Number.isInteger(value) && value >= 0 ? String(value) : "尚未统计";
@@ -285,7 +287,7 @@ window.CompanionMemoryPage = (() => {
     if (active) {
       const breadcrumb = document.querySelector("#breadcrumb strong");
       if (breadcrumb) breadcrumb.textContent = "事实与经历";
-      document.title = "事实与经历 · 陪伴 V2";
+      document.title = "陪伴小屋";
     }
   }
 
@@ -592,7 +594,16 @@ window.CompanionMemoryPage = (() => {
       <span class="mem-badge">${e(jobLabels[job?.state] || "尚未登记后台处理")}</span>
     </div>
     ${stageTrackMarkup(item.state)}
-    <p class="mem-quote" style="margin-top:17px">${e(item.summary ?? (item.captured ? "结果已保存；摘要尚不可读取或仍待解析。" : "等待本批次的整理结果。"))}</p>
+    <p class="mem-quote" style="margin-top:17px">${e(item.summary ?? (
+      item.state === "failed" && item.captured
+        ? "模型原始输出已保留，但未通过校验，尚未写入记忆；请查看下方原因并修复未完成项。"
+        : item.state === "partial"
+          ? "部分条目已写入记忆，未完成项可在下方单独修复。"
+          : item.captured
+            ? "模型结果已保存，正在解析或等待写入。"
+            : item.state === "failed"
+              ? "本次整理未完成，没有可复用的模型结果；可明确发起修复。"
+              : "等待本批次的整理结果。"))}</p>
     <dl class="mem-fields">
       <div><dt>已处理项</dt><dd class="is-mono">${num(receipts.length)}</dd></div>
       <div><dt>剩余来源</dt><dd class="is-mono">${e(count(item.remaining_sources))}</dd></div>
@@ -908,8 +919,10 @@ window.CompanionMemoryPage = (() => {
          有个兜底口径，所以不能让它跟着后面 `page/targets` 的失败一起丢掉——
          目录失败时页面确实没有目标，但「记忆由谁提供」仍然该说出来。
          它自己 catch，绝不改 data.error / data.notice。 */
-      await loadOwnership();
-      const catalog = await api("GET", "page/targets");
+      const [, catalog] = await Promise.all([
+        loadOwnership(),
+        window.CompanionProduct?.directory?.() || api("GET", "page/targets"),
+      ]);
       if (!live(ticket)) return;
       if (!Array.isArray(catalog.targets) || !catalog.installation_id || !catalog.operator_id
           || catalog.targets.some(t=>!Array.isArray(t.roles))) throw problem("invalid_response");

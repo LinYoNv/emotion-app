@@ -9,7 +9,7 @@
   const parameters = person => ({subject_id: person.subject_id, ...routeOf(person)});
   const states = new Map();
   let current = null;
-  const fieldLabels = {default_nickname: "对用户的称呼", user_gender: "性别", user_birthday: "生日", user_occupation: "职业",
+  const fieldLabels = {default_nickname: "对用户的称呼", user_gender: "性别", user_birthday: "生日或纪念日", user_occupation: "职业",
     role_relation: "关系定位", interaction: "相处方式", extra: "其他补充"};
   const replyLabels = {
     enabled: "启用消息分段", streaming: "启用模型流式传输", streaming_mode: "流式发送方式",
@@ -29,6 +29,12 @@
     voice_language: "语音语言", voice_foreign_text_mode: "外语文字处理",
     voice_provider_id: "通用语音扩展", voice_zh_provider_id: "中文语音扩展",
     voice_ja_provider_id: "日语语音扩展", voice_en_provider_id: "英语语音扩展",
+    voice_private_zh_provider_id: "私聊 · 中文语音扩展",
+    voice_private_ja_provider_id: "私聊 · 日语语音扩展",
+    voice_private_en_provider_id: "私聊 · 英语语音扩展",
+    voice_group_zh_provider_id: "群聊 · 中文语音扩展",
+    voice_group_ja_provider_id: "群聊 · 日语语音扩展",
+    voice_group_en_provider_id: "群聊 · 英语语音扩展",
     voice_probability: "语音触发概率", voice_cooldown_seconds: "语音冷却（秒）",
     voice_max_speech_chars: "单段朗读上限", voice_timeout_seconds: "合成超时（秒）",
     voice_trigger_keywords: "语音触发词", voice_extra_prompt: "语音表达偏好",
@@ -44,7 +50,8 @@
     file_understanding_format_groups: "可读取文件格式", file_understanding_max_size_mb: "文件大小上限（MB）",
     file_understanding_max_chars: "文件正文长度上限", file_understanding_timeout_seconds: "文件读取等待时间（秒）",
     file_understanding_prompt: "文件阅读提示词补充",
-    image_understanding_private_enabled: "私聊图片理解", video_understanding_private_enabled: "私聊视频理解",
+    image_understanding_private_enabled: "私聊图片理解", astrbot_animated_image_understanding_enabled: "AstrBot 原生动图理解优化",
+    video_understanding_private_enabled: "私聊视频理解",
     file_understanding_private_enabled: "私聊文件理解",
   };
   const replyChoices = {
@@ -52,7 +59,7 @@
     rule_mode: {words: "词列表", regex: "正则表达式", sentences: "按句子", paragraphs: "按段落"},
     part_gap_mode: {fixed: "固定", random: "随机", log: "按文本长度"},
     content_cleanup_mode: {words: "按清理词", regex: "按正则"},
-    content_cleanup_scope: {all: "整段回复", trailing: "仅句尾"},
+    content_cleanup_scope: {leading: "句首", middle: "句中", trailing: "句尾"},
     voice_trigger_mode: {always: "每轮", request: "按请求", adaptive: "模型择句"},
     voice_generation_mode: {plain: "朗读正文", model_tag: "模型语音标签"},
     voice_segment_mode: {each: "每一段", first: "仅首段", last: "仅末段"},
@@ -62,11 +69,23 @@
     voice_foreign_text_mode: {original: "原文", translation: "中文译文", bilingual: "双语"},
     image_position: {after_text: "文字后", before_text: "文字前"},
   };
+  /* 主回复页已经停用「整段回复」，并把旧值 all 视为句中去重。
+     成员页复用同一份回复设置，历史值读回时也要先归一，否则下拉框会
+     多出一个原始英文选项，甚至在下一次修改其他字段时把旧值继续写回。 */
+  const normalizeReplyField = (name, value) => name === "content_cleanup_scope"
+    && String(value ?? "").trim().toLowerCase() === "all" ? "middle" : value;
+  const normalizeReplyDraft = draft => {
+    if (draft && Object.hasOwn(draft, "content_cleanup_scope")) {
+      draft.content_cleanup_scope = normalizeReplyField(
+        "content_cleanup_scope", draft.content_cleanup_scope);
+    }
+    return draft;
+  };
   const contactPurposeGroups = [
     ["关系", [["affection", "想念与亲近"], ["care", "情绪关怀"], ["play", "轻松互动"],
       ["repair", "关系修复"], ["chat", "日常话题"]]],
     ["日程", [["greeting", "问候与纪念"], ["followup", "接回旧话题"], ["invitation", "共同活动邀请"],
-      ["reminder", "约定与提醒"], ["meal", "饭点问候"]]],
+      ["reminder", "约定与提醒"], ["meal", "饭点话题"]]],
     ["分享", [["life", "分享自己的生活"], ["creation", "作品与阅读"], ["news", "外部资讯"],
       ["environment", "环境与状态变化"], ["screen", "已授权屏幕观察"]]],
   ];
@@ -79,10 +98,13 @@
       "content_cleanup_rule", "content_cleanup_words", "content_replacement_enabled", "content_replacements"]},
     {title: "语音回复", fields: ["voice_enabled", "voice_trigger_mode", "voice_generation_mode", "voice_segment_mode",
       "voice_delivery_mode", "voice_position", "voice_language", "voice_foreign_text_mode", "voice_provider_id",
-      "voice_zh_provider_id", "voice_ja_provider_id", "voice_en_provider_id", "voice_probability",
-      "voice_cooldown_seconds", "voice_max_speech_chars", "voice_timeout_seconds", "voice_trigger_keywords", "voice_extra_prompt"]},
-    {title: "图片理解", fields: ["image_understanding_private_enabled", "enable_private_image_self_recognition",
-      "private_image_self_recognition_hint", "enable_private_image_vision_cache", "private_image_vision_cache_max_items",
+      "voice_zh_provider_id", "voice_ja_provider_id", "voice_en_provider_id",
+      "voice_private_zh_provider_id", "voice_private_ja_provider_id", "voice_private_en_provider_id",
+      "voice_probability", "voice_cooldown_seconds", "voice_max_speech_chars", "voice_timeout_seconds",
+      "voice_trigger_keywords", "voice_extra_prompt"]},
+    {title: "图片理解", fields: ["image_understanding_private_enabled", "astrbot_animated_image_understanding_enabled",
+      "enable_private_image_self_recognition", "private_image_self_recognition_hint",
+      "enable_private_image_vision_cache", "private_image_vision_cache_max_items",
       "private_image_vision_custom_prompt", "private_image_vision_max_chars", "private_image_vision_wait_seconds",
       "private_image_provider_failure_cooldown_seconds"]},
     {title: "视频理解", fields: ["video_understanding_private_enabled", "video_understanding_enabled",
@@ -102,7 +124,7 @@
   // 渲染顺序就是视觉顺序：核心在最上，逐级向下收窄。
   const tierOrder = ["core", "important", "standard"];
   // 名字来源：后端 directory_display_name 回传的 basis，用于说明这一行名字是怎么来的。
-  const nameBasisLabels = {administrator: "管理员备注", platform: "平台昵称", account: "账号回退"};
+  const nameBasisLabels = {administrator: "管理员备注", platform: "平台昵称", legacy: "已保存称呼", account: "账号回退"};
   const nameBasisOf = person => person.name_basis || (person.admin_nickname ? "administrator"
     : person.display_name && person.display_name !== person.native_account_id ? "platform" : "account");
   const tierHelp = {standard: "普通用户，没有管理员权限。", important: "重要用户，可用普通功能；管理操作仍需核心身份。",
@@ -193,7 +215,12 @@
     return data;
   }
   function errorText(error, fallback = "操作未完成，请核对当前状态后重试。") {
-    return failureLabels[error?.code] || fallback;
+    const code = error?.code;
+    const label = failureLabels[code];
+    if (label) return label;
+    // Keep the machine code visible even when this page has no translation:
+    // the panel bridge sometimes only forwards ``message``.
+    return code ? `${fallback.replace(/。$/, "")}（${code}）` : fallback;
   }
   function sectionErrorText(state, section) {
     const failure = state.sectionErrors?.[section];
@@ -224,13 +251,20 @@
     if (replaceSnapshot) state.sections = {};
     state.sectionErrors = result.section_errors && typeof result.section_errors === "object"
       ? {...result.section_errors} : {};
+    state.tts = result.tts && typeof result.tts === "object" ? result.tts : state.tts || null;
     for (const [section, value] of Object.entries(result.sections || {})) {
       const retained = {};
       if (preserve) for (const [field, draft] of Object.entries(state.drafts[section] || {})) {
         if (state.dirty.has(section + "." + field)) retained[field] = draft;
       }
       state.sections[section] = value;
-      state.drafts[section] = {...value.settings, ...retained};
+      const draft = {...value.settings, ...retained};
+      if (section === "reply") normalizeReplyDraft(draft);
+      state.drafts[section] = draft;
+      if (section === "reply"
+          && draft.content_cleanup_scope !== value.settings.content_cleanup_scope) {
+        state.dirty.add("reply.content_cleanup_scope");
+      }
     }
     for (const section of Object.keys(state.sectionErrors)) delete state.sections[section];
     if (!preserve) { state.dirty.clear(); state.resetToRole.clear(); state.contactResetToInherit.clear(); }
@@ -549,7 +583,7 @@
     if (core) {
       factsBlock.body.append(facts([
         ["对用户的称呼", profile.default_nickname], ["关系定位", profile.role_relation],
-        ["性别", profile.user_gender], ["生日", profile.user_birthday],
+        ["性别", profile.user_gender], ["生日/纪念日", profile.user_birthday],
         ["职业", profile.user_occupation], ["相处方式", profile.interaction], ["其他补充", profile.extra],
       ]));
     } else {
@@ -867,9 +901,9 @@
     candidate_queued: ["候选已进入后台执行", "若没有发出，请查看任务执行和投递回执诊断。"],
     contact_model_unregistered: ["主动联系模型任务尚未登记", "检查模型路由配置并重启插件。"],
     background_capacity_exhausted: ["后台执行槽位暂时占满", "等待现有后台任务结束后会继续评估。"],
-    contact_attempt_budget: ["旧版本的模型调用次数上限已触发", "当前版本已取消该独立上限，请查看窗口每日实际联系额度。"],
+    contact_attempt_budget: ["模型调用次数上限已触发", "请查看窗口每日实际联系额度。"],
     delivery_history_unavailable: ["当前私聊历史无法完成核验", "检查 AstrBot 会话历史是否可读取后再重新评估。"],
-    contact_conversation_changed: ["原私聊已变化，旧候选被安全取消", "等待当前私聊完成后重新评估。"],
+    contact_conversation_changed: ["私聊已变化，待发送计划已取消", "等待当前私聊完成后重新评估。"],
     scheduler_heartbeat_missing: ["尚未收到主动调度心跳", "确认插件已启动且主动联系模型已登记。"],
     scheduler_heartbeat_stale: ["主动调度心跳已中断", "检查插件调度器是否异常或已停止。"],
   };
@@ -1007,7 +1041,16 @@
     const wrapper = element("div", undefined, "member-reply-field");
     if (provenance.explicit) wrapper.dataset.explicit = "true";
     const label = name === "voice_probability" ? "语音触发概率（0–1）" : replyLabels[name] || name;
-    wrapper.append(field(state, "reply", name, label, {rows}));
+    const providerFields = new Set(["voice_provider_id", "voice_zh_provider_id",
+      "voice_ja_provider_id", "voice_en_provider_id", "voice_private_zh_provider_id",
+      "voice_private_ja_provider_id", "voice_private_en_provider_id"]);
+    const tts = Array.isArray(state.tts?.providers) ? state.tts.providers : [];
+    const providerChoices = providerFields.has(name) && tts.length ? {
+      "": name === "voice_provider_id" ? "跟随角色默认" : "使用通用扩展",
+      ...Object.fromEntries(tts.filter(item => item && typeof item.id === "string" && item.id).map(item =>
+        [item.id, [item.id, item.model, item.voice].filter(Boolean).join(" · ")])),
+    } : null;
+    wrapper.append(field(state, "reply", name, label, {rows, choices: providerChoices}));
     const source = element("small", provenance.explicit ? "此用户覆盖" : "跟随角色默认", "member-reply-source");
     wrapper.append(source);
     if (provenance.explicit) {
@@ -1017,7 +1060,7 @@
       reset.setAttribute("aria-label", `恢复${label}的角色默认值`);
       reset.addEventListener("click", () => {
         if (state.pendingSave) return;
-        state.drafts.reply[name] = inherited;
+        state.drafts.reply[name] = normalizeReplyField(name, inherited);
         state.resetToRole.add(name);
         state.dirty.add("reply." + name);
         state.pendingSave = null;
@@ -1043,6 +1086,7 @@
       "part_gap_max_ms", "part_gap_log_base", "prompt", "split_words", "match_width_variants", "rule_regex",
       "content_cleanup_enabled", "content_replacement_enabled", "voice_enabled", "reply_quote_enabled",
       "enable_private_image_self_recognition", "image_understanding_private_enabled",
+      "astrbot_animated_image_understanding_enabled",
       "video_understanding_private_enabled", "video_understanding_enabled",
       "file_understanding_private_enabled", "file_understanding_enabled",
     ]);
@@ -1302,7 +1346,14 @@
             }
           }
           for (const section of submittedSections) {
-            if (state.sections[section]) state.drafts[section] = {...state.sections[section].settings};
+            if (!state.sections[section]) continue;
+            const draft = {...state.sections[section].settings};
+            if (section === "reply") normalizeReplyDraft(draft);
+            state.drafts[section] = draft;
+            if (section === "reply"
+                && draft.content_cleanup_scope !== state.sections[section].settings.content_cleanup_scope) {
+              state.dirty.add("reply.content_cleanup_scope");
+            }
           }
           state.pendingSave = null;
           notify(state, state.dirty.size ? "可读取分区已保存；未读取分区的草稿仍保留。"

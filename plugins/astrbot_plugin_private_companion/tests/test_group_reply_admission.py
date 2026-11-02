@@ -15,6 +15,8 @@ from companion_v2.identity_policy.object_access import ObjectAccessPolicy
 from companion_v2.conversation.participation import CONFIG_GROUP, GroupParticipationConfigurationOwner, configuration_fields
 from companion_v2.conversation.reply_settings import (GROUP as REPLY_GROUP, ReplyConfigurationOwner, target_for,
     configuration_fields as reply_fields)
+from astrbot.core.config import DEFAULT_CONFIG
+from astrbot.core.pipeline.process_stage.stage import ProcessStage
 from companion_v2.conversation.reset import ConversationWindow, reset_window
 from astrbot_host.core_reply import CORE_REPLY_CONTEXT_EXTRA, activate_core_reply_delivery_guard
 from astrbot.core.agent.message import Message, ToolCall
@@ -161,11 +163,29 @@ class GroupReplyAdmissionTests(GroupFixture, unittest.IsolatedAsyncioTestCase):
         prepared = await self.core_turn(event)
         prompt = "\n".join(part.text for part in event.core_request.extra_user_content_parts)
         self.assertIn("group_participation", prepared["context_sections"])
-        for text in ("求助强度参考 95/100", "兴趣话题自主接话宜低频", "参考强度约 1%",
+        for text in ("求助强度参考 95/100", "兴趣话题自主接话宜低频", "兴趣候选抽取概率为 1%",
                      "自主插话参考额度剩余 0/0", "最小间隔参考 33 分钟", "本轮没有明确 @"):
             self.assertIn(text, prompt)
         self.assertIsNotNone(event.core_request.func_tool.get_tool(native_tool_name("group.participation.choose")))
         self.assert_no_v2_generation()
+
+    async def test_interest_probability_is_a_candidate_gate(self):
+        await self.configure(group_wakeup_interest_keywords='["星图"]',
+                             group_wakeup_interest_probability=0)
+        blocked = await self.candidate(self.event("interest-zero", "我在看星图的介绍"))
+        self.assertNotEqual(blocked["reason"], "interest")
+        await self.configure(group_wakeup_interest_probability=1)
+        admitted = await self.candidate(self.event("interest-one", "我在看星图的介绍"))
+        self.assertEqual(admitted["reason"], "interest")
+
+    async def test_interest_probability_samples_candidates_below_one(self):
+        await self.configure(group_wakeup_interest_keywords='["星图"]',
+                             group_wakeup_interest_probability=0.5)
+        results = [await self.candidate(self.event(f"interest-sample-{index}", "我在看星图的介绍"))
+                   for index in range(8)]
+        reasons = [result["reason"] for result in results]
+        self.assertIn("interest", reasons)
+        self.assertTrue(any(reason != "interest" for reason in reasons))
 
     async def test_native_group_skip_is_silent_and_never_counts_as_a_successful_send_or_missing_reply(self):
         event = self.event("core-skip", "这个问题有人知道怎么处理吗")
@@ -277,6 +297,14 @@ class GroupReplyAdmissionTests(GroupFixture, unittest.IsolatedAsyncioTestCase):
             self.assertFalse((await self.candidate(self.event("silent-repeat-" + str(index), "好", sender=str(210 + index))))["admitted"])
         self.clock.advance(timedelta(seconds=1))
         self.assertEqual((await self.candidate(self.event("repeat-trigger", "好", sender="214")))["reason"], "repeat")
+
+    async def test_mentioning_another_member_suppresses_role_name_direct_word(self):
+        await self.configure(group_wakeup_bot_name="小星")
+        event = self.event("other-at-with-role-name", "小星 小天使")
+        event.message_obj.message.insert(0, NS(type="At", qq="201"))
+        decision = await self.candidate(event)
+        self.assertNotEqual(decision["reason"], "direct_word")
+        self.assertFalse(decision["admitted"])
 
     async def test_direct_words_question_and_disabled_strategies_use_effective_settings(self):
         await self.configure(group_wakeup_bot_name="小星", group_wakeup_question_enabled=False)
@@ -638,6 +666,144 @@ class GroupReplyAdmissionTests(GroupFixture, unittest.IsolatedAsyncioTestCase):
             await self.core_send(event)
         self.assertEqual(event.sent, ["可以先看看设置。"])
         self.assert_no_v2_generation()
+
+    async def test_default_followup_fuse_counts_events_and_blocks_native_fallback_and_weak_wakes(self):
+        first = self.event("fuse-root", "先说一句", mention=True)
+        await self.core_turn(first)
+        await self.core_send(first)
+        for index in range(3):
+            self.clock.advance(timedelta(seconds=1))
+            event = self.event("fuse-turn-" + str(index), "接着聊这一点")
+            candidate = await self.candidate(event)
+            self.assertEqual(candidate["reason"], "reply_follow_up")
+            self.assertEqual(candidate["continuation"]["used_turns"], index)
+            prepared = await self.core_turn(event)
+            await self.core_send(event, "第一段")
+            await self.core_send(event, "同轮工具处理后的第二段")
+            saved = self.admission.recorded_core_reply(prepared["context"], prepared["event_id"])
+            self.assertEqual(saved["send_returns"], 2)
+        self.clock.advance(timedelta(seconds=1))
+        blocked = self.event("fuse-blocked", "这个问题应该怎么处理？")
+        blocked.is_at_or_wake_command = True
+        candidate = await self.candidate(self.event("fuse-status", "接着聊"))
+        self.assertFalse(candidate["admitted"])
+        self.assertEqual(candidate["continuation"]["used_turns"], 3)
+        self.assertTrue(candidate["continuation"]["limit_reached"])
+        # Keep the native wake flag off during admission, then simulate a
+        # later host stage setting it; the fuse must still prevent fallback.
+        blocked.is_at_or_wake_command = False
+        await self.plugin.receive_companion_message(blocked)
+        blocked.is_at_or_wake_command = True
+        self.assertTrue(blocked.call_llm)
+        self.assertIsNone(blocked.get_extra(CORE_REPLY_CONTEXT_EXTRA))
+        stage = ProcessStage()
+        stage.ctx = NS(astrbot_config=DEFAULT_CONFIG)
+        async for _ in stage.process(blocked):
+            self.fail("the native model must not run after the follow-up fuse")
+        self.assertEqual(blocked.sent, [])
+        self.assert_no_v2_generation()
+
+    async def test_explicit_wakeup_reply_reopens_capped_chain_and_other_groups_are_independent(self):
+        await self.configure(group_conversation_followup_max_turns=1, group_wakeup_bot_name="小星")
+        root_prepared = None
+        for identifier, text, mention in (("one-root", "开始", True), ("one-follow", "接着说", False)):
+            event = self.event(identifier, text, mention=mention)
+            prepared = await self.core_turn(event)
+            if mention:
+                root_prepared = prepared
+            await self.core_send(event)
+            self.clock.advance(timedelta(seconds=1))
+        self.assertFalse((await self.candidate(self.event("one-blocked", "接着说")))["admitted"])
+        other = await self.candidate(self.event("another-group", "接着说", target="group-b"))
+        self.assertFalse(other["continuation"]["limit_reached"])
+        original_binding = root_prepared["context"].role_binding
+        other_role = dc_replace(original_binding.role, subject_id="synthetic-other-role")
+        other_context = dc_replace(root_prepared["context"],
+                                   role_binding=dc_replace(original_binding, role=other_role))
+        role_status = self.admission.continuation_status(other_context, root_prepared["instruction"],
+            self.clock.now(), settings={}, event_id="different-role-turn")
+        self.assertEqual(role_status["used_turns"], 0)
+        named = self.event("name-reopens", "小星，这次继续")
+        self.assertEqual((await self.candidate(named))["reason"], "direct_word")
+        await self.core_turn(named)
+        await self.core_send(named)
+        self.clock.advance(timedelta(seconds=1))
+        follow = await self.candidate(self.event("reopened", "然后呢"))
+        self.assertEqual(follow["reason"], "reply_follow_up")
+        self.assertEqual(follow["continuation"]["used_turns"], 0)
+
+    async def test_skip_and_laya_wait_do_not_consume_or_extend_sent_followup_chain(self):
+        await self.configure(group_conversation_followup_max_turns=1, group_conversation_followup_seconds=15)
+        first = self.event("wait-root", "开始", mention=True)
+        await self.core_turn(first)
+        await self.core_send(first)
+        self.clock.advance(timedelta(seconds=2))
+        skipped = self.event("skip-no-charge", "先等一下")
+        await self.core_turn(skipped)
+        await self.choose(skipped, "skip", reason="等对方补充")
+        finish_core_reply_tracking(skipped)
+        await self.flush_tracking()
+        self.clock.advance(timedelta(seconds=2))
+        waiting = self.event("wait-no-charge", "我还没说完")
+        prepared = await self.core_turn(waiting)
+        self.admission.mark_core_participation(prepared["context"], prepared["event_id"],
+            mode="skip", reason="等待补充", source="laya", decision_action="wait")
+        finish_core_reply_tracking(waiting)
+        await self.flush_tracking()
+        self.clock.advance(timedelta(seconds=2))
+        fresh = await self.candidate(self.event("after-wait", "这一部分"))
+        self.assertEqual(fresh["reason"], "active_follow_up")
+        self.assertEqual(fresh["continuation"]["used_turns"], 0)
+        self.assertEqual(fresh["continuation"]["pending_turns"], 0)
+        self.clock.advance(timedelta(seconds=10))
+        self.assertFalse((await self.candidate(self.event("wait-expired", "这一部分")))["admitted"])
+
+    async def test_pending_followup_reserves_last_turn_but_a_failed_send_releases_it(self):
+        await self.configure(group_conversation_followup_max_turns=1)
+        root = self.event("pending-root", "开始", mention=True)
+        await self.core_turn(root)
+        await self.core_send(root)
+        self.clock.advance(timedelta(seconds=1))
+        pending = self.event("pending-last", "接着说")
+        prepared = await self.core_turn(pending)
+        candidate = await self.candidate(self.event("while-pending", "再补一条"))
+        self.assertEqual(candidate["continuation"]["used_turns"], 0)
+        self.assertEqual(candidate["continuation"]["pending_turns"], 1)
+        self.assertFalse(candidate["admitted"])
+        observe_core_reply_tool_delivery(pending, "started")
+        observe_core_reply_tool_delivery(pending, "failed")
+        await self.flush_tracking()
+        candidate = await self.candidate(self.event("after-failure", "再补一条"))
+        self.assertEqual(candidate["continuation"]["used_turns"], 0)
+        self.assertEqual(candidate["continuation"]["pending_turns"], 0)
+        self.assertFalse(candidate["continuation"]["limit_reached"])
+        self.assertFalse(candidate["admitted"])
+        self.assertEqual(self.admission.recorded_core_reply(prepared["context"], prepared["event_id"])["send_state"], "failed")
+
+    async def test_fuse_state_unavailable_suppresses_default_reply_instead_of_failing_open(self):
+        event = self.event("fuse-state-unavailable", "接着说")
+        with patch.object(self.admission, "continuation_status", side_effect=OSError("policy state unavailable")):
+            await self.plugin.receive_companion_message(event)
+        event.is_at_or_wake_command = True
+        self.assertTrue(event.call_llm)
+        self.assertIsNone(event.get_extra(CORE_REPLY_CONTEXT_EXTRA))
+        stage = ProcessStage()
+        stage.ctx = NS(astrbot_config=DEFAULT_CONFIG)
+        async for _ in stage.process(event):
+            self.fail("an unavailable follow-up fuse must not fall through to AstrBot")
+
+    async def test_followup_switch_and_seconds_are_effective(self):
+        await self.configure(group_conversation_followup_enabled=False)
+        root = self.event("disabled-root", "开始", mention=True)
+        await self.core_turn(root)
+        await self.core_send(root)
+        self.clock.advance(timedelta(seconds=1))
+        self.assertFalse((await self.candidate(self.event("disabled-follow", "接着说")))["admitted"])
+        await self.configure(group_conversation_followup_enabled=True, group_conversation_followup_seconds=15)
+        self.clock.advance(timedelta(seconds=13))
+        self.assertEqual((await self.candidate(self.event("inside-window", "接着说")))["reason"], "reply_follow_up")
+        self.clock.advance(timedelta(seconds=2))
+        self.assertFalse((await self.candidate(self.event("outside-window", "接着说")))["admitted"])
 
 
 if __name__ == "__main__":

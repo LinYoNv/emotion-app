@@ -5,6 +5,11 @@ from __future__ import annotations
 import hashlib
 import re
 
+from .relationship_anniversary_schema import (
+    RELATIONSHIP_ANNIVERSARY_STATEMENTS,
+    RELATIONSHIP_ANNIVERSARY_TABLES,
+)
+
 
 SCHEMA_VERSION_V1 = "companion-v2.storage.v1"
 SCHEMA_VERSION_V2 = "companion-v2.storage.v2"
@@ -2065,6 +2070,77 @@ SCHEMA_VERSION = SCHEMA_VERSION_V64
 MIGRATION_V63_TO_V64_ID = "companion-v2.storage.v63-to-v64"
 MIGRATION_V63_TO_V64_FINGERPRINT = hashlib.sha256(
     "\n".join(V64_MIGRATION_STATEMENTS).encode("utf-8")
+).hexdigest()
+
+V65_MIGRATION_STATEMENTS = (
+    "ALTER TABLE outbox ADD COLUMN receipt_ref TEXT CHECK(receipt_ref IS NULL OR length(receipt_ref) BETWEEN 1 AND 512)",
+)
+V65_REQUIRED_TABLES = V64_REQUIRED_TABLES
+V65_SCHEMA_STATEMENTS = V64_SCHEMA_STATEMENTS + V65_MIGRATION_STATEMENTS
+REQUIRED_TABLES = V65_REQUIRED_TABLES
+SCHEMA_STATEMENTS = V65_SCHEMA_STATEMENTS
+SCHEMA_VERSION_V65 = "companion-v2.storage.v65"
+SCHEMA_VERSION = SCHEMA_VERSION_V65
+MIGRATION_V64_TO_V65_ID = "companion-v2.storage.v64-to-v65"
+MIGRATION_V64_TO_V65_FINGERPRINT = hashlib.sha256(
+    "\n".join(V65_MIGRATION_STATEMENTS).encode("utf-8")
+).hexdigest()
+
+V66_MIGRATION_STATEMENTS = RELATIONSHIP_ANNIVERSARY_STATEMENTS
+V66_REQUIRED_TABLES = V65_REQUIRED_TABLES.union(RELATIONSHIP_ANNIVERSARY_TABLES)
+V66_SCHEMA_STATEMENTS = V65_SCHEMA_STATEMENTS + V66_MIGRATION_STATEMENTS
+REQUIRED_TABLES = V66_REQUIRED_TABLES
+SCHEMA_STATEMENTS = V66_SCHEMA_STATEMENTS
+SCHEMA_VERSION_V66 = "companion-v2.storage.v66"
+SCHEMA_VERSION = SCHEMA_VERSION_V66
+MIGRATION_V65_TO_V66_ID = "companion-v2.storage.v65-to-v66"
+MIGRATION_V65_TO_V66_FINGERPRINT = hashlib.sha256(
+    "\n".join(V66_MIGRATION_STATEMENTS).encode("utf-8")
+).hexdigest()
+
+# `jev` is a third judgment backend beside local and SystemOne, so the decision
+# ledger has to record it. SQLite cannot relax a CHECK constraint in place, so
+# this rebuilds the table exactly the way v61 did; the DDL stays frozen here
+# because every data root verifies this migration by fingerprint.
+V67_MIGRATION_STATEMENTS = (
+    "ALTER TABLE laya_decision_events RENAME TO laya_decision_events_v66",
+    """CREATE TABLE laya_decision_events (
+        event_id TEXT PRIMARY KEY NOT NULL CHECK(length(event_id) = 32),
+        origin_key TEXT NOT NULL CHECK(length(origin_key) BETWEEN 1 AND 256),
+        batch_id TEXT CHECK(batch_id IS NULL OR length(batch_id) BETWEEN 1 AND 128),
+        source TEXT NOT NULL CHECK(source IN ('conversation', 'dashboard_preview', 'probe', 'role_intervention')),
+        status TEXT NOT NULL CHECK(status IN ('ok', 'skipped', 'failed')),
+        mode TEXT NOT NULL CHECK(mode IN ('local', 'remote', 'jev')),
+        reason_code TEXT CHECK(reason_code IS NULL OR length(reason_code) BETWEEN 1 AND 96),
+        reason TEXT CHECK(reason IS NULL OR length(reason) <= 1000),
+        elapsed_ms INTEGER CHECK(elapsed_ms IS NULL OR elapsed_ms >= 0),
+        decision_json TEXT CHECK(decision_json IS NULL OR (json_valid(decision_json) AND length(decision_json) <= 4096)),
+        enabled_fields_json TEXT NOT NULL CHECK(json_valid(enabled_fields_json) AND length(enabled_fields_json) <= 2048),
+        observed_at TEXT NOT NULL,
+        request_json TEXT CHECK(request_json IS NULL OR (json_valid(request_json) AND length(request_json) <= 131072)),
+        response_json TEXT CHECK(response_json IS NULL OR (json_valid(response_json) AND length(response_json) <= 65536)),
+        processing_json TEXT CHECK(processing_json IS NULL OR (json_valid(processing_json) AND length(processing_json) <= 16384))
+    )""",
+    """INSERT INTO laya_decision_events (
+        event_id, origin_key, batch_id, source, status, mode, reason_code, reason, elapsed_ms,
+        decision_json, enabled_fields_json, observed_at, request_json, response_json, processing_json
+    ) SELECT
+        event_id, origin_key, batch_id, source, status, mode, reason_code, reason, elapsed_ms,
+        decision_json, enabled_fields_json, observed_at, request_json, response_json, processing_json
+    FROM laya_decision_events_v66""",
+    "DROP TABLE laya_decision_events_v66",
+    "CREATE INDEX laya_decision_events_role_recent_idx ON laya_decision_events(origin_key, observed_at DESC)",
+    "CREATE INDEX laya_decision_events_batch_idx ON laya_decision_events(origin_key, batch_id, observed_at)",
+)
+V67_REQUIRED_TABLES = V66_REQUIRED_TABLES
+V67_SCHEMA_STATEMENTS = V66_SCHEMA_STATEMENTS + V67_MIGRATION_STATEMENTS
+REQUIRED_TABLES = V67_REQUIRED_TABLES
+SCHEMA_STATEMENTS = V67_SCHEMA_STATEMENTS
+SCHEMA_VERSION_V67 = "companion-v2.storage.v67"
+SCHEMA_VERSION = SCHEMA_VERSION_V67
+MIGRATION_V66_TO_V67_ID = "companion-v2.storage.v66-to-v67"
+MIGRATION_V66_TO_V67_FINGERPRINT = hashlib.sha256(
+    "\n".join(V67_MIGRATION_STATEMENTS).encode("utf-8")
 ).hexdigest()
 
 

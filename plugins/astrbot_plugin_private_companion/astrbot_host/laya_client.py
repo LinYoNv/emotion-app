@@ -7,7 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
 import logging
+import math
+import os
 from pathlib import Path
+import shlex
+import sys
 import threading
 from time import perf_counter
 from urllib.error import HTTPError, URLError
@@ -19,7 +23,7 @@ from companion_v2.decision.contract import (CONFIGURABLE_DECISION_FIELDS, DECISI
                        DecisionContractError, deterministic_skip_reason, parse_decision)
 from companion_v2.decision.prompt import (DECISION_QUESTIONS, INTERVENTION_CHOICES, build_state,
     decision_questions, facts_document, intervention_question, render_intervention_state, render_model_state)
-from companion_v2.decision.store import cached_multilingual_model
+from companion_v2.decision.store import MODE_MODELS, cached_multilingual_model
 
 
 logger = logging.getLogger(__name__)
@@ -30,21 +34,74 @@ _LOCAL_READY = set()
 _LOCAL_INFERENCE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="companion-laya")
 _LOCAL_PREDICTION_TRACE = threading.local()
 MAX_RESPONSE_BYTES = 1024 * 1024
-DEFAULT_MODEL = "multilingual"
+DEFAULT_MODEL = MODE_MODELS["local"]
+SYSTEMONE_PATH = "/v1/systemone"
+CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
+WORKERS_AI_PATH = "/ai/run"
 
 
 from companion_v2.decision.client import LayaClientError
 
 
-def _endpoint(value: str) -> str:
+def _endpoint(value: str, target: str = SYSTEMONE_PATH) -> str:
+    """Normalise a service address to the exact path the selected backend posts to."""
     raw = str(value or "").strip()
     parsed = urlsplit(raw)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise LayaClientError("laya_endpoint_invalid", "Laya 服务地址必须是 HTTP(S) 地址")
     path = parsed.path.rstrip("/")
-    if not path.endswith("/v1/systemone"):
-        path += "/systemone" if path.endswith("/v1") else "/v1/systemone"
+    if not path.endswith(target):
+        path += target[len("/v1"):] if path.endswith("/v1") else target
     return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
+
+
+def _workers_ai_endpoint(value: str) -> str:
+    """Cloudflare Workers AI accepts the model in the body of ``<account>/ai/run``.
+
+    Unlike SystemOne and the OpenAI-compatible gateway, this endpoint must not
+    receive a ``/v1/...`` suffix, so the operator may paste the run address, the
+    ``/ai`` root, or only the account base.
+    """
+    raw = str(value or "").strip()
+    parsed = urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise LayaClientError("laya_endpoint_invalid", "Laya 服务地址必须是 HTTP(S) 地址")
+    path = parsed.path.rstrip("/")
+    if path.endswith(WORKERS_AI_PATH):
+        return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
+    if "/v1/" in path or path.endswith("/v1"):
+        raise LayaClientError(
+            "laya_endpoint_invalid",
+            "Workers AI 地址不需要 /v1 后缀；请填 "
+            "https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/run")
+    if path.endswith("/ai"):
+        path += "/run"
+    elif "/accounts/" in path:
+        path += WORKERS_AI_PATH
+    else:
+        raise LayaClientError(
+            "laya_endpoint_invalid",
+            "Cloudflare Workers AI 地址应形如 "
+            "https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/run")
+    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
+
+
+def _answers_document(value):
+    """Accept the answers document, or a JSON string carrying it, inside ``result``."""
+    if not isinstance(value, dict):
+        return {"answers": {}}
+    if isinstance(value.get("answers"), dict):
+        return value
+    for key in ("response", "content", "text", "output"):
+        text = value.get(key)
+        if isinstance(text, str) and text.strip().startswith("{"):
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(parsed, dict) and isinstance(parsed.get("answers"), dict):
+                return parsed
+    return value
 
 
 def _source_key(local_model_path=""):
@@ -190,15 +247,40 @@ def _load_local_model(local_model_path=""):
         return device
 
 
+def _torch_install_command():
+    executable = str(Path(sys.executable).resolve())
+    if os.name == "nt":
+        quote = lambda value: "'" + value.replace("'", "''") + "'"
+        return (f"& {quote(executable)} -m pip install --force-reinstall "
+                "--index-url https://download.pytorch.org/whl/cu128 torch")
+    return (shlex.quote(executable) + " -m pip install --force-reinstall "
+            "--index-url https://download.pytorch.org/whl/cu128 torch")
+
+
+def _torch_runtime_status():
+    """Expose the installed torch build so the page can explain CUDA failures."""
+    status = {"torch_version": "", "cuda_version": "", "cuda_available": False,
+              "torch_install_command": _torch_install_command()}
+    try:
+        import torch
+        status["torch_version"] = str(getattr(torch, "__version__", "") or "")
+        status["cuda_available"] = bool(torch.cuda.is_available())
+        status["cuda_version"] = str(getattr(torch.version, "cuda", "") or "")
+    except Exception:
+        pass
+    return status
+
+
 def local_runtime_status(*, local_model_path=""):
-    if not _cuda_available():
-        return {"local_runtime_state": "gpu_unavailable"}
+    runtime = _torch_runtime_status()
+    if not runtime["cuda_available"]:
+        return {**runtime, "local_runtime_state": "gpu_unavailable"}
     source = _source_key(local_model_path)
     task = _LOCAL_WARMUP_TASKS.get(source)
     if task is not None and not task.done():
-        return {"local_runtime_state": "warming"}
+        return {**runtime, "local_runtime_state": "warming"}
     ready = source in _LOCAL_READY and source in _LOCAL_ROUTERS
-    return {"local_runtime_state": "ready" if ready else "not_loaded"}
+    return {**runtime, "local_runtime_state": "ready" if ready else "not_loaded"}
 
 
 def start_laya_warmup(store):
@@ -296,9 +378,32 @@ def _decision_from_result(document: dict, enabled_fields=None) -> LayaDecision:
         choices[name] = choice
     choices["reason_codes"] = []
     try:
-        return parse_decision(choices)
+        decision = parse_decision(choices)
     except DecisionContractError as error:
         raise LayaClientError("laya_contract_invalid", str(error)) from error
+    # Laya's calibrated action probability is transport metadata, not a new
+    # decision field. Prefer `answer_confidence`; the strict SystemOne wire
+    # contract may retain only the full `probabilities` map for choice answers.
+    return replace(decision, action_confidence=_action_answer_confidence(answers.get("action")))
+
+
+def _action_answer_confidence(answer) -> float | None:
+    if type(answer) is not dict:
+        return None
+
+    def probability(value):
+        if (type(value) not in (int, float) or isinstance(value, bool)
+                or not math.isfinite(value) or not 0.0 <= value <= 1.0):
+            return None
+        return float(value)
+
+    calibrated = probability(answer.get("answer_confidence"))
+    if calibrated is not None:
+        return calibrated
+    probabilities, choice = answer.get("probabilities"), answer.get("choice")
+    if type(probabilities) is dict and type(choice) is str:
+        return probability(probabilities.get(choice))
+    return None
 
 
 def _safe_error_text(raw: bytes, secret: str) -> str:
@@ -306,8 +411,14 @@ def _safe_error_text(raw: bytes, secret: str) -> str:
         text = raw.decode("utf-8", errors="replace")
         document = json.loads(text)
         if isinstance(document, dict):
-            detail = document.get("detail") or document.get("error") or document
-            text = detail if isinstance(detail, str) else json.dumps(detail, ensure_ascii=False)
+            errors = document.get("errors")
+            if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+                message = errors[0].get("message")
+                text = (str(message) if isinstance(message, str) and message.strip()
+                        else json.dumps(errors[0], ensure_ascii=False))
+            else:
+                detail = document.get("detail") or document.get("error") or document
+                text = detail if isinstance(detail, str) else json.dumps(detail, ensure_ascii=False)
     except (TypeError, ValueError):
         text = raw.decode("utf-8", errors="replace")
     if secret:
@@ -315,16 +426,88 @@ def _safe_error_text(raw: bytes, secret: str) -> str:
     return " ".join(text.replace("\r", " ").replace("\n", " ").split())[:1000]
 
 
+class _SystemOneTransport:
+    """Official Laya SystemOne protocol: the decision document is the whole body."""
+
+    def __init__(self, model: str):
+        self.model = model
+
+    def payload(self, model_state: str, questions: dict) -> dict:
+        return {"state": model_state, "questions": questions, "model": self.model}
+
+    def document(self, raw: str) -> dict:
+        return _parse_document(raw)
+
+
+class _JevTransport:
+    """System One decisions carried by an OpenAI-compatible chat completion.
+
+    A gateway that serves a decisions model next to chat models (New API,
+    OpenRouter, Venice) keeps the same state/questions document, but accepts it
+    only as the text of one user message. The answer arrives as JSON text in
+    ``choices[0].message.content`` and is decoded into the same document shape,
+    so both remote backends share one contract conversion.
+    """
+
+    def __init__(self, model: str):
+        self.model = model
+
+    def payload(self, model_state: str, questions: dict) -> dict:
+        decision = {"model": self.model, "state": model_state, "questions": questions}
+        return {"model": self.model, "messages": [{"role": "user", "content": json.dumps(
+            decision, ensure_ascii=False, separators=(",", ":"))}]}
+
+    def document(self, raw: str) -> dict:
+        envelope = _parse_document(raw)
+        choices = envelope.get("choices")
+        message = choices[0].get("message") if type(choices) is list and choices else None
+        content = message.get("content") if type(message) is dict else None
+        if type(content) is not str or not content.strip():
+            raise LayaClientError("laya_response_invalid", "Jev 响应缺少 choices[0].message.content")
+        return _parse_document(content)
+
+
+class _WorkersAITransport:
+    """Cloudflare Workers AI: the decision document travels inside ``input``."""
+
+    def __init__(self, model: str):
+        self.model = model
+
+    def payload(self, model_state: str, questions: dict) -> dict:
+        return {"model": self.model, "input": {"state": model_state, "questions": questions}}
+
+    def document(self, raw: str) -> dict:
+        envelope = _parse_document(raw)
+        if envelope.get("success") is False:
+            errors = envelope.get("errors")
+            message = ""
+            if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+                message = str(errors[0].get("message") or "")
+            raise LayaClientError("laya_response_invalid",
+                                  "Cloudflare Workers AI 拒绝了该次判断" + (f"：{message}" if message else ""))
+        return _answers_document(envelope.get("result"))
+
+
 class LayaDecisionClient:
     runtime_status = staticmethod(local_runtime_status)
 
     def __init__(self, *, mode: str = "local", endpoint: str = "", api_key: str = "",
-                 timeout_seconds: int = 8, local_model_path: str = ""):
-        if mode not in {"local", "remote"}:
-            raise LayaClientError("laya_mode_invalid", "Laya 接入方式必须是 local 或 remote")
+                 timeout_seconds: int = 8, local_model_path: str = "", model: str = ""):
+        if mode not in MODE_MODELS:
+            raise LayaClientError("laya_mode_invalid",
+                                  "Laya 接入方式必须是 local、remote、jev 或 workers_ai")
         self.mode = mode
         self.local_model_path = local_model_path
-        self.endpoint = _endpoint(endpoint) if mode == "remote" else ""
+        self.model = str(model or "").strip() or MODE_MODELS[mode]
+        self.endpoint, self.transport = "", None
+        if mode == "remote":
+            self.endpoint, self.transport = _endpoint(endpoint), _SystemOneTransport(self.model)
+        elif mode == "jev":
+            self.endpoint = _endpoint(endpoint, CHAT_COMPLETIONS_PATH)
+            self.transport = _JevTransport(self.model)
+        elif mode == "workers_ai":
+            self.endpoint = _workers_ai_endpoint(endpoint)
+            self.transport = _WorkersAITransport(self.model)
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
         self.last_trace = {}
@@ -345,7 +528,7 @@ class LayaDecisionClient:
         questions = decision_questions(facts, enabled)
         model_state = render_model_state(state)
         self.last_trace = {
-            "request": {"model": DEFAULT_MODEL, "state": model_state, "questions": questions, "sent": False},
+            "request": {"model": self.model, "state": model_state, "questions": questions, "sent": False},
             "response": None,
             "processing": {"stages": [{"name": "request_preparation", "status": "ok"}]},
         }
@@ -372,7 +555,7 @@ class LayaDecisionClient:
             self.last_trace["request"]["sent"] = True
             raw_body = await self._post(model_state, questions)
             self.last_trace["response"] = {"format": "json", "body": raw_body}
-            raw_result = _parse_document(raw_body)
+            raw_result = self.transport.document(raw_body)
             self.last_trace["response"]["value"] = raw_result
         if type(raw_result) is not dict:
             raise LayaClientError("laya_response_invalid", "Laya predict 返回的结果不是对象")
@@ -398,6 +581,7 @@ class LayaDecisionClient:
             ],
             "contract_decision": contract_decision,
             "effective_decision": decision.document(),
+            "action_confidence": decision.action_confidence,
             "transformations": transformations,
         }
         if local_runtime is not None:
@@ -415,7 +599,7 @@ class LayaDecisionClient:
         state = render_intervention_state(facts)
         model_state = render_model_state(state)
         self.last_trace = {
-            "request": {"model": DEFAULT_MODEL, "state": model_state, "questions": questions, "sent": False},
+            "request": {"model": self.model, "state": model_state, "questions": questions, "sent": False},
             "response": None,
             "processing": {"stages": [{"name": "request_preparation", "status": "ok"}]},
         }
@@ -438,7 +622,7 @@ class LayaDecisionClient:
             self.last_trace["request"]["sent"] = True
             raw_body = await self._post(model_state, questions)
             self.last_trace["response"] = {"format": "json", "body": raw_body}
-            raw_result = _parse_document(raw_body)
+            raw_result = self.transport.document(raw_body)
             self.last_trace["response"]["value"] = raw_result
         if type(raw_result) is not dict:
             raise LayaClientError("laya_response_invalid", "Laya intervention result is not an object")
@@ -466,7 +650,7 @@ class LayaDecisionClient:
         }, enabled_fields=enabled_fields)
 
     async def _post(self, model_state: str, questions: dict) -> str:
-        body = json.dumps({"state": model_state, "questions": questions, "model": DEFAULT_MODEL},
+        body = json.dumps(self.transport.payload(model_state, questions),
                           ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
         if self.api_key:
@@ -479,7 +663,10 @@ class LayaDecisionClient:
                     content = response.read(MAX_RESPONSE_BYTES + 1)
             except HTTPError as error:
                 detail = _safe_error_text(error.read(4096), self.api_key)
-                raise LayaClientError("laya_http_error",
+                # A rejected credential is the operator's to fix, so it keeps its
+                # own code instead of the generic HTTP status.
+                code = "laya_auth_failed" if error.code in {401, 403} else "laya_http_error"
+                raise LayaClientError(code,
                     f"Laya HTTP {error.code}" + (f"：{detail}" if detail else "")) from error
             except (URLError, TimeoutError, OSError) as error:
                 raise LayaClientError("laya_transport_failed",

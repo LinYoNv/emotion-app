@@ -181,6 +181,41 @@ class OpenItemsContextTests(OpenItemsFixture, unittest.IsolatedAsyncioTestCase):
         self.clock.advance(timedelta(days=4))
         self.assertEqual(reader.capture(self.context, self.clock.now())["references"], [])
 
+    async def test_delivered_followup_opens_one_review_context_without_consuming_surface_cap(self):
+        self.add_item()
+        repository = self.agenda.repository
+        claimed_at = self.clock.now()
+        self.assertTrue(repository.claim_open_loop_followup("item-a", at=claimed_at))
+        delivered_at = claimed_at + timedelta(seconds=7)
+        self.assertTrue(repository.record_open_loop_followup_delivery("item-a", at=delivered_at))
+        self.clock.advance(timedelta(seconds=20))
+
+        consumer = self.messages.open_items_context
+        snapshot = consumer.capture(self.context, self.clock.now())
+        self.assertEqual([item["memo_id"] for item in snapshot["references"]], ["item-a"])
+        payload = self.item_payloads_from(consumer, snapshot)
+        self.assertTrue(payload["followup_review"])
+        self.assertEqual(payload["last_followup_at"], delivered_at.isoformat())
+        self.assertEqual(payload["followup_count"], 1)
+
+        with self.runtime.read_snapshot():
+            materials = consumer.contributions(snapshot, self.context, self.clock.now())
+        self.assertEqual(consumer.record_exposure(snapshot, self.context, self.clock.now(), materials),
+                         frozenset({"item-a"}))
+        memo = repository.memo("item-a")
+        self.assertEqual(memo.context_count, 0)
+        self.assertEqual(memo.last_context_at, self.clock.now())
+        self.assertEqual(consumer.capture(self.context, self.clock.now())["references"], [])
+
+        self.clock.advance(timedelta(days=4))
+        normal = consumer.capture(self.context, self.clock.now())
+        self.assertEqual([item["memo_id"] for item in normal["references"]], ["item-a"])
+        self.assertFalse(self.item_payloads_from(consumer, normal).get("followup_review"))
+
+    def item_payloads_from(self, consumer, snapshot):
+        return [json.loads(item.payload) for item in consumer.contributions(
+            snapshot, self.context, self.clock.now()) if item.purpose == "participant_open_item"][0]
+
     async def test_exposure_cooldown_removes_stale_optional_material_from_request(self):
         self.add_item()
         batch = self.accept()

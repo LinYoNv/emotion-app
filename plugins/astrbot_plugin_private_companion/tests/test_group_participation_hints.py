@@ -6,6 +6,7 @@ import unittest
 
 from companion_v2.conversation.group_timing import short_input_wait
 from companion_v2.conversation.participation_prompts import group_hints
+from companion_v2.conversation.native_participation import speaker_history_instruction
 from companion_v2.foundation.refs import ScopeKind
 
 
@@ -13,10 +14,33 @@ NOW = datetime(2026, 9, 27, 10, tzinfo=timezone.utc)
 
 
 class GroupParticipationHintTests(unittest.TestCase):
-    def hints(self, recent=(), batches=None, settings=None, materials=(), sender="200", images=(), native=False):
+    def hints(self, recent=(), batches=None, settings=None, materials=(), sender="200", images=(), native=False,
+              current_text=""):
         request = NS(event=NS(received_at=NOW), context=NS(materials=materials), images=images)
         context = NS(actor=NS(principal=NS(native_account_id=sender)))
-        return group_hints(request, context, settings or {}, recent, batches or {}, native=native)
+        return group_hints(request, context, settings or {}, recent, batches or {}, native=native,
+                           current_text=current_text)
+
+    def test_mention_attribution_never_claims_another_accounts_name(self):
+        other = self.hints(current_text="[提及账号 123] 小天使")
+        self.assertIn("其他账号", other)
+        self.assertIn("不要接成", other)
+        own = self.hints(current_text="[提及机器人] 小天使")
+        self.assertIn("明确 @ 了本角色", own)
+        speaking_about = self.hints(current_text="给星缘搓了一个家")
+        self.assertIn("没有明确 @ 本角色", speaking_about)
+        self.assertIn("第三人称", speaking_about)
+
+    def test_recent_group_history_keeps_each_speaker_out_of_the_current_turn(self):
+        history = speaker_history_instruction((
+            {"speaker_id": "A", "text": "@星缘 小天使"},
+            {"speaker_id": "B", "text": "什么"},
+        ), "B")
+        self.assertIn("[speaker_id=A] @星缘 小天使", history)
+        self.assertIn("[speaker_id=B] 什么", history)
+        self.assertIn("不同的人", history)
+        self.assertIn("current_group_speaker=B", history)
+        self.assertEqual(speaker_history_instruction((), "B"), "")
 
     def test_segmented_reply_is_one_round_and_future_receipts_do_not_count(self):
         recent = [dict(type="confirmed_group_reply", part_id=part, delivered_at=at.isoformat())
@@ -62,12 +86,24 @@ class GroupParticipationHintTests(unittest.TestCase):
         self.assertNotIn("图片中与你明确兴趣", self.hints(settings=settings))
         hint = self.hints(settings=settings, images=(object(),))
         self.assertIn("图片中与你明确兴趣", hint)
-        self.assertIn("参考权重 35%", hint)
+        self.assertIn("图片候选抽取概率 35%", hint)
         self.assertIn("不要求接话", hint)
         self.assertIn('["星星", "小星"]', hint)
         self.assertIn('["小星同学"]', hint)
         self.assertIn("表情包优先理解其情绪和表达", hint)
         self.assertNotIn("图片中与你明确兴趣", self.hints(settings=settings, native=True))
+
+    def test_image_only_messages_get_a_default_restraint_hint_unless_disabled(self):
+        """抽中候选不等于必须接话：默认提示只在开启时追加。"""
+        settings = {"group_wakeup_image_enabled": True, "group_wakeup_image_weight": 0.35}
+        image_only = self.hints(settings=settings, images=(object(),))
+        self.assertIn("图片唤醒默认克制", image_only)
+        self.assertIn("不构成接话理由", image_only)
+        with_text = self.hints(settings=settings, images=(object(),), current_text="看这个")
+        self.assertIn("以文字内容为判断主体", with_text)
+        disabled = self.hints(settings={**settings, "group_wakeup_image_default_guidance_enabled": False},
+                              images=(object(),))
+        self.assertNotIn("图片唤醒默认克制", disabled)
 
     def test_dense_group_replies_prompt_a_configured_cooldown_for_weak_candidates(self):
         recent = [dict(type="native_group_reply", turn_id=str(index),

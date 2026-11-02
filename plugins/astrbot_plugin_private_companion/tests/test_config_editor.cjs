@@ -21,7 +21,7 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 const drains = async (times = 6) => { for (let index = 0; index < times; index += 1) await flush(); };
 const TOKEN = a => a.repeat(64);
 const plain = value => JSON.parse(JSON.stringify(value));
-const PREFIX = '/astrbot_plugin_private_companion_v2/';
+const PREFIX = '/astrbot_plugin_private_companion/';
 
 const quota = {
   private_owner_max_daily: -1, private_friend_max_daily: -1, group_max_daily: -1, proactive_max_daily: -1,
@@ -132,13 +132,13 @@ const NEW_KINDS = {
       first_person: '我', voice_examples: '今天的风有点像海边的。\n你先说，我听着。',
       signature_phrases: '慢慢来、我在呢', hobbies: '植物随笔、听雨',
       avatar_data_url: '',
-      world_adaptation_mode: 'auto', main_companion_subject: '',
+      main_companion_subject: '',
       expression_private_source_mode: 'owner', expression_private_source_subject_ids: '[]',
       expression_private_application_mode: 'all', expression_private_application_subject_ids: '[]'},
     fields: {name: ['text'], birthday: ['text'], gender: ['text'], species: ['text'],
       first_person: ['text'], voice_examples: ['text'], signature_phrases: ['text'],
       avatar_data_url: ['text'],
-      hobbies: ['text'], world_adaptation_mode: ['text'], main_companion_subject: ['text'],
+      hobbies: ['text'], main_companion_subject: ['text'],
       expression_private_source_mode: ['text'], expression_private_source_subject_ids: ['text'],
       expression_private_application_mode: ['text'], expression_private_application_subject_ids: ['text']},
   },
@@ -345,6 +345,11 @@ function harness(kinds = ['quota', 'image_review'], views = {}, endpointOverride
       acquaintanceDirectory: options.people ? async () => ({persons: options.people}) : undefined,
       identity: () => ({installation_id: 'inst', operator_id: 'admin'}),
       scopeKey: () => options.scopeKey || 'scope-a',
+      ...(options.batchRead ? {request: async (method, path, body) => {
+        const response = await new Promise((resolve, reject) =>
+          requests.push({method, route: 'config', body, resolve, reject}));
+        return response?.status === 'ok' ? response.data : response;
+      }} : {}),
     },
     AstrBotPluginPage: {
       apiGet: (route, body) => new Promise((resolve, reject) =>
@@ -360,7 +365,9 @@ function harness(kinds = ['quota', 'image_review'], views = {}, endpointOverride
     createElement: () => ({
       dataset: {}, classList: {add() {}}, textContent: '',
       innerHTML: '', appendChild() {}, querySelector: () => null, querySelectorAll: () => [],
-      addEventListener() {}, removeEventListener() {},
+      listeners: {},
+      addEventListener(type, callback) { this.listeners[type] = callback; },
+      removeEventListener(type) { delete this.listeners[type]; },
     }),
     querySelector: () => null, querySelectorAll: () => [],
     hidden: false,
@@ -394,34 +401,99 @@ async function loaded(harnessed, kinds = ['quota', 'image_review'], requestOverr
   return harnessed.editors.state.instances;
 }
 
+test('a multi-section page reads all configuration groups in one batch', async () => {
+  const h = harness(['quota', 'image_review'], {}, '', {batchRead: true});
+  h.editors.restore();
+  h.editors.paint();
+  const read = h.editors.read();
+  await drains();
+  assert.equal(h.requests.length, 1, 'multiple sections should share one read request');
+  assert.equal(h.requests[0].method, 'GET');
+  assert.deepEqual(plain(h.requests[0].body), {sections: 'quota,image_review'});
+  h.requests[0].resolve({status: 'ok', data: {sections: {
+    quota: payload('quota').sections.quota,
+    image_review: payload('image_review').sections.image_review,
+  }}});
+  await read;
+  await drains();
+  assert.ok(h.editors.state.instances.every(instance => instance.state.status));
+  assert.equal(h.requests.length, 1, 'prefetched sections must not be fetched again on mount');
+});
+
+test('dirty editor exposes changed field names and discard clears the source before unmount', async () => {
+  const h = harness(['quota']);
+  const [instance] = await loaded(h, ['quota']);
+  instance.state.draft.private_owner_max_daily = 6;
+  const [pending] = h.workbench.dirtyEditors();
+  assert.equal(pending.fields.length, 1);
+  assert.equal(pending.fields[0], h.window.CompanionConfigEditors.spec.quota.labels.private_owner_max_daily);
+  assert.equal(pending.discard(), true);
+  assert.equal(h.workbench.dirtyEditors().length, 0);
+  instance.state.draft.private_owner_max_daily = 7;
+  h.editors.unmount();
+  assert.equal(h.workbench.dirtyEditors().length, 0);
+  assert.equal(instance.state.draft, null);
+});
+
+test('detached config editors cannot keep prompting on subsequent navigation', async () => {
+  const h = harness(['quota']);
+  const [instance] = await loaded(h, ['quota']);
+  instance.state.draft.private_owner_max_daily = 6;
+  h.holders.quota.isConnected = false;
+  assert.equal(h.workbench.dirtyEditors().length, 0);
+  assert.equal(instance.state.draft, null);
+});
+
+test('save from navigation uses the existing receipt and preserves invalid drafts', async () => {
+  const h = harness(['quota']);
+  const [instance] = await loaded(h, ['quota']);
+  instance.state.draft.private_owner_max_daily = 999;
+  const invalid = await h.workbench.dirtyEditors()[0].save();
+  assert.ok(invalid.error);
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.workbench.dirtyEditors().length, 1);
+  instance.state.draft.private_owner_max_daily = 6;
+  const save = h.workbench.dirtyEditors()[0].save();
+  await drains();
+  assert.equal(h.requests[1].method, 'POST');
+  h.requests[1].resolve({result:{operation_id:'navigation-save',replayed:false},
+    status:{sections:{quota:section('quota',{private_owner_max_daily:6},TOKEN('b'))}}});
+  assert.equal(await save, true);
+  assert.equal(h.workbench.dirtyEditors().length, 0);
+  h.editors.unmount();
+});
+
 test('the role dossier exposes the V1 character and world detail fields in one grouped contract', () => {
   const {window} = harness(['role_profile']);
   const profile = window.CompanionConfigEditors.spec.role_profile;
   const grouped = plain(profile.sections.flatMap(section => section.fields));
-  assert.equal(profile.sections.length, 9);
+  assert.equal(profile.sections.length, 8);
   assert.equal(new Set(grouped).size, grouped.length, 'each field belongs to one dossier group');
   assert.deepEqual(grouped.slice().sort(), plain(profile.order).slice().sort());
   assert.deepEqual(grouped.slice().sort(), Object.keys(profile.labels).sort());
   for (const field of ['name', 'species', 'birthday', 'age', 'gender', 'appearance_points', 'hair', 'eyes',
     'clothing', 'occupation', 'personality', 'first_person', 'reaction_patterns', 'voice_examples',
     'emotional_style', 'social_distance', 'signature_phrases', 'desire', 'hobbies', 'taboos', 'key_lore',
-    'world_name', 'era', 'tone', 'rules', 'scenes', 'network', 'platform_group_chat']) {
+    'world_name', 'era', 'tone', 'rules', 'scenes', 'network', 'world_extra', 'world']) {
     assert.ok(grouped.includes(field), `${field} is part of the editable role dossier`);
   }
-  for (const legacy of ['identity', 'appearance', 'personality', 'motivations', 'boundaries', 'world', 'platform_names']) {
+  for (const legacy of ['identity', 'appearance', 'personality', 'motivations', 'boundaries', 'world']) {
     assert.ok(grouped.includes(legacy), `${legacy} retains its earlier saved content`);
   }
-  assert.deepEqual(plain(profile.choices.world_adaptation_mode),
-    {auto: '自动', modern: '现代日常', fantasy: '幻想世界', sci_fi: '科幻世界', custom: '自定义', off: '关闭'});
-  assert.ok(profile.sections.flatMap(section => section.fields).includes('world_adaptation'));
+  // 平台称呼与世界观适配已下线：既不在可编辑字段里，也不再作为分组出现。
+  for (const removed of ['platform_names', 'platform_group_chat', 'world_adaptation_mode', 'world_adaptation']) {
+    assert.ok(!grouped.includes(removed), `${removed} must be gone from the dossier`);
+  }
 });
 
 test('the settings search catalogue exposes field metadata without reading configuration values', () => {
   const {window} = harness(['proactive.contact', 'knowledge']);
   const entries = plain(window.CompanionConfigEditors.searchEntries());
   const contact = entries.filter(item => item.group === 'proactive.contact');
-  assert.equal(contact.length, 160);
-  assert.equal(new Set(contact.map(item => item.field)).size, 160);
+  assert.equal(contact.length, 173);
+  assert.equal(new Set(contact.map(item => item.field)).size, 173);
+  assert.ok(contact.some(item => item.field === 'morning_chain_enabled'
+    && item.sectionTitle === '起床与晨间确认'));
   assert.ok(contact.some(item => item.field === 'balance_awareness_enabled'
     && item.label === '允许因余额变化联系' && item.sectionTitle === '余额感知'));
   assert.ok(entries.some(item => item.group === 'knowledge' && item.section === 'members'
@@ -654,6 +726,126 @@ test('explicit field saves preserve unrelated configuration drafts', async () =>
   assert.equal((await instance.saveField('group_max_daily', 5)).state, 'dirty');
   assert.equal(instance.state.draft.group_max_daily, -1);
   assert.equal(harnessed.requests.length, 1);
+});
+
+test('核对新版本保留本地改动，并采用其他页面已保存的无冲突字段', async () => {
+  const h = harness(['quota']);
+  const [instance] = await loaded(h, ['quota']);
+  instance.state.draft.group_max_daily = 5;
+  const saving = instance.save();
+  await drains();
+  h.requests[1].reject(Object.assign(new Error('configuration_revision_conflict'), {code: 'configuration_revision_conflict'}));
+  await saving;
+  assert.match(h.painted.quota, /data-wb-action="reconcile"/);
+  assert.match(h.painted.quota, /改动已保留，待核对当前配置/);
+  const reading = instance.refresh();
+  await drains();
+  h.requests[2].resolve(payload('quota', {private_friend_max_daily: 9}, TOKEN('b')));
+  await reading;
+  assert.equal(instance.state.draft.group_max_daily, 5);
+  assert.equal(instance.state.draft.private_friend_max_daily, 9);
+  assert.deepEqual(plain(instance.state.conflicts), {});
+  const retry = instance.save();
+  await drains();
+  assert.deepEqual(plain(h.requests[3].body.changes), {group_max_daily: 5});
+  assert.equal(h.requests[3].body.edit_token, TOKEN('b'));
+  h.requests[3].resolve({result: {operation_id: 'merged', replayed: false},
+    status: payload('quota', {group_max_daily: 5, private_friend_max_daily: 9}, TOKEN('c'))});
+  await retry;
+  assert.equal(instance.dirty(), false);
+});
+
+test('同一字段同时修改需逐项确认，刷新两次也不会静默覆盖', async () => {
+  const h = harness(['quota']);
+  const [instance] = await loaded(h, ['quota']);
+  instance.state.draft.group_max_daily = 5;
+  for (let index = 1; index <= 2; index += 1) {
+    const reading = instance.refresh();
+    await drains();
+    h.requests[index].resolve(payload('quota', {group_max_daily: 7}, TOKEN('b')));
+    await reading;
+    assert.equal(instance.state.draft.group_max_daily, 5);
+    assert.ok(instance.state.conflicts.group_max_daily);
+  }
+  await instance.save();
+  assert.equal(h.requests.length, 3);
+  assert.match(h.painted.quota, /当前已保存：7/);
+  assert.match(h.painted.quota, /我的修改：5/);
+  h.holders.quota.listeners.click({target: {closest: selector => selector === '[data-wb-conflict]'
+    ? {dataset: {wbConflict: 'group_max_daily', wbChoice: 'draft'}} : null}});
+  assert.deepEqual(plain(instance.state.conflicts), {});
+  const saving = instance.save();
+  await drains();
+  assert.equal(h.requests[3].body.changes.group_max_daily, 5);
+  h.requests[3].resolve({result: {operation_id: 'chosen-draft', replayed: false},
+    status: payload('quota', {group_max_daily: 5}, TOKEN('c'))});
+  await saving;
+  assert.equal(instance.dirty(), false);
+});
+
+test('选择当前值消除冲突，只提交剩余本地改动', async () => {
+  const h = harness(['quota']);
+  const [instance] = await loaded(h, ['quota']);
+  Object.assign(instance.state.draft, {group_max_daily: 5, proactive_max_daily: 3});
+  const reading = instance.refresh();
+  await drains();
+  h.requests[1].resolve(payload('quota', {group_max_daily: 7}, TOKEN('b')));
+  await reading;
+  h.holders.quota.listeners.click({target: {closest: selector => selector === '[data-wb-conflict]'
+    ? {dataset: {wbConflict: 'group_max_daily', wbChoice: 'current'}} : null}});
+  assert.equal(instance.state.draft.group_max_daily, 7);
+  const saving = instance.save();
+  await drains();
+  assert.deepEqual(plain(h.requests[2].body.changes), {proactive_max_daily: 3});
+  h.requests[2].resolve({result: {operation_id: 'chosen-current', replayed: false},
+    status: payload('quota', {group_max_daily: 7, proactive_max_daily: 3}, TOKEN('c'))});
+  await saving;
+});
+
+test('冲突后使用已保存配置会重新读取，恢复后可以继续编辑保存', async () => {
+  const h = harness(['quota']);
+  const [instance] = await loaded(h, ['quota']);
+  instance.state.draft.group_max_daily = 5;
+  const saving = instance.save();
+  await drains();
+  h.requests[1].reject(Object.assign(new Error('configuration_revision_conflict'), {code: 'configuration_revision_conflict'}));
+  await saving;
+  h.holders.quota.listeners.click({target: {closest: selector => selector === '[data-wb-action]'
+    ? {dataset: {wbAction: 'reset'}} : null}});
+  await drains();
+  h.requests[2].resolve(payload('quota', {group_max_daily: 7}, TOKEN('b')));
+  await drains();
+  assert.equal(instance.state.stale, false);
+  assert.equal(instance.state.draft.group_max_daily, 7);
+  assert.equal(instance.dirty(), false);
+  assert.equal(h.requests.length, 3, '恢复配置只读取，不重复执行被拒绝的保存');
+});
+
+test('未确认保存的工作台重新挂载后仍能读取状态并核对原请求', async () => {
+  const h = harness(['quota']);
+  const [instance] = await loaded(h, ['quota']);
+  instance.state.draft.group_max_daily = 5;
+  const saving = instance.save();
+  await drains();
+  const original = plain(h.requests[1].body);
+  h.requests[1].reject(Object.assign(new Error('bridge down'), {code: 'bridge_timeout'}));
+  await saving;
+  instance.unmount();
+  instance.mount();
+  await drains();
+  assert.equal(h.requests[2].method, 'GET');
+  h.requests[2].resolve(payload('quota', {group_max_daily: 5}, TOKEN('b')));
+  await drains();
+  assert.ok(instance.state.pending);
+  const reconciling = instance.save(true);
+  await drains();
+  assert.deepEqual(plain(h.requests[3].body), original);
+  h.requests[3].resolve({result: {operation_id: 'recovered', replayed: true},
+    status: payload('quota', {group_max_daily: 5}, TOKEN('b'))});
+  await reconciling;
+  assert.equal(instance.state.pending, null);
+  assert.equal(instance.dirty(), false);
+  instance.unmount();
 });
 
 test('an enum-valued text field is edited as a select, not a free-text box', async () => {
@@ -1125,12 +1317,150 @@ test('knowledge source checkmarks survive saving and rereading newline-separated
   assert.match(harnessed.painted.knowledge, /data-wb-source-id="doc:kb-1:doc-1"[^>]*checked/);
   assert.match(harnessed.painted.knowledge, /data-wb-source-id="kb:missing"[^>]*checked/);
   assert.match(harnessed.painted.knowledge, /已选 2 \/ 16 项/);
-  assert.doesNotMatch(harnessed.painted.knowledge, /data-wb-source-id="kb:kb-1"[^>]*checked/);
+  /* 逐篇令牌选满这个库时，父级按「已全选」显示勾选；写回值仍是逐篇令牌，
+     不会被折叠成 kb:kb-1，否则以后新增的文档会被顺带纳入引用。 */
+  assert.match(harnessed.painted.knowledge, /data-wb-source-base="kb-1"[^>]*checked/);
   const reading = instance.refresh(true);
   await drains();
   harnessed.requests[2].resolve(status);
   await reading;
   assert.match(harnessed.painted.knowledge, /data-wb-source-id="doc:kb-1:doc-1"[^>]*checked/);
+});
+
+/* ==== 世界知识来源：整库 / 逐篇 / 半选 ==== */
+
+const kbDocuments = count => Array.from({length: count}, (_, index) => ({
+  id: `doc:kb-1:doc-${index + 1}`, doc_id: `doc-${index + 1}`,
+  name: `资料${index + 1}.md`, file_type: 'md', chunk_count: index + 1,
+}));
+
+/* 一个库有 3 篇文档时，父级与子项的组合才分得出「整库 / 选满 / 选一部分」。 */
+const knowledgePayload = (documents, sourceIds) => {
+  const response = payload('knowledge', {source_ids: sourceIds});
+  response.sections.knowledge.knowledge_sources = [{
+    id: 'kb:kb-1', type: 'knowledge_base', kb_id: 'kb-1', name: '星河设定', emoji: '📚',
+    doc_count: documents.length,
+    chunk_count: documents.reduce((sum, doc) => sum + doc.chunk_count, 0),
+    documents,
+  }];
+  return response;
+};
+
+async function loadedSources(documents, sourceIds) {
+  const harnessed = harness(['knowledge']);
+  const [instance] = await loaded(harnessed, ['knowledge'],
+    {knowledge: {response: knowledgePayload(documents, sourceIds)}});
+  return {harnessed, instance, painted: harnessed.painted.knowledge};
+}
+
+/* 半选属性只能由 JS 设置，把这段实现单独取出来验证。 */
+const sourceIndeterminate = (() => {
+  const start = workbench.indexOf('  const syncSourceIndeterminate');
+  const end = workbench.indexOf('  /* 把一次复选框点击换算成新的 source_ids', start);
+  return vm.runInNewContext(`() => { ${workbench.slice(start, end)}
+    return syncSourceIndeterminate; }`)();
+})();
+
+test('a whole knowledge base renders checked with documents disabled and a hint', async () => {
+  const {painted} = await loadedSources(kbDocuments(3), 'kb:kb-1');
+  assert.match(painted, /<section class="wb-source-group" data-wb-source-state="whole">/);
+  assert.match(painted, /data-wb-source-base="kb-1"[^>]*checked/);
+  assert.match(painted, /data-wb-source-id="doc:kb-1:doc-1"[^>]* disabled/);
+  assert.match(painted, /data-wb-source-id="doc:kb-1:doc-2"[^>]* disabled/);
+  assert.doesNotMatch(painted, /data-wb-source-id="doc:kb-1:doc-1"[^>]*checked/);
+  assert.match(painted, /整库引用中：本库 3 篇文档整体参与引用。需要逐篇选择时，请先取消整库。/);
+  assert.match(painted, /已选 1 \/ 16 项/);
+});
+
+test('a partially selected knowledge base renders a mixed parent without checked', async () => {
+  const {painted} = await loadedSources(kbDocuments(3),
+    'doc:kb-1:doc-1\ndoc:kb-1:doc-2');
+  assert.match(painted, /<section class="wb-source-group" data-wb-source-state="partial">/);
+  assert.match(painted, /data-wb-source-base="kb-1"[^>]*aria-checked="mixed"/);
+  assert.match(painted, /data-wb-source-base="kb-1"[^>]*data-wb-source-state="partial"/);
+  assert.doesNotMatch(painted, /data-wb-source-base="kb-1"[^>]* checked/);
+  assert.match(painted, /逐篇引用 · 已选 2\/3 篇/);
+  assert.doesNotMatch(painted, /整库引用中/);
+});
+
+test('a fully selected knowledge base renders the parent checked but keeps document tokens', async () => {
+  const {painted} = await loadedSources(kbDocuments(3),
+    'doc:kb-1:doc-1\ndoc:kb-1:doc-2\ndoc:kb-1:doc-3');
+  assert.match(painted, /<section class="wb-source-group" data-wb-source-state="full">/);
+  assert.match(painted, /data-wb-source-base="kb-1"[^>]*checked/);
+  assert.match(painted, /data-wb-source-id="doc:kb-1:doc-1"[^>]*checked/);
+  assert.match(painted, /data-wb-source-id="doc:kb-1:doc-2"[^>]*checked/);
+  assert.match(painted, /data-wb-source-id="doc:kb-1:doc-3"[^>]*checked/);
+  assert.match(painted, /逐篇引用 · 已选 3\/3 篇/);
+  assert.doesNotMatch(painted, /aria-checked="mixed"/);
+});
+
+test('a legacy value mixing kb: and doc: renders as whole instead of checking both', async () => {
+  const {painted} = await loadedSources(kbDocuments(3),
+    'kb:kb-1\ndoc:kb-1:doc-1\ndoc:kb-1:doc-2');
+  assert.match(painted, /<section class="wb-source-group" data-wb-source-state="whole">/);
+  assert.match(painted, /data-wb-source-base="kb-1"[^>]*checked/);
+  assert.match(painted, /data-wb-source-id="doc:kb-1:doc-1"[^>]* disabled/);
+  assert.doesNotMatch(painted, /data-wb-source-id="doc:kb-1:doc-1"[^>]*checked/);
+  assert.match(painted, /整库引用中/);
+});
+
+test('partial parent input is marked indeterminate after the list is rendered', () => {
+  const inputs = [{indeterminate: false}, {indeterminate: false}];
+  sourceIndeterminate({querySelectorAll: selector => {
+    assert.equal(selector, 'input[data-wb-source-state="partial"]');
+    return inputs;
+  }});
+  assert.ok(inputs.every(input => input.indeterminate === true));
+});
+
+test('resolveSourceToggle keeps whole and document references mutually exclusive', () => {
+  const {workbench: kernel} = harness([]);
+  const docs = ['doc-1', 'doc-2', 'doc-3'];
+  const other = 'doc:kb-2:doc-9';
+
+  /* 取消整库：同库逐篇一起清掉，别的库不动。 */
+  const cancelled = kernel.resolveSourceToggle(
+    `kb:kb-1\ndoc:kb-1:doc-1\n${other}`,
+    {kbId: 'kb-1', checked: false, docIds: docs, limit: 16});
+  assert.equal(cancelled.accepted, true);
+  assert.equal(cancelled.value, other);
+
+  /* 半选状态点父级 = 全选：逐篇换成一条整库令牌。 */
+  const whole = kernel.resolveSourceToggle(
+    'doc:kb-1:doc-1\ndoc:kb-1:doc-2',
+    {kbId: 'kb-1', checked: true, docIds: docs, limit: 16});
+  assert.equal(whole.accepted, true);
+  assert.equal(whole.value, 'kb:kb-1');
+
+  /* 逐篇选满后点父级 = 取消：结果为空，而不是留下三条 doc:。 */
+  const cleared = kernel.resolveSourceToggle(
+    'doc:kb-1:doc-1\ndoc:kb-1:doc-2\ndoc:kb-1:doc-3',
+    {kbId: 'kb-1', checked: false, docIds: docs, limit: 16});
+  assert.equal(cleared.accepted, true);
+  assert.equal(cleared.value, '');
+
+  /* 点子项：写出 doc: 令牌；历史值里的 kb: 兜底删掉。 */
+  const picked = kernel.resolveSourceToggle(
+    'kb:kb-1',
+    {kbId: 'kb-1', docId: 'doc:kb-1:doc-2', checked: true, docIds: docs, limit: 16});
+  assert.equal(picked.accepted, true);
+  assert.equal(picked.value, 'doc:kb-1:doc-2');
+
+  /* 选中最后一篇也不自动折叠成 kb:，覆盖率语义保持不变。 */
+  const completed = kernel.resolveSourceToggle(
+    'doc:kb-1:doc-1\ndoc:kb-1:doc-2',
+    {kbId: 'kb-1', docId: 'doc-3', checked: true, docIds: docs, limit: 16});
+  assert.equal(completed.accepted, true);
+  assert.equal(completed.value, 'doc:kb-1:doc-1\ndoc:kb-1:doc-2\ndoc:kb-1:doc-3');
+
+  /* 超过 source_limit：拒绝这一次勾选，值原样返回。 */
+  const limited = kernel.resolveSourceToggle(
+    'doc:kb-1:doc-1',
+    {kbId: 'kb-1', docId: 'doc-2', checked: true, docIds: docs, limit: 1});
+  assert.equal(limited.accepted, false);
+  assert.equal(limited.value, 'doc:kb-1:doc-1');
+  assert.match(limited.notice, /最多读取 1 个来源/);
 });
 
 test('the rest gate mode and dream afterglow are edited as selects, not free text', async () => {
@@ -1151,6 +1481,37 @@ test('the rest gate mode and dream afterglow are edited as selects, not free tex
   assert.match(painted, /value="llm"[^>]*>模型判定/);
   assert.match(painted, /value="auto"[^>]*>自动/);
   assert.match(painted, /rest_reply_active_windows[\s\S]{0,400}23:00-08:30/);
+});
+
+test('legacy rest-gate aliases normalize before validation and save canonically', async () => {
+  const aliases = {model: 'llm', '模型': 'llm', llm_judge: 'llm', 'llm-judge': 'llm'};
+  const {window} = harness([]);
+  const normalizeDraft = window.CompanionConfigEditors.spec.life.normalizeDraft;
+  for (const [legacy, canonical] of Object.entries(aliases)) {
+    const draft = {rest_reply_mode: legacy};
+    normalizeDraft(draft);
+    assert.equal(draft.rest_reply_mode, canonical, `legacy mode ${legacy} should normalize`);
+  }
+
+  const harnessed = harness(['life']);
+  harnessed.editors.restore();
+  harnessed.editors.paint();
+  harnessed.editors.read();
+  await drains();
+  harnessed.requests[0].resolve(payload('life', {rest_reply_mode: '模型'}));
+  await drains();
+  const [instance] = harnessed.editors.state.instances;
+  assert.equal(instance.state.draft.rest_reply_mode, 'llm');
+  assert.equal(instance.state.base.rest_reply_mode, '模型', 'the saved value stays visible as a migration diff');
+  assert.match(fieldRow(harnessed.painted.life, 'rest_reply_mode'), /value="llm"[^>]*selected/);
+
+  const saving = instance.save(false);
+  await drains();
+  assert.deepEqual(plain(harnessed.requests[1].body.changes), {rest_reply_mode: 'llm'});
+  harnessed.requests[1].resolve({result: {operation_id: 'life-mode', replayed: false},
+    status: newSection('life', {rest_reply_mode: 'llm'}, TOKEN('b'))});
+  await saving;
+  await drains();
 });
 
 test('a life field outside its registered bounds never reaches the network', async () => {
@@ -1545,14 +1906,14 @@ test('a group participation refusal is translated instead of shown raw', async (
   assert.match(markup, /打断语只能是一行/);
 });
 
-/* ==== 主动联系偏好（proactive.contact）：160 项、四层、23 段 ====
+/* ==== 主动联系偏好（proactive.contact）：173 个页面可编辑项、四层、24 段 ====
  *
- * 这一组此前四个触点全缺（编辑器 / SECTIONS / spec / 挂载点），158 项里 92 项
+ * 这一组此前四个触点全缺（编辑器 / SECTIONS / spec / 挂载点），173 个可编辑项里 92 项
  * 在任何页面上都点不到。字段名与类型按注册表抄成独立的一份：页面与它逐项对齐
  * 才算「没有字段被丢掉」，而页面与**注册表**的对齐由
  * tools/audit_page_config_coverage.py 的 MODULES 表保证。
  *
- * 数量本身就是断言：42 boolean / 54 integer / 46 text / 17 weight / 3 probability。
+ * 数量本身就是断言：47 boolean / 58 integer / 47 text / 17 weight / 4 probability。
  */
 const CONTACT_KINDS = {
   boolean: [
@@ -1563,11 +1924,13 @@ const CONTACT_KINDS = {
     "environment.enabled", "external_event_self_link_enabled", "followup.enabled", "greeting.enabled",
     "insomnia_require_sleep_state", "invitation.enabled", "life.enabled", "meal.enabled",
     "meal_checkin_enabled", "news.enabled", "news_daily_hot_read_enabled", "news_share_enabled",
+    "morning_chain_enabled", "morning_nudge_enabled", "morning_role_greeting_enabled",
     "official_weather_alert_enabled", "play.enabled", "poke_action_enabled",
     "proactive_hour_activity_enabled", "quiet_enabled", "reminder.enabled", "repair.enabled",
+    "routine_learning_enabled",
     "screen.enabled", "screen_glance_enabled", "screen_glance_followup_enabled",
     "screen_glance_goodnight_enabled", "voice_action_enabled", "weather_change_enabled",
-    "weather_checkin_enabled", "web_exploration_enabled",
+    "wake_require_device_evidence", "weather_checkin_enabled", "web_exploration_enabled",
   ],
   integer: [
     "appointment_lag_minutes", "appointment_lead_minutes", "appointment_pre_silence_minutes",
@@ -1578,7 +1941,8 @@ const CONTACT_KINDS = {
     "dedup_weather_window_minutes", "event_max_age_seconds", "external_event_self_link_cooldown_hours",
     "generation_history_limit", "greeting_idle_minutes", "history_max_chars", "idle_seconds",
     "important_date_lookahead_days", "insomnia_night_daily_limit", "interval_seconds",
-    "max_contacts_24h", "meal_care_followup_minutes", "news_check_interval_minutes",
+    "max_contacts_24h", "meal_care_followup_minutes", "morning_nudge_delay_minutes",
+    "morning_nudge_max_attempts", "news_check_interval_minutes",
     "news_hot_result_count", "official_alert_poll_minutes", "poke_action_cooldown_minutes",
     "poke_action_daily_limit", "proactive_burst_gap_max_seconds", "proactive_burst_gap_min_seconds",
     "proactive_burst_max_messages", "proactive_closing_contacts_threshold",
@@ -1587,7 +1951,9 @@ const CONTACT_KINDS = {
     "proactive_persona_judge_threshold", "proactive_share_probability", "screen_glance_cooldown_minutes",
     "screen_glance_daily_limit", "screen_glance_followup_after_minutes",
     "screen_glance_followup_cooldown_minutes", "screen_glance_goodnight_delay_minutes",
-    "unanswered_pause_after", "unanswered_slowdown_start", "voice_action_cooldown_minutes",
+    "routine_window_days", "unanswered_pause_after", "unanswered_slowdown_start",
+    "wake_contact_max_daily", "wake_contact_min_confidence", "wake_contact_window_minutes",
+    "voice_action_cooldown_minutes",
     "voice_action_max_chars", "weather_sample_minutes", "web_exploration_min_interval_hours",
     "web_exploration_result_count",
   ],
@@ -1595,14 +1961,14 @@ const CONTACT_KINDS = {
     "affection.pause_until", "balance_currency_label", "care.pause_until", "chat.pause_until",
     "creation.pause_until", "date_checkin_time", "dedup_policies", "environment.pause_until",
     "followup.pause_until", "greeting.pause_until", "greeting_evening_window", "greeting_morning_window",
-    "greeting_noon_window", "important_dates", "insomnia_night_end", "insomnia_night_start",
+    "greeting_noon_window", "insomnia_night_end", "insomnia_night_start",
     "invitation.pause_until", "life.pause_until", "meal.pause_until", "meal_dinner_time",
     "meal_lunch_time", "news.pause_until", "news_hot_sources", "news_source_kind", "news_source_uid",
     "news_source_url", "note", "official_alert_min_severity", "pause_until", "play.pause_until",
     "proactive_hour_activity_curve", "proactive_intensity_preset",
     "proactive_persona_judge_exempt_purposes", "quiet_end", "quiet_start", "quiet_timezone",
     "reminder.pause_until", "repair.pause_until", "screen.pause_until", "style_prompt",
-    "weather_checkin_time", "web_exploration_interests",
+    "wake_morning_end", "wake_morning_start", "weather_checkin_time", "web_exploration_interests",
     "expression_prompt", "news_sharing_prompt", "length_prompt", "news_length_prompt",
   ],
   weight: [
@@ -1611,7 +1977,7 @@ const CONTACT_KINDS = {
     "life.weight", "meal.weight", "news.weight", "play.weight", "reminder.weight", "repair.weight",
     "screen.weight", "unanswered_max_interval_multiplier",
   ],
-  probability: ["dedup_min_overlap_ratio", "silence_feedback_penalty", "silence_min_confidence"],
+  probability: ["dedup_min_overlap_ratio", "morning_wake_confidence_floor", "silence_feedback_penalty", "silence_min_confidence"],
 };
 /* 文本字段的默认值照注册表抄：页面审计按这些值判断时刻、窗口、曲线与清单的形状。 */
 const CONTACT_DEFAULTS = {
@@ -1620,7 +1986,10 @@ const CONTACT_DEFAULTS = {
   date_checkin_time: '09:00', insomnia_night_start: '23:00', insomnia_night_end: '06:00',
   greeting_morning_window: '07:45-10:20', greeting_noon_window: '12:05-13:35',
   greeting_evening_window: '20:10-21:20',
-  important_dates: '[]', dedup_policies: 'semantic,content_fingerprint,life_event,event_revision',
+  morning_nudge_delay_minutes: 25, morning_nudge_max_attempts: 1, routine_window_days: 60,
+  wake_contact_window_minutes: 90, wake_contact_min_confidence: 65, wake_contact_max_daily: 1,
+  wake_morning_start: '05:00', wake_morning_end: '11:30', morning_wake_confidence_floor: 0.25,
+  dedup_policies: 'semantic,content_fingerprint,life_event,event_revision',
   contact_followup_after_minutes: 45, contact_followup_cooldown_minutes: 180,
   news_source_kind: 'host', news_hot_sources: 'weibo,hackernews', official_alert_min_severity: '',
   proactive_intensity_preset: 'off', balance_currency_label: '元',
@@ -1630,6 +1999,10 @@ const CONTACT_DEFAULTS = {
 const CONTACT_BOUNDS = {
   contact_followup_after_minutes: [10, 1440],
   contact_followup_cooldown_minutes: [30, 2880],
+  morning_nudge_delay_minutes: [10, 90], morning_nudge_max_attempts: [0, 2],
+  routine_window_days: [14, 180], wake_contact_window_minutes: [15, 240],
+  wake_contact_min_confidence: [40, 100], wake_contact_max_daily: [0, 3],
+  morning_wake_confidence_floor: [0, 1],
 };
 const CONTACT_SETTINGS = {};
 const CONTACT_FIELDS = {};
@@ -1653,7 +2026,7 @@ NEW_KINDS['proactive.contact'] = {
     [name, CONTACT_LAYERS.filter(layer => layer !== 'relationship')])),
 };
 const CONTACT_SECTIONS = ['master', 'rhythm', 'freshness', 'intensity', 'quiet', 'dedup',
-  'judgement', 'bond', 'daily', 'followup', 'share', 'greeting', 'meal', 'date', 'weather', 'news', 'web',
+  'judgement', 'bond', 'daily', 'followup', 'share', 'greeting', 'morning', 'meal', 'date', 'weather', 'news', 'web',
   'selflink', 'balance', 'screen', 'action', 'appointment', 'context', 'prompts'];
 
 async function contactLoaded(changes = {}, token = TOKEN('a')) {
@@ -1666,6 +2039,35 @@ async function contactLoaded(changes = {}, token = TOKEN('a')) {
   await drains();
   return harnessed;
 }
+
+test('legacy proactive intensity aliases normalize before validation and save canonically', async () => {
+  const aliases = {'': 'off', manual: 'off', none: 'off', default: 'off', standard: 'balanced',
+    active: 'high_private', private: 'high_private', group: 'high_group',
+    online: 'live', '直播': 'live', '高频': 'live'};
+  const {window} = harness([]);
+  const normalizeDraft = window.CompanionConfigEditors.spec['proactive.contact'].normalizeDraft;
+  for (const [legacy, canonical] of Object.entries(aliases)) {
+    const draft = {proactive_intensity_preset: legacy};
+    normalizeDraft(draft);
+    assert.equal(draft.proactive_intensity_preset, canonical, `legacy tier ${legacy} should normalize`);
+  }
+
+  const harnessed = await contactLoaded({proactive_intensity_preset: '高频'});
+  const [instance] = harnessed.editors.state.instances;
+  assert.equal(instance.state.draft.proactive_intensity_preset, 'live');
+  assert.equal(instance.state.base.proactive_intensity_preset, '高频',
+    'the saved alias stays visible as a migration diff');
+  assert.match(fieldRow(harnessed.painted['proactive.contact'], 'proactive_intensity_preset'),
+    /value="live"[^>]*selected/);
+
+  const saving = instance.save(false);
+  await drains();
+  assert.deepEqual(plain(harnessed.requests[1].body.changes), {proactive_intensity_preset: 'live'});
+  harnessed.requests[1].resolve({result: {operation_id: 'contact-tier', replayed: false},
+    status: newSection('proactive.contact', {proactive_intensity_preset: 'live'}, TOKEN('b'))});
+  await saving;
+  await drains();
+});
 
 /* 画出来的某一行控件：从它的行标记切到下一条行标记。 */
 function fieldRow(markup, name) {
@@ -1737,15 +2139,15 @@ test('a legacy pending revision conflict restores its draft without replaying th
   await drains();
 });
 
-test('the contact section renders all 160 fields exactly once', async () => {
+test('the contact section renders all 173 editable fields exactly once', async () => {
   const harnessed = await contactLoaded();
   const painted = harnessed.painted['proactive.contact'];
   assert.ok(painted, '主动联系偏好必须画进自己的挂载点');
   const container = harnessed.editors.state.instances[0].state.container;
   const rendered = plain(container.groups.flatMap(group => group.fields));
   const expected = plain(Object.keys(CONTACT_FIELDS));
-  assert.equal(rendered.length, 160, '160 项一个都不能少');
-  assert.equal(new Set(rendered).size, 160, '同一个字段不能出现在两段里');
+  assert.equal(rendered.length, 173, '173 个可编辑字段一个都不能少');
+  assert.equal(new Set(rendered).size, 173, '同一个字段不能出现在两段里');
   assert.deepEqual(rendered.slice().sort(), expected.slice().sort());
   assert.deepEqual(plain(container.order).slice().sort(), expected.slice().sort());
   /* 24 段全部画出来，段落 id 是测试能定位依赖说明的锚点。 */
@@ -1768,6 +2170,8 @@ test('the contact section renders all 160 fields exactly once', async () => {
   assert.ok(!plain(harnessed.editors.state.instances[0].state.status.fields.max_contacts_24h.editable_layers)
     .includes('relationship'));
   assert.doesNotMatch(painted, /data-layer="relationship"|data-layer="window"/);
+  assert.doesNotMatch(painted, /data-wb-row="important_dates"/,
+    '生日与纪念日自动读取资料，不再渲染手动 JSON 清单');
 });
 
 test('the contact card clearly identifies global defaults and personal overrides', async () => {
@@ -1800,7 +2204,7 @@ test('the contact audit blocks malformed shapes before any request', async () =>
     ['dedup_policies', 'semantic,nope', /只能填允许的名字/],
     ['news_hot_sources', 'weibo,weibo', /不能重复/],
     ['proactive_persona_judge_exempt_purposes', 'nope', /只能填允许的名字/],
-    ['important_dates', '{', /JSON 数组/],
+    ['date_checkin_time', '25:00', /二十四小时制/],
     ['news_source_kind', 'bilibili', /十进制 UID/],
   ];
   for (const [name, value, expected] of cases) {
@@ -1837,15 +2241,14 @@ test('the role dossier maps profile fields onto the purpose-built controls', () 
       name: 'line', avatar_data_url: 'line', age: 'line', occupation: 'line', appearance_points: 'line',
       hair: 'line', eyes: 'line', clothing: 'line', image_identity_hint: 'line',
       world_name: 'line', era: 'line', tone: 'line',
-      platform_group_chat: 'line', platform_screen: 'line', platform_bilibili: 'line',
-      platform_qzone: 'line', platform_library: 'line', main_companion_subject: 'catalog-select',
+      main_companion_subject: 'catalog-select',
       expression_private_source_subject_ids: 'identity-checklist',
       expression_private_application_subject_ids: 'identity-checklist'});
   assert.equal(profile.chipOptions.gender.mode, 'single');
   assert.deepEqual(plain(profile.chipOptions.gender.options), ['女', '男', '无性别']);
   assert.deepEqual(plain(profile.chipOptions.species.options),
     ['人类', '精灵', '仿生人', 'AI', '兽人']);
-  assert.deepEqual(plain(profile.segmentedChoices), ['world_adaptation_mode',
+  assert.deepEqual(plain(profile.segmentedChoices), [
     'expression_private_source_mode', 'expression_private_application_mode']);
   assert.deepEqual(plain(profile.choices.expression_private_source_mode),
     {owner: '主要陪伴对象', selected: '指定对象', all: '所有获准私聊'});
@@ -1855,6 +2258,14 @@ test('the role dossier maps profile fields onto the purpose-built controls', () 
   assert.equal(relationship.inputs.user_gender, 'chips');
   assert.equal(relationship.inputs.default_nickname, 'line');
   assert.deepEqual(plain(relationship.chipOptions.user_gender.options), ['女', '男', '未说明']);
+});
+
+test('quote rows carry the marker used by removal and renumbering', () => {
+  /* The rendered row and the node added at runtime must both carry
+     data-wb-quote; removeQuote/renumberQuotes select exactly that marker. */
+  assert.match(workbench, /class="wb-quote" data-wb-quote/);
+  assert.match(workbench, /node\.dataset\.wbQuote = ""/);
+  assert.match(workbench, /querySelectorAll\("\[data-wb-quote\]"\),?/);
 });
 
 test('role profile controls render as date, chips, quotes, tags and a segmented mode', async () => {
@@ -1878,14 +2289,14 @@ test('role profile controls render as date, chips, quotes, tags and a segmented 
   assert.match(html, /class="wb-chip-opt is-on" data-wb-chip="gender" data-wb-chip-value="女"/);
   assert.match(html, /class="wb-chip-opt" data-wb-chip="gender" data-wb-chip-value="男"/);
   assert.match(html, /data-wb-quotes="voice_examples"/);
+  assert.match(html, /class="wb-quote" data-wb-quote(?:=""|>)/);
   assert.match(html, /今天的风有点像海边的。/);
   assert.match(html, /data-wb-tagset="signature_phrases"/);
   assert.match(html, /data-wb-tag-remove="signature_phrases" data-wb-tag-index="1"/);
   assert.match(html, /type="hidden" data-wb-field="hobbies"/);
-  /* 世界观适配模式走分段条：六个档位一档不少，auto 选中。 */
-  assert.match(html, /name="wb-world_adaptation_mode" value="auto" checked/);
-  assert.match(html, /name="wb-world_adaptation_mode" value="off"/);
-  assert.match(html, /现代日常/);
+  // 平台称呼与世界观适配已下线，页面不再渲染这两组控件。
+  assert.doesNotMatch(html, /wb-world_adaptation_mode/);
+  assert.doesNotMatch(html, /wb-platform_names/);
   assert.match(html, /data-wb-section-panel="expression_learning"/);
   assert.match(html, /data-wb-field="main_companion_subject"/);
   assert.match(html, /name="wb-expression_private_source_mode" value="owner"/);

@@ -6,7 +6,8 @@ from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-from astrbot.core.message.components import At, Image, Plain, Reply
+from tests import astrbot_data_root  # Isolate the SDK before importing the host.
+from astrbot.core.message.components import At, Image, Plain, Record, Reply
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot_host.core_reply import (
     CORE_REPLY_CONTEXT_EXTRA, activate_core_reply_delivery_guard, prepare_core_reply_event,
@@ -69,6 +70,48 @@ class CoreReplyPresentationTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(self.texts(event), ["甲，乙。丙"])
                     self.assertEqual(self.observed, ["甲，乙。丙"])
                     self.assertEqual(source.chain[0].text, "甲，乙。丙。， \n")
+
+    async def test_internal_reaction_metadata_is_removed_before_guard_activation(self):
+        event = self.prepare()
+        source = MessageChain(chain=[
+            Plain("正文。<pc_reaction_"),
+            Plain('expression">{"intent":"内部态度"}</pc_reaction_expression>'),
+        ])
+        await event.send(source)
+        self.assertEqual(self.texts(event), ["正文。"])
+
+    async def test_tool_loop_voice_tail_does_not_leak_paired_control_tags(self):
+        event = self.prepare()
+        activate_core_reply_delivery_guard(event)
+        source = MessageChain(chain=[
+            Record(file="base64://voice"),
+            Plain('这种莫名其妙的功能到底是谁加进来的啊...扫吧'
+                  '<pc_reaction_expression>{"purpose":"轻吐槽","emotion":"无奈",'
+                  '"intensity":2}</pc_reaction_expression>'),
+        ])
+        await event.send(source)
+        delivered = [args[0] for args, _ in event.sent]
+        self.assertTrue(any(isinstance(part, Record)
+                            for message in delivered for part in message.chain))
+        self.assertIn("这种莫名其妙的功能到底是谁加进来的啊...扫吧", self.texts(event))
+        self.assertNotIn("pc_reaction_expression", str(delivered))
+        self.assertEqual(source.chain[1].text.count("pc_reaction_expression"), 2)
+
+    async def test_internal_reaction_metadata_is_removed_across_native_stream_chunks(self):
+        def native_streamer(event):
+            async def send_stream(generator, **_):
+                async for chunk in generator:
+                    await event.send(chunk)
+            return send_stream
+
+        event = self.prepare(stream=True, streamer=native_streamer)
+        await event.send_streaming(self.chunks(
+            "正文。<pc_reaction_",
+            'expression\">{"intent":"内部态度，害羞"}',
+            "</pc_reaction_",
+            "expression>后续正文。",
+        ))
+        self.assertEqual(self.texts(event), ["正文。", "后续正文。"])
 
     async def test_each_native_private_bubble_cleans_its_own_tail(self):
         event = self.prepare(CLEANUP)

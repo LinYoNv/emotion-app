@@ -508,6 +508,8 @@ class PrivateMemberTests(MultiFixture, unittest.IsolatedAsyncioTestCase):
         persons = result["data"]["persons"]
         self.assertEqual(len(persons), 4)
         self.assertTrue(all(person["private_target"] and not person["private_chat"] for person in persons))
+        self.assertEqual(result["data"]["counts"]["private_chat"], 0)
+        self.assertEqual(result["data"]["counts"]["total"], 0)
         self.assertTrue(all(person["revision"] == 0 for person in persons))
         self.assertTrue(all(person["settings_available"] for person in persons), persons)
         for person in persons:

@@ -17,7 +17,9 @@ const confirmationClients = [
 function control() {
   const listeners = new Map();
   return {
-    textContent: "", dataset: {}, open: false, returnValue: "",
+    textContent: "", dataset: {}, open: false, returnValue: "", children: [],
+    appendChild(node) {this.children.push(node);},
+    setAttribute() {}, removeAttribute() {},
     addEventListener(type, callback) {
       const group = listeners.get(type) || [];
       group.push(callback); listeners.set(type, group);
@@ -32,8 +34,8 @@ function control() {
 
 function harness() {
   const elements = Object.fromEntries(["confirmationDialog", "confirmationTitle", "confirmationMessage",
-    "confirmationCancel", "confirmationAccept"].map(id => [id, control()]));
-  const document = {querySelector: selector => elements[selector.slice(1)] || null};
+    "confirmationCancel", "confirmationAccept", "confirmationSave", "confirmationDetails", "confirmationStatus"].map(id => [id, control()]));
+  const document = {querySelector: selector => elements[selector.slice(1)] || null, createElement: () => control()};
   const window = {};
   vm.runInNewContext(source, {window, document});
   return {window, elements};
@@ -71,6 +73,40 @@ test("Escape and backdrop interactions cancel the active request", async () => {
   const backdrop = window.CompanionConfirm("确认第二步");
   elements.confirmationDialog.dispatch("click", {target: elements.confirmationDialog, clientX: 150, clientY: 50});
   assert.equal(await backdrop, false);
+});
+
+test("unsaved changes show field names and wait for a confirmed save before leaving", async () => {
+  const {window, elements: e} = harness();
+  let resolveSave, calls = 0;
+  const decision = window.CompanionConfirm({message:'以下配置还没有保存。',
+    details:[{title:'设备观察契机',fields:['每天主动观察次数','<img src=x>']}],
+    onSave:() => {calls++;return new Promise(resolve => {resolveSave=resolve;});}});
+  assert.equal(e.confirmationDetails.children[0].textContent, '设备观察契机');
+  assert.equal(e.confirmationDetails.children[1].children[1].textContent, '<img src=x>');
+  assert.equal(e.confirmationSave.hidden, false);
+  e.confirmationSave.dispatch('click'); e.confirmationSave.dispatch('click');
+  e.confirmationCancel.dispatch('click');
+  assert.equal(calls, 1);
+  assert.equal(e.confirmationSave.disabled, true);
+  assert.equal(e.confirmationDialog.open, true);
+  resolveSave({error:'每天主动观察次数：请填写有效整数。'});
+  await new Promise(setImmediate);
+  assert.equal(e.confirmationDialog.open, true);
+  assert.match(e.confirmationStatus.textContent, /每天主动观察次数/);
+  assert.equal(e.confirmationSave.disabled, false);
+  e.confirmationSave.dispatch('click'); resolveSave(true);
+  assert.equal(await decision, true);
+  assert.equal(e.confirmationDialog.open, false);
+});
+
+test("discard callback completes before navigation is allowed", async () => {
+  const {window, elements: e} = harness();
+  let discarded = false;
+  const decision = window.CompanionConfirm({message:'未保存的改动',onConfirm:() => {discarded=true;return true;}});
+  e.confirmationAccept.dispatch('click');
+  assert.equal(await decision, true);
+  assert.equal(discarded, true);
+  assert.equal(e.confirmationSave.hidden, true);
 });
 
 test("destructive pages use in-page confirmation instead of the browser confirm API", () => {

@@ -42,7 +42,7 @@ class ActionDefinition:
 
 DEFAULT_ACTIONS = (
     *(ActionDefinition(f"memo.{action}", ("memo",)) for action in (
-        "read", "edit", "complete", "reopen", "pin", "unpin", "delete.commit", "reminder.set",
+        "read", "edit", "complete", "reopen", "pin", "unpin", "delete", "delete.commit", "reminder.set",
     )),
     ActionDefinition("memo.create", ("memo",), shareable=False),
     ActionDefinition("memo.list", ("memo",), shareable=False),
@@ -59,6 +59,12 @@ DEFAULT_ACTIONS = (
     ActionDefinition("proactive.contact", ("proactive",), shareable=False),
     ActionDefinition("role.journal.write", ("role.journal",), shareable=False),
     ActionDefinition("role.growth.read", ("role.growth",), shareable=False),
+    # The scheduled daily review only reads the role's own recorded behaviour in
+    # the exact private window it is bound to, so that window's verified owner can
+    # run it without a per-window grant. The evidence catalog still rechecks the
+    # private scope and exact audience on every read, and no other window opens.
+    ActionDefinition("role.self_review.read", ("role.self_review",), shareable=False,
+                     private_owner_without_grant=True),
     # A verified private route can read its own expression samples and rules;
     # group tasks still require a grant for the exact speaker and group.
     ActionDefinition("role.expression.read", ("role.expression",), shareable=False,
@@ -266,7 +272,13 @@ class ObjectAccessPolicy:
                 and scope.kind is ScopeKind.PRIVATE
             ) else None
             private_owner_feature = route is not None and route.user == actor.subject
-            if tier is AuthorizationTier.STANDARD and not private_owner_feature:
+            from .grants import PERSON_PERMISSION_GRANT_PREFIX
+            explicit_private_decision = scope.kind is ScopeKind.PRIVATE and action in (
+                "conversation.reply", "proactive.contact") and any(
+                    grant.scope == scope and grant.capability == action
+                    and grant.grant_id.startswith(PERSON_PERMISSION_GRANT_PREFIX)
+                    for grant in self.identity.grants_for_subject(actor.subject))
+            if explicit_private_decision or tier is AuthorizationTier.STANDARD and not private_owner_feature:
                 granted = self.identity.authorize(actor, scope=scope, capability=action, observed_at=observed_at)
                 if not granted.is_success:
                     return Outcome(failure=granted.failure)

@@ -1,6 +1,7 @@
 """Reality belongs to the active V2 context, actual host providers and Cron lifecycle."""
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -17,7 +18,11 @@ from astrbot.core.provider.entities import LLMResponse, ProviderRequest, TokenUs
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 from astrbot_host.integration_registry import UnifiedCompanionExtensionAPI
 from astrbot_host.multi_controller import AstrBotMultiController
+from astrbot_host.multi_settings import PrivateTarget
+from companion_v2.adapters.astrbot.native import HostAccount
+from companion_v2.identity_policy.object_access import ObjectAccessPolicy
 from astrbot_host.native_extensions.reality.host_events import RealityHostEvents
+from astrbot_host.native_extensions.reality import mobile_gateway
 from astrbot_host.native_extensions.reality.mobile_gateway import _MobileRequestState, _mobile_request_state
 from companion_v2.capabilities import CapabilityAuthorizationState, CapabilityRepository
 from companion_v2.conversation.native_history import body, reference
@@ -82,6 +87,22 @@ class RealityHostGlueTests(unittest.IsolatedAsyncioTestCase):
         return {table: self.app.runtime.read_one("SELECT COUNT(*) AS n FROM " + table, ())["n"]
             for table in ("conversation_batches", "conversation_delivery_receipts",
                           "conversation_native_turns", "conversation_native_sends")}
+
+    async def test_primary_camera_user_is_not_ambiguous_with_a_wildcard_test_account(self):
+        policy = ObjectAccessPolicy(self.app.runtime)
+        policy.set_tier(self.context.actor.subject, AuthorizationTier.CORE,
+                        expected_revision=policy.revision, observed_at=support.NOW)
+        settings = self.controller.settings
+        wildcard = PrivateTarget("test-wildcard", "test", "test-account", "bot-test", "*")
+        test_account = HostAccount("test", "test-account", "bot-test")
+        self.controller.settings = replace(
+            settings,
+            targets=settings.targets + (wildcard,),
+            account_bindings=settings.accounts + (test_account,),
+        )
+
+        self.assertTrue(self.runtime._is_configured_admin_user_id("200"))
+        self.assertTrue(self.runtime._reality_touch_camera_user_eligible("200"))
 
     async def test_current_private_persona_history_and_actual_model_usage(self):
         background = await self.api.get_realtime_context("200", purpose="提醒喝水")
@@ -388,6 +409,16 @@ class RealityHostGlueTests(unittest.IsolatedAsyncioTestCase):
         finally:
             _mobile_request_state.reset(marker)
 
+    async def test_reality_page_snapshot_exposes_active_mobile_pairing(self):
+        self.mobile_session(name="测试手机")
+
+        snapshot = self.runtime._reality_touch_page_snapshot()
+
+        observation = next(row for row in snapshot["mobile_observations"] if row["user_id"] == "200")
+        self.assertEqual(len(observation["connections"]), 1)
+        self.assertEqual(observation["connections"][0]["device_name"], "测试手机")
+        self.assertTrue(observation["connections"][0]["online"])
+
     async def upload_mobile_samples(self, token):
         self.runtime.config["mobile"]["activity_enabled"] = True
         self.runtime.health_enabled = True
@@ -512,6 +543,22 @@ class RealityHostGlueTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(code, 409)
                 self.assertEqual(rejected['code'], reason)
                 self.assertIn(message, rejected['message'])
+
+    async def test_mobile_gateway_registers_legacy_native_routes(self):
+        self.runtime.config['mobile'].update({
+            'enabled': True, 'pairing_token': 'synthetic-long-pairing-token', 'proxy_rooms': False})
+        runner = NS(setup=AsyncMock(), cleanup=AsyncMock())
+        site = NS(start=AsyncMock(), stop=AsyncMock())
+        with (patch.object(mobile_gateway.web, 'AppRunner', return_value=runner) as make_runner,
+              patch.object(mobile_gateway.web, 'TCPSite', return_value=site)):
+            self.assertTrue(await self.runtime._start_mobile_server())
+            app = make_runner.call_args.args[0]
+            paths = {route.resource.canonical for route in app.router.routes()}
+            self.assertIn('/pair', paths)
+            self.assertIn('/status', paths)
+            self.assertIn('/astrbot_plugin_reality_companion/mobile/pair', paths)
+            self.assertIn('/astrbot_plugin_reality_companion/mobile/status', paths)
+            await self.runtime._stop_mobile_server()
 
     async def test_mobile_room_failure_preserves_code_and_unknown_result_without_replay(self):
         phone = self.mobile_session(ttl=600)

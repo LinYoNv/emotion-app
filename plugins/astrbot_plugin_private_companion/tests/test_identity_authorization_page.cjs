@@ -132,11 +132,11 @@ function harness({ persons, groups = [], group_networks = [], group_access, auth
   const requests = [];
   const byId = new Map();
   const tabs = [element("button"), element("button"), element("button")];
-  const chips = [element("button"), element("button")];
+  const chips = [element("button"), element("button"), element("button")];
   const graphFilters = [element("button"), element("button"), element("button")];
   const panels = [element("section"), element("section"), element("section")];
   tabs.forEach((tab, index) => { tab.dataset.tab = ["network", "people", "groups"][index]; });
-  chips.forEach((chip, index) => { chip.dataset.filter = ["stable", "temporary"][index]; });
+  chips.forEach((chip, index) => { chip.dataset.filter = ["stable", "temporary", "discovered"][index]; });
   graphFilters.forEach((filter, index) => { filter.dataset.graphScope = ["all", "private", "group"][index]; });
   panels.forEach((panel, index) => { panel.id = ["panel-network", "panel-people", "panel-groups"][index]; });
   tabs.forEach((tab, index) => { tab.id = ["tab-network", "tab-people", "tab-groups"][index]; });
@@ -167,7 +167,7 @@ function harness({ persons, groups = [], group_networks = [], group_access, auth
   const window = {
     parent: {postMessage: (message, origin) => navigations.push({message, origin})},
     AstrBotPluginPage: {
-      ready: () => Promise.resolve({ pluginName: "astrbot_plugin_private_companion_v2" }),
+      ready: () => Promise.resolve({ pluginName: "astrbot_plugin_private_companion" }),
       apiGet: (route, params, requestOptions) => new Promise((resolve, reject) => {
         requests.push({ method: "GET", route, params, requestOptions, resolve, reject });
       }),
@@ -216,6 +216,7 @@ function harness({ persons, groups = [], group_networks = [], group_access, auth
     },
     card: (name) => cardFor(byId.get("people-grid"), name),
     mappingChanged: () => documentEvents["companion-mappings-change"](),
+    fire: (type, detail = {}) => documentEvents[type]?.({detail}),
   };
   harness.send = async (read) => { await settle(); harness.answer(read); await settle(); };
   return harness;
@@ -279,7 +280,7 @@ function tree(node, depth = 0) {
 test("关系图作为关系网默认视图，人物筛选保留", async () => {
   const html = fs.readFileSync(path.resolve(__dirname, "../pages/关系与权限/workspace.html"), "utf8");
   assert.deepEqual([...html.matchAll(/data-tab="([^"]+)"/g)].map(match => match[1]), ["network", "people", "groups"]);
-  assert.deepEqual([...html.matchAll(/data-filter="([^"]+)"/g)].map(match => match[1]), ["stable", "temporary"]);
+  assert.deepEqual([...html.matchAll(/data-filter="([^"]+)"/g)].map(match => match[1]), ["stable", "temporary", "discovered"]);
   const h = harness();
   await h.send();
   assert.equal(h.document.querySelectorAll(".tab")[0].getAttribute("aria-selected"), "true");
@@ -408,13 +409,13 @@ test("稳定和临时只按成员往来类型筛选，跳转时保持对应分�
   ]});
   await h.send();
   const chips = h.document.querySelectorAll(".chip");
-  assert.equal(chips.length, 2);
+  assert.equal(chips.length, 3);
   assert.equal(h.element("chip-stable").textContent, "2");
-  assert.equal(h.element("chip-temporary").textContent, "1");
+  assert.equal(h.element("chip-temporary").textContent, "2");
   assert.equal(h.element("people-result-count").textContent, "2 人");
 
   chips[1].handlers.click();
-  assert.equal(h.element("people-result-count").textContent, "1 人");
+  assert.equal(h.element("people-result-count").textContent, "2 人");
   assert.match(flat(h.element("people-grid")), /临时成员/);
   assert.equal(chips[1].getAttribute("aria-pressed"), "true");
 
@@ -423,7 +424,7 @@ test("稳定和临时只按成员往来类型筛选，跳转时保持对应分�
     return selector === "[data-person-id]" ? this : null;
   }}});
   assert.equal(chips[1].getAttribute("aria-pressed"), "true");
-  assert.equal(h.element("people-result-count").textContent, "1 人");
+  assert.equal(h.element("people-result-count").textContent, "2 人");
 
   h.document.querySelectorAll(".tab")[2].handlers.click();
   findAll(h.element("groups-list"), "group-card")[0].handlers.click();
@@ -587,6 +588,31 @@ test("同一人格跨内部归属合并群关系网成员与互动边", async ()
   assert.match(networkMarkup, /data-member-account="702"/);
   assert.match(flat(detail), /青禾 ↔ 木木.*3 次/);
   assert.match(flat(detail), /青禾 ↔ 小满.*2 次/);
+});
+
+test("已接入群只保留当前角色，历史人格网络不生成重复卡片", async () => {
+  const base = {group_id: "300", display_name: "周末读书群", platform_id: "qq-main",
+    bot_id: "bot-a", account_id: "account-a", configured: true, discovered: true,
+    member_count: 2, msg_count: 12};
+  const current = {...base, role_id: "role-a", persona_ids: ["星缘-群聊", "星缘-私聊"],
+    role_name: "星缘·群聊、星缘·私聊", configured: true, interaction_count: 3, members: [], edges: []};
+  const stale = {...base, role_id: "星缘", persona_ids: [], role_name: "",
+    configured: false, interaction_count: 1, members: [], edges: []};
+  const h = harness({groups: [base], group_networks: [current, stale]});
+  await h.send();
+  const cards = findAll(h.element("groups-list"), "group-card");
+  assert.equal(cards.length, 1, "a configured route must hide the stale historical duplicate");
+  assert.equal(h.element("groups-result-count").textContent, "1 个群");
+  assert.equal(h.element("group-summary-total").textContent, "1");
+  assert.equal(h.element("group-summary-configured").textContent, "1");
+  assert.equal(h.element("group-summary-history").textContent, "0");
+  assert.match(flat(cards[0]), /周末读书群.*已接入.*星缘/);
+  assert.doesNotMatch(flat(cards[0]), /人格分线|星缘·群聊|星缘·私聊/);
+  cards[0].handlers.click();
+  findControl(h.element("group-detail"), "本群回应设置").handlers.click();
+  assert.equal(h.navigations.at(-1).message.target.role_id, "role-a");
+  h.fire("companion-navigate-failed", {message: "这个群的人格或角色映射已经变化，请重新读取群聊目录后再试。"});
+  assert.match(h.element("notice").textContent, /角色映射已经变化.*重新读取群聊目录/);
 });
 
 test("面板为每一项能力画一行，状态取自服务端读回的那一份", async () => {
@@ -761,7 +787,7 @@ test("私聊联系页提供每日实际联系上限、未回应降频和恢复�
     quiet_start: "22:00", quiet_end: "08:00", quiet_timezone: "Asia/Shanghai", pause_until: "", note: "", style_prompt: ""};
   const purposeGroups = [
     [["affection", "想念与亲近"], ["care", "情绪关怀"], ["play", "轻松互动"], ["repair", "关系修复"], ["chat", "日常话题"]],
-    [["greeting", "问候与纪念"], ["followup", "接回旧话题"], ["invitation", "共同活动邀请"], ["reminder", "约定与提醒"], ["meal", "饭点问候"]],
+    [["greeting", "问候与纪念"], ["followup", "接回旧话题"], ["invitation", "共同活动邀请"], ["reminder", "约定与提醒"], ["meal", "饭点话题"]],
     [["life", "分享自己的生活"], ["creation", "作品与阅读"], ["news", "外部资讯"], ["environment", "环境与状态变化"], ["screen", "已授权屏幕观察"]],
   ];
   for (const [name] of purposeGroups.flat()) {
@@ -892,6 +918,43 @@ test("私聊回复默认继承角色，字段可即时展开并单独覆盖或�
   assert.deepEqual(JSON.parse(JSON.stringify(written.body.sections.reply.changes)),
     {streaming: true, streaming_mode: "incremental"});
   assert.deepEqual(JSON.parse(JSON.stringify(written.body.sections.reply.reset_to_inherit)), ["style_prompt"]);
+});
+
+test("旧整段清理范围在成员回复页归一为句中并随保存写回", async () => {
+  const fields = {
+    content_cleanup_enabled: {kind: "boolean"}, content_cleanup_mode: {kind: "text"},
+    content_cleanup_scope: {kind: "text"}, content_cleanup_words: {kind: "text"},
+  };
+  const reply = {edit_token: "reply-edit-1", scope: "window", fields,
+    editable_fields: ["content_cleanup_scope"],
+    settings: {content_cleanup_enabled: true, content_cleanup_mode: "words",
+      content_cleanup_scope: "all", content_cleanup_words: "嗯"},
+    inherited_settings: {content_cleanup_enabled: true, content_cleanup_mode: "words",
+      content_cleanup_scope: "middle", content_cleanup_words: "嗯"},
+    provenance: {content_cleanup_enabled: {layer: "window", explicit: true},
+      content_cleanup_mode: {layer: "window", explicit: true},
+      content_cleanup_scope: {layer: "window", explicit: true},
+      content_cleanup_words: {layer: "window", explicit: true}}};
+  const h = harness({persons: [person("subject-1", "阿澈")],
+    authorizations: {"subject-1": status("subject-1", [])},
+    memberSettings: {"subject-1": {sections: {reply}}}, post: request => ({sections: {reply: {
+      ...reply, edit_token: "reply-edit-2",
+      settings: {...reply.settings, ...request.body.sections.reply.changes},
+    }}})});
+  const detail = await open(h, "阿澈", "回复微调");
+  await h.settle();
+  const scope = inputByName(detail, "content_cleanup_scope");
+  assert.ok(scope, "清理范围应在开启文字清理后出现");
+  assert.deepEqual(scope.children.map(option => option.value), ["leading", "middle", "trailing"]);
+  assert.equal(scope.children.find(option => option.selected)?.value, "middle",
+    "已停用的 all 应显示为规范值 middle，而不是多出一个原始英文选项");
+  const save = findControl(detail, "保存回复设置");
+  assert.equal(save.disabled, false, "归一后的差异应可直接保存回规范值");
+  save.handlers.click();
+  await h.send(request => request.method === "POST");
+  const written = h.requests.find(request => request.method === "POST");
+  assert.deepEqual(JSON.parse(JSON.stringify(written.body.sections.reply.changes)),
+    {content_cleanup_scope: "middle"});
 });
 
 test("私聊回复配置读取失败时显示未确认状态并禁用保存", async () => {
@@ -1447,3 +1510,23 @@ function findPermission(node, capability) {
   }
   return null;
 }
+
+
+test("原生窗口不冒充私聊用户，已迁入用户与目录计数一致", async () => {
+  const migrated = person("old", "旧版用户", {private_chat: false, private_contact: true,
+    legacy_private_contact: true, private: null, total: {msg_count: 0}});
+  const discovered = Array.from({length: 76}, (_, i) => person("route-" + i, "宿主会话" + i, {
+    private_chat: false, private_target: true, private: null, total: {msg_count: 0}}));
+  const h = harness({persons: [migrated, ...discovered]});
+  await h.send();
+  assert.equal(h.element("count-total").textContent, "1");
+  assert.equal(h.element("count-private").textContent, "1");
+  assert.equal(h.element("chip-stable").textContent, "1");
+  assert.equal(h.element("chip-discovered").textContent, "76");
+  assert.equal(h.element("people-result-count").textContent, "1 人");
+  assert.match(flat(h.element("people-grid")), /旧版用户/);
+  assert.doesNotMatch(flat(h.element("people-grid")), /宿主会话/);
+  h.document.querySelectorAll(".chip")[2].handlers.click();
+  assert.equal(h.element("people-result-count").textContent, "76 人");
+  assert.match(flat(h.element("people-grid")), /宿主会话0/);
+});

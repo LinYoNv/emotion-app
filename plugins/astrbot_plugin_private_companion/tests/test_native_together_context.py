@@ -113,7 +113,7 @@ class NativeTogetherContextTests(MultiFixture, unittest.IsolatedAsyncioTestCase)
     async def test_memory_toggle_keeps_role_relationship_and_custom_prompt(self):
         reads = []
 
-        def memory(owner, context, native_input, at):
+        def memory(owner, context, native_input, at, timezone_name):
             if owner is None:
                 return ()
             reads.append(context.key)
@@ -144,8 +144,10 @@ class NativeTogetherContextTests(MultiFixture, unittest.IsolatedAsyncioTestCase)
         self.assertIsNone(await resolve_room_context(self.runtime, self.room))
         self.active = True
         self.native.selections["qq-main"] = "second"
+        self.window_personas["qq-main:FriendMessage:200"] = "second"
         self.assertIsNone(await resolve_room_context(self.runtime, self.room))
         self.native.selections["qq-main"] = "original"
+        self.window_personas["qq-main:FriendMessage:200"] = "original"
         self.room.members["201"] = RoomMember("201", "guest")
         self.assertIsNone(await resolve_room_context(self.runtime, self.room))
         received_input(self.runtime, self.room, "访客的话", turn_id="guest")

@@ -1,10 +1,15 @@
 """Invocation-bound reference release for optional native image providers."""
 
+import hashlib
 import json
+import random
+from io import BytesIO
 from types import SimpleNamespace as NS
 import unittest
 
-from astrbot_host.native_extensions.images import ImageReferenceLease
+from PIL import Image
+
+from astrbot_host.native_extensions.images import ImageReferenceLease, _inspect_role_reference
 from companion_v2.execution.models import TaskError
 from companion_v2.conversation.external_tools import ExternalToolExecutor
 from companion_v2.foundation.refs import ScopeKind
@@ -62,6 +67,24 @@ class NativeImageReferenceTests(unittest.TestCase):
                           lambda ticket, at: None)
         self.assertEqual(lease.fetch("source-handle", "a" * 64, role="identity"), b"source-bytes")
         self.assertEqual(lease.fetch("mask-handle", "b" * 64, role="outfit"), b"mask-bytes")
+
+    def test_saved_role_reference_uses_native_image_budget_instead_of_inbound_limit(self):
+        width = height = 1536
+        pixels = random.Random(42).randbytes(width * height * 3)
+        stream = BytesIO()
+        Image.frombytes("RGB", (width, height), pixels).save(stream, format="PNG", compress_level=0)
+        raw = stream.getvalue()
+        self.assertGreater(len(raw), 5 * 1024 * 1024)
+        digest = hashlib.sha256(raw).hexdigest()
+        asset = NS(content_hash=NS(sha256=digest), size_bytes=len(raw), mime_type="image/png")
+
+        image = _inspect_role_reference(asset, raw)
+
+        self.assertEqual(image.content, raw)
+        asset.content_hash.sha256 = "0" * 64
+        with self.assertRaises(TaskError) as mismatch:
+            _inspect_role_reference(asset, raw)
+        self.assertEqual(mismatch.exception.code, "reference_fingerprint_mismatch")
 
     def test_explicit_input_index_selects_only_the_named_image_and_rebinds_its_role(self):
         tickets = self.tickets()

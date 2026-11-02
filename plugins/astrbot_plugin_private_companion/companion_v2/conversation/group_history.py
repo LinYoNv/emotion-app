@@ -9,6 +9,7 @@ from companion_v2.execution.models import TaskError, digest, require
 from companion_v2.configuration.models import ConfigurationError
 from companion_v2.delivery.media import payload_hash
 from companion_v2.sources.dependencies import key as source_key
+from .awareness_context import ConversationAwarenessContext
 from .foreground import ContributionState
 from .reply_settings import validate as validate_reply_settings
 from .style_context import ConversationExpressionStyleContext
@@ -168,7 +169,8 @@ class GroupReplyHistory:
         saved = json.loads(batch["contributions_json"])
         if (type(saved) is not dict
                 or set(saved) - {"inputs", "materials", "group_context", "group_memory", "reply_settings",
-                                 "expression_style", "person_card", "group_network"}
+                                 "expression_style", "person_card", "group_network", "cross_window",
+                                 "role_profile", "busy_delay"}
                 or type(saved.get("inputs")) is not list or not 1 <= len(saved["inputs"]) <= 32
                 or type(saved.get("materials")) is not list or len(saved["materials"]) > 32):
             raise TaskError("group_reply_profile", "group history has no reader for another profile's material")
@@ -177,6 +179,12 @@ class GroupReplyHistory:
                 groups.messages.acquaintance.validate_snapshot(saved["person_card"], original)
             if "group_network" in saved:
                 groups.messages.group_network.validate_snapshot(saved["group_network"], original)
+            if "cross_window" in saved:
+                ConversationAwarenessContext.validate_snapshot(saved["cross_window"], original)
+            if "role_profile" in saved:
+                groups.messages.role_profile_context.instruction(saved["role_profile"], original)
+            if "busy_delay" in saved and saved["busy_delay"] is not True:
+                raise TaskError("group_reply_profile", "group reply delay metadata is invalid")
         except TaskError as error:
             raise TaskError("group_reply_profile", "group reply metadata belongs to another conversation") from error
         if "expression_style" in saved:

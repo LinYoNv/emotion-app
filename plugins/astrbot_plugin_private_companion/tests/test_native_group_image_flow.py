@@ -42,10 +42,16 @@ class NativeGroupImageFlowTests(GroupImageDeliveryFixture, unittest.IsolatedAsyn
                             if declaration.descriptor.tool.action == "image.generate")
         repository = CapabilityRepository(self.app.runtime)
         repository.register_descriptor(self.package, registered_at=self.clock.now()).unwrap()
-        repository.acquire(extension_id=self.package.extension_id, package_id=self.package.package_id,
-            package_version=self.package.package_version, expected_revision=0, observed_at=self.clock.now()).unwrap()
-        repository.set_role_enabled(extension_id=self.package.extension_id, role=context.role_binding.role,
-            bot_id=context.scope.bot_id, enabled=True, expected_revision=0, observed_at=self.clock.now()).unwrap()
+        installation = repository.installation(extension_id=self.package.extension_id).unwrap()
+        self.assertEqual((installation.package_id, installation.package_version, installation.artifact_hash),
+                         (self.package.package_id, self.package.package_version, self.package.artifact_hash))
+        projection = repository.projection(extension_id=self.package.extension_id,
+            role=context.role_binding.role, scope=context.scope).unwrap()
+        if projection.role_selection is None:
+            repository.set_role_enabled(extension_id=self.package.extension_id, role=context.role_binding.role,
+                bot_id=context.scope.bot_id, enabled=True, expected_revision=0, observed_at=self.clock.now()).unwrap()
+        else:
+            self.assertTrue(projection.role_selection.enabled)
         for capability in self.package.capabilities:
             repository.set_authorization(extension_id=self.package.extension_id, capability_id=capability,
                 subject=context.actor.subject, scope=context.scope, state=CapabilityAuthorizationState.ACTIVE,

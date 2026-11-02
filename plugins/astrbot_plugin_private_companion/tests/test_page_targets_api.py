@@ -3,6 +3,7 @@
 import json
 import asyncio
 from pathlib import Path
+import re
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace as NS
 import unittest
@@ -19,6 +20,7 @@ from companion_v2.identity_policy.models import AuthorizationTier
 from companion_v2.identity_policy.object_access import ObjectAccessPolicy
 from companion_v2.memory.person.management import PersonAcquaintanceDirectory
 from companion_v2.relationships.group_network import GroupRelationshipStore, VERSION, metadata_key, route_owner_key
+from tools.host_page_render import render_html
 
 
 class PageRequests:
@@ -75,6 +77,7 @@ class SinglePageTests(PageRequests, unittest.IsolatedAsyncioTestCase):
             "screen_access_api": PREFIX + "/screen-access",
             # QQ 空间拓展与 Reality/Screen 同层：按角色安装与授权，所以地址跟角色走。
             "qzone_extension_api": PREFIX + "/qzone-extension",
+            "game_access_api": PREFIX + "/game-access",
             "image_material_api": PREFIX + "/image-materials"}])
         self.assertNotIn("provider", json.dumps(listed))
         operator = dashboard_operator(self.controller.runtime, "admin", at=support.NOW)
@@ -176,7 +179,7 @@ class SinglePageTests(PageRequests, unittest.IsolatedAsyncioTestCase):
             connection.execute("INSERT INTO runtime_metadata(key, value) VALUES (?, ?)",
                                (metadata_key(owner), json.dumps(document)))
         routes = {path: handler for path, handler, _, _ in self.native.registered_web_apis}
-        directory = routes["/astrbot_plugin_private_companion_v2/acquaintance"]
+        directory = routes["/astrbot_plugin_private_companion/acquaintance"]
         with patch("astrbot_host.acquaintance_api.request", NS(username="admin", query={})), \
                 patch.object(PersonAcquaintanceDirectory, "directory",
                              return_value={"persons": [], "counts": {"total": 0}}):
@@ -190,7 +193,7 @@ class SinglePageTests(PageRequests, unittest.IsolatedAsyncioTestCase):
     async def test_native_group_session_is_listed_without_importing_v2_permissions(self):
         (await self.controller.initialize_profile()).unwrap()
         routes = {path: handler for path, handler, _, _ in self.native.registered_web_apis}
-        directory = routes["/astrbot_plugin_private_companion_v2/acquaintance"]
+        directory = routes["/astrbot_plugin_private_companion/acquaintance"]
         topology = self.controller.session_topology
         self.native.platform.client._wsr_api_clients = {"100": object()}
         umo = "qq-main:GroupMessage:450"
@@ -225,7 +228,7 @@ class SinglePageTests(PageRequests, unittest.IsolatedAsyncioTestCase):
     async def test_native_group_directory_failure_is_reported_with_its_cause(self):
         (await self.controller.initialize_profile()).unwrap()
         routes = {path: handler for path, handler, _, _ in self.native.registered_web_apis}
-        directory = routes["/astrbot_plugin_private_companion_v2/acquaintance"]
+        directory = routes["/astrbot_plugin_private_companion/acquaintance"]
         topology = self.controller.session_topology
         with patch("astrbot_host.acquaintance_api.request", NS(username="admin", query={})), \
                 patch.object(PersonAcquaintanceDirectory, "directory",
@@ -258,6 +261,26 @@ class SinglePageTests(PageRequests, unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await configure())["data"]["code"], "model_request_invalid")
         self.assertEqual(self.native.provider.client.state.calls, [])
 
+    async def test_model_status_projection_runs_off_the_event_loop(self):
+        (await self.controller.initialize_profile()).unwrap()
+        import threading
+        import astrbot_host.model_api as model_api
+        routes = {path: handler for path, handler, _, _ in self.native.registered_web_apis}
+        status = routes[PREFIX + "/model"]
+        main_thread = threading.get_ident()
+        workers = []
+        original = model_api.ModelManagement.status
+
+        def tracked(manager, *args, **kwargs):
+            workers.append(threading.get_ident())
+            return original(manager, *args, **kwargs)
+
+        with patch.object(model_api.ModelManagement, "status", new=tracked), \
+                patch("astrbot_host.model_api.request", NS(username="admin", query={})):
+            response = await status()
+        self.assertEqual(response["status"], "ok", response)
+        self.assertTrue(workers)
+        self.assertNotIn(main_thread, workers)
     async def test_setup_reads_pinned_identity_without_starting_the_host(self):
         (await self.controller.initialize_profile()).unwrap()
         before = self.controller.status()["session_state"]
@@ -271,6 +294,9 @@ class SinglePageTests(PageRequests, unittest.IsolatedAsyncioTestCase):
         pinned = self.controller._read_intent()
         self.assertEqual(progress["data"]["binding"]["role_id"], pinned.persona.role.subject_id)
         self.assertEqual(set(choices["data"]), {"accounts", "personas", "targets", "directory"})
+        from astrbot_host.legacy_api import PREFIX as LEGACY_PREFIX
+        self.assertTrue(any(role.get("legacy_api") == LEGACY_PREFIX
+                            for target in choices["data"]["targets"] for role in target["roles"]))
         self.assertEqual(set(choices["data"]["directory"]), {"complete", "issues"})
         self.assertIsInstance(choices["data"]["directory"]["complete"], bool)
         self.assertIsInstance(choices["data"]["directory"]["issues"], list)
@@ -369,22 +395,31 @@ class SinglePageTests(PageRequests, unittest.IsolatedAsyncioTestCase):
         self.assertEqual([page.name for page in pages], ["陪伴小屋"])
         page = next(page for page in pages if page.name == "陪伴小屋")
         entry = await service.resolve_plugin_page_file(plugin, page.name, "")
-        html = service.rewrite_plugin_page_html(entry.read_text(encoding="utf-8"), plugin_root.name, page.name,
-                                               "index.html", theme="light")
+        html = render_html(service, entry.read_text(encoding="utf-8"), plugin_root.name, page.name,
+                           "index.html", theme="light")
         self.assertIn("assets/voxel-room.js", html)
         self.assertIn("memory-page.js", html)
         self.assertIn("models-page.js", html)
         self.assertIn("perception-native-page.js", html)
         self.assertIn("/api/plugin/page/bridge-sdk.js", html)
         self.assertIn('name="companion-api-host"', html)
-        # GIF 地址必须来自静态 HTML 属性，宿主才能把它改写到插件资源路由；
-        # 内联脚本只负责从 template 中随机克隆，不再把裸相对路径交给浏览器。
-        for asset in ("room-loading-tea-coffee.gif", "room-loading-mug.gif"):
-            self.assertRegex(
-                html,
-                rf'src="/api/plugin/page/content/astrbot_plugin_private_companion_v2/[^" ]+/assets/{asset}\?'
-            )
-            self.assertNotIn(f'src="assets/{asset}', html)
+        # GIF 地址必须来自静态 HTML 属性；内联脚本只负责从 template 中随机克隆，
+        # 不再把裸相对路径交给浏览器。
+        if callable(getattr(service, "process_plugin_page_html", None)):
+            # 4.29 起视图由路径令牌路由提供，相对地址按自身解析即可，宿主不再改写，
+            # 因此这里钉住两件事：地址仍是静态属性的相对路径，且引用的文件确实存在。
+            page_root = await service.resolve_plugin_page_root(plugin, page.name)
+            for asset in ("room-loading-tea-coffee.gif", "room-loading-mug.gif"):
+                self.assertIn(f'src="assets/{asset}?', html)
+                self.assertTrue((page_root / "assets" / asset).is_file())
+        else:
+            # 4.28 以前的宿主把相对资源改写成带资源的绝对路由，这里钉住改写结果。
+            for asset in ("room-loading-tea-coffee.gif", "room-loading-mug.gif"):
+                self.assertRegex(
+                    html,
+                    rf'src="/api/plugin/page/content/{re.escape(plugin_root.name)}/[^" ]+/assets/{asset}\?'
+                )
+                self.assertNotIn(f'src="assets/{asset}', html)
         host_page = await service.resolve_plugin_page_file(plugin, "陪伴小屋", "workspaces/host/index.html")
         host_html = host_page.read_text(encoding="utf-8")
         self.assertRegex(host_html, r'<script src="app\.js(?:\?[^\"]*)?" defer></script>')
@@ -395,6 +430,35 @@ class SinglePageTests(PageRequests, unittest.IsolatedAsyncioTestCase):
 
 
 class MultiPageTests(PageRequests, MultiFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_setup_targets_publish_migration_paths_before_runtime_starts(self):
+        from astrbot_host.role_paths import HOST_PREFIX, role_legacy_paths
+        from astrbot_host.setup_api import PREFIX as SETUP_PREFIX
+
+        self.controller = self.make_controller(multi_config(group_targets=[dict(
+            target_id="groups", platform_id="qq-main", account_id="100",
+            bot_id="bot-a", group_id="300")]))
+        self.controller.register_routes()
+        routes = {path: handler for path, handler, _, _ in self.native.registered_web_apis}
+        with patch("astrbot_host.setup_api.request", NS(username="admin", query={})):
+            response = await routes[SETUP_PREFIX + "/targets"]()
+        self.assertEqual(response["status"], "ok", response)
+        targets = response["data"]["targets"]
+        private_roles = [role for target in targets if target["scope_kind"] == "private"
+                         for role in target["roles"]]
+        group_roles = [role for target in targets if target["scope_kind"] == "group"
+                       for role in target["roles"]]
+        self.assertTrue(private_roles)
+        self.assertTrue(group_roles)
+        for source_target in targets:
+            for role in source_target["roles"]:
+                expected = role_legacy_paths(source_target["target_id"], role["role_id"],
+                                             source_target["scope_kind"])
+                self.assertEqual(role["legacy_api"], expected["legacy_api"])
+                self.assertEqual(role["legacy_group_data_api"], expected["legacy_group_data_api"])
+                if expected["legacy_api"]:
+                    self.assertTrue(role["legacy_api"].startswith(HOST_PREFIX + "/targets/"))
+        self.assertEqual(self.controller.runtime, None)
+
     async def test_historical_group_for_removed_role_is_not_marked_configured(self):
         from astrbot_host.acquaintance_api import _group_relationship_networks
 
@@ -471,12 +535,17 @@ class MultiPageTests(PageRequests, MultiFixture, unittest.IsolatedAsyncioTestCas
         self.assertTrue(all(path in routes and path + "/configure" in routes for path in screen_paths))
         group = next(target for target in targets if target["scope_kind"] == "group")
         self.assertTrue(all(role["memory_api"] is None for role in group["roles"]))
-        self.assertTrue(all(role["model_api"] is None for role in group["roles"]))
+        group_model_paths = [role["model_api"] for role in group["roles"]]
+        self.assertTrue(all(path and path in routes and path + "/configure" in routes
+                            for path in group_model_paths))
         self.assertTrue(all(role["perception_native_api"] is None for role in group["roles"]))
         self.assertTrue(all(role["persona_api"] is None for role in group["roles"]))
         self.assertTrue(all(role["screen_access_api"] is None for role in group["roles"]))
         # 群目标没有「角色设置」这回事，所以迁移地址同样是 None，
         # 而不是一个读不出东西的地址。
         self.assertTrue(all(role["legacy_api"] is None for role in group["roles"]))
+        migration_paths = [role["legacy_group_data_api"] for role in group["roles"]]
+        self.assertTrue(all(path + "/plan" in routes and path + "/apply" in routes
+                            for path in migration_paths))
         await self.controller.terminate()
         self.assertEqual(self.native.registered_web_apis, [])

@@ -2,7 +2,7 @@
 
 from companion_v2.execution.models import require
 from companion_v2.foundation.outcome import Outcome
-from .native import account_number
+from .native import route_id
 
 
 class OneBotPresencePort:
@@ -15,7 +15,7 @@ class OneBotPresencePort:
             if (context.audience.recipients != (context.actor.subject,)
                     or principal.host_id != self.bridge.host_id or principal.account_id != scope.account_id
                     or principal.bot_id != scope.bot_id or principal.platform != scope.platform
-                    or account_number(principal.native_account_id) != scope.native_scope_id):
+                    or route_id(principal.native_account_id) != scope.native_scope_id):
                 return {"state": "not_started", "code": "presence_scope_mismatch"}
             check = self.authorize()
             if isinstance(check, Outcome):

@@ -27,16 +27,39 @@ def prepare_reaction_turn(semantic, context, original, turn_id):
     return semantic.reaction_available(context, turn_id)
 
 
+def _reaction_turn_note(capable, enabled):
+    """Tell the model this turn's choice without touching the cached prefix."""
+    if not capable:
+        return ""
+    if enabled:
+        return "本轮图库表情可用：需要时调用 reaction.search，或按表达需要附带一次表情意图。"
+    return ("本轮不使用图库表情：不要调用 reaction.search，也不要输出表情意图标签；"
+            "按普通文字回复，不要向用户解释这条规则。")
+
+
 def inject_core_reaction_instruction(event, request, semantic, turn_id):
     core = event.get_extra(CORE_REPLY_CONTEXT_EXTRA)
     if not isinstance(core, dict):
         return
     context = core["prepared"]["context"]
-    enabled = semantic.reaction_available(context, turn_id)
-    core["_reaction_reply"] = core.get("_reaction_reply", {}) | {
-        "semantic": semantic, "context": context, "turn_id": turn_id, "enabled": enabled}
-    if enabled and INSTRUCTION not in (request.system_prompt or ""):
+    capable = semantic.reaction_capable(context)
+    enabled = capable and semantic.reaction_available(context, turn_id)
+    previous = core.get("_reaction_reply")
+    previous = previous if isinstance(previous, dict) else {}
+    core["_reaction_reply"] = previous | {
+        "semantic": semantic, "context": context, "turn_id": turn_id, "enabled": enabled,
+        # Kept here so an attempted/deferred turn still has a readable reason;
+        # the response observer logs it before any capture can run.
+        "reason": previous.get("reason", "")}
+    if capable and INSTRUCTION not in (request.system_prompt or ""):
         request.system_prompt = ((request.system_prompt or "").rstrip() + "\n\n" + INSTRUCTION).lstrip()
+    # The per-turn roll belongs to the current user message, not the system
+    # prefix: flipping it there would invalidate the whole cached conversation.
+    # The host clears turn context after tool injection, so record it here and
+    # let the caller apply it once that pass has finished.
+    notes = core.setdefault("_turn_notes", {})
+    if isinstance(notes, dict):
+        notes["reactions"] = _reaction_turn_note(capable, enabled)
 
 
 def capture_core_reaction_intent(event, message):
@@ -76,20 +99,25 @@ def observe_core_reaction_response(event, response):
         return
     source = getattr(response, "completion_text", "") or ""
     cleaned, intent = extract_reply_intent(source)
-    reaction = core.get("_reaction_reply")
-    if (intent and isinstance(reaction, dict) and reaction.get("enabled")
-            and not getattr(response, "tools_call_name", ())):
-        reaction["intent"] = intent
-    if isinstance(reaction, dict) and reaction.get("enabled") and not getattr(response, "tools_call_name", ()):
-        _capture_reply_intent(core, source)
-        logger.info("[CompanionV2][media] stage=response event_ref=%s media=reaction authored_intent=%s lookup=%s reason=%s",
-                    core["prepared"].get("event_ref", "unknown"), bool(intent),
-                    bool(reaction.get("intent")), reaction["reason"])
+    # Strip before any side effect: capture/logging used to abort on a missing
+    # reason and leave the protocol in text AstrBot was about to send.
     if cleaned != source:
         response.completion_text = cleaned
         for part in getattr(getattr(response, "result_chain", None), "chain", ()):
             if isinstance(part, Plain):
                 part.text = extract_reply_intent(part.text)[0]
+    reaction = core.get("_reaction_reply")
+    try:
+        if (intent and isinstance(reaction, dict) and reaction.get("enabled")
+                and not getattr(response, "tools_call_name", ())):
+            reaction["intent"] = intent
+        if isinstance(reaction, dict) and reaction.get("enabled") and not getattr(response, "tools_call_name", ()):
+            _capture_reply_intent(core, source)
+            logger.info("[CompanionV2][media] stage=response event_ref=%s media=reaction authored_intent=%s lookup=%s reason=%s",
+                        core["prepared"].get("event_ref", "unknown"), bool(intent),
+                        bool(reaction.get("intent")), reaction.get("reason", "unset"))
+    except Exception:
+        logger.debug("[CompanionV2][media] reaction observer degraded", exc_info=True)
 
 
 async def prepare_core_reaction_message(event, message, *, authorize, segment_index=0, segment_count=1):

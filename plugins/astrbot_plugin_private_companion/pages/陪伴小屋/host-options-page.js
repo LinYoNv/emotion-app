@@ -78,8 +78,13 @@ window.CompanionHostOptionsPage = (() => {
       </div>`;
     };
     return `<section class="host-options-panel" aria-label="语音默认值">
-      <header class="host-options-heading"><div><h3>语音默认值</h3>
-        <p>作为各对象的起始值；对象单独设置的朗读概率优先。修改后需重启插件。</p></div></header>
+      <header class="host-options-heading"><div><h3>语音回复 · 开关与概率</h3>
+        <p>这一页只管“发不发语音、多大概率发”。发音人、音色、语速与试听在「模型与连接 → 语音」，分段与发送位置在「表达 → 语音」。</p></div></header>
+      <nav class="host-options-jumps" aria-label="语音的其他配置位置">
+        <a class="button small" href="#manage/models">发音人与音色 · 模型与连接</a>
+        <a class="button small" href="#manage/models">试听与语种 · 同上（语音配置）</a>
+        <a class="button small" href="#manage/expression/text">分段与发送位置 · 表达 / 文本</a>
+      </nav>
       ${!value.enabled ? '<p class="host-options-warning" role="note">语音总开关关闭时，对象页启用语音也不会合成。</p>' : ""}
       <form data-host-form="voice" novalidate>
         <div class="host-options-row"><div class="host-options-copy"><strong>允许语音回复</strong>
@@ -133,6 +138,14 @@ window.CompanionHostOptionsPage = (() => {
           <small>在已决定回应的戳一戳中，命中后使用模型生成。</small></div>
           <label class="host-options-percent"><input type="number" name="model_reply_probability" min="0" max="100" step="1"
             inputmode="numeric" data-wb-field="model_reply_probability" value="${percent(value.model_reply_probability)}"><span>%</span></label></div>
+        <div class="host-options-row"><div class="host-options-copy"><strong>拍一拍上下文接话</strong>
+          <small>默认关闭，仅群聊生效：拍一拍发生数秒后，模型查看最近几条群消息，有需要接的话题才回一句，否则保持安静。与上面的拍一拍回应相互独立。</small></div>
+          <label class="host-options-switch"><input type="checkbox" name="context_reply_enabled" data-wb-field="context_reply_enabled" ${value.context_reply_enabled ? "checked" : ""}>
+            <span>${value.context_reply_enabled ? "已开启" : "已关闭"}</span></label></div>
+        <div class="host-options-row"><div class="host-options-copy"><strong>上下文接话延迟秒数</strong>
+          <small>拍一拍后等待多少秒再查看群消息。0 = 瞬时快照（立即读取，先拍后说的话来不及进入上下文）；1–30 秒 = 等待后读取。</small></div>
+          <input class="host-options-number" type="number" name="context_delay_seconds" min="0" max="30" step="1"
+            inputmode="numeric" data-wb-field="context_delay_seconds" value="${value.context_delay_seconds}"></div>
         <label class="host-options-replies"><span><strong>可选回复</strong><small>每行一句，1–20 句；每句最多 120 字。</small></span>
           <textarea name="replies" rows="4" maxlength="2500" data-wb-field="replies">${replies}</textarea></label>
         <footer class="host-options-footer">${messageMarkup("poke")}
@@ -144,25 +157,29 @@ window.CompanionHostOptionsPage = (() => {
 
   function renderForwardIntake() {
     const value = state.forwardIntake;
-    if (state.loading && !value) return '<p class="host-options-empty" role="status">正在读取合并转发上限…</p>';
-    if (!value) return `<div class="host-options-empty" role="status"><p>${esc(state.error || "合并转发上限暂时不可用。")}</p>
+    if (state.loading && !value) return '<p class="host-options-empty" role="status">正在读取合并转发设置…</p>';
+    if (!value) return `<div class="host-options-empty" role="status"><p>${esc(state.error || "合并转发设置暂时不可用。")}</p>
       <button type="button" class="button small" data-host-reload>重新读取</button></div>`;
     const fields = [
       ["max_forwards", "单条消息最大转发数"],
-      ["max_nodes", "单条转发最大节点数"],
+      ["max_nodes", "单次最多展开节点数"],
       ["max_depth", "最大嵌套深度"],
     ];
-    return `<section class="host-options-panel" aria-label="合并转发摄取上限">
-      <header class="host-options-heading"><div><h3>合并转发摄取上限</h3></div></header>
+    return `<section class="host-options-panel" aria-label="合并转发设置">
+      <header class="host-options-heading"><div><h3>合并转发理解</h3></div></header>
       <form data-host-form="forward_intake" novalidate>
         ${fields.map(([name, title]) => `<label class="host-options-row">
           <span class="host-options-copy"><strong>${title}</strong><small>1–${state.forwardBounds[name]}</small></span>
           <input class="host-options-number" type="number" name="${name}" min="1" max="${state.forwardBounds[name]}"
             step="1" inputmode="numeric" data-wb-field="${name}" value="${value[name]}">
         </label>`).join("")}
+        <div class="host-options-row"><div class="host-options-copy"><strong>展开嵌套合并转发</strong>
+          <small>关闭时保留未展开提示，不读取内部节点。</small></div>
+          <label class="host-options-switch"><input type="checkbox" name="parse_nested" data-wb-field="parse_nested" ${value.parse_nested ? "checked" : ""}>
+            <span>${value.parse_nested ? "已开启" : "已关闭"}</span></label></div>
         <footer class="host-options-footer">${messageMarkup("forward_intake")}
           <button type="submit" class="button small primary" ${state.saving === "forward_intake" ? "disabled" : ""}>
-            ${state.saving === "forward_intake" ? "正在保存…" : "保存合并转发上限"}</button>
+            ${state.saving === "forward_intake" ? "正在保存…" : "保存合并转发设置"}</button>
         </footer>
       </form>
     </section>`;
@@ -233,14 +250,20 @@ window.CompanionHostOptionsPage = (() => {
         const backTimes = Number(backTimesRaw);
         if (!Number.isInteger(backTimes) || backTimes < 1 || backTimes > 5)
           throw new Error("连续回戳次数请输入 1 到 5 之间的整数。");
+        const delayRaw = String(formElement(form, "context_delay_seconds")?.value ?? "");
+        const delaySeconds = Number(delayRaw);
+        if (!Number.isInteger(delaySeconds) || delaySeconds < 0 || delaySeconds > 30)
+          throw new Error("上下文接话延迟请输入 0 到 30 之间的整数。");
         changes = {enabled: !!formElement(form, "enabled")?.checked,
           trigger_probability: fraction(form, "trigger_probability"),
           back_probability: fraction(form, "back_probability"), back_times: backTimes,
           model_reply_enabled: !!formElement(form, "model_reply_enabled")?.checked,
-          model_reply_probability: fraction(form, "model_reply_probability"), replies};
+          model_reply_probability: fraction(form, "model_reply_probability"), replies,
+          context_reply_enabled: !!formElement(form, "context_reply_enabled")?.checked,
+          context_delay_seconds: delaySeconds};
       } else {
         changes = {};
-        const labels = {max_forwards: "每条消息中的转发数", max_nodes: "每条转发的节点数", max_depth: "嵌套深度"};
+        const labels = {max_forwards: "每条消息中的转发数", max_nodes: "节点数", max_depth: "嵌套深度"};
         for (const name of ["max_forwards", "max_nodes", "max_depth"]) {
           const raw = String(formElement(form, name)?.value ?? "");
           const value = Number(raw);
@@ -248,6 +271,7 @@ window.CompanionHostOptionsPage = (() => {
             throw new Error(`${labels[name]}请输入 1 到 ${state.forwardBounds[name]} 之间的整数。`);
           changes[name] = value;
         }
+        changes.parse_nested = !!formElement(form, "parse_nested")?.checked;
       }
     } catch (error) {
       const message = form.querySelector("[data-host-options-message]");
@@ -275,7 +299,7 @@ window.CompanionHostOptionsPage = (() => {
       state.saving = "";
       if (saved) paint();
       else if (button) {button.disabled = false;button.textContent = group === "voice" ? "保存语音默认值"
-        : group === "poke" ? "保存戳一戳设置" : "保存合并转发上限";}
+        : group === "poke" ? "保存戳一戳设置" : "保存合并转发设置";}
     }
   }
 
@@ -343,8 +367,9 @@ window.CompanionHostOptionsPage = (() => {
       field, label, help: "", section: "received", sectionTitle, sectionCount: 1, aliases}));
     const forward = [
       ["max_forwards", "每条消息中的转发数", "每次摄取的数量上限", ["合并转发", "上限"]],
-      ["max_nodes", "每条转发的节点数", "转发节点上限", ["合并转发", "节点"]],
+      ["max_nodes", "单次最多展开节点数", "转发节点上限", ["合并转发", "节点", "300"]],
       ["max_depth", "嵌套深度", "转发嵌套层数", ["合并转发", "深度"]],
+      ["parse_nested", "展开嵌套合并转发", "关闭时保留未展开提示", ["嵌套", "开关"]],
     ].map(([field, label, sectionTitle, aliases]) => ({group: "forward_intake", groupTitle: "合并转发理解",
       field, label, help: "", section: "intake", sectionTitle, sectionCount: 1, aliases}));
     return [...voice, ...poke, ...forward];

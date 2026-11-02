@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 from companion_v2.execution.models import digest, stamp
 
-from .configuration import INTENSITY_PRESETS, hour_activity_curve, intensity_preset
+from .configuration import CURVE_CEILING, CURVE_FLOOR, INTENSITY_PRESETS, hour_activity_curve, intensity_preset
 
 
 # An unclaimed burst slot is gone, exactly like an unclaimed ordinary slot: the
@@ -116,7 +116,7 @@ class ContactRhythm:
     body_chars = staticmethod(body_chars)
 
     # ---- hourly activity curve ------------------------------------------
-    def hour_allows(self, context, preferences, opened_at, *, observed_at=None):
+    def hour_allows(self, context, preferences, opened_at, *, observed_at=None, curve=None):
         """Voluntary opportunity weighting by the relationship's local hour.
 
         The curve is opt-in: an unconfigured deployment keeps the exact slot grid
@@ -128,7 +128,10 @@ class ContactRhythm:
         """
         if not preferences.values["proactive_hour_activity_enabled"]:
             return True
-        weights = hour_activity_curve(preferences.values["proactive_hour_activity_curve"])
+        if isinstance(curve, (tuple, list)) and len(curve) == 24:
+            weights = tuple(max(CURVE_FLOOR, min(CURVE_CEILING, float(value))) for value in curve)
+        else:
+            weights = hour_activity_curve(preferences.values["proactive_hour_activity_curve"])
         zone = ZoneInfo(preferences.values["quiet_timezone"])
         weight = weights[(observed_at or opened_at).astimezone(zone).hour]
         share = min(1.0, weight / max(weights))

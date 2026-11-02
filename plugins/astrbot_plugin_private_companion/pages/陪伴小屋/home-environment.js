@@ -27,7 +27,8 @@ window.CompanionHomeEnvironment = (() => {
     const date = new Date(now);
     const parts = new Intl.DateTimeFormat("en-GB", {timeZone:zone, hour:"2-digit", minute:"2-digit", hourCycle:"h23"}).formatToParts(date);
     const hour = Number(parts.find(part => part.type === "hour")?.value || 0);
-    const dateLabel = new Intl.DateTimeFormat("zh-CN", {timeZone:zone, month:"long", day:"numeric", weekday:"long"}).format(date);
+    /* 星期用短名（周二），给 320px 手机留出同排显示时区的空间。 */
+    const dateLabel = new Intl.DateTimeFormat("zh-CN", {timeZone:zone, month:"long", day:"numeric", weekday:"short"}).format(date);
     return {date, hour, label:parts.map(part => part.value).join(""), dateLabel, phase:phase(hour)};
   }
   function sceneForTime(now, state, life) {

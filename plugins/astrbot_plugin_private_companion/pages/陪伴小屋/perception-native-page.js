@@ -104,12 +104,14 @@ window.CompanionNativePerceptionPage = (() => {
         || typeof value.environment.sources.weather_provider === "string")
       && typeof value[section].edit_token === "string"
       && fields[section].every(([name, , type]) =>
-        typeof value[section].settings[name] === (type === "bool" ? "boolean" : type === "number" ? "number" : "string")));
+        ((name === "health_enabled" || name === "health_proactive_enabled") && value[section].settings[name] === undefined)
+        || typeof value[section].settings[name] === (type === "bool" ? "boolean" : type === "number" ? "number" : "string")));
   }
   function publicSnapshot() {
     if (!status) return {ready:false, loading:!notices.load, error:notices.load || ""};
     const environment = status.environment.settings || {}, model = status.model.settings || {};
-    const contact = status.contact?.settings || {};
+    const contactStatus = status.contact || {};
+    const contact = contactStatus.settings || {};
     let locationName = "";
     try { locationName = JSON.parse(environment.planning_weather_location || "{}").name || ""; } catch (_) {}
     return {
@@ -119,13 +121,16 @@ window.CompanionNativePerceptionPage = (() => {
         weatherEnabled:environment.planning_weather_enabled === true,
         timezone:environment.planning_timezone || ""},
       model:{calendarEnabled:model.calendar_enabled === true, timezone:model.calendar_timezone || "",
+        healthEnabled:model.health_enabled === true,
         lunarEnabled:model.lunar_enabled === true, solarTermsEnabled:model.automatic_solar_terms_enabled === true,
         almanacEnabled:model.almanac_enabled === true, platformEnabled:model.platform_enabled === true,
         routeEnabled:model.model_route_enabled === true, modalitiesEnabled:model.configured_modalities_enabled === true},
       contact:{dateCheckinEnabled:contact.date_checkin_enabled === true,
-        dates:typeof contact.important_dates === "string" ? contact.important_dates : "[]",
-        lookaheadDays:Number.isInteger(contact.important_date_lookahead_days)
-          ? contact.important_date_lookahead_days : 0,
+        dates:typeof contactStatus.dates === "string" ? contactStatus.dates
+          : typeof contact.important_dates === "string" ? contact.important_dates : "[]",
+        lookaheadDays:Number.isInteger(contactStatus.lookaheadDays)
+          ? contactStatus.lookaheadDays : Number.isInteger(contact.important_date_lookahead_days)
+            ? contact.important_date_lookahead_days : 0,
         timezone:contact.quiet_timezone || "",
         balanceAwarenessEnabled:contact.balance_awareness_enabled === true,
         automaticAllowed:status.contact?.effective?.automatic_allowed === true},
@@ -155,6 +160,10 @@ window.CompanionNativePerceptionPage = (() => {
   function values(_section, data) { return {...data.settings}; }
   function merge(next, force = "") {
     if (!checked(next)) throw error("invalid_response");
+    if (next.model?.settings && typeof next.model.settings.health_enabled !== "boolean")
+      next.model.settings.health_enabled = false;
+    if (next.model?.settings && typeof next.model.settings.health_proactive_enabled !== "boolean")
+      next.model.settings.health_proactive_enabled = false;
     status = next;
     for (const section of Object.keys(fields)) {
       const current = drafts[section], entry = next[section], latest = values(section, entry);
@@ -327,7 +336,10 @@ window.CompanionNativePerceptionPage = (() => {
       if (!active(ticket)) return;
       if (!response.status || !checked(response.status)) throw error("invalid_response");
       merge(response.status, section);
-      notices[section] = "已保存。";
+      const setup = response.result?.health_setup;
+      notices[section] = setup?.state === "warning"
+        ? "已保存；" + (setup.message || "健康感知尚未完全就绪。")
+        : setup?.enabled === true ? "已保存，健康感知已开启。" : "已保存。";
     } catch (failure) {
       if (!active(ticket)) return;
       if (failure.confirmed) {
@@ -434,6 +446,28 @@ window.CompanionNativePerceptionPage = (() => {
       return [...draft.touched].some(name => String(draft.values?.[name]) !== String(draft.original?.[name]));
     });
   }
+  function changedFields() {
+    return Object.entries(drafts).flatMap(([section, draft]) => (fields[section] || [])
+      .filter(([name]) => draft.touched?.has(name) && String(draft.values?.[name]) !== String(draft.original?.[name]))
+      .map(([, label]) => label));
+  }
+  async function saveBeforeLeave() {
+    for (const [section, draft] of Object.entries(drafts)) {
+      if (![...(draft.touched || [])].some(name => String(draft.values[name]) !== String(draft.original[name]))) continue;
+      if (draft.pending) return {error:'上次保存结果待核对，请在感知配置中核对原请求。'};
+      await save(section);
+      if (drafts[section]?.pending || drafts[section]?.stale) return {error:notices[section] || '保存尚未确认。'};
+    }
+    return !isDirty() ? true : {error:Object.values(notices).find(Boolean) || '感知配置未保存，请回到配置中检查。'};
+  }
+  function discardChanges() {
+    if (busy) return {error:'感知配置正在处理，请稍后切换。'};
+    for (const draft of Object.values(drafts)) {
+      draft.values = {...draft.original}; draft.touched = new Set();
+    }
+    rememberState(); render();
+    return true;
+  }
   /* 全局搜索用：感知页自己的字段表（日期、节假日、农历、黄历、平台标识等）。
      这一组不在 config-editor 的 spec 里，此前整组搜不到。
      「资讯」段的字段其实是主动联系的 news.*，spec 里已经能搜到，这里不再重复索引。 */
@@ -446,7 +480,7 @@ window.CompanionNativePerceptionPage = (() => {
       sectionCount: Object.keys(sectionTitles).length,
     })));
   }
-  return {mount, unmount, refresh:load, searchEntries, isDirty, subscribe(listener) {
+  return {mount, unmount, refresh:load, searchEntries, isDirty, changedFields, saveBeforeLeave, discardChanges, subscribe(listener) {
     if (typeof listener !== "function") return () => {};
     subscribers.add(listener); listener(publicSnapshot());
     return () => subscribers.delete(listener);

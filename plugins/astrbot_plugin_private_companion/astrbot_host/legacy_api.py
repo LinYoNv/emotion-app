@@ -16,7 +16,7 @@
 
 ## 为什么 apply 要重算
 
-``apply`` **不接受**客户端传回来的字段值，只接受一个 ``plan_token``：它必须等于
+``apply`` **不接受**客户端传回来的字段值，只接受 ``plan_token`` 与预览字段的选择标识：令牌必须等于
 当前 V1 目录的指纹。不这么做的话，客户端可以在「试算」与「执行」之间换一份数据，
 或者干脆自己编一份改动——那等于把「先看后做」这个保证作废。重算一次很便宜
 （只读 + 纯转换），换来的是「界面上看到的」与「实际写入的」必定是同一份。
@@ -26,19 +26,28 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import os
+import re
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from astrbot.api.web import request
-from companion_v2.execution.models import TaskError, digest
+from companion_v2.execution.models import TaskError, digest, require
+from companion_v2.configuration.models import ConfigLayer
 from companion_v2.foundation.outcome import Outcome
 from companion_v2.legacy.migration import LegacyMigration, MigrationState, plugin_data_path
+from companion_v2.legacy.image_configuration_migration import plan_image_output_changes
 from companion_v2.legacy.reality_migration import (
     REALITY_SETTING_DEFAULTS,
     reality_setting_value,
     reality_settings_state_token,
+)
+from companion_v2.legacy.native_extension_configuration import (
+    SOURCE_PLUGINS, WRITABLE_PLUGINS, REVIEW_ONLY_PLUGINS, HOST_VERIFIED_FIELDS, preview_value,
+    setting_value as native_setting_value,
+    settings_state_token as native_settings_state_token,
 )
 from companion_v2.legacy.data_migration import (
     build_data_plan,
@@ -72,19 +81,51 @@ from companion_v2.legacy.configuration_migration import (
 )
 
 from .management_identity import dashboard_operator
-from .identity_derivation import derive_role_id
+from .legacy_archive_location import migration_archive_root
 from .legacy_config import (V1_HOST_CONFIG_NAME, V1_PLUGIN_DATA_NAME,
-                            V1_REALITY_PLUGIN_DATA_NAME, read_v1_host_configuration,
+                            V1_REALITY_PLUGIN_DATA_NAME, V1_IMAGE_PLUGIN_DATA_NAME,
+                            read_v1_host_configuration,
                             read_v1_plugin_configuration, v1_host_config_path,
-                            find_v1_data_root)
+                            v1_setting, find_v1_data_root)
 from .persona_catalog import available_personas
+from .legacy_persona_mapping import legacy_account_inventory
 
 
 PREFIX = "/astrbot_plugin_private_companion/legacy"
 MAX_REQUEST_BYTES = 8192
+logger = logging.getLogger(__name__)
+_WINDOWS_PATH = re.compile(r"[A-Za-z]:\\[^'\"\n]*")
+
+
+def logger_safe_detail(text: str) -> str:
+    """日志里保留错误形状，抹掉绝对路径。"""
+    return _WINDOWS_PATH.sub("<path>", str(text))[:200]
+
+
+def batch_group_receipt_state(code: str) -> str:
+    """批量迁移里单个群的回执状态。
+
+    ``legacy_nothing_to_import`` 表示这个 V1 群只有一条空关系网行、也没有群知识或
+    群表达可导入：**没有失败**，只是没有东西要写。把它记成 ``failed`` 会让操作者
+    去找一条并不存在的错误，因此归到 ``review``（回执文案是「没有可导入内容」，
+    不会自动写任何东西）。其余错误码仍然如实记成 ``failed``。
+    """
+    return "review" if code == "legacy_nothing_to_import" else "failed"
 
 MEMORY_PLUGIN_DATA_NAME = "astrbot_plugin_memory_companion"
 _NO_ACCOUNT_CHANGE = object()
+
+
+@dataclass
+class _PendingBindingApply:
+    root: Path
+    configuration_scope: str
+    document: dict
+    intent: object
+    expected_state_token: str
+    auto_import: bool = False
+
+
 _WEATHER_PLUGIN_FIELDS = frozenset({
     "weather.provider", "weather.api_host", "weather.credential", "weather.refresh_minutes",
 })
@@ -120,6 +161,8 @@ class LegacyMigrationWebAPI:
                 (PREFIX + "/upgrade-confirm", self.confirm_upgrade, ["POST"],
                  "Confirm the migrated configuration after a restart"),
                 (PREFIX + "/data-plan", self.data_plan, ["GET"], "Preview reviewed V1 profile, knowledge, reaction and journal data"),
+                (PREFIX + "/scope", self.scope, ["GET"], "Preview the role-driven migration scope without writing"),
+                (PREFIX + "/batch-apply", self.batch_apply, ["POST"], "Import every automatically mapped window once"),
                 (PREFIX + "/data-apply", self.data_apply, ["POST"], "Import the reviewed V1 data batch")] + PrivateMemoryMigrationAPI(self).routes(PREFIX) + LegacyArchiveWebAPI(self).routes(PREFIX)
 
     # ── 定址 ───────────────────────────────────────────────────────────
@@ -170,30 +213,24 @@ class LegacyMigrationWebAPI:
             personas = await available_personas(self.controller.context)
         except (AttributeError, TypeError, ValueError):
             personas = []
-        persona_ids = personas or ["[%None]"]
-        enriched_accounts = []
-        for account in accounts:
-            if not isinstance(account, dict):
-                continue
-            account_id = account.get("account_id")
-            try:
-                persona_roles = {persona_id: derive_role_id(account_id, persona_id)
-                                 for persona_id in persona_ids}
-                persona_roles[""] = derive_role_id(account_id, None)
-                persona_roles["[%None]"] = derive_role_id(account_id, None)
-            except (TypeError, ValueError, AttributeError):
-                continue
-            enriched_accounts.append({**account, "persona_roles": persona_roles,
-                                      "default_role_id": derive_role_id(account_id, None)})
         reality_configuration, reality_issue = self._v1_reality_configuration()
+        image_configuration, image_issue = self._v1_image_configuration()
+        native_configurations, native_issues = self._v1_native_extension_configurations()
         host_configuration, host_issue = self._read_v1_host_configuration()
+        enriched_accounts = await legacy_account_inventory(
+            self.controller, host_configuration, accounts, personas)
         return LegacyMigration(v1_root=root, v1_configuration=host_configuration,
                                v1_host_configuration_issue=host_issue,
                                configuration_registry=registry,
                                host_accounts=enriched_accounts,
                                configuration_scope_kind=configuration_scope_kind,
                                v1_reality_configuration=reality_configuration,
-                               v1_reality_configuration_issue=reality_issue), root, origin
+                                v1_reality_configuration_issue=reality_issue,
+                                v1_image_configuration=image_configuration,
+                                v1_image_configuration_issue=image_issue,
+                                v1_native_configurations=native_configurations,
+                                v1_native_configuration_issues=native_issues,
+                                native_extension_baselines=self._native_extension_baselines()), root, origin
 
     # ── V1 的宿主配置 ─────────────────────────────────────────────────
     def _v1_host_config_path(self):
@@ -227,6 +264,47 @@ class LegacyMigrationWebAPI:
             return None, "unreadable"
         return loaded, "" if loaded is not None else "unreadable"
 
+    def _relationship_seed_configuration(self, migration):
+        """「用户档案」提示词该从哪一份配置里读。
+
+        ``migration.v1_configuration`` 就是 ``build_data_plan`` 用的那份快照，正常情况下
+        一律用它：预览和执行各读一次宿主文件会得到两份不同的 seed，计划令牌也就无法
+        证明用户看到的就是将要写入的。
+
+        只有迁移对象**完全没有**携带宿主配置时（直接由 V1 数据根转储构造的迁移）才回退
+        读一次宿主配置，否则「用户档案」提示词里的性别、生日、职业、相处方式会被静默
+        丢掉。回退路径同样受计划令牌约束：``relationship_seed_state`` 把解析后的 seed 算进
+        令牌，两次读取不一致时执行会以 ``legacy_plan_stale`` 拒绝，而不是写出一份没预览过
+        的档案。
+        """
+        configuration = getattr(migration, "v1_configuration", None)
+        if isinstance(configuration, dict) and configuration:
+            return configuration
+        return self._v1_host_configuration()
+
+    def _relationship_config_seed(self, configuration):
+        """旧版配置里的「用户档案」提示词 → 主要陪伴对象的关系档案种子。
+
+        用户库里没有性别、生日、职业、相处方式；这些只存在于这份提示词里，
+        读不到就返回 None，迁移预览不会因此多出一条空记录。
+
+        ``configuration`` 必须是本次迁移实际使用的那份配置快照
+        （``migration.v1_configuration``，也就是传给 ``build_data_plan`` 的同一份，
+        统一由 ``_relationship_seed_configuration`` 取）。这里刻意不给默认值：
+        少传一次就读成另一份，正是要避免的那个缺陷。
+        """
+        if not isinstance(configuration, dict):
+            return None
+        target_ids = v1_setting(configuration, "basic_config.target_user_ids", None)
+        if not isinstance(target_ids, (list, tuple)) or not target_ids:
+            return None
+        primary_user_id = str(target_ids[0] or "").strip()
+        if not primary_user_id:
+            return None
+        text = v1_setting(configuration, "life_schedule_config.roleplay_user_profile_prompt", "")
+        from companion_v2.legacy.relationship_profiles import config_relationship_profile
+        return config_relationship_profile(text, primary_user_id=primary_user_id)
+
     def _v1_reality_configuration(self):
         try:
             loaded, _, _ = read_v1_plugin_configuration(
@@ -235,6 +313,41 @@ class LegacyMigrationWebAPI:
         except (OSError, ValueError, UnicodeDecodeError):
             return None, "unreadable"
         return loaded, ""
+
+    def _v1_image_configuration(self):
+        try:
+            loaded, _, _ = read_v1_plugin_configuration(
+                self._v1_source_data_root(), V1_IMAGE_PLUGIN_DATA_NAME,
+            )
+        except (OSError, ValueError, UnicodeDecodeError):
+            return None, "unreadable"
+        return loaded, ""
+
+    def _v1_native_extension_configurations(self):
+        configurations, issues = {}, {}
+        for name, plugin_id in (WRITABLE_PLUGINS | REVIEW_ONLY_PLUGINS).items():
+            try:
+                loaded, _, _ = read_v1_plugin_configuration(self._v1_source_data_root(), plugin_id)
+            except (OSError, ValueError, UnicodeDecodeError):
+                issues[name] = "unreadable"
+            else:
+                if loaded is not None:
+                    configurations[name] = loaded
+        return configurations, issues
+
+    @staticmethod
+    def _native_extension_baselines():
+        package = Path(__file__).parent / "native_extensions"
+        baselines = {}
+        for name in SOURCE_PLUGINS:
+            try:
+                baselines[name] = {
+                    key: json.loads((package / name / f"settings-{key}.json").read_text(encoding="utf-8"))
+                    for key in ("defaults", "schema")
+                }
+            except (OSError, ValueError, UnicodeDecodeError):
+                continue
+        return baselines
 
     def _fingerprint(self, root) -> str:
         """V1 目录的指纹：只取顶层条目的「名字 + 大小 + 修改时间」。
@@ -266,6 +379,17 @@ class LegacyMigrationWebAPI:
                 stat = config_path.stat()
                 content = hashlib.sha256(config_path.read_bytes()).hexdigest()
                 entries.append((str(config_path), stat.st_size, stat.st_mtime_ns, content))
+            except OSError:
+                pass
+        for plugin_id in WRITABLE_PLUGINS.values():
+            from .legacy_config import v1_plugin_config_path
+            path = v1_plugin_config_path(self._v1_source_data_root(), plugin_id)
+            if path is None:
+                continue
+            try:
+                stat = path.stat()
+                entries.append((str(path), stat.st_size, stat.st_mtime_ns,
+                                hashlib.sha256(path.read_bytes()).hexdigest()))
             except OSError:
                 pass
         digest = hashlib.sha256(repr(entries).encode("utf-8")).hexdigest()
@@ -312,13 +436,19 @@ class LegacyMigrationWebAPI:
         from .web_api import outcome_response
         try:
             raw = await request.body()
-            if len(raw) > MAX_REQUEST_BYTES:
+            if len(raw) > 300000:
                 raise ValueError()
             arguments = json.loads(raw.decode("utf-8")) if raw else {}
             if (type(arguments) is not dict or not {"plan_token"}.issubset(arguments)
-                    or set(arguments) - {"plan_token", "v1_root", "configuration_scope"}):
+                    or set(arguments) - {"plan_token", "v1_root", "configuration_scope", "selected_fields"}):
                 raise ValueError()
             if type(arguments["plan_token"]) is not str or not arguments["plan_token"]:
+                raise ValueError()
+            if "selected_fields" in arguments and (
+                    type(arguments["selected_fields"]) is not list
+                    or len(arguments["selected_fields"]) > 4096
+                    or any(type(value) is not str or len(value) != 64
+                           for value in arguments["selected_fields"])):
                 raise ValueError()
             root_override = arguments.get("v1_root")
             if root_override is not None and (type(root_override) is not str or not root_override.strip()):
@@ -331,7 +461,8 @@ class LegacyMigrationWebAPI:
             return outcome_response(Outcome.failed("legacy_request_invalid", "invalid apply request"))
         return await self._run(
             lambda migration, root, session: self._apply(
-                migration, root, session, arguments["plan_token"], configuration_scope),
+                migration, root, session, arguments["plan_token"], configuration_scope, defer_bindings=True,
+                selected_fields=arguments.get("selected_fields")),
             root_override=root_override,
         )
 
@@ -372,10 +503,15 @@ class LegacyMigrationWebAPI:
             )
             if blocked_sources:
                 return self._configuration_source_unavailable(blocked_sources)
+            optional_errors = self._optional_extension_source_errors(
+                document.get("findings", ()), PLUGIN_CONFIGURATION_SCOPE)
             token = document.get("plan_token")
             if not token:
                 return Outcome.failed("legacy_plan_stale", "试算没有产出可写入的计划")
             if not document.get("change_count"):
+                if optional_errors:
+                    return Outcome.failed("legacy_native_source_unavailable",
+                                          "独立拓展配置尚未读入；核心配置可单独试算，升级暂不登记完成。")
                 marked = self._mark_imported(
                     0, root, configuration_scope=PLUGIN_CONFIGURATION_SCOPE,
                     restart_required=False,
@@ -387,7 +523,11 @@ class LegacyMigrationWebAPI:
                     "configuration_scope": PLUGIN_CONFIGURATION_SCOPE,
                     "restart_required": False,
                 })
-            applied = await self._apply(migration, root, session, token, PLUGIN_CONFIGURATION_SCOPE)
+            applied = await self._apply(migration, root, session, token, PLUGIN_CONFIGURATION_SCOPE,
+                                        defer_bindings=True)
+            if isinstance(applied, _PendingBindingApply):
+                applied.auto_import = True
+                return applied
             if not applied.is_success:
                 return applied
             result = dict(applied.unwrap())
@@ -424,6 +564,278 @@ class LegacyMigrationWebAPI:
                                    "install": self._install_state(root, [])})
 
         return await self._run(work)
+
+    async def scope(self):
+        """Preview the role-driven migration scope; nothing is written."""
+        from .web_api import outcome_response
+        query = request.query
+        if (set(query.keys()) - {"v1_root"}
+                or any(len(query.getlist(key)) != 1 for key in query.keys())):
+            return outcome_response(Outcome.failed("legacy_request_invalid", "invalid migration scope query"))
+        root_override = query.get("v1_root")
+        if root_override is not None and (type(root_override) is not str or not root_override.strip()):
+            return outcome_response(Outcome.failed("legacy_request_invalid", "invalid migration scope query"))
+        return await self._run(
+            lambda migration, root, session: self._scope(migration, root, session),
+            root_override=root_override, offload_sync=True)
+
+    async def batch_apply(self):
+        """Run every reviewed, automatically mapped window once; never guess."""
+        from .web_api import outcome_response
+        try:
+            raw = await request.body()
+            if len(raw) > MAX_REQUEST_BYTES:
+                raise ValueError()
+            arguments = json.loads(raw.decode("utf-8")) if raw else {}
+            allowed = {"token", "v1_root", "personas", "groups", "options"}
+            if (type(arguments) is not dict or set(arguments) - allowed
+                    or type(arguments.get("token")) is not str or not arguments["token"]
+                    or type(arguments.get("personas", [])) is not list
+                    or type(arguments.get("groups", [])) is not list
+                    or type(arguments.get("options", {})) is not dict):
+                raise ValueError()
+            for item in arguments.get("personas", []):
+                if type(item) is not str or len(item) > 96:
+                    raise ValueError()
+            for item in arguments.get("groups", []):
+                if (type(item) is not dict or set(item) != {"persona_id", "group_id"}
+                        or type(item["persona_id"]) is not str or len(item["persona_id"]) > 96
+                        or type(item["group_id"]) is not str or not item["group_id"]
+                        or len(item["group_id"]) > 256):
+                    raise ValueError()
+            root_override = arguments.get("v1_root")
+            if root_override is not None and (type(root_override) is not str or not root_override.strip()):
+                raise ValueError()
+        except (ValueError, TypeError, UnicodeError, RecursionError):
+            return outcome_response(Outcome.failed("legacy_request_invalid", "invalid batch migration request"))
+        return await self._run(
+            lambda migration, root, session: self._batch_apply(migration, root, session, arguments),
+            root_override=root_override)
+
+    @staticmethod
+    def _group_import_arguments(root, key, plan):
+        """Request only the group sections V1 actually has.
+
+        The explicit single-group page applies the same rule from its preview
+        (``setup-guide.js`` gates the worldbook checkbox on entries+members and
+        the expression checkbox on availability). The batch calls the importer
+        directly, so it must derive the same flags from the reviewed plan: an
+        empty worldbook is not a request the importer can satisfy, and asking
+        for it used to fail a group that only had a relationship network.
+
+        The plan comes from the host, so the fields read below are validated
+        first: an unusable plan is one receipt (``legacy_group_plan_invalid``)
+        instead of a traceback that escapes the batch.
+        """
+        if (not isinstance(plan, dict) or type(plan.get("plan_token")) is not str
+                or not plan["plan_token"]):
+            raise ValueError("legacy_group_plan_invalid")
+        worldbook = plan.get("group_worldbook")
+        if worldbook is None:
+            worldbook = {}
+        expression = plan.get("group_expression")
+        if (not isinstance(worldbook, dict) or not isinstance(expression, dict)
+                or type(expression.get("available")) is not bool):
+            raise ValueError("legacy_group_plan_invalid")
+        network = plan.get("source_group_network") or {}
+        if not isinstance(network, dict):
+            raise ValueError("legacy_group_plan_invalid")
+        return {
+            "v1_root": str(root),
+            "source_persona_id": key[0],
+            "source_group_id": key[1],
+            "plan_token": plan["plan_token"],
+            # Group networks are imported per (persona, group); an expression-only
+            # V1 group still produces a zero-count row, which is not a network.
+            "import_group_network": bool(network.get("member_count") or network.get("edge_count")),
+            "confirm_group_mapping": True,
+            "confirm_member_ids": True,
+            "import_group_worldbook": bool(worldbook.get("entries") or worldbook.get("members")),
+            "import_group_expression": bool(expression.get("available")),
+            "confirm_expression_mapping": True,
+        }
+
+    async def _batch_apply(self, migration, root, session, arguments):
+        """Apply the reviewed scope item by item, keeping one receipt per item."""
+        from .legacy_group_data_api import LegacyGroupDataWebAPI
+        scope = await asyncio.to_thread(self._scope, migration, root, session)
+        if not scope.is_success:
+            return scope
+        scope = scope.unwrap()
+        if scope["token"] != arguments["token"]:
+            return Outcome.failed("legacy_scope_stale",
+                "the reviewed migration scope changed; preview the role again before importing.")
+        personas = {item["source_id"]: item for item in scope["personas"]}
+        groups = {(item["persona_id"], item["source_id"]): item for item in scope["groups"]}
+        options = arguments.get("options") or {}
+        flags = {
+            "import_reactions": True, "import_group_network": True, "confirm_member_ids": True,
+            "import_journals": True, "confirm_persona_mapping": True, "import_worldbook": True,
+            "import_archive": options.get("import_archive") is True,
+            "import_memory_database": options.get("import_memory_database") is True,
+            "confirm_memory_mapping": options.get("confirm_memory_mapping") is True,
+            "import_reference_images": True, "import_wardrobe_items": True,
+            "confirm_reference_persona_mapping": True,
+            "import_expressions": True, "confirm_expression_mapping": True,
+            "import_private_contacts": True, "import_relationship_profiles": True,
+        }
+        items = []
+        for persona_id in arguments.get("personas", []):
+            entry = personas.get(persona_id)
+            if entry is None or not entry["auto"]:
+                items.append({"kind": "persona", "persona_id": persona_id, "state": "review",
+                              "reason": (entry or {}).get("reason") or "persona_not_in_scope"})
+                continue
+            items.append(await self._import_persona(migration, root, session, persona_id, flags))
+        for request_item in arguments.get("groups", []):
+            key = (request_item["persona_id"], request_item["group_id"])
+            entry = groups.get(key)
+            if entry is None or not entry["auto"]:
+                items.append({"kind": "group", "persona_id": key[0], "group_id": key[1],
+                              "state": "review",
+                              "reason": (entry or {}).get("reason") or "group_not_in_scope"})
+                continue
+            api = LegacyGroupDataWebAPI(self.controller, entry["target_id"],
+                                        getattr(self.controller, "role_id", ""))
+            try:
+                target, group_session = await asyncio.to_thread(api._target)
+                plan = await asyncio.to_thread(api._plan, root, key[0], key[1], target, group_session)
+                try:
+                    group_arguments = self._group_import_arguments(root, key, plan)
+                except (KeyError, TypeError, ValueError):
+                    # The reviewed plan cannot be turned into an import request;
+                    # that is this group's receipt, with its own error code.
+                    items.append({"kind": "group", "persona_id": key[0], "group_id": key[1],
+                                  "state": "failed", "reason": "legacy_group_plan_invalid"})
+                    continue
+                response = await asyncio.to_thread(
+                    api.apply_import, group_arguments, root, target, group_session)
+            except Exception as error:  # noqa: BLE001 - one group must not stop the rest
+                # A plan/apply exception is this group's receipt, not the end of
+                # the batch: the next group has its own transaction and target.
+                logger.warning("[CompanionV2] 群迁移条目失败 group=%s error_type=%s",
+                               logger_safe_detail(key[1]), type(error).__name__)
+                items.append({"kind": "group", "persona_id": key[0], "group_id": key[1],
+                              "state": "failed",
+                              "reason": getattr(error, "code", type(error).__name__)})
+                continue
+            code = (response.get("data") or {}).get("code") if isinstance(
+                response.get("data"), dict) else None
+            code = code or response.get("message")
+            imported = response.get("status") == "ok"
+            items.append({"kind": "group", "persona_id": key[0], "group_id": key[1],
+                          "state": "imported" if imported else batch_group_receipt_state(code),
+                          "reason": None if imported else code,
+                          "result": response.get("data")})
+        counts = {"imported": sum(1 for item in items if item["state"] == "imported"),
+                  "review": sum(1 for item in items if item["state"] == "review"),
+                  "failed": sum(1 for item in items if item["state"] == "failed")}
+        return Outcome.success({"token": scope["token"], "items": items, "counts": counts,
+                                "memory_database_skipped": not flags["import_memory_database"]})
+
+    async def _import_persona(self, migration, root, session, persona_id, flags):
+        plan = await asyncio.to_thread(self._data_plan, migration, root, session, "", persona_id,
+            reference_slots_available=24, wardrobe_slots_available=24)
+        if not plan.is_success:
+            return {"kind": "persona", "persona_id": persona_id, "state": "failed",
+                    "reason": plan.failure.code}
+        document = plan.unwrap()
+        flags = dict(flags)
+        # Sections without an available V1 source must not be requested: the
+        # importer rejects "import expressions" when the persona has none.
+        if not (document.get("expressions") or {}).get("available"):
+            flags["import_expressions"] = False
+            flags["confirm_expression_mapping"] = False
+        # Only request the sections this persona actually has; an empty section
+        # is a validator error, not a silent no-op.
+        worldbook = document.get("worldbook") or {}
+        network = document.get("group_networks") or ()
+        worldbook_has_data = bool(worldbook.get("general_count") or worldbook.get("member_count")
+            or worldbook.get("groups") or worldbook.get("member_profile_groups"))
+        # Group networks are imported per (persona, group) by the group batch;
+        # a persona-level request has no group id and would fail as "not found".
+        flags["import_group_network"] = False
+        flags["import_worldbook"] = worldbook_has_data
+        flags["confirm_member_ids"] = True
+        contacts = document.get("private_contacts") or {}
+        flags["import_private_contacts"] = bool(contacts.get("importable") or contacts.get("total"))
+        # Relationship details are part of the same per-person migration; the
+        # importer only fills empty V2 fields and reports skipped identities.
+        flags["import_relationship_profiles"] = True
+        flags["import_journals"] = bool((document.get("journals") or {}).get("batch_count"))
+        flags["import_reactions"] = bool((document.get("reaction_assets") or {}).get("batch_count"))
+        flags["import_reference_images"] = bool((document.get("reference_images") or {}).get("image_count"))
+        flags["import_wardrobe_items"] = bool((document.get("wardrobe_items") or {}).get("image_count"))
+        result = await self._data_apply(migration, root, session, document["plan_token"], "", persona_id,
+            **flags)
+        if not result.is_success:
+            return {"kind": "persona", "persona_id": persona_id, "state": "failed",
+                    "reason": result.failure.code}
+        data = result.unwrap()
+        relationships = data.get("relationship_profiles") or {}
+        return {"kind": "persona", "persona_id": persona_id, "state": "imported",
+                "relationship_profiles": {
+                    "imported": relationships.get("imported", 0),
+                    "unchanged": relationships.get("unchanged", 0),
+                    "skipped": relationships.get("skipped", 0),
+                },
+                "result": data}
+
+    def _scope(self, migration, root, session):
+        from companion_v2.legacy.data_migration import build_data_plan
+        from companion_v2.legacy.migration_scope import build_scope
+        planned = migration.discover()
+        if not planned.is_success:
+            return planned
+        main_document = build_data_plan(root, v1_configuration=migration.v1_configuration).document()
+        context, _service = self._data_context(session)
+        scope_ref = context.scope
+        platform_id, account_id = scope_ref.platform, scope_ref.account_id
+        role_id = getattr(self.controller, "role_id", "")
+        group_targets = []
+        for item in self.controller.web_api.target_inventory():
+            if item.get("scope_kind") != "group":
+                continue
+            if (item.get("platform_id"), item.get("account_id")) != (platform_id, account_id):
+                continue
+            roles = [role for role in item.get("roles", ()) if role.get("legacy_group_data_api")]
+            group_targets.append({**item, "has_role": bool(roles)})
+        persona_roles = {}
+        configuration = getattr(self.controller, "config", None) or {}
+        rows = configuration.get("multi_host", {}).get("personas", ()) if isinstance(configuration, dict) else ()
+        for row in rows if isinstance(rows, (list, tuple)) else ():
+            if (isinstance(row, dict) and type(row.get("persona_id")) is str and row["persona_id"]
+                    and type(row.get("role_id")) is str and row["role_id"]):
+                persona_roles[row["persona_id"]] = row["role_id"]
+        # The profile without an id still owns a role: it is the default persona
+        # of the account, derived the same way the host derives it.
+        from .identity_derivation import derive_role_id
+        try:
+            # The profile without an id still owns a role: it is the profile the
+
+            # operator is migrating into this role, so the target role wins over
+
+            # the account default.
+
+            persona_roles.setdefault("", role_id or derive_role_id(account_id, "[%None]"))
+        except (TypeError, ValueError):
+            pass
+        plans = [("", main_document)]
+        seen = set()
+        for item in main_document.get("persona_sources") or ():
+            persona_id = item.get("persona_id") if isinstance(item, dict) else None
+            if (type(persona_id) is not str or not persona_id or persona_id in seen
+                    or item.get("state") != "ready"):
+                continue
+            seen.add(persona_id)
+            try:
+                document = build_data_plan(root, source_persona_id=persona_id,
+                                           v1_configuration=migration.v1_configuration).document()
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+            plans.append((persona_id, document))
+        return Outcome.success(build_scope(plans, group_targets, persona_roles,
+            role_id=role_id, platform_id=platform_id, account_id=account_id))
 
     async def data_plan(self):
         from .web_api import outcome_response
@@ -494,13 +906,18 @@ class LegacyMigrationWebAPI:
                        "import_journals", "confirm_persona_mapping", "import_worldbook",
                        "import_archive", "import_memory_database", "memory_owner_ids",
                        "memory_group_mappings", "confirm_memory_mapping", "import_reference_images",
-                       "import_wardrobe_items", "confirm_reference_persona_mapping"}
+                       "import_wardrobe_items", "confirm_reference_persona_mapping",
+                       "import_expressions", "confirm_expression_mapping", "import_private_contacts",
+                       "import_relationship_profiles"}
             if (type(arguments) is not dict or not {"plan_token", "import_reactions",
                     "import_group_network", "confirm_member_ids", "source_persona_id",
                     "import_journals", "confirm_persona_mapping", "import_worldbook"}.issubset(arguments)
                     or set(arguments) - allowed):
                 raise ValueError()
             if (type(arguments["plan_token"]) is not str or not arguments["plan_token"]
+                    or any(type(arguments.get(key, False)) is not bool for key in
+                           ("import_expressions", "confirm_expression_mapping", "import_private_contacts",
+                            "import_relationship_profiles"))
                     or type(arguments["import_reactions"]) is not bool
                     or type(arguments["import_group_network"]) is not bool
                     or type(arguments["confirm_member_ids"]) is not bool
@@ -550,7 +967,10 @@ class LegacyMigrationWebAPI:
                 arguments.get("confirm_memory_mapping", False), memory_group_mappings,
                 arguments.get("import_reference_images", False),
                 arguments.get("import_wardrobe_items", False),
-                arguments.get("confirm_reference_persona_mapping", False)),
+                arguments.get("confirm_reference_persona_mapping", False),
+                arguments.get("import_expressions", False), arguments.get("confirm_expression_mapping", False),
+                arguments.get("import_private_contacts", False),
+                arguments.get("import_relationship_profiles", False)),
             root_override=root_override,
         )
 
@@ -657,14 +1077,17 @@ class LegacyMigrationWebAPI:
                        existing_reaction_ids=(), existing_journal_heads=None,
                        existing_worldbook=None, archive_inventory_fingerprint="",
                          memory_database_fingerprint="", memory_owner_ids=(), memory_group_mappings=(),
-                         reference_state=None):
+                         reference_state=None, expression_state=None, contact_state=None,
+                         relationship_state=None, relationship_seed=None):
         scope = context.scope
         material = {
             "source": data_plan.source_fingerprint,
             "archive_inventory": archive_inventory_fingerprint,
             "memory_database": memory_database_fingerprint,
             "memory_owner_ids": sorted(memory_owner_ids),
-            "memory_group_mappings": list(memory_group_mappings),
+            # Selection order does not change a binding. Apply normalizes these
+            # mappings too; hash the same selection consistently in both stages.
+            "memory_group_mappings": sorted(memory_group_mappings, key=lambda item: item["owner_id"]),
             "source_group_id": source_group_id,
             "source_persona_id": source_persona_id,
             "target_owner": service.reaction_owner(context),
@@ -680,6 +1103,10 @@ class LegacyMigrationWebAPI:
                 for (kind, local_date), head in (existing_journal_heads or {}).items()),
             "existing_worldbook": existing_worldbook or {},
             "reference_state": reference_state or {},
+            "expression_state": expression_state or {},
+            "private_contacts": contact_state or {},
+            "relationship_profiles": relationship_state or {},
+            "relationship_seed": relationship_seed or {},
         }
         encoded = json.dumps(material, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -693,7 +1120,9 @@ class LegacyMigrationWebAPI:
             return planned
         data_plan = build_data_plan(root, source_persona_id=source_persona_id,
                                     v1_configuration=migration.v1_configuration)
-        archive_plan = build_v1_archive_plan(root)
+        runtime_root = getattr(self.controller, "data_root", None)
+        archive_plan = build_v1_archive_plan(
+            root, exclude_roots=(runtime_root,) if runtime_root is not None else ())
         memory_plan = self._memory_source_plan(root)
         context, service = self._data_context(session)
         owner = service.ensure_reaction_catalog(context)
@@ -714,7 +1143,27 @@ class LegacyMigrationWebAPI:
                                       reference_slots_available=reference_slots_available,
                                       reference_bytes_available=reference_bytes_available,
                                       wardrobe_slots_available=wardrobe_slots_available)
+        from companion_v2.memory.person.legacy_import import contact_plan
+        contact_state = contact_plan(self.controller.runtime, context, data_plan.private_contacts)
+        from companion_v2.identity_policy.legacy_import import authorization_plan
+        contact_state["authorization"] = authorization_plan(
+            self.controller.runtime, context, data_plan.private_contacts, self.controller.now())
+        document["private_contacts"] = {**contact_state, "rejected": list(data_plan.private_contact_rejected)}
+        from companion_v2.relationships.legacy_import import (
+            relationship_profile_entries, relationship_profile_plan, relationship_profile_token,
+            relationship_seed_state)
+        relationship_seed = self._relationship_config_seed(self._relationship_seed_configuration(migration))
+        relationship_entries = relationship_profile_entries(
+            self.controller.runtime, context, data_plan.relationship_profiles,
+            seed=relationship_seed)
+        relationship_state = relationship_profile_plan(relationship_entries)
+        relationship_token = relationship_profile_token(relationship_entries)
+        relationship_seed_token = relationship_seed_state(relationship_seed)
+        document["relationship_profiles"] = {**relationship_state,
+            "rejected": list(data_plan.relationship_profile_rejected)}
         document["archive"] = archive_plan.document()
+        expression_state = self._expression_state(data_plan, context, source_group_id)
+        document["expressions"] = expression_state
         document["memory_database"] = memory_plan.document()
         memory_projection = self._memory_projection(session, memory_plan, context, memory_owner_ids,
                                                     memory_group_mappings)
@@ -762,7 +1211,10 @@ class LegacyMigrationWebAPI:
                                                 source_persona_id, existing_ids, existing_heads,
                                                 worldbook_state, archive_plan.inventory_fingerprint,
                                                 memory_plan.fingerprint, memory_owner_ids,
-                                                memory_group_mappings, reference_state),
+                                                memory_group_mappings, reference_state, expression_state,
+                                                contact_state,
+                                                relationship_state=relationship_token,
+                                                relationship_seed=relationship_seed_token),
         })
         document["worldbook"]["available_count"] = (
             document["worldbook"]["general_count"]
@@ -790,6 +1242,15 @@ class LegacyMigrationWebAPI:
     @staticmethod
     def _memory_database_path(v1_root):
         return plugin_data_path(v1_root, MEMORY_PLUGIN_DATA_NAME + "/memory_companion.db")
+
+    def _expression_state(self, data_plan, context, source_group_id):
+        from companion_v2.legacy.expression_data import selected_profile
+        from companion_v2.expression.legacy_import import preview
+        profiles = getattr(data_plan, "expression_profiles", ())
+        profile = selected_profile(profiles, context, source_group_id)
+        return {**preview(self.controller.runtime, profile, context), "sources": [
+            {"source_kind": item["source_kind"], "source_id": item["source_id"],
+             "rule_count": len(item["rules"]), "sample_count": len(item["samples"])} for item in profiles]}
 
     def _memory_source_plan(self, root):
         """Reuse the checked source inventory while its file snapshot is unchanged."""
@@ -1086,13 +1547,17 @@ class LegacyMigrationWebAPI:
                           import_worldbook, import_archive=False, import_memory_database=False,
                           memory_owner_ids=(), confirm_memory_mapping=False, memory_group_mappings=(),
                           import_reference_images=False, import_wardrobe_items=False,
-                          confirm_reference_persona_mapping=False):
+                          confirm_reference_persona_mapping=False,
+                          import_expressions=False, confirm_expression_mapping=False, import_private_contacts=False,
+                          import_relationship_profiles=False):
         return await asyncio.to_thread(
             self._data_apply_sync, migration, root, session, plan_token, source_group_id,
             source_persona_id, import_reactions, import_group_network, confirm_member_ids,
             import_journals, confirm_persona_mapping, import_worldbook, import_archive,
             import_memory_database, memory_owner_ids, confirm_memory_mapping, memory_group_mappings,
-            import_reference_images, import_wardrobe_items, confirm_reference_persona_mapping)
+            import_reference_images, import_wardrobe_items, confirm_reference_persona_mapping,
+            import_expressions, confirm_expression_mapping, import_private_contacts,
+            import_relationship_profiles)
 
     def _data_apply_sync(self, migration, root, session, plan_token, source_group_id,
                          source_persona_id, import_reactions, import_group_network,
@@ -1100,13 +1565,17 @@ class LegacyMigrationWebAPI:
                          import_worldbook, import_archive=False, import_memory_database=False,
                          memory_owner_ids=(), confirm_memory_mapping=False, memory_group_mappings=(),
                          import_reference_images=False, import_wardrobe_items=False,
-                         confirm_reference_persona_mapping=False):
+                         confirm_reference_persona_mapping=False,
+                         import_expressions=False, confirm_expression_mapping=False, import_private_contacts=False,
+                         import_relationship_profiles=False):
         found = migration.discover()
         if not found.is_success:
             return found
         data_plan = build_data_plan(root, source_persona_id=source_persona_id,
                                     v1_configuration=migration.v1_configuration)
-        archive_plan = build_v1_archive_plan(root)
+        runtime_root = getattr(self.controller, "data_root", None)
+        archive_plan = build_v1_archive_plan(
+            root, exclude_roots=(runtime_root,) if runtime_root is not None else ())
         memory_plan = self._memory_source_plan(root)
         if (not isinstance(memory_owner_ids, (tuple, list)) or len(memory_owner_ids) > MAX_OWNER_BINDINGS
                 or any(type(value) is not str or len(value) != 64
@@ -1126,13 +1595,39 @@ class LegacyMigrationWebAPI:
         existing_heads = self._journal_heads(data_plan, session, context)
         worldbook_state = self._worldbook_state(data_plan, context, source_group_id)
         reference_state = self._reference_import_state(session, context)
+        expression_state = self._expression_state(data_plan, context, source_group_id)
+        from companion_v2.memory.person.legacy_import import contact_plan, import_contacts
+        contact_state = contact_plan(self.controller.runtime, context, data_plan.private_contacts)
+        from companion_v2.identity_policy.legacy_import import authorization_plan, import_authorizations
+        contact_state["authorization"] = authorization_plan(
+            self.controller.runtime, context, data_plan.private_contacts, self.controller.now())
+        from companion_v2.relationships.legacy_import import (
+            import_relationship_profiles as import_legacy_relationship_profiles,
+            relationship_profile_entries, relationship_profile_token, relationship_seed_state)
+        relationship_seed = self._relationship_config_seed(self._relationship_seed_configuration(migration))
+        relationship_entries = relationship_profile_entries(
+            self.controller.runtime, context, data_plan.relationship_profiles,
+            seed=relationship_seed)
+        relationship_token = relationship_profile_token(relationship_entries)
+        relationship_seed_token = relationship_seed_state(relationship_seed)
         if plan_token != self._data_plan_token(data_plan, context, service, source_group_id,
                                                source_persona_id, existing_ids, existing_heads,
                                                worldbook_state, archive_plan.inventory_fingerprint,
                                                memory_plan.fingerprint, memory_owner_ids,
-                                               memory_group_mappings, reference_state):
+                                               memory_group_mappings, reference_state, expression_state,
+                                               contact_state,
+                                               relationship_state=relationship_token,
+                                               relationship_seed=relationship_seed_token):
             return Outcome.failed("legacy_plan_stale", "V1 来源或 V2 目标在预览后发生变化，请重新试算。")
         from companion_v2.foundation.refs import ScopeKind
+        if import_private_contacts and context.scope.kind is not ScopeKind.PRIVATE:
+            return Outcome.failed("legacy_contacts_private_target_required", "请选择这些用户所属的私聊角色。")
+        if import_relationship_profiles and context.scope.kind is not ScopeKind.PRIVATE:
+            return Outcome.failed("legacy_relationship_private_target_required",
+                "人工关系资料只能写入这些用户所属的私聊角色。")
+        if import_expressions and (not expression_state["available"] or not confirm_expression_mapping):
+            return Outcome.failed("legacy_expression_mapping_required",
+                "请确认旧版表达来源与当前角色及同一私聊对象或群的对应关系。")
         if (memory_owner_ids or memory_group_mappings) and (not import_memory_database or not confirm_memory_mapping):
             return Outcome.failed("legacy_memory_mapping_confirmation_required",
                 "请先选择独立记忆库迁移，并确认所选旧身份映射。")
@@ -1151,7 +1646,8 @@ class LegacyMigrationWebAPI:
                     "请确认所选 V1 人格的参考图与衣柜归属于当前 V2 私聊角色。")
         if (not import_reactions and not import_group_network and not import_journals
                 and not import_worldbook and not import_archive and not import_memory_database
-                and not import_reference_images and not import_wardrobe_items):
+                and not import_reference_images and not import_wardrobe_items and not import_expressions
+                and not import_private_contacts and not import_relationship_profiles):
             return Outcome.failed("legacy_nothing_to_import", "请选择至少一种要导入的数据。")
 
         archive_result = None
@@ -1159,7 +1655,7 @@ class LegacyMigrationWebAPI:
         memory_materials_result = None
         if import_memory_database:
             try:
-                archive_root = Path(self.controller.data_root).resolve() / "legacy-v1-archives"
+                archive_root = migration_archive_root(self.controller, root)
                 memory_archive_result = copy_memory_database_archive(memory_plan, archive_root)
             except Exception as error:  # noqa: BLE001 - keep source paths and memory content private
                 code = str(error) if str(error).startswith("memory_archive_") else "memory_archive_failed"
@@ -1190,10 +1686,16 @@ class LegacyMigrationWebAPI:
                 }
         if import_archive:
             try:
-                archive_root = Path(self.controller.data_root).resolve() / "legacy-v1-archives"
+                archive_root = migration_archive_root(self.controller, root)
                 archive_result = copy_v1_archive(archive_plan, archive_root, allow_incomplete=True)
             except Exception as error:  # noqa: BLE001 - do not expose source paths or content
+                # 保留原始异常，否则长路径/权限/磁盘错误都会被折叠成同一句，
+                # 用户和日志都无从定位。
+                logger.warning("[CompanionV2] 旧版资料归档失败 error_type=%s detail=%s",
+                               type(error).__name__, logger_safe_detail(str(error)))
                 code = str(error) if str(error).startswith("archive_") else "legacy_archive_failed"
+                if code == "legacy_archive_failed" and getattr(error, "winerror", None) in (206, 3):
+                    code = "archive_path_too_long"
                 return Outcome.failed(code,
                     "V1 只读资料归档未完成；V2 领域数据尚未写入，请重新试算后重试。")
 
@@ -1331,6 +1833,26 @@ class LegacyMigrationWebAPI:
             if worldbook_result.get("errors"):
                 errors.extend(worldbook_result["errors"])
 
+        expression_result = None
+        if import_expressions:
+            from companion_v2.legacy.expression_data import selected_profile
+            from companion_v2.expression.legacy_import import import_profile
+            expression_result = import_profile(self.controller.runtime,
+                selected_profile(data_plan.expression_profiles, context, source_group_id), context,
+                self.controller.now(), expected_token=expression_state["token"])
+
+        contact_result = import_contacts(self.controller.runtime, context, data_plan.private_contacts,
+            self.controller.now()) if import_private_contacts else None
+        if contact_result is not None:
+            authorization = import_authorizations(self.controller.runtime, context,
+                data_plan.private_contacts, self.controller.now())
+            contact_result["authorization"] = authorization
+            contact_result["permissions_restored"] = bool(authorization["permissions_restored"])
+
+        relationship_result = import_legacy_relationship_profiles(
+            self.controller.runtime, context, relationship_entries, self.controller.now()
+        ) if import_relationship_profiles else None
+
         refreshed_ids = self._reaction_ids(service, owner)
         remaining = sum(1 for item in data_plan.reaction_assets if item.sha256 not in refreshed_ids)
         refreshed_heads = self._journal_heads(data_plan, session, context)
@@ -1356,6 +1878,9 @@ class LegacyMigrationWebAPI:
             "journal_derivatives_remaining": journal_derivatives_remaining,
             "journal_errors": journal_errors,
             "reference_images": reference_result,
+            "expressions": expression_result,
+            "private_contacts": contact_result,
+            "relationship_profiles": relationship_result,
             "group_network": group_result,
             "worldbook": worldbook_result,
             "archive": archive_result,
@@ -1570,11 +2095,16 @@ class LegacyMigrationWebAPI:
                           if offload_sync else work(migration, root, session))
                 if inspect.isawaitable(result):
                     result = await result
-                return outcome_response(result)
+                if not isinstance(result, _PendingBindingApply):
+                    return outcome_response(result)
             except TaskError as error:
                 return outcome_response(Outcome.failed(error.code, str(error)))
             except (TypeError, ValueError, KeyError):
+                logger.warning("[CompanionV2] 旧版迁移请求参数处理失败", exc_info=True)
                 return outcome_response(Outcome.failed("legacy_request_invalid", "invalid legacy arguments"))
+        # Binding application owns the lifecycle/control locks and may replace
+        # the runtime. All writes through the old session have finished above.
+        return outcome_response(await self._finish_binding_apply(result))
 
     # ── 实现 ───────────────────────────────────────────────────────────
     def _discovery(self, migration, root, session, configuration_scope="all"):
@@ -1853,6 +2383,8 @@ class LegacyMigrationWebAPI:
         if not planned.is_success:
             return planned
         plan = self._configuration_scoped_plan(planned.unwrap(), configuration_scope)
+        from .legacy_contact_configuration import append_private_contact_plan
+        plan = append_private_contact_plan(self.controller, session, migration, plan, configuration_scope)
         intents, differences, scope_status, edit_tokens = self._prepare_intents(session, plan)
         document = plan.document()
         document["intents"] = self._intent_documents(intents)
@@ -1865,9 +2397,14 @@ class LegacyMigrationWebAPI:
         document["plan_token"] = self._plan_fingerprint(
             root, session, edit_tokens, migration, configuration_scope)
         document["scope_status"] = scope_status
+        from .legacy_configuration_review import configuration_rows
+        document["configuration_review"] = {
+            "version": 1, "rows": configuration_rows(self, session, intents, differences),
+        }
         return Outcome.success(document)
 
-    async def _apply(self, migration, root, session, plan_token, configuration_scope="all"):
+    async def _apply(self, migration, root, session, plan_token, configuration_scope="all", *,
+                     defer_bindings=False, selected_fields=None):
         """按当前 V1 目录重算一遍，再用宿主的配置服务写入。
 
         重算而不是相信客户端传来的改动：那是「先看后做」这个保证的全部意义所在。
@@ -1876,6 +2413,8 @@ class LegacyMigrationWebAPI:
         if not planned.is_success:
             return planned
         plan = self._configuration_scoped_plan(planned.unwrap(), configuration_scope)
+        from .legacy_contact_configuration import append_private_contact_plan
+        plan = append_private_contact_plan(self.controller, session, migration, plan, configuration_scope)
         blocked_sources = self._configuration_source_blockers(
             [item.document() for item in plan.findings], configuration_scope,
         )
@@ -1893,23 +2432,31 @@ class LegacyMigrationWebAPI:
                 "legacy_plan_stale",
                 "V1 来源、账号范围或 V2 配置在试算后发生了变化，请重新试算。",
             )
-        if not intents:
+        if not intents and selected_fields is None:
             return Outcome.failed(
                 "legacy_nothing_to_migrate",
                 "试算没有产出可写入的新设置；已存在的 V2 设置会被保留。",
             )
 
+        kept_count = 0
+        if selected_fields is not None:
+            from .legacy_configuration_review import selected_intents
+            before_count = sum(len(intent.changes) for intent in intents)
+            try:
+                intents, edit_tokens = selected_intents(self, session, intents, edit_tokens, selected_fields)
+            except TaskError as error:
+                return Outcome.failed(error.code, str(error))
+            kept_count = before_count - sum(len(intent.changes) for intent in intents)
+
         baseline_snapshots = {}
         service = session.application.configuration
         operator = self._operator()
-        # 同一组被拆成多条意图时（role.state 的偏好/环境拆层），组内 edit token
-        # 会在前一条写完后推进；这类组允许用最新快照继续，其余组保持严格比对。
-        split_groups = {intent.group_id for intent in intents} & {
-            group for group in (intent.group_id for intent in intents)
-            if sum(1 for other in intents if other.group_id == group) > 1}
+        # 此时还没有写入；拆层后的每个目标都必须匹配预览快照。
+        # 执行期间由本批前序写入引起的继承变化在 _apply_intent 中逐字段核对。
         for intent in intents:
             if intent.target_kind in ("plugin_config", "semantic_config", "weather_host_settings",
-                                      "reality_config"):
+                                      "reality_config", "image_output_config",
+                                      "native_extension_config"):
                 continue
             target = self._scope_target(session, intent)
             if target is None:
@@ -1919,20 +2466,26 @@ class LegacyMigrationWebAPI:
             snapshot = service._snapshot(
                 operator, target, intent.group_id, self.controller.now(), "configuration.read",
             )
-            if snapshot.edit_token != self._intent_token(edit_tokens, intent):
-                if intent.group_id not in split_groups:
-                    return Outcome.failed(
-                        "legacy_plan_stale",
-                        f"V2 目标设置在执行前发生了变化（{intent.group_id}），请重新试算。")
-                edit_tokens[self._intent_key(intent)] = snapshot.edit_token
+            if snapshot.edit_token != edit_tokens.get(self._intent_key(intent)):
+                return Outcome.failed(
+                    "legacy_plan_stale",
+                    f"V2 目标设置在执行前发生了变化（{intent.group_id}），请重新试算。")
             baseline_snapshots[self._intent_key(intent)] = snapshot
 
         written: list[str] = []
-        errors: list[dict] = []
+        errors: list[dict] = self._optional_extension_source_errors(
+            [item.document() for item in plan.findings], configuration_scope)
         restart_required = False
-        for intent in intents:
+        pending = None
+        # A binding update closes and reopens the host runtime. Finish all
+        # configuration writes using this session before applying that update.
+        for intent in sorted(intents, key=lambda item: item.target_kind == "plugin_config"):
             try:
                 if intent.target_kind == "plugin_config":
+                    if (defer_bindings and ACCOUNT_CONFIGURATION_TARGETS.intersection(intent.changes)
+                            and callable(getattr(self.controller, "apply_bindings", None))):
+                        pending = intent
+                        continue
                     plugin_written, binding_result = await self._apply_plugin_intent(
                         intent, edit_tokens.get("plugin_config_state", ""))
                     written.extend(plugin_written)
@@ -1954,6 +2507,12 @@ class LegacyMigrationWebAPI:
                     written.extend(await self._apply_reality_config_intent(
                         intent, edit_tokens.get("reality_config_state", ""),
                         edit_tokens.get("reality_config_fields", ())))
+                elif intent.target_kind == "image_output_config":
+                    written.extend(self._apply_image_output_intent(
+                        intent, edit_tokens.get("image_output_config_state", "")))
+                elif intent.target_kind == "native_extension_config":
+                    written.extend(await self._apply_native_extension_config_intent(
+                        intent, edit_tokens.get("native_extension_states", {}).get(intent.group_id, "")))
                 else:
                     written.extend(self._apply_intent(
                         intent, session, baseline_snapshots[self._intent_key(intent)]))
@@ -1967,34 +2526,70 @@ class LegacyMigrationWebAPI:
                 "legacy_apply_failed",
                 "迁移没有写入任何设置：" + "；".join(item["reason"] for item in errors),
             )
-        completion_recorded = self._mark_imported(
-            len(written), root, configuration_scope,
-            restart_required=restart_required,
-        ) if not errors else False
-        return Outcome.success({
+        document = {
             "v1_root": str(root),
             "configuration_scope": configuration_scope,
             "written": written,
             "written_count": len(written),
             "change_count": sum(len(intent.changes) for intent in intents),
             "restart_required": restart_required,
-            "completion_recorded": completion_recorded,
-            "configuration_imported": self._already_imported(root),
             "differences": differences,
             "errors": errors,
+            "selection_applied": selected_fields is not None,
+            "kept_count": kept_count,
             "skipped": [
                 {"source_id": item.source_id, "state": item.state, "detail": item.detail}
                 for item in plan.findings
                 if item.state not in (MigrationState.READY.value, MigrationState.ABSENT.value)
             ],
-        })
+        }
+        if pending is not None:
+            return _PendingBindingApply(root, configuration_scope, document, pending,
+                                        edit_tokens.get("plugin_config_state", ""))
+        return self._complete_configuration_apply(root, configuration_scope, document)
+
+    def _complete_configuration_apply(self, root, configuration_scope, document):
+        document["written_count"] = len(document["written"])
+        document["completion_recorded"] = self._mark_imported(
+            document["written_count"], root, configuration_scope,
+            restart_required=document["restart_required"],
+        ) if not document["errors"] else False
+        document["configuration_imported"] = self._already_imported(root)
+        return Outcome.success(document)
+
+    async def _finish_binding_apply(self, pending):
+        document = pending.document
+        try:
+            written, result = await self._apply_plugin_intent(pending.intent, pending.expected_state_token)
+            document["written"].extend(written)
+            document["restart_required"] = True
+            if result and (result.get("startup_error") or result.get("requires_initialize")):
+                document["errors"].append({"scope": pending.intent.scope,
+                    "code": result.get("startup_error") or "host_initialize_required",
+                    "reason": "绑定配置已保存，但共享运行档没有启动；请读取宿主状态并处理启动原因。"})
+        except TaskError as error:
+            if not document["written"]:
+                return Outcome.failed(error.code, str(error))
+            document["errors"].append({"scope": pending.intent.scope, "code": error.code, "reason": str(error)})
+        except Exception as error:
+            if not document["written"]:
+                return Outcome.failed("legacy_apply_failed", str(error))
+            document["errors"].append({"scope": pending.intent.scope,
+                "code": "legacy_apply_failed", "reason": str(error)})
+        async with self.controller._control_lock:
+            outcome = self._complete_configuration_apply(pending.root, pending.configuration_scope, document)
+            if pending.auto_import:
+                document["state"] = "imported" if document["completion_recorded"] else "partial"
+                document["configuration_imported"] = bool(document["completion_recorded"])
+                document["data_import_required"] = True
+            return outcome
 
     @staticmethod
     def _configuration_source_blockers(findings, configuration_scope):
         """Require each in-scope source to be confirmed readable or genuinely absent."""
         source_ids = {
-            "all": ("private.host_configuration", "reality.configuration"),
-            PLUGIN_CONFIGURATION_SCOPE: ("private.host_configuration",),
+            "all": ("private.host_configuration", "reality.configuration", "image.configuration"),
+            PLUGIN_CONFIGURATION_SCOPE: ("private.host_configuration", "image.configuration"),
             PROACTIVE_CONFIGURATION_SCOPE: ("private.host_configuration",),
             REALITY_CONFIGURATION_SCOPE: ("reality.configuration",),
         }.get(configuration_scope)
@@ -2021,10 +2616,28 @@ class LegacyMigrationWebAPI:
         return blockers
 
     @staticmethod
+    def _optional_extension_source_errors(findings, configuration_scope):
+        if configuration_scope not in ("all", PLUGIN_CONFIGURATION_SCOPE):
+            return []
+        by_id = {item.get("source_id"): item for item in findings if isinstance(item, dict)}
+        errors = []
+        for name in WRITABLE_PLUGINS:
+            finding = by_id.get(name + ".configuration")
+            if finding is None or finding.get("state") in (MigrationState.READY.value,
+                                                               MigrationState.ABSENT.value):
+                continue
+            errors.append({"scope": {"content": "content.authoring", "memory": "memory"}.get(name, name + ".settings"),
+                           "code": "legacy_native_source_unavailable",
+                           "reason": f"旧 {name} 配置未能读取或目标 schema 不可用；其余配置已允许迁移。"})
+        return errors
+
+    @staticmethod
     def _configuration_source_unavailable(blockers):
         labels = {
             "private.host_configuration": "V1 陪伴插件配置",
             "reality.configuration": "V1 Reality 配置",
+            "image.configuration": "V1 Image 配置",
+            **{name + ".configuration": f"V1 {name} 配置" for name in WRITABLE_PLUGINS},
         }
         reasons = []
         for item in blockers:
@@ -2042,18 +2655,21 @@ class LegacyMigrationWebAPI:
         if configuration_scope == "all":
             return plan
         if configuration_scope == PLUGIN_CONFIGURATION_SCOPE:
+            plugin_sources = {"private.host_configuration", "image.configuration"} | {
+                name + ".configuration" for name in WRITABLE_PLUGINS
+            }
             intents = tuple(intent for intent in plan.intents
-                            if intent.source_id == "private.host_configuration")
+                            if intent.source_id in plugin_sources)
             differences = tuple(item for item in plan.differences
                                 if not str(item.get("field", item.get("field_id", ""))).startswith("reality."))
             findings = tuple(item for item in plan.findings
-                             if item.source_id == "private.host_configuration")
+                             if item.source_id in plugin_sources | {"content.configuration", "screen.configuration"})
             return replace(
                 plan,
                 findings=findings,
                 warnings=(
                     "本次迁移 V1 陪伴插件配置中可转换的绑定、模型与运行设置；V2 已有明确设置会保留。",
-                    "独立 Reality 配置不在本范围内，可在需要时单独迁移。",
+                    "独立生图、游戏、同玩、直播、创作、记忆拓展的可移植配置也在本范围内；现实拓展配置可单独迁移。",
                 ),
                 intents=intents,
                 differences=differences,
@@ -2121,6 +2737,14 @@ class LegacyMigrationWebAPI:
         )
 
     def _apply_intent(self, intent, session, baseline_snapshot):
+        from companion_v2.legacy.proactive_configuration import PRIVATE_KINDS
+        if intent.target_kind in PRIVATE_KINDS:
+            # Preference and its exact-route grant commit or roll back together.
+            with self.controller.runtime.transaction():
+                return self._write_configuration_intent(intent, session, baseline_snapshot)
+        return self._write_configuration_intent(intent, session, baseline_snapshot)
+
+    def _write_configuration_intent(self, intent, session, baseline_snapshot):
         """把一条 ConfigIntent 交给配置服务写。
 
         用 ``patch`` 而不是绕过它直接写表：patch 会带上操作者身份、写变更记录、
@@ -2135,7 +2759,17 @@ class LegacyMigrationWebAPI:
         snapshot = service._snapshot(operator, target, intent.group_id, self.controller.now(), "configuration.read")
         if snapshot.edit_token != baseline_snapshot.edit_token:
             changed_targets = tuple(f"{intent.group_id}.{field}" for field in intent.changes)
-            if any(snapshot.fields.get(field) != baseline_snapshot.fields.get(field) for field in changed_targets):
+            from companion_v2.legacy.proactive_configuration import PRIVATE_KINDS
+            def own_field_changed(field):
+                current, baseline = snapshot.fields.get(field), baseline_snapshot.fields.get(field)
+                if intent.target_kind in PRIVATE_KINDS and all(item is not None and
+                        (item.source is None or item.source.layer in (ConfigLayer.INSTALLATION, ConfigLayer.ROLE))
+                        for item in (current, baseline)):
+                    # This batch has already validated all original tokens. Its
+                    # preceding global writes must not invalidate a person override.
+                    return False
+                return current != baseline
+            if any(own_field_changed(field) for field in changed_targets):
                 raise TaskError("legacy_plan_stale", "V2 待迁移字段在迁移执行期间发生了变化，请重新试算。")
         changes = {f"{intent.group_id}.{field}": value for field, value in intent.changes.items()}
         # operation 的属主是**分组声明的 owner_id**，不是分组名——patch 会拿
@@ -2150,7 +2784,33 @@ class LegacyMigrationWebAPI:
         )
         if not receipt.is_success:
             raise TaskError(receipt.failure.code, receipt.failure.reason)
-        return list(receipt.unwrap().changed_fields)
+        saved = receipt.unwrap()
+        # Use the same exact-route grant synchronization as the normal editors.
+        # The role preference stays role-owned; only the reviewed execution
+        # context receives its existing routine's permission. Replays must not
+        # undo a subsequent explicit revoke.
+        if not saved.replayed and "enabled" in intent.changes:
+            context = session.profile.target
+            from companion_v2.legacy.proactive_configuration import PRIVATE_KINDS
+            if intent.group_id == "proactive.contact" and intent.target_kind in PRIVATE_KINDS:
+                from companion_v2.proactive.management import ContactManagement
+                ContactManagement(session.application, context).sync_configuration_grant(
+                    operator, intent.changes["enabled"],
+                    {"replayed": False, "operation_id": saved.operation_id})
+            elif intent.group_id == "role.state" and target.layer is ConfigLayer.ROLE:
+                from companion_v2.role_work.state.configuration import DEFAULTS, sync_window_grants, target_for
+                window = target_for(context)
+                effective = require(service.read(operator, target=window,
+                    group_id=intent.group_id, observed_at=self.controller.now()))
+                settings = {name: effective.values["role.state." + name] for name in DEFAULTS}
+                sync_window_grants(self.controller.runtime, window, context.actor.subject,
+                    settings, frozenset({"enabled"}), self.controller.now())
+            elif intent.group_id == "role.life":
+                from companion_v2.role_work.life.management import RoleLifeManagement
+                RoleLifeManagement(session.application, context).sync_configuration_grant(
+                    operator, intent.changes["enabled"],
+                    {"replayed": False, "operation_id": saved.operation_id})
+        return list(saved.changed_fields)
 
     def _operator(self):
         from astrbot.api.web import request
@@ -2180,12 +2840,31 @@ class LegacyMigrationWebAPI:
             role = target_context.role_binding.role
             subject = target_context.actor.subject
             installation_id = scope.installation_id
+            from companion_v2.legacy.proactive_configuration import PRIVATE_RELATIONSHIP, PRIVATE_WINDOW
+            if intent.target_kind in (PRIVATE_RELATIONSHIP, PRIVATE_WINDOW):
+                if intent.group_id != "proactive.contact" or scope.kind.value != "private":
+                    return None
+                from companion_v2.proactive.configuration import target_for
+                from companion_v2.proactive.rhythm_configuration import relationship_target_for
+                return (relationship_target_for(target_context) if intent.target_kind == PRIVATE_RELATIONSHIP
+                        else target_for(target_context))
             layers = definitions[0].layers
+            if intent.group_id == "conversation.image_output" and ConfigLayer.ROLE in layers:
+                # Image prompt preferences describe the role.  Keep them at the role
+                # layer so a different private/group window does not silently fork
+                # the character's image style.
+                layer = ConfigLayer.ROLE
+            else:
+                layer = None
             from companion_v2.configuration.role_settings import RoleSharedSettingsOwner
             owner = getattr(service, "_owners", {}).get(definitions[0].owner_id)
-            if isinstance(owner, RoleSharedSettingsOwner) and ConfigLayer.WINDOW in layers:
-                layer = ConfigLayer.WINDOW
-            elif intent.group_id == "role.state" and ConfigLayer.WINDOW in layers:
+            if layer is None and isinstance(owner, RoleSharedSettingsOwner) and ConfigLayer.WINDOW in layers:
+                changed = set(getattr(intent, "changes", {}) or {})
+                shared = {field.field_id.rsplit(".", 1)[-1]
+                          for field in owner.role_fields(definitions)}
+                layer = (ConfigLayer.ROLE if changed and changed <= shared
+                         and ConfigLayer.ROLE in layers else ConfigLayer.WINDOW)
+            elif layer is None and intent.group_id == "role.state" and ConfigLayer.WINDOW in layers:
                 # role.state 的字段同时声明 ROLE/WINDOW，但只有「角色偏好」类字段
                 # 允许写角色层；环境项（展示、规划、天气、情绪…）只能写窗口层。
                 # 所以按这次要改的字段逐个判断，而不是整组挑一层。
@@ -2194,7 +2873,7 @@ class LegacyMigrationWebAPI:
                 role_only = (ConfigLayer.ROLE in layers and bool(names)
                              and all(role_preference(name) for name in names))
                 layer = ConfigLayer.ROLE if role_only else ConfigLayer.WINDOW
-            else:
+            elif layer is None:
                 layer = next((candidate for candidate in (
                     ConfigLayer.INSTALLATION, ConfigLayer.ROLE, ConfigLayer.RELATIONSHIP,
                     ConfigLayer.WINDOW, ConfigLayer.SCOPE,
@@ -2206,7 +2885,9 @@ class LegacyMigrationWebAPI:
             if layer is ConfigLayer.RELATIONSHIP:
                 return ConfigTarget(installation_id, layer, role, bot_id=scope.bot_id, subject=subject)
             if layer is ConfigLayer.WINDOW:
-                return ConfigTarget(installation_id, layer, role, scope, bot_id=scope.bot_id, subject=subject)
+                # Match each domain's target_for(context). A relationship subject
+                # creates a different storage key and is only valid for that layer.
+                return ConfigTarget(installation_id, layer, role, scope, bot_id=scope.bot_id)
             if layer is ConfigLayer.SCOPE:
                 return ConfigTarget(installation_id, layer, scope=scope)
         except (AttributeError, KeyError, TypeError, ValueError):
@@ -2221,7 +2902,24 @@ class LegacyMigrationWebAPI:
         differences = list(plan.differences)
         scope_status = []
         edit_tokens = {}
-        for intent in plan.intents:
+        from companion_v2.legacy.proactive_configuration import PRIVATE_KINDS
+        edit_tokens["private_contact_preferences"] = digest([
+            [intent.target_kind, intent.changes, intent.sources] for intent in plan.intents
+            if intent.target_kind in PRIVATE_KINDS])
+        for intent in self._configuration_layer_intents(session, plan.intents):
+            if intent.target_kind == "native_extension_config":
+                native_intent = self._prepare_native_extension_config_intent(
+                    intent, differences, scope_status, edit_tokens)
+                if native_intent is not None:
+                    intents.append(native_intent)
+                continue
+            if intent.target_kind == "image_output_config":
+                image_intent = self._prepare_image_output_intent(
+                    intent, differences, scope_status, edit_tokens,
+                )
+                if image_intent is not None:
+                    intents.append(image_intent)
+                continue
             if intent.target_kind == "reality_config":
                 reality_intent = self._prepare_reality_config_intent(
                     intent, differences, scope_status, edit_tokens,
@@ -2285,7 +2983,12 @@ class LegacyMigrationWebAPI:
             sources = {}
             for field_id, value in intent.changes.items():
                 current = snapshot.fields.get(f"{intent.group_id}.{field_id}")
-                if current is not None and current.source is not None:
+                from companion_v2.legacy.proactive_configuration import PRIVATE_KINDS
+                private_override = intent.target_kind in PRIVATE_KINDS
+                existing_override = (current is not None and current.source is not None
+                    and (not private_override or current.source.layer in
+                         (ConfigLayer.RELATIONSHIP, ConfigLayer.WINDOW)))
+                if existing_override:
                     if current.value == value:
                         kind = "already_present"
                         explanation = "V2 已有相同的显式配置，保留现值。"
@@ -2293,7 +2996,10 @@ class LegacyMigrationWebAPI:
                         kind = "preserved_v2"
                         explanation = "V2 已有不同的显式或继承配置，为避免覆盖，保留 V2 现值。"
                     differences.append({"field": f"{intent.group_id}.{field_id}", "kind": kind,
-                                        "before": str(value), "after": str(current.value),
+                                        "before": self._migration_display_value(field_id, value,
+                                            target_kind=intent.target_kind),
+                                        "after": self._migration_display_value(field_id, current.value,
+                                            target_kind=intent.target_kind),
                                         "explain": explanation})
                     continue
                 changes[field_id] = value
@@ -2328,43 +3034,183 @@ class LegacyMigrationWebAPI:
                     confidence = {field: value for field, value in confidence.items() if field in changes}
                     sources = {field: value for field, value in sources.items() if field in changes}
             if changes:
-                split = self._split_role_state_intent(intent, changes, confidence, sources)
-                if split is not None:
-                    intents.extend(split)
-                    continue
-                intents.append(replace(intent, changes=changes, confidence=confidence, sources=sources))
+                prepared = replace(intent, changes=changes, confidence=confidence, sources=sources)
+                # 保留已有值和跳过无效组合都会缩小字段集合。执行使用的是最终
+                # 意图的键，不能从同组其他层或原字段集合的令牌中猜测。
+                edit_tokens[self._intent_key(prepared)] = snapshot.edit_token
+                intents.append(prepared)
         return intents, differences, scope_status, edit_tokens
 
-    @staticmethod
-    def _split_role_state_intent(intent, changes, confidence, sources):
-        """把 role.state 的改动按「角色偏好 / 环境项」拆成两条意图。
+    def _image_extension_api(self):
+        registry = getattr(self.controller, "native_extensions", None)
+        getter = getattr(registry, "image_extension_api", None)
+        return getter() if callable(getter) else None
 
-        这一组的字段同时声明 ROLE 与 WINDOW，但角色层的写入只接受角色共享偏好
-        （`role_settings.py` 的 “field is not a role-shared preference”）；
-        混在一条意图里发出去，整组都会被拒（真实 V1 数据上表现为
-        `role.state: configuration_scope_not_supported`）。拆成两条后，
-        每条内部的字段都在同一个层级里，校验不会再被跨层字段触发。
+    def _prepare_image_output_intent(self, intent, differences, scope_status, edit_tokens):
+        api = self._image_extension_api()
+        reader = getattr(api, "output_configuration", None)
+        if not callable(reader):
+            scope_status.append({"scope": intent.scope, "group_id": intent.group_id,
+                                 "available": False, "reason": "image_service_unavailable"})
+            differences.append({"field": "image.output", "kind": "unavailable",
+                                "explain": "V2 原生图片服务当前不可写；启动 V2 图片能力后可重新试算。"})
+            return None
+        try:
+            current = reader()
+            settings = current.get("settings") if isinstance(current, dict) else None
+            revision = current.get("revision") if isinstance(current, dict) else None
+            if not isinstance(settings, dict) or not isinstance(revision, str) or not revision:
+                raise ValueError("image_configuration_unavailable")
+        except Exception as error:  # noqa: BLE001 - report an unavailable target in the preview
+            scope_status.append({"scope": intent.scope, "group_id": intent.group_id,
+                                 "available": False, "reason": "image_service_unavailable"})
+            differences.append({"field": "image.output", "kind": "unavailable",
+                                "explain": f"无法读取 V2 图片模型配置：{type(error).__name__}。"})
+            return None
+
+        edit_tokens["image_output_config_state"] = revision
+        scope_status.append({"scope": intent.scope, "group_id": intent.group_id,
+                             "available": True, "reason": ""})
+        # 保留哪些组由迁移层判定：整份保留与「只保留已由 V2 单独设置的下载代理」
+        # 都必须让未迁移的端点和后端照常写入，不能整份放弃。
+        changes, retained = plan_image_output_changes(settings, intent.changes)
+        differences.extend(retained)
+        if not changes:
+            return None
+        prepared = replace(intent, changes=changes,
+                           confidence={field: value for field, value in intent.confidence.items()
+                                       if field in changes},
+                           sources={field: value for field, value in intent.sources.items()
+                                    if field in changes})
+        edit_tokens[self._intent_key(prepared)] = revision
+        return prepared
+
+    def _apply_image_output_intent(self, intent, expected_revision):
+        api = self._image_extension_api()
+        reader = getattr(api, "output_configuration", None)
+        writer = getattr(api, "save_output_configuration", None)
+        if not callable(reader) or not callable(writer):
+            raise TaskError("legacy_image_service_unavailable", "V2 原生图片服务当前不可写")
+        current = reader()
+        if not isinstance(current, dict) or current.get("revision") != expected_revision:
+            raise TaskError("legacy_plan_stale", "V2 图片模型配置在试算后发生变化，请重新试算。")
+        try:
+            saved = writer(expected_revision, dict(intent.changes))
+        except Exception as error:  # noqa: BLE001 - the native image API exposes stable error codes
+            code = getattr(error, "code", "legacy_image_output_invalid")
+            raise TaskError(code, "V2 图片模型配置未通过校验；请在模型页检查端点地址、尺寸与协议。") from error
+        if not isinstance(saved, dict) or not isinstance(saved.get("settings"), dict):
+            raise TaskError("legacy_image_output_unconfirmed", "V2 图片模型配置保存结果未确认。")
+        return ["image.output." + field for field in sorted(intent.changes)]
+
+    @staticmethod
+    def _configuration_layer_intents(session, intents):
+        """Split role defaults and window-only fields before tokens and validation.
+
+        Domain owners define which fields can be shared. Device permissions and
+        typing presentation remain in their original window; QQ account status is role-shared.
         """
-        if intent.group_id != "role.state":
-            return None
-        from companion_v2.role_work.state.configuration import role_preference
-        preference = {name: value for name, value in changes.items() if role_preference(name)}
-        environment = {name: value for name, value in changes.items() if not role_preference(name)}
-        if not preference or not environment:
-            return None
-        rows = []
-        for subset in (preference, environment):
-            rows.append(replace(
-                intent, changes=subset,
-                confidence={name: value for name, value in confidence.items() if name in subset},
-                sources={name: value for name, value in sources.items() if name in subset},
-            ))
-        return rows
+        service = session.application.configuration
+        for intent in intents:
+            if intent.target_kind != "configuration_registry":
+                yield intent
+                continue
+            definitions = service.registry.group(intent.group_id)
+            owner = getattr(service, "_owners", {}).get(definitions[0].owner_id)
+            role_fields = getattr(owner, "role_fields", None)
+            if not callable(role_fields):
+                yield intent
+                continue
+            shared = {field.field_id.rsplit(".", 1)[-1] for field in role_fields(definitions)}
+            role_changes = {key: value for key, value in intent.changes.items() if key in shared}
+            window_changes = {key: value for key, value in intent.changes.items() if key not in shared}
+            for subset in (role_changes, window_changes):
+                if subset:
+                    yield replace(intent, changes=subset,
+                        confidence={key: value for key, value in intent.confidence.items() if key in subset},
+                        sources={key: value for key, value in intent.sources.items() if key in subset})
 
     def _reality_runtime(self):
         registry = getattr(self.controller, "native_extensions", None)
         getter = getattr(registry, "service", None)
         return getter("reality") if callable(getter) else None
+
+    def _prepare_native_extension_config_intent(self, intent, differences, scope_status, edit_tokens):
+        registry = getattr(self.controller, "native_extensions", None)
+        service = registry.service(intent.group_id) if callable(getattr(registry, "service", None)) else None
+        config = getattr(service, "config", None)
+        if not isinstance(config, dict) or not callable(getattr(config, "revision", None)):
+            scope_status.append({"scope": intent.scope, "group_id": intent.group_id,
+                                 "available": False, "reason": "native_service_unavailable"})
+            return None
+        baseline = self._native_extension_baselines().get(intent.group_id, {}).get("defaults", {})
+        changes = {}
+        for field, value in intent.changes.items():
+            if f"{intent.group_id}.{field}" in HOST_VERIFIED_FIELDS and not self._legacy_provider_available(field, value):
+                differences.append({"field": f"{intent.group_id}.{field}",
+                                    "kind": "provider_reselection_required",
+                                    "explain": "旧模型提供方在当前宿主没有可用实例，请在新版共处电话设置中重新选择。"})
+                continue
+            default = native_setting_value(baseline, field)
+            current = native_setting_value(config, field, default)
+            if current == value:
+                kind, explain = "already_present", "新版拓展已有相同设置。"
+            elif current != default:
+                kind, explain = "preserved_v2", "新版拓展已有非默认设置，保留现值。"
+            else:
+                changes[field] = value
+                continue
+            differences.append({"field": f"{intent.group_id}.{field}",
+                                "kind": kind, "explain": explain})
+        scope_status.append({"scope": intent.scope, "group_id": intent.group_id,
+                             "available": True, "reason": ""})
+        if changes:
+            edit_tokens.setdefault("native_extension_states", {})[intent.group_id] = (
+                native_settings_state_token(config, changes))
+        return replace(intent, changes=changes,
+                       confidence={key: value for key, value in intent.confidence.items() if key in changes},
+                       sources={key: value for key, value in intent.sources.items() if key in changes}) if changes else None
+
+    def _legacy_provider_available(self, field, provider_id):
+        context = getattr(self.controller, "context", None)
+        if not context or not isinstance(provider_id, str) or not provider_id.strip():
+            return False
+        try:
+            if field == "speech.tts_provider_id":
+                from .model_api import _find_tts_provider
+                return _find_tts_provider(context, provider_id) is not None
+            getter = getattr(context, "get_provider_by_id", None)
+            provider = getter(provider_id) if callable(getter) else None
+            if field == "speech.stt_provider_id":
+                return callable(getattr(provider, "get_text", None))
+            if field in ("conversation.vision_provider_id", "vision_provider_id"):
+                from .native_extensions.together.model_methods import TogetherModelMethods
+                return (callable(getattr(provider, "text_chat", None))
+                        and TogetherModelMethods._provider_image_capability(provider) is not False)
+            return callable(getattr(provider, "text_chat", None))
+        except Exception:  # noqa: BLE001 - 可选宿主提供方查询失败时不导入失效 ID
+            return False
+
+    async def _apply_native_extension_config_intent(self, intent, expected_revision):
+        registry = getattr(self.controller, "native_extensions", None)
+        service = registry.service(intent.group_id) if callable(getattr(registry, "service", None)) else None
+        config = getattr(service, "config", None)
+        configure = getattr(registry, "configure_service", None)
+        if not isinstance(config, dict) or not callable(configure):
+            raise TaskError("legacy_native_service_unavailable", "新版拓展配置当前不可写")
+        if native_settings_state_token(config, intent.changes) != expected_revision:
+            raise TaskError("legacy_plan_stale", "新版拓展配置在试算后发生变化，请重新试算。")
+        updates = {}
+        for path, value in intent.changes.items():
+            section = updates
+            parts = path.split(".")
+            for part in parts[:-1]:
+                section = section.setdefault(part, {})
+            section[parts[-1]] = value
+        result = await configure(intent.group_id, updates, config.revision())
+        if not isinstance(result, dict) or result.get("saved") is not True:
+            raise TaskError("legacy_native_apply_failed", "新版拓展配置未确认保存")
+        return [f"{intent.group_id}.{field}" for field in intent.changes]
 
     def _prepare_reality_config_intent(self, intent, differences, scope_status, edit_tokens):
         runtime = self._reality_runtime()
@@ -2400,6 +3246,11 @@ class LegacyMigrationWebAPI:
                                     "before": str(value), "after": str(current),
                                     "explain": "V2 Reality 已有非默认设置，为避免覆盖而保留现值。"})
                 continue
+            if field == "vision_provider_id" and not self._legacy_provider_available(field, value):
+                differences.append({"field": "reality.vision_provider_id",
+                                    "kind": "provider_reselection_required",
+                                    "explain": "旧视觉模型在当前宿主没有兼容的可用实例，此项未写入；其他偏好继续迁移。"})
+                continue
             changes[field] = value
             if field in intent.confidence:
                 confidence[field] = intent.confidence[field]
@@ -2417,6 +3268,9 @@ class LegacyMigrationWebAPI:
         current_token = reality_settings_state_token(config, fields)
         if current_token != expected_state_token:
             raise TaskError("legacy_plan_stale", "V2 Reality 设置在迁移试算后发生变化，请重新试算。")
+        if ("vision_provider_id" in intent.changes and not self._legacy_provider_available(
+                "vision_provider_id", intent.changes["vision_provider_id"])):
+            raise TaskError("legacy_reality_provider_unavailable", "旧视觉模型目前不可用，请重新试算以接续其他设置。")
         result = apply(dict(intent.changes), expected_state_token, fields)
         if inspect.isawaitable(result):
             result = await result
@@ -2856,7 +3710,7 @@ class LegacyMigrationWebAPI:
             raise TaskError("legacy_plugin_config_invalid", "迁移后的插件设置未通过宿主校验，请重新试算。")
         apply_bindings = getattr(self.controller, "apply_bindings", None)
         if ACCOUNT_CONFIGURATION_TARGETS.intersection(intent.changes) and callable(apply_bindings):
-            result = await apply_bindings(candidate)
+            result = await apply_bindings(candidate, expected_config=self._plugin_config_candidate(config, {}))
             if not isinstance(result, dict) or result.get("saved") is not True:
                 raise TaskError("legacy_binding_apply_failed", "宿主没有确认保存迁移的绑定配置。")
             return sorted(intent.changes), result
@@ -2874,7 +3728,8 @@ class LegacyMigrationWebAPI:
         return [
             {"scope": intent.scope, "group_id": intent.group_id, "target_kind": intent.target_kind,
              "fields": sorted(intent.changes), "values": {
-                 field: LegacyMigrationWebAPI._migration_display_value(field, value)
+                 field: LegacyMigrationWebAPI._migration_display_value(
+                     field, value, target_kind=intent.target_kind)
                  for field, value in sorted(intent.changes.items())
              },
              "confidence": dict(sorted(intent.confidence.items())),
@@ -2884,9 +3739,31 @@ class LegacyMigrationWebAPI:
         ]
 
     @staticmethod
-    def _migration_display_value(field_id, value):
+    def _migration_display_value(field_id, value, *, target_kind=""):
         if field_id in _WEATHER_REDACTED_FIELDS:
             return "（已配置，值不在此显示）" if value not in (None, "") else "（未填写）"
+        if target_kind in {"native_extension_config", "configuration_registry"}:
+            return preview_value("", field_id, value)
+        if target_kind == "image_output_config" and field_id in {"comfyui", "sd_webui"}:
+            from companion_v2.legacy.migration import ConfigIntent, _intent_value_document
+            return _intent_value_document(ConfigIntent(
+                scope="image.output", group_id="image.output", changes={},
+                source_id="", target_kind="image_output_config"), field_id, value)
+        if target_kind == "image_output_config" and field_id == "endpoints":
+            result = []
+            for endpoint in value if isinstance(value, list) else ():
+                if not isinstance(endpoint, dict):
+                    continue
+                item = {key: endpoint.get(key) for key in (
+                    "id", "name", "enabled", "platform", "model", "width", "height",
+                    "quality", "max_reference_images", "base_url", "timeout_seconds", "ratio",
+                ) if key in endpoint}
+                headers = endpoint.get("custom_headers")
+                item["api_key_set"] = bool(endpoint.get("api_key"))
+                item["custom_headers_set"] = bool(headers)
+                item["custom_header_names"] = sorted(headers) if isinstance(headers, dict) else []
+                result.append(item)
+            return result
         return value
 
     @staticmethod
@@ -2910,40 +3787,7 @@ class LegacyMigrationWebAPI:
         # 所以键里要带上这组字段名，否则两条意图会互相覆盖 edit token，
         # 执行时第二条被判成 legacy_plan_stale。
         names = ",".join(sorted(getattr(intent, "changes", {}) or {}))
-        return intent.scope + "|" + intent.group_id + "|" + names
-
-    def _plan_sources_match(self, root, session, migration, configuration_scope, plan_token):
-        """计划只在「来源数据 + V2 注册表 + 作用域」没变时继续；edit token 的推进不算变。"""
-        material = {
-            "v1": self._fingerprint(root),
-            "registry": session.application.configuration.registry.fingerprint,
-            "configuration_scope": configuration_scope,
-        }
-        if migration is not None:
-            material["host_account_context"] = getattr(
-                migration, "configuration_context_fingerprint", "",
-            )
-        for key, token in self._plan_fingerprint_tokens(plan_token):
-            material.setdefault("v2_edit_tokens", {})[key] = token
-        encoded = json.dumps(material, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-        return plan_token == hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-    def _intent_token(self, edit_tokens, intent):
-        """取这条意图的 edit token；兼容旧的（不带字段名）键。
-
-        `_prepare_intents` 在拆分之前就把 token 记在键里，拆分后意图的键多了
-        字段名，直接查会落空、被误判成计划过期。这里两个键都试。
-        """
-        key = LegacyMigrationWebAPI._intent_key(intent)
-        if key in edit_tokens:
-            return edit_tokens[key]
-        prefix = intent.scope + "|" + intent.group_id
-        if prefix in edit_tokens:
-            return edit_tokens[prefix]
-        for candidate, token in edit_tokens.items():
-            if candidate.startswith(prefix + "|"):
-                return token
-        return None
+        return intent.scope + "|" + intent.group_id + "|" + intent.target_kind + "|" + names
 
     def _plan_fingerprint_tokens(self, plan_token):
         """占位：指纹里原有的 edit token 无法从摘要反推，这里返回空列表。"""
@@ -2974,6 +3818,14 @@ class LegacyMigrationWebAPI:
         status = []
         registry = session.application.configuration.registry
         for intent in planned.unwrap().intents:
+            if intent.target_kind == "image_output_config":
+                api = self._image_extension_api()
+                available = callable(getattr(api, "output_configuration", None)) and callable(
+                    getattr(api, "save_output_configuration", None))
+                status.append({"scope": intent.scope, "group_id": intent.group_id,
+                    "available": available,
+                    "reason": "" if available else "image_service_unavailable"})
+                continue
             if intent.target_kind == "plugin_config":
                 status.append({"scope": intent.scope, "group_id": intent.group_id,
                     "available": callable(getattr(self.controller, "save_plugin_config", None)),
@@ -2986,6 +3838,16 @@ class LegacyMigrationWebAPI:
                 status.append({"scope": intent.scope, "group_id": intent.group_id,
                     "available": available,
                     "reason": "" if available else "reality_service_unavailable"})
+                continue
+            if intent.target_kind == "native_extension_config":
+                registry_service = getattr(self.controller, "native_extensions", None)
+                getter = getattr(registry_service, "service", None)
+                service = getter(intent.group_id) if callable(getter) else None
+                config = getattr(service, "config", None)
+                available = isinstance(config, dict) and callable(getattr(registry_service, "configure_service", None))
+                status.append({"scope": intent.scope, "group_id": intent.group_id,
+                               "available": available,
+                               "reason": "" if available else "native_service_unavailable"})
                 continue
             if intent.target_kind == "semantic_config":
                 available = getattr(session.application, "semantics", None) is not None
@@ -3024,7 +3886,8 @@ class LegacyMigrationWebAPI:
         # 同一时间戳；把字段名摘要并进 id，保证每条意图的 operation 唯一。
         import hashlib as _hashlib
         fields = _hashlib.sha256(
-            ",".join(sorted(getattr(intent, "changes", {}) or {})).encode("utf-8")
+            (intent.target_kind + "|" + target.key + "|" +
+             ",".join(sorted(getattr(intent, "changes", {}) or {}))).encode("utf-8")
         ).hexdigest()[:12]
         operation_id = f"legacy-{scope}-{fields}-{stamp}"
         return OperationRef(operation_id, owner_id, target.authorization_scope,

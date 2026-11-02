@@ -1,10 +1,12 @@
 """Meal opportunities reuse the original private contact and delivery path."""
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 import json
 import unittest
+from zoneinfo import ZoneInfo
 
 from companion_v2.conversation.foreground import BackgroundPromptTrigger
+from companion_v2.proactive.meal_events import MealContactEvents
 from tests.contact_schedule_support import ContactScheduleFixture
 from tests.test_role_tool_loop import answered
 
@@ -17,7 +19,43 @@ class MealContactTests(ContactScheduleFixture, unittest.IsolatedAsyncioTestCase)
         if enabled is not None:
             settings["meal_checkin_enabled"] = enabled
         self.settings(app, settings).unwrap()
+        # Window/cadence are tested separately; keep the integration probes on
+        # both lunch and dinner so a date-dependent daily plan cannot hide them.
+        app.contact_schedule.meal_events._daily_plan = lambda context, day: ("lunch", "dinner")
+        app.contact_schedule.meal_events._opening = lambda context, day, wall, zone, name: datetime.combine(
+            day, wall, tzinfo=zone)
         return app, batch
+
+    def test_daily_cadence_is_stable_and_does_not_contact_every_meal(self):
+        context = self.contact_context()
+        plans = [MealContactEvents._daily_plan(context, date(2026, 9, 1) + timedelta(days=offset))
+                 for offset in range(40)]
+        self.assertEqual(plans, [MealContactEvents._daily_plan(context, date(2026, 9, 1) + timedelta(days=offset))
+                                 for offset in range(40)])
+        self.assertTrue(any(plan == () for plan in plans))
+        self.assertTrue(any(len(plan) == 1 for plan in plans))
+        self.assertTrue(any(len(plan) == 2 for plan in plans))
+
+    def test_meal_opening_floats_around_the_reference_time_but_is_stable(self):
+        context = self.contact_context()
+        zone = ZoneInfo("Asia/Shanghai")
+        base_day = date(2026, 9, 1)
+        wall = time(12, 0)
+        openings = [MealContactEvents._opening(context, base_day + timedelta(days=offset),
+                                               wall, zone, "lunch") for offset in range(20)]
+        self.assertEqual(openings, [MealContactEvents._opening(context, base_day + timedelta(days=offset),
+                                                               wall, zone, "lunch") for offset in range(20)])
+        offsets = [int((item - datetime.combine(item.date(), wall, tzinfo=zone)).total_seconds() // 60)
+                   for item in openings]
+        self.assertTrue(all(-20 <= offset <= 40 for offset in offsets))
+        self.assertGreater(len(set(offsets)), 1)
+
+    def test_meal_angles_are_stable_and_not_a_single_formula(self):
+        context = self.contact_context()
+        angles = [MealContactEvents._angle(context, date(2026, 9, 1) + timedelta(days=offset), "lunch")
+                  for offset in range(20)]
+        self.assertEqual(angles[0], MealContactEvents._angle(context, date(2026, 9, 1), "lunch"))
+        self.assertGreater(len(set(angles)), 1)
 
     async def test_opt_in_is_required_and_invalid_local_time_is_rejected(self):
         app, _ = await self.setup_meal(enabled=None)
@@ -34,7 +72,11 @@ class MealContactTests(ContactScheduleFixture, unittest.IsolatedAsyncioTestCase)
         calls = self.contact_calls()
         self.assertEqual(len(calls), 1)
         request = calls[0].original
-        self.assertIn("午餐", request.context.materials[0].payload)
+        payload = request.context.materials[0].payload
+        self.assertIn("午餐", payload)
+        self.assertIn("不是对对方的三餐打卡", payload)
+        self.assertIn("不要默认询问对方吃没吃", payload)
+        self.assertNotIn("当前是对方当地", payload)
         self.assertEqual([item.payload for item in request.context.materials
                           if item.purpose == "contact_evidence"], ["输入 event-1"])
         record = json.loads(self.contacts(app)[0]["record_json"])

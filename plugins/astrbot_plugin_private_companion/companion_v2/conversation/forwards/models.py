@@ -13,7 +13,10 @@ from companion_v2.execution.models import TaskError
 OWNER = "conversation.forward"
 NODE_OWNER = "conversation.forward_node"
 MAX_FORWARDS = 4
-MAX_NODES = 32
+# Keep descriptor/path validation broad enough for the V1-supported range. The
+# default intake remains 32 for installs that have not mapped a V1 setting.
+MAX_NODES = 300
+DEFAULT_MAX_NODES = 32
 MAX_DEPTH = 4
 MAX_TEXT = 65536
 INSTRUCTION = (
@@ -25,22 +28,23 @@ INSTRUCTION = (
 class ForwardIntakePolicy:
     """Operator intake ceilings, always inside the structural constants above.
 
-    The structural constants stay fixed because they also bound the persisted
-    descriptor validation in `node_fields` and `check_tree`. A stored forward must
-    stay readable no matter how an operator later narrows intake, so this policy
-    only ever decides what a new input may bring in. Defaults equal the structural
-    constants, so an installation that never edits them behaves exactly as before.
+    The structural constants also bound persisted descriptors. An operator can
+    tune the limits and nested expansion for new inputs; stored forwards remain
+    readable after a later setting change.
     """
 
     max_forwards: int = MAX_FORWARDS
-    max_nodes: int = MAX_NODES
+    max_nodes: int = DEFAULT_MAX_NODES
     max_depth: int = MAX_DEPTH
+    parse_nested: bool = True
 
     def __post_init__(self):
         for name, ceiling in (("max_forwards", MAX_FORWARDS), ("max_nodes", MAX_NODES), ("max_depth", MAX_DEPTH)):
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= ceiling:
                 raise TaskError("forward_intake_invalid", f"{name} must be an integer from 1 to {ceiling}")
+        if type(self.parse_nested) is not bool:
+            raise TaskError("forward_intake_invalid", "parse_nested must be a boolean")
 
     @property
     def max_path_length(self):

@@ -7,15 +7,19 @@ from companion_v2.conversation.quotes.models import message_number
 from companion_v2.execution.models import TaskError
 from companion_v2.foundation.refs import ScopeKind
 from .history import extract_history_messages
-from .native import account_number
+from .native import native_id
 from .quote_content import capture_quote_content
 
 
-def mention_text(value, account):
+def mention_text(value, account, *, bot_ids=()):
     if value == "all":
         return "[提及全体成员]"
-    mentioned = account_number(value)
-    return "[提及机器人]" if mentioned == account else "[提及账号 " + mentioned + "]"
+    try:
+        mentioned = native_id(value)
+    except ValueError:
+        return "[提及不可用]"
+    bot_ids = {str(item) for item in (*bot_ids, account) if item not in (None, "")}
+    return "[提及机器人]" if mentioned in bot_ids else "[提及账号 " + mentioned + "]"
 
 
 async def read_group_quote(locator, *, client, scope, reverse_api_type, image_loader, audio_loader=None,

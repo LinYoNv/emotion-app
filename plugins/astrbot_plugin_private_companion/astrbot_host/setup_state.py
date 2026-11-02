@@ -9,7 +9,20 @@ from uuid import uuid4
 
 
 SCHEMA_VERSION = 3
-SETUP_STEPS = ("model", "knowledge", "relationships")
+# 与旧版配置引导一致的八步：窗口、模型、人格与世界知识、关系教学、主动功能与强度、
+# 日程与观察、群聊配置，最后是主动消息测试（测试完成才算 ready）。
+SETUP_STEPS = ("model", "knowledge", "relationships", "proactive", "life", "group")
+
+
+class SetupStepsIncomplete(ValueError):
+    """A guided section is still open, so the one-time test cannot start yet.
+
+    Stays a ``ValueError``: every rejection in this store is one, and existing
+    callers keep working unchanged.  The distinct type exists only so a host
+    route can tell "the guide is not finished" apart from "this attempt already
+    ran and cannot be replayed" — two conditions with nothing in common, which
+    used to reach the operator as the same, misleading, replay-flavoured code.
+    """
 
 
 def empty_state() -> dict:
@@ -140,7 +153,7 @@ class SetupStateStore:
         if state["proactive_test"] is not None and state["proactive_test"]["state"] != "failed":
             raise ValueError("the proactive test has already started and cannot be replayed")
         if any(step not in state["completed"] + state["skipped"] for step in SETUP_STEPS):
-            raise ValueError("complete the guided setup steps first")
+            raise SetupStepsIncomplete("complete the guided setup steps first")
         state["proactive_test"] = {"state": "started", "attempt_id": attempt_id,
                                     "started_at": started_at,
                                     "stages": [{"stage": "authorization", "state": "passed"},

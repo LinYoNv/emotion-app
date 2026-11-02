@@ -1,5 +1,6 @@
 """TTS provider management and image config delegation use the real SDK with isolated data."""
 
+import asyncio
 from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -12,9 +13,23 @@ from unittest.mock import AsyncMock, patch
 
 from tests import test_astrbot_staging_host as support
 from tests.multi_host_support import MultiFixture
-from astrbot_host.model_api import PREFIX
+from astrbot_host.model_api import PREFIX, _probe_error_summary
 from astrbot.api.web import PluginMultiDict, PluginRequest, bind_request_context
 from starlette.requests import Request
+
+
+class ProbeLogTests(unittest.TestCase):
+    def test_probe_failure_summary_is_bounded_and_redacted(self):
+        summary = _probe_error_summary(RuntimeError(
+            "upstream https://provider.invalid/v1?api_key=secret-value "
+            "api_key=another-secret Bearer token-value"))
+        self.assertLessEqual(len(summary), 320)
+        self.assertNotIn("provider.invalid", summary)
+        self.assertNotIn("secret-value", summary)
+        self.assertNotIn("another-secret", summary)
+        self.assertNotIn("token-value", summary)
+        self.assertIn("[URL]", summary)
+        self.assertIn("[REDACTED]", summary)
 
 
 class FakeProviderManager:
@@ -150,7 +165,7 @@ class ProviderRouteTests(unittest.IsolatedAsyncioTestCase):
         return providers
 
     async def call(self, route, *, payload=None, username="admin", query=None):
-        prefix = "C:/Users/99505/.astrbot/data/plugins/astrbot_plugin_private_companion_v2/astrbot_host.model_api"
+        prefix = "C:/Users/99505/.astrbot/data/plugins/astrbot_plugin_private_companion/astrbot_host.model_api"
         import astrbot_host.model_api as model_api
         request = Request({"type": "http", "method": "POST" if payload is not None else "GET",
                            "path": route, "headers": [], "query_string": b""})
@@ -178,6 +193,37 @@ class ProviderRouteTests(unittest.IsolatedAsyncioTestCase):
         read_main.assert_awaited_once_with(self.controller)
         self.assertEqual(response["data"]["external_token_sources"], {**sources, "main": main})
         self.assertNotEqual(response["data"]["summary"]["tokens"], main["totals"]["tokens"])
+
+    async def test_maintenance_adds_read_only_backup_disk_and_mobile_checks(self):
+        (await self.controller.initialize_profile()).unwrap()
+        runtime_root = Path(self.controller.runtime.data_root)
+        snapshot_id = "a" * 32
+        backup_directory = runtime_root / "backups"
+        backup_directory.mkdir(parents=True, exist_ok=True)
+        (backup_directory / f"companion-v2-{snapshot_id}.sqlite3").write_bytes(b"SQLite format 3\x00")
+        (backup_directory / f"companion-v2-{snapshot_id}.json").write_text(json.dumps({
+            "format": "companion-v2.installation-backup.v1", "snapshot_id": snapshot_id,
+            "created_at": "2026-10-30T12:00:00+00:00", "byte_size": 16,
+        }), encoding="utf-8")
+        extension_directory = runtime_root / "extensions" / "reality"
+        extension_directory.mkdir(parents=True, exist_ok=True)
+        (extension_directory / "config.json").write_text(json.dumps({
+            "mobile": {"enabled": True, "pairing_token": "secret-token-value"},
+        }), encoding="utf-8")
+
+        response = await self.call(PREFIX + "/maintenance")
+
+        self.assertEqual(response["status"], "ok", response)
+        checks = response["data"]["host_checks"]
+        self.assertTrue(checks["backup"]["available"])
+        self.assertEqual(checks["backup"]["snapshot_count"], 1)
+        self.assertEqual(checks["backup"]["latest_success_at"], "2026-10-30T12:00:00+00:00")
+        self.assertTrue(checks["backup"]["same_volume"])
+        self.assertGreater(checks["disk"]["data_root"]["free_bytes"], 0)
+        self.assertTrue(checks["mobile"]["available"])
+        self.assertTrue(checks["mobile"]["enabled"])
+        self.assertTrue(checks["mobile"]["pairing_token_configured"])
+        self.assertNotIn("secret-token-value", json.dumps(response, ensure_ascii=False))
 
     async def test_global_usage_is_not_read_before_dashboard_authorization(self):
         (await self.controller.initialize_profile()).unwrap()
@@ -216,6 +262,20 @@ class ProviderRouteTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(query=query):
                 result = await self.call(PREFIX, query=query)
                 self.assertEqual(result["message"], "model_request_invalid", result)
+
+    async def test_image_provider_schema_exposes_editable_sd_sampling_fields(self):
+        (await self.controller.initialize_profile()).unwrap()
+        result = await self.call(PREFIX + "/image-schema")
+
+        self.assertEqual(result["status"], "ok", result)
+        fields = result["data"]["image_provider_group"]["sd_webui"]["fields"]
+        self.assertEqual(fields["steps"]["kind"], "integer")
+        self.assertEqual(fields["steps"]["storage"], "parameters")
+        self.assertEqual(fields["cfg_scale"]["kind"], "number")
+        self.assertEqual(fields["cfg_scale"]["group"], "sampling")
+        self.assertIn("denoising_strength", fields)
+        self.assertNotIn("endpoint", fields)
+        self.assertNotIn("model", fields)
 
     async def test_staging_reopen_prepares_legacy_reaction_settings_before_read_only_assembly(self):
         from dataclasses import replace
@@ -280,7 +340,7 @@ class ProviderRouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tts_provider_roundtrip_masks_secrets(self):
         (await self.controller.initialize_profile()).unwrap()
-        prefix = "C:/Users/99505/.astrbot/data/plugins/astrbot_plugin_private_companion_v2/astrbot_host.model_api"
+        prefix = "C:/Users/99505/.astrbot/data/plugins/astrbot_plugin_private_companion/astrbot_host.model_api"
         import astrbot_host.model_api as model_api
         listed = await self.call(model_api.PREFIX + "/tts/providers")
         item = listed["data"]["items"][0]
@@ -346,6 +406,62 @@ class ProviderRouteTests(unittest.IsolatedAsyncioTestCase):
                                     payload=b'{"type": "fishaudio_tts_api", "id": "tts-b"}')
         self.assertEqual(duplicate["data"]["code"], "tts_provider_exists")
         self.assertEqual(self.native.provider.client.state.calls, [])
+
+    async def test_voice_save_busy_keeps_settings_and_can_retry_once_host_is_ready(self):
+        (await self.controller.initialize_profile()).unwrap()
+        status = (await self.call(PREFIX + "/voice"))["data"]
+        payload = json.dumps({"operation_key": "voice-lock-busy", "edit_token": status["edit_token"],
+                              "changes": {"voice_timeout_seconds": 45}}).encode()
+        lock = self.controller._control_lock
+        await lock.acquire()
+        try:
+            with patch("astrbot_host.model_api.VOICE_SAVE_LOCK_WAIT_SECONDS", 0.01):
+                busy = await asyncio.wait_for(self.call(PREFIX + "/voice/save", payload=payload), 1)
+            self.assertEqual(busy["data"]["code"], "host_busy", busy)
+            self.assertTrue(lock.locked(), "a refused save must not release the lifecycle owner's lock")
+        finally:
+            lock.release()
+        unchanged = (await self.call(PREFIX + "/voice"))["data"]
+        self.assertEqual(unchanged["edit_token"], status["edit_token"])
+        self.assertEqual(unchanged["timeout_seconds"], status["timeout_seconds"])
+        saved = await self.call(PREFIX + "/voice/save", payload=payload)
+        self.assertEqual(saved["status"], "ok", saved)
+        self.assertEqual(saved["data"]["timeout_seconds"], 45)
+        self.assertFalse(saved["data"]["replayed"])
+        replayed = await self.call(PREFIX + "/voice/save", payload=payload)
+        self.assertTrue(replayed["data"]["replayed"], replayed)
+        self.assertEqual(replayed["data"]["edit_token"], saved["data"]["edit_token"])
+
+    async def test_cancelled_voice_save_does_not_write_after_lock_is_released(self):
+        (await self.controller.initialize_profile()).unwrap()
+        status = (await self.call(PREFIX + "/voice"))["data"]
+        payload = json.dumps({"operation_key": "voice-lock-cancel", "edit_token": status["edit_token"],
+                              "changes": {"voice_timeout_seconds": 45}}).encode()
+        lock = self.controller._control_lock
+        await lock.acquire()
+        try:
+            task = asyncio.create_task(self.call(PREFIX + "/voice/save", payload=payload))
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertTrue(lock.locked())
+        finally:
+            lock.release()
+        await asyncio.sleep(0)
+        unchanged = (await self.call(PREFIX + "/voice"))["data"]
+        self.assertEqual(unchanged["edit_token"], status["edit_token"])
+        self.assertFalse(lock.locked())
+
+    async def test_voice_save_authorization_failure_releases_its_lock(self):
+        (await self.controller.initialize_profile()).unwrap()
+        status = (await self.call(PREFIX + "/voice"))["data"]
+        payload = json.dumps({"operation_key": "voice-lock-auth", "edit_token": status["edit_token"],
+                              "changes": {"voice_timeout_seconds": 45}}).encode()
+        refused = await self.call(PREFIX + "/voice/save", payload=payload, username="api_key:fixture")
+        self.assertEqual(refused["data"]["code"], "dashboard_identity_required", refused)
+        self.assertFalse(self.controller._control_lock.locked())
+        self.assertEqual((await self.call(PREFIX + "/voice"))["data"]["edit_token"], status["edit_token"])
 
     async def test_voice_test_returns_audio_for_inline_preview(self):
         (await self.controller.initialize_profile()).unwrap()
@@ -523,12 +639,46 @@ class ProviderRouteTests(unittest.IsolatedAsyncioTestCase):
         registry = NS(
             image_enabled={"image.generate": True, "image.edit": True, "image.mask_edit": True},
             declarations=lambda: (), status=lambda _extension: {"state": "unavailable", "error_code": "native_extension_unavailable"},
-            issues=(("astrbot_plugin_private_companion_v2.image", "native_configuration_invalid"),),
+            issues=(("astrbot_plugin_private_companion.image", "native_configuration_invalid"),),
         )
         with patch.object(self.controller, "native_extensions", registry):
             response = await self.call(PREFIX + "/image")
         self.assertEqual(response["data"]["module"]["issue_code"], "native_configuration_invalid")
         self.assertEqual(response["data"]["actions"][0]["diagnostic_code"], "native_configuration_invalid")
+
+    async def test_image_status_projects_the_first_configured_model_in_the_generate_queue(self):
+        (await self.controller.initialize_profile()).unwrap()
+        import astrbot_host.model_api as model_api
+
+        fake = FakeImageExtensionAPI()
+        fake.configuration = {
+            "enabled": True,
+            "backend": "online_api",
+            "endpoints": [
+                {"id": "primary", "name": "主在线 API", "enabled": True, "model": "gpt-image-2"},
+                {"id": "secondary", "name": "备用在线 API", "enabled": True, "model": "gpt-image-2.5"},
+            ],
+            "operation_routes": {"generate": ["online:primary", "online:secondary"], "edit": []},
+        }
+        registry = NS(image_extension_api=lambda: fake)
+
+        preferred = model_api.ModelWebAPI(self.controller)._preferred_image_projection(registry)
+
+        self.assertEqual(preferred, {"model": "gpt-image-2", "name": "主在线 API",
+                                     "route": "online:primary", "enabled": True})
+
+        fake.configuration["endpoints"][0]["enabled"] = False
+        preferred = model_api.ModelWebAPI(self.controller)._preferred_image_projection(registry)
+        self.assertEqual(preferred, {"model": "gpt-image-2.5", "name": "备用在线 API",
+                                     "route": "online:secondary", "enabled": True})
+
+        fake.configuration["endpoints"][1]["name"] = "   "
+        preferred = model_api.ModelWebAPI(self.controller)._preferred_image_projection(registry)
+        self.assertEqual(preferred["name"], "gpt-image-2.5")
+
+        fake.configuration["endpoints"][1]["name"] = "  夜间线路  "
+        preferred = model_api.ModelWebAPI(self.controller)._preferred_image_projection(registry)
+        self.assertEqual(preferred["name"], "夜间线路")
 
     async def test_image_status_distinguishes_unsupported_routes_from_stale_declarations(self):
         (await self.controller.initialize_profile()).unwrap()

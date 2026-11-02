@@ -196,6 +196,9 @@
 .wb-source-option>span{display:grid;gap:2px;min-width:0}
 .wb-source-option b{min-width:0;color:var(--t-text-strong);font-size:var(--fs-tiny);font-weight:600;overflow-wrap:anywhere}
 .wb-source-option small{color:var(--t-text-faint);font-size:var(--fs-micro);line-height:1.45;overflow-wrap:anywhere}
+.wb-source-option.is-disabled{opacity:.55;cursor:default}
+.wb-source-option.is-disabled:hover{background:none}
+.wb-source-whole-hint{color:var(--t-accent-ink)}
 .wb-source-missing{padding:var(--sp-1);border:1px dashed var(--t-line-firm);border-radius:var(--r-xs);color:var(--t-risk-ink)}
 .wb-source-count{justify-self:end;color:var(--t-text-faint);font-size:var(--fs-micro);font-variant-numeric:tabular-nums}
 .wb-textarea-wrap{display:grid;gap:var(--sp-1);min-width:0}
@@ -453,6 +456,14 @@
 .wb-notice.is-error{border-color:var(--t-risk);background:var(--t-risk-quiet);color:var(--t-risk-ink)}
 .wb-notice.is-ok{border-color:var(--t-ok);background:var(--t-ok-quiet);color:var(--t-ok-ink)}
 .wb-notice svg{width:14px;height:14px;flex:none;margin-top:2px}
+.wb-notice{flex-wrap:wrap}
+.wb-notice>span{flex:1;min-width:180px}
+.wb-conflicts{padding:var(--sp-4);border:1px solid var(--t-warn);border-radius:var(--r-sm);background:var(--t-warn-quiet);font-size:var(--fs-tiny)}
+.wb-conflicts>p{margin:0 0 var(--sp-3);color:var(--t-text-soft)}
+.wb-conflict+.wb-conflict{margin-top:var(--sp-3);padding-top:var(--sp-3);border-top:1px solid var(--t-line)}
+.wb-conflict-values{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:var(--sp-2);margin:var(--sp-2) 0;color:var(--t-text-soft)}
+.wb-conflict-values>span{white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto}
+.wb-conflict-actions{display:flex;flex-wrap:wrap;gap:var(--sp-2)}
 
 /* 未确认回执：独立提示，带核对按钮 */
 .wb-pending{

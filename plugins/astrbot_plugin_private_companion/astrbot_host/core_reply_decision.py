@@ -130,6 +130,8 @@ def core_decision_facts(event, prepared, application, *, at):
     if prepared.get("channel") == "group":
         group_admission = prepared.get("group_admission") or {}
         facts["candidate_reason"] = group_admission.get("reason", "")
+        if isinstance(group_admission.get("continuation"), dict):
+            facts["group_continuation"] = dict(group_admission["continuation"])
         facts["group_participation_policy"] = dict(group_admission.get("participation_policy") or {})
         if isinstance(group_admission.get("question_reference"), dict):
             facts["question_reference"] = dict(group_admission["question_reference"])

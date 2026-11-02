@@ -34,6 +34,24 @@ class SegmentSpacingTests(unittest.TestCase):
         self.assertGreater(sleepy, short)
         self.assertLess(energetic, short)
 
+    def test_log_mode_honors_operator_bounds_and_counts_visible_characters(self):
+        policy = {"part_gap_mode": "log", "part_gap_log_base": 1.8,
+                  "part_gap_min_ms": 1500, "part_gap_max_ms": 3500}
+        for text in ("……", "🥺", "好。", "hahahahaha"):
+            with self.subTest(text=text):
+                gap = part_gap_seconds(policy, text, "punctuation:" + text)
+                self.assertGreaterEqual(gap, 1.5)
+                self.assertLessEqual(gap, 4.0)
+        self.assertAlmostEqual(minimum_part_gap_seconds(policy, "🥺"), 1.5)
+        self.assertGreaterEqual(minimum_part_gap_seconds(policy, "……"), 1.5)
+        long = part_gap_seconds(policy, "这是很长的一段回复，用来确认上限不再被日志曲线绕过。" * 10, "long")
+        self.assertLessEqual(long, 4.0)
+        self.assertGreaterEqual(long, 3.5)
+        self.assertGreater(part_gap_seconds(policy, "hahahahaha", "ascii"),
+                           part_gap_seconds(policy, "哈", "han"))
+        sleepy = minimum_part_gap_seconds({**policy, "role_sleepy": True}, "🥺")
+        self.assertGreater(sleepy, minimum_part_gap_seconds(policy, "🥺"))
+
     def test_registered_defaults_and_legacy_configuration(self):
         legacy = {**asdict(SegmentationPolicy()), "streaming": False, "part_gap_ms": 0}
         validate(legacy)

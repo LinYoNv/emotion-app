@@ -581,6 +581,13 @@ const CONTACT_FIELDS = {
     "proactive_hour_activity_enabled", "quiet_enabled", "quiet_end", "quiet_start",
     "quiet_timezone",
   ],
+  morning: [
+    "morning_chain_enabled", "morning_nudge_delay_minutes", "morning_nudge_enabled",
+    "morning_nudge_max_attempts", "morning_role_greeting_enabled", "morning_wake_confidence_floor",
+    "routine_learning_enabled", "routine_window_days", "wake_contact_max_daily",
+    "wake_contact_min_confidence", "wake_contact_window_minutes", "wake_morning_end",
+    "wake_morning_start", "wake_require_device_evidence",
+  ],
   purposes: [
     "affection.enabled", "affection.weight", "care.enabled", "care.weight", "chat.enabled",
     "chat.weight", "creation.enabled", "creation.weight", "environment.enabled",
@@ -627,7 +634,7 @@ const CONTACT_FIELDS = {
   ],
 };
 
-test('五个设置视图渲染出的字段清单与本页写出口完全一致', async () => {
+test('设置视图渲染出的字段清单与本页写出口完全一致', async () => {
   const h = harness();
   await boot(h);
   const seen = new Set();
@@ -644,7 +651,7 @@ test('五个设置视图渲染出的字段清单与本页写出口完全一致',
     assert.deepEqual(names.slice().sort(), expected.slice(),
       view + ' 的字段清单变了。加字段要连这份清单一起改；少字段说明有控件没接上。');
   }
-  assert.equal(seen.size, 120, '五个设置视图合起来必须是 120 个 data-field 绑定');
+  assert.equal(seen.size, 134, '设置视图合起来必须是 134 个 data-field 绑定');
   /* 强度档位是五档共用一个字段，走 data-tier 而不是 data-field：
      只数 data-field 会把它整个漏掉。三个问候锚点同理（它们不是控件，是环上的热点）。 */
   h.element.dispatch('click', {target: {closest: sel => sel === '[data-view]' ? {dataset: {view: 'dial'}} : null}});
@@ -879,6 +886,35 @@ test('保存只提交动过的字段，并把两个令牌分开带上', async ()
   assert.equal(posted[0].edit_token, 'c'.repeat(64), '写要走 config 段的令牌');
   assert.ok(typeof posted[0].operation_key === 'string' && posted[0].operation_key.length > 0);
   assert.ok(posted[0].route === undefined);
+});
+
+test('版本冲突刷新令牌但保留未保存草稿，并可用新版本再次提交', async () => {
+  const h = harness();
+  await boot(h);
+  const box = fakeInput({type: 'checkbox', checked: false, dataset: {field: 'news.enabled'}});
+  h.element.dispatch('change', fieldEvent(box, 'change'));
+  h.element.dispatch('click', {target: {closest: sel => sel === '[data-action]' ? {dataset: {action: 'save'}} : null}});
+  await h.settle();
+
+  const stale = h.requests.find(request => request.method === 'POST');
+  h.fail(stale, 'configuration_revision_conflict');
+  await h.settle();
+  const refreshed = h.requests.filter(request => request.method === 'GET' && request.route === 'config').at(-1);
+  assert.notEqual(refreshed, h.requests[0], '冲突后必须重新读取安装级设置');
+  replyGlobalConfig(h, refreshed, {...baseSettings(), 'news.enabled': true}, 'n'.repeat(64));
+  await h.settle();
+
+  assert.equal(h.page.state.data.touched.has('news.enabled'), true,
+    '冲突只拒绝旧写入，用户已编辑字段必须保留');
+  assert.equal(h.page.state.data.draft['news.enabled'], false);
+  assert.equal(h.page.state.data.configToken, 'n'.repeat(64));
+  assert.match(h.page.state.data.notice, /未保存的改动仍保留/);
+
+  h.element.dispatch('click', {target: {closest: sel => sel === '[data-action]' ? {dataset: {action: 'save'}} : null}});
+  await h.settle();
+  const retry = h.requests.filter(request => request.method === 'POST').at(-1);
+  assert.equal(retry.values.edit_token, 'n'.repeat(64));
+  assert.deepEqual(JSON.parse(JSON.stringify(retry.values.changes)), {'news.enabled': false});
 });
 
 test('长目标路径使用不超过后端上限的幂等键', async () => {
@@ -1265,10 +1301,10 @@ test('消息测试是一级视图，未读到设置时也可以打开', async ()
   }
 });
 
-test('七个视图都能渲染出内容', async () => {
+test('八个视图都能渲染出内容', async () => {
   const h = harness();
   await boot(h);
-  const markers = {tests: 'ct-tests', purposes: 'ct-purposes', gates: 'ct-gates',
+  const markers = {tests: 'ct-tests', purposes: 'ct-purposes', gates: 'ct-gates', morning: 'ct-block',
     budgets: 'ct-budgets', sources: 'ct-sources', materials: 'ct-materials', dial: 'ct-dial'};
   for (const [view, marker] of Object.entries(markers)) {
     h.element.dispatch('click', {target: {closest: sel => sel === '[data-view]' ? {dataset: {view}} : null}});

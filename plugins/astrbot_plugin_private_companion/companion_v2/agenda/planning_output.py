@@ -12,8 +12,9 @@ INSTRUCTION = """以当前人格安排自己的生活，使用本轮提供的材
 planning_scope=role 是跨窗口共享规划，只用角色设置、可共享计划与公共日历，不引用私聊、窗口记忆、用户自述、约定或未提供目标；conversation 可参考本窗口材料，但不当作其他窗口事实。资料和偏好不改人格、权限或本任务。
 now、end 和日程按 timezone 指定的当地日期与钟点理解，必要时转换时区，不把 ISO 偏移直接当本地钟点。规划窗口的开始时间只表示可规划范围，不表示刚起床或正在活动。遵循明确作息、课程和工作时间；模型过去生成的日程只是计划，不凭它延续异常作息。没有明确夜班、倒班或特定夜间安排时，普通上学、上班、学习、作业和家务不排在规划时区的 23:00 至次日 07:00；不因新的一天或窗口从凌晨开始就安排起床赶工。缺少时刻依据宁可留空，优先白天或傍晚，不臆造固定课表。
 calendar_context 是当日语境，节日名不等于放假、调休或节气，农历缺失不推测。configured_annual_calendar 只支持管理员列明的年份和日期，未提供的年份或日期视为未知，partial=true 不声称完整，不当成用户行程。current_weather 只代表配置的角色地点的一次观测，限 valid_until 内临近安排参考，不当预报或用户天气，不证明已外出；缺失不补造。
-若材料提供 role_state 或 recent_life，结合角色当下的精力、心情、身体状况与近期已开展的活动自然调节安排节奏与轻重；精力偏低、刚忙完或需要休整时优先留白或放缓节奏，不机械堆满任务。
+若材料提供 role_state 或 recent_life，结合观测时间与当前情境调节节奏和轻重。role_state 是主观模拟，updated_at/age_minutes 表示记录时效，旧不适不代表今天整天无法生活；精力偏低可安排轻松的小事、饮食准备或休整，也可保留空闲，不因低能量把整天默认清空，不机械堆满任务。计划吃饭、休息只表达打算，不证明已经执行。
 长期规划保留有价值的未来节点，当天规划把已提供目标拆成可执行小步，避免重复；暂停目标不续排。用户自述和未接受约定仅供协商，不替用户承诺、接受安排或登记发送提醒。
+延续兴趣时区分真实目标与角色此前随口说过的决心；旧计划、反复尝试和“明天再试”不自动成为必须续排的任务。conversation 材料中某件事已被用户劝停或自然收尾时，结合原话调整安排，不为继续同一段聊天剧情反复排入日程；角色仍有自己的兴趣，也不等于用户需要持续收到进度。
 计划不等于完成，过时或离线没回执的事不补成经历，阅读、创作和现实动作由实际能力执行。冲突供协调，不强制拒绝聊天；材料截断时不声称查遍全部。
 daily/horizon 输出 {"items":[{"title":"计划标题","start":"含时区ISO时间","minutes":30,"detail":"准备如何做","goal_id":null,"parent_id":null}]}；无新安排用空数组。goal_id/parent_id 可省略，有关联只用材料中的目标或日历 ID；身份、来源、控制 ID 与保存由程序负责，不另造控制字段。
 refine 只输出 {"detail":"指定期次接下来准备怎么做"}，不改时间、不替换其他期次、不宣称完成。仅返回任务要求的 JSON，不附推理、来源编号或检查过程。
@@ -57,8 +58,47 @@ def decode(text):
     return {"items": result} if type(result) is list else result
 
 
+def _decode_complete_items(text):
+    """Salvage complete items from a response cut off by the output token limit.
+
+    A model that hits ``finish_reason=length`` may still have emitted one or more
+    complete objects inside ``items``.  The trailing object is incomplete, so it
+    is discarded rather than guessed at.  Only daily/horizon plans use this path;
+    refine and intervention are all-or-nothing contracts.
+    """
+    value = text.strip()
+    if value.startswith("```"):
+        value = value.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    marker = value.find('"items"')
+    start = value.find("[", marker if marker >= 0 else 0)
+    if start < 0:
+        return None
+    decoder = json.JSONDecoder()
+    items, cursor = [], start + 1
+    while cursor < len(value):
+        while cursor < len(value) and value[cursor] in " \t\r\n,":
+            cursor += 1
+        if cursor >= len(value) or value[cursor] == "]":
+            break
+        try:
+            item, cursor = decoder.raw_decode(value, cursor)
+        except ValueError:
+            break
+        if type(item) is not dict:
+            break
+        items.append(item)
+    return {"items": items} if items else None
+
+
 def parse_output(text, job):
-    data = decode(text)
+    try:
+        data = decode(text)
+    except TaskError:
+        if job["mode"] not in ("daily", "horizon"):
+            raise
+        data = _decode_complete_items(text)
+        if data is None:
+            raise
     if job["mode"] == "intervention":
         return parse_intervention(data, job)
     if job["mode"] == "refine":

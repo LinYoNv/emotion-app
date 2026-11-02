@@ -11,10 +11,8 @@ The mechanism is taken from the V1 dream-fragment pool
 * each adopted rule keeps ``injections`` and ``last_injected_at``;
 * a rule that was never used outranks any used rule, so every new rule gets its
   first turn instead of waiting behind favourites;
-* a used rule's weight is ``pow(0.72, waited_hours / 24)`` -- the V1 decay --
-  times a frequency factor ``4 / (4 + injections)`` with a small floor, so a rule
-  that keeps being drawn becomes less likely each time without ever being locked
-  out of the rotation;
+* a used rule's chance is reduced immediately, then recovers smoothly over the
+  configured recovery window; frequency still lowers its long-term weight;
 * selection is a weighted sample without replacement, which spreads turns
   across the whole pool instead of always taking the top few;
 * ``MIN_EFFECTIVE_WEIGHT`` is zero by default: "used often" lowers the chance
@@ -33,7 +31,7 @@ from companion_v2.execution.models import digest, stamp
 
 
 PREFIX = "role.expression.rotation.v1:"
-DECAY_PER_DAY = 0.72
+DEFAULT_RECOVERY_HOURS = 336
 UNUSED_WEIGHT = 5.0
 FREQUENCY_HALF_LIFE = 4.0
 FREQUENCY_FLOOR = 0.05
@@ -89,21 +87,15 @@ def usage(runtime, owner_key, scope_key):
     return result
 
 
-def effective_weight(entry, *, at):
-    """V1's shape: an unused rule is fresh, a used rule decays, and use counts.
-
-    ``pow(0.72, waited_days)`` is the V1 dream-fragment decay
-    (``dreaming.py:330``) applied to "time since last used". The frequency factor
-    is V1's ``usage_count`` saturation: a rule drawn ``n`` times has roughly
-    ``4 / (4 + n)`` of the chance, so favourites fade instead of dominating and no
-    adopted rule is ever locked out.
-    """
+def effective_weight(entry, *, at, decay_hours=DEFAULT_RECOVERY_HOURS):
+    """Recent use lowers the chance; waiting restores it without a hard cooldown."""
     injections, last = entry
     if last is None:
         return UNUSED_WEIGHT
     waited_hours = max(0.0, (at - last).total_seconds() / 3600.0)
     frequency = FREQUENCY_HALF_LIFE / (FREQUENCY_HALF_LIFE + max(0, injections))
-    return pow(DECAY_PER_DAY, waited_hours / 24.0) * max(FREQUENCY_FLOOR, frequency)
+    recovery = 1.0 - pow(0.5, waited_hours / max(1.0, decay_hours))
+    return (FREQUENCY_FLOOR + (1.0 - FREQUENCY_FLOOR) * recovery) * max(FREQUENCY_FLOOR, frequency)
 
 
 def _rank(candidates, *, usage_map, at):
@@ -122,26 +114,23 @@ def _rank(candidates, *, usage_map, at):
 
 
 def order(candidates, *, usage_map, at, decay_hours):
-    """Deterministic full ordering, most deserving first; used by review and tests.
-
-    ``decay_hours`` names the operator-visible recovery window: how long a used
-    rule stays behind the others before it is a fair pick again. The decay curve
-    itself is the V1 constant, so this only documents the window the operator
-    configures; the ordering below already reflects it through ``last_injected_at``.
-    """
-    del decay_hours
+    """Deterministic full ordering using the configured recovery window."""
+    ranked = _rank(candidates, usage_map=usage_map, at=at)
+    ranked = sorted(ranked, key=lambda item: -effective_weight(
+        usage_map.get(item[2], (0, None)), at=at, decay_hours=decay_hours))
     return tuple((signal_id, run_id) for _, _, signal_id, run_id
-                 in _rank(candidates, usage_map=usage_map, at=at))
+                 in ranked)
 
 
-def sample(candidates, *, usage_map, at, count, seed):
+def sample(candidates, *, usage_map, at, count, seed, decay_hours=DEFAULT_RECOVERY_HOURS):
     """Weighted sample without replacement, seeded so a turn stays replayable."""
     remaining = [(signal_id, run_id) for _, _, signal_id, run_id
                  in _rank(candidates, usage_map=usage_map, at=at)]
     picked = []
     generator = random.Random(digest(["expression-style-rotation.v1", seed]))
     while remaining and len(picked) < max(0, count):
-        eligible = [(item, effective_weight(usage_map.get(item[0], (0, None)), at=at)) for item in remaining]
+        eligible = [(item, effective_weight(usage_map.get(item[0], (0, None)), at=at,
+                                           decay_hours=decay_hours)) for item in remaining]
         eligible = [(item, weight) for item, weight in eligible if weight >= MIN_EFFECTIVE_WEIGHT]
         if not eligible:
             break

@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import json
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
 from uuid import uuid4
@@ -17,11 +18,29 @@ from companion_v2.sources.models import SourceRecord
 
 from ..media import inspect_image
 from .image_native.references import ReferenceSelectionError, edit_role, select_edit_tickets
+from .image_native.types import NativeImageError, inspect_image as inspect_reference_image
 
 
 IMAGE_ACTIONS = frozenset({"image.generate", "image.edit", "image.mask_edit"})
 IMAGE_REFERENCE_ROLES = frozenset({"identity", "outfit", "pose", "scene", "style", "background", "continuity",
                                    "edit_source", "edit_mask"})
+
+
+@dataclass(frozen=True, slots=True)
+class _ReferenceImageContent:
+    content: bytes = field(repr=False)
+
+
+def _inspect_role_reference(asset, raw):
+    try:
+        info = inspect_reference_image(raw)
+    except NativeImageError as error:
+        code = "reference_image_limit" if error.code == "image_size_limit" else "reference_image_invalid"
+        raise TaskError(code, "saved role reference does not meet the native image input contract") from error
+    if (info["sha256"] != asset.content_hash.sha256 or info["size_bytes"] != asset.size_bytes
+            or info["media_type"] != asset.mime_type):
+        raise TaskError("reference_fingerprint_mismatch", "saved reference bytes differ from their registration")
+    return _ReferenceImageContent(raw)
 
 
 class ImageReferenceLease:
@@ -98,12 +117,7 @@ class ImageReferenceLease:
                 if position >= 8:
                     raise TaskError("native_reference_limit", "the current edit has too many image references")
                 asset, raw, roles = references.read_asset(invocation.context, asset_id)
-                image = inspect_image(raw, position)
-                if (type(image.descriptor) is not ImageDescriptor
-                        or image.descriptor.content_hash != asset.content_hash.sha256
-                        or image.descriptor.byte_count != asset.size_bytes
-                        or image.descriptor.mime_type != asset.mime_type):
-                    raise TaskError("reference_fingerprint_mismatch", "saved reference bytes differ from their registration")
+                image = _inspect_role_reference(asset, raw)
                 handle = uuid4().hex
                 ticket = {
                     "reference_handle": handle,
@@ -112,7 +126,6 @@ class ImageReferenceLease:
                     "content_hash": asset.content_hash.sha256,
                     "position": position,
                     "event": None,
-                    "descriptor": image.descriptor,
                     "reference": None,
                     "asset": None,
                     "parent": None,

@@ -105,8 +105,14 @@ class ConfigurationService:
         })
         edit_token = fingerprint({
             "resolution": resolution, "revisions": owned.dependencies,
+            # A reset removes the sparse value row. The group's change sequence
+            # still detects set/reset cycles, including changes in its parents.
+            "group_changes": sequence,
             "actor_binding": [actor.binding_id, actor.binding_revision],
-            "policy_revision": [access.identity_policy_revision, access.policy_revision],
+            # Authorization is rechecked inside every write/replay transaction.
+            # Global policy counters also advance for unrelated users and newly
+            # registered memories/reminders; those must not expire this editor.
+            "access_tier": access.tier.value,
         })
         return ConfigurationSnapshot(
             target, group_id, self.registry.version, owned.revision, sequence,

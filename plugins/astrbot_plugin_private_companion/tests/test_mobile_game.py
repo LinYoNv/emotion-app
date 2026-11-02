@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 import json
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from tests import test_mobile_together as together_support
 # Establish the temporary SDK import root before importing the actual gateway.
 from tests import test_astrbot_staging_host as host_support
 from astrbot_host.mobile_game import GAME_KINDS, MobileGameBridge
+from astrbot_host.native_extensions.reality import mobile_gateway
 from astrbot_host.native_extensions.reality.mobile_gateway import MobileGatewayMixin
 from companion_v2.execution.models import TaskError
 
@@ -250,6 +252,46 @@ class MobileGatewayStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.together_tokens, [])
         self.assertEqual(body["data"]["games"]["games"], [])
         self.assertFalse(body["data"]["capabilities"]["room"])
+
+    async def test_pair_response_skips_optional_capability_discovery(self):
+        game = AsyncMock(side_effect=AssertionError("pair must not wait for game discovery"))
+        together = AsyncMock(side_effect=AssertionError("pair must not wait for room discovery"))
+        self.gateway.api = SimpleNamespace(companion_v2_mobile_game_status=game,
+            companion_v2_mobile_together_status=together)
+
+        body = await self.gateway._mobile_status_response(
+            {"user_id": "12345"}, session_token=TOKEN, discover_capabilities=False)
+
+        self.assertEqual(body["data"]["user_id"], "12345")
+        self.assertTrue(body["data"]["paired"])
+        self.assertFalse(body["data"]["capabilities"]["room"])
+        self.assertEqual(body["data"]["games"]["blockers"], ["连接完成后同步游戏状态"])
+        game.assert_not_awaited()
+        together.assert_not_awaited()
+
+    async def test_status_discovery_times_out_independently(self):
+        started = set()
+
+        async def slow_game(token):
+            started.add("game")
+            await asyncio.sleep(0.1)
+            return self.game_status
+
+        async def slow_together(token, *, via_mobile_gateway=False):
+            started.add("together")
+            await asyncio.sleep(0.1)
+            return self.together_status
+
+        self.gateway.api = SimpleNamespace(companion_v2_mobile_game_status=slow_game,
+            companion_v2_mobile_together_status=slow_together)
+        with patch.object(mobile_gateway, "MOBILE_STATUS_DISCOVERY_TIMEOUT_SECONDS", 0.01):
+            body = await self.gateway._mobile_status_response(
+                {"user_id": "12345"}, session_token=TOKEN)
+
+        self.assertEqual(started, {"game", "together"})
+        self.assertEqual(body["data"]["games"]["games"], [])
+        self.assertFalse(body["data"]["capabilities"]["room"])
+        self.assertIn("暂时无法确认", body["data"]["games"]["blockers"][0])
 
 
 if __name__ == "__main__":

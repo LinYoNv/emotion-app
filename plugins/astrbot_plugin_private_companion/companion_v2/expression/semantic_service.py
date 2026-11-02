@@ -113,10 +113,21 @@ class SemanticService:
         scope_setting = "reactions_group_enabled" if context.scope.kind is ScopeKind.GROUP else "reactions_private_enabled"
         return cfg["reactions_enabled"] and cfg[scope_setting]
 
-    def reaction_available(self, context, batch_id, cfg=None):
+    def reaction_capable(self, context, cfg=None):
+        """Return whether this role may ever use the reaction library.
+
+        Mount-time capability only. Per-turn eligibility stays in
+        ``reaction_available``; keeping the per-turn roll out of the tool
+        catalog stops the model-facing tool list from flipping between turns
+        and invalidating the provider prefix cache.
+        """
         cfg = cfg or self.store.settings()
         return (cfg["enabled"] and not self.closed and self.reaction_enabled(context, cfg)
-                and self.app.messages.reply_images.enabled
+                and self.app.messages.reply_images.enabled)
+
+    def reaction_available(self, context, batch_id, cfg=None):
+        cfg = cfg or self.store.settings()
+        return (self.reaction_capable(context, cfg)
                 and self.reaction_preferences.available(context, batch_id, cfg))
 
     def proactive_reaction_available(self, context, contact_id, *, diagnostic=False):
@@ -149,7 +160,7 @@ class SemanticService:
             return False
         return self.slang.validate(item, context) if item["kind"] == "slang" else True
 
-    def catalog_for(self, context, batch_id=None):
+    def catalog_for(self, context, batch_id=None, *, mount_stable=False):
         cfg = self.store.settings()
         if not cfg["enabled"] or self.closed:
             return ()
@@ -157,7 +168,11 @@ class SemanticService:
         available = []
         for tool in self.catalog:
             if tool.action == "reaction.search":
-                if self.reaction_available(context, batch_id, cfg):
+                # The native core reply mounts a stable catalog and lets the
+                # per-turn check deny the call, so the tool list does not churn.
+                permitted = (self.reaction_capable(context, cfg) if mount_stable
+                             else self.reaction_available(context, batch_id, cfg))
+                if permitted:
                     available.append(tool)
             elif cfg["slang_enabled"] and context.scope.kind is ScopeKind.GROUP:
                 try:
@@ -218,7 +233,7 @@ class SemanticService:
         return {"state": "succeeded", "effect": "committed" if call.action == "slang.learn" else "none", "payload": payload}
 
     async def execute_native(self, context, turn_id, call_id, action, args):
-        if action not in {tool.action for tool in self.catalog_for(context, turn_id)}:
+        if action not in {tool.action for tool in self.catalog_for(context, turn_id, mount_stable=True)}:
             raise TaskError("semantic_action_unavailable", "semantic action is disabled or unauthorized")
         self.validate_arguments(action, args)
         if action == "reaction.search":
@@ -497,11 +512,17 @@ class SemanticService:
             return "reactions_collection_group_enabled", "reactions_collection_group_probability", "group_capture"
         return None
 
+    def reaction_collection_allowed(self, context, turn_id):
+        fields = self._reaction_collection_fields(context)
+        settings = self.store.settings()
+        if fields is None or self.closed or not settings["enabled"] or not settings[fields[0]]:
+            return False
+        sample = int(digest(["reaction-capture-sample.v1", self.reaction_owner(context), turn_id])[:16], 16) / 2**64
+        return sample < settings[fields[1]]
+
     def schedule_native_reaction_collection(self, context, turn_id, event):
         """Read captured originals on a worker before the existing collection flow."""
-        fields = self._reaction_collection_fields(context)
-        cfg = self.store.settings()
-        if fields is None or self.closed or not cfg["enabled"] or not cfg[fields[0]]:
+        if not self.reaction_collection_allowed(context, turn_id):
             return
         key = "native-reaction-prepare:" + digest(turn_id)
         if key in self.background:
@@ -528,8 +549,7 @@ class SemanticService:
         if fields is None:
             return
         enabled_field, probability_field, source = fields
-        settings = self.store.settings()
-        if self.closed or not settings["enabled"] or not settings[enabled_field]:
+        if not self.reaction_collection_allowed(context, batch_id):
             return
         direct_sources = ({image.source for image in native_images} if native_images is not None else
             {material.source for material in request.context.materials
@@ -544,9 +564,6 @@ class SemanticService:
         self.reaction_capture_runs = {key: at for key, at in self.reaction_capture_runs.items()
                                       if now - at < 600}
         if run_key in self.reaction_capture_runs or key in self.background:
-            return
-        sample = int(digest(["reaction-capture-sample.v1", owner, batch_id])[:16], 16) / 2**64
-        if sample >= settings[probability_field]:
             return
         try:
             images = (native_images if native_images is not None else

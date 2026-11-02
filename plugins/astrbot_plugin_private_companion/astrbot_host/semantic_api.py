@@ -184,6 +184,14 @@ class SemanticWebAPI:
                         WHERE v.owner=? AND v.kind=? AND v.model=? AND v.revision=i.revision AND i.enabled=1""",(owner,kind,result["model_binding"])).fetchone()[0]
                     result["catalog"][kind] = {"enabled":counts.get("1",0),"disabled":counts.get("0",0),
                                                "total":sum(counts.values()),"embedded":embedded}
+                    if kind == "reaction":
+                        # Match the UI's pending-only analyze action across the entire catalog,
+                        # rather than counting only the current 24-item page.
+                        result["catalog"][kind]["pending"] = db.execute(
+                            """SELECT COUNT(*) FROM items WHERE owner=? AND kind='reaction'
+                               AND json_extract(payload, '$.analysis')='pending'""",
+                            (owner,)
+                        ).fetchone()[0]
             result["reaction_collection"] = (service.store.reaction_collection_summary(reaction_owner)
                                              if context else {"totals": {}, "recent": []})
         return result
@@ -196,7 +204,9 @@ class SemanticWebAPI:
             selection = {key:query[key] for key in ("target_id","role_id","session_id","global") if key in query}
             service, context = self.resolve(selection)
             result = self.status(service,context)
-            if hasattr(self.controller.settings, "all_targets"):
+            if context is not None and hasattr(self.controller.settings, "all_targets"):
+                # Global settings requests intentionally carry no target/role.
+                # Resolve target-specific group sessions only for a chat scope.
                 target = self.controller.settings.target(query["target_id"])
                 if isinstance(target, GroupTarget):
                     result["sessions"] = list(self.group_sessions(target, query["role_id"], service))
@@ -303,8 +313,14 @@ class SemanticWebAPI:
                         raise ValueError("revise the bounded meaning of this exact term")
                     payload["source"]="manual"
                 else:
+                    # Saving an editor with untouched empty fields must not mark
+                    # those fields as human-authored. Otherwise a user who saves
+                    # before pressing "complete blank fields" permanently pins
+                    # every empty field and the vision model can never fill it.
+                    changed_fields = {name for name, value in values.items()
+                                      if value != item["payload"].get(name, "")}
                     payload["analysis"]="manual"
-                    payload["manual_fields"] = sorted(set(payload.get("manual_fields", ())) | set(values))
+                    payload["manual_fields"] = sorted(set(payload.get("manual_fields", ())) | changed_fields)
                     if data["enabled"] and payload.get("collection_state") == "awaiting_confirmation":
                         payload["collection_state"] = "confirmed"
                 payload["text"]="；".join(payload.get(k,"") for k in allowed)

@@ -3,11 +3,10 @@
 import json
 
 from astrbot.api.web import request
-from companion_v2.adapters.astrbot.native import account_number
 from companion_v2.execution.models import TaskError
 from companion_v2.foundation.outcome import Outcome
 from companion_v2.memory.group.management import GroupMemoryManagement, GroupMemoryTarget
-from .group_settings import GroupTarget
+from .group_settings import GroupTarget, group_session_matches
 from .management_identity import dashboard_operator
 from .web_api import outcome_response
 
@@ -39,9 +38,7 @@ class GroupMemoryWebAPI:
                 p.bot_id == selected.bot_id and p.role_id == self.role_id for p in controller.settings.personas):
             raise TaskError("group_memory_target_required", "the configured group/role is unavailable")
         native_session = selected.group_id if session_id is None else session_id
-        parts = native_session.split("_") if type(native_session) is str else ()
-        if (len(parts) not in (1, 2) or parts[-1] != selected.group_id
-                or any(account_number(part) != part for part in parts)):
+        if not group_session_matches(native_session, selected.group_id):
             raise TaskError("group_memory_session_invalid", "choose this group's shared or per-member native session")
         operator = dashboard_operator(controller.runtime, username, at=controller.now())
         target = GroupMemoryTarget(controller.runtime.installation_id, selected.platform_id, selected.bot_id,

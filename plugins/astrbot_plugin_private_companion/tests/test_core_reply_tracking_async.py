@@ -5,11 +5,12 @@ from datetime import timedelta
 from threading import Event, get_ident
 from types import SimpleNamespace as NS
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from astrbot_host.core_reply import CORE_REPLY_CONTEXT_EXTRA
 from astrbot_host.core_reply_tracking import (
-    finish_core_reply_tracking, mark_core_reply_inflight, prepare_core_reply_tracking,
+    adopt_core_reply_tracking, finish_core_reply_tracking, mark_core_reply_inflight,
+    prepare_core_reply_tracking,
 )
 from tests.group_host_support import GroupFixture
 
@@ -85,6 +86,27 @@ class CoreReplyTrackingAsyncTests(GroupFixture, unittest.IsolatedAsyncioTestCase
         self.assertEqual((saved["send_attempts"], saved["send_returns"]), (1, 1))
         self.assertEqual(saved["logged_stages"], ["admitted", "completed"])
         self.assertEqual(self.app.runtime.read_all("SELECT * FROM conversation_batches", ()), ())
+
+    async def test_new_instance_rebinds_group_bookkeeping_for_inflight_reply(self):
+        event, prepared = await self.prepared_event("adopted-group-record")
+        self.attach(event, prepared, submit=self.observer.submit)
+        mark_core_reply_inflight(event)
+        new_admission = NS(
+            mark_core_reply=Mock(),
+            mark_core_reply_logged=Mock(return_value=False),
+            note_live_core_turn=Mock(),
+        )
+
+        adopted = adopt_core_reply_tracking(
+            event, admission=new_admission, now=self.clock.now, submit=None, prepared=prepared)
+
+        self.assertTrue(adopted)
+        await event.send("新实例接管后的群回复")
+        delivery = finish_core_reply_tracking(event)
+        self.assertEqual(event.sent, ["新实例接管后的群回复"])
+        self.assertEqual(delivery["send_state"], "returned")
+        self.assertEqual([call.kwargs["stage"] for call in new_admission.mark_core_reply.call_args_list],
+                         ["send_started", "send_returned", "completed"])
 
     async def test_background_record_failures_do_not_stop_later_phases_or_native_send(self):
         event, prepared = await self.prepared_event("async-group-failure")

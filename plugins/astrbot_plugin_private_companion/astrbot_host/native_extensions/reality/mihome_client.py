@@ -26,6 +26,15 @@ from astrbot.api import logger
 # 任何上游实例前抑制，避免 DID、动作文本及登录令牌进入 AstrBot 日志。
 logging.getLogger("mijiaAPI").setLevel(logging.WARNING)
 
+from .mihome_arc4_compat import ensure_arc4_compat  # noqa: E402
+
+_ARC4_NATIVE_ERROR = ensure_arc4_compat()
+if _ARC4_NATIVE_ERROR:
+    logger.warning(
+        "[MiHome] pycryptodome 原生 ARC4 不可用（%s），已启用内置兼容实现。",
+        _ARC4_NATIVE_ERROR,
+    )
+
 try:
     from mijiaAPI import (  # noqa: E402 - security guard must run before import
         mijiaAPI,
@@ -162,6 +171,10 @@ class MiHomeClient:
         environment.pop("PYTHONPATH", None)
         environment.pop("PYTHONHOME", None)
         environment["PYTHONNOUSERSITE"] = "1"
+        # Worker stdout is decoded as UTF-8 by the parent process. Pin the
+        # child encoding so dependency errors cannot become mojibake.
+        environment["PYTHONIOENCODING"] = "utf-8"
+        environment["PYTHONUTF8"] = "1"
         return environment
 
     def _initialize_api(self) -> None:

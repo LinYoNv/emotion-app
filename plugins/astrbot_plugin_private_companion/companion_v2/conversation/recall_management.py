@@ -1,9 +1,10 @@
 """Authorized management view over this window's withdrawn originals.
 
-V1 answered a chat command or a natural-language question here. V2 keeps the same
-bounded read but exposes it as an authenticated Dashboard view: the operator is
-authorized with the existing core-only memory-management action, the window switch
-must be on, and the answer is a read-only list that never becomes context.
+V1 answered a chat command or a natural-language question here. V2 keeps the
+same bounded read in the authenticated Dashboard and, for an explicit recall
+question from a core administrator, can also hand the same bounded summary to
+that turn's reply context. A page read alone still never republishes a source
+or injects anything into an ordinary chat turn.
 """
 
 from companion_v2.conversation.perception_settings import GROUP as PERCEPTION_GROUP
@@ -50,7 +51,7 @@ class RecallManagement:
             result = self.app.messages.recalls.transcribe(self.context, operator, settings,
                                                           at=self.app.now())
             return {**result, "enabled": settings["transcribe_enabled"],
-                    "note": "撤回内容只作管理查询，不会重新变成聊天上下文，也不会重新发布来源。"}
+                    "note": "页面读取只作管理查询；核心管理员在明确询问撤回时，本轮回复上下文可读取同一份有界摘要。"}
 
 
 __all__ = ["RecallManagement"]

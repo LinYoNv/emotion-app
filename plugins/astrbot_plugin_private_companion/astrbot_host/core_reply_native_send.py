@@ -3,6 +3,8 @@
 from copy import copy, deepcopy
 
 from astrbot.core.agent.tool import ToolSet
+from astrbot.core.message.components import Image
+from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.tools.message_tools import SendMessageToUserTool
 
@@ -34,17 +36,24 @@ class _CurrentReplyContext:
             raise TaskError("group_participation_skipped", "this group turn chose to keep listening")
         if str(session) != tool._origin:
             raise TaskError("core_reply_tool_target_changed", "native reply tools can send only to their admitted session")
-        from .core_reply_reaction_delivery import capture_core_reaction_intent
-        capture_core_reaction_intent(tool._event, message_chain)
-        from .core_reply_voice_authoring import author_core_voice_message
-        await author_core_voice_message(tool._event, message_chain)
-        from .core_reply_voice import capture_core_voice_message
-        message_chain = capture_core_voice_message(tool._event, message_chain)
+        chain = getattr(message_chain, "chain", ())
+        image_parts = [part for part in chain if isinstance(part, Image)]
+        image_only = bool(image_parts)
+        if image_only:
+            derive = getattr(message_chain, "derive", None)
+            message_chain = derive(image_parts) if callable(derive) else MessageChain(chain=image_parts)
+        else:
+            from .core_reply_reaction_delivery import capture_core_reaction_intent
+            capture_core_reaction_intent(tool._event, message_chain)
+            from .core_reply_voice_authoring import author_core_voice_message
+            await author_core_voice_message(tool._event, message_chain)
+            from .core_reply_voice import capture_core_voice_message
+            message_chain = capture_core_voice_message(tool._event, message_chain)
         voice_source = message_chain.get_plain_text()
         message_chain = present_core_reply_message(tool._event, message_chain)
         if message_chain is None:
             raise TaskError("core_reply_text_removed", "the configured text rules removed all message content; nothing was sent")
-        if state.get("_voice_authored"):
+        if state.get("_voice_authored") and not image_only:
             object.__setattr__(message_chain, "_companion_v2_voice_source", voice_source)
         try:
             await state["_authorize_delivery"]()
@@ -60,13 +69,20 @@ class _CurrentReplyContext:
         if state["send_unknown"] or attempts.get(key) in {"started", "unknown", "partial_returned"}:
             raise TaskError("core_reply_delivery_unknown", "the previous native send outcome is unknown; do not replay it")
         callback = state.get("prepare_send")
-        if callable(callback):
+        if callable(callback) and not image_only:
             from inspect import isawaitable
             message_chain = callback(state["prepared"], message_chain, state["_authorize_delivery"], 0, 1)
             if isawaitable(message_chain):
                 message_chain = await message_chain
         from .core_reply_voice import commit_pending_voice_claim, release_pending_voice_claim
         returned = 0
+        # native_reply_messages can return an empty tuple now that a quote or @
+        # with no body is dropped. This value is what AstrBot's tool turns into
+        # its own reply, and its `if not sent` branch reads a falsy one as
+        # "failed to find platform for session ...": consuming the decoration is
+        # a no-op success, not a platform failure, so the loop starts from a
+        # truthy result and every real send overwrites it.
+        result = True
         for part in native_reply_messages(tool._event, message_chain):
             try:
                 await state["_authorize_delivery"]()

@@ -102,6 +102,19 @@ class GroupImageToolFixture(MessageFixture):
             state=CapabilityAuthorizationState.ACTIVE if active else CapabilityAuthorizationState.REVOKED,
             expected_revision=revision, observed_at=NOW).unwrap()
 
+    def set_image_output(self, **changes):
+        from companion_v2.configuration.models import ConfigLayer, ConfigTarget
+        from companion_v2.conversation.media.output_settings import (
+            GROUP as IMAGE_OUTPUT_GROUP, ImageOutputConfigurationOwner, configuration_fields,
+        )
+        target = ConfigTarget(self.context.scope.installation_id, ConfigLayer.ROLE,
+                              self.context.role_binding.role, bot_id=self.context.scope.bot_id)
+        fields = configuration_fields()
+        owner = ImageOutputConfigurationOwner(self.runtime)
+        owner.write(target, fields,
+                    changes={IMAGE_OUTPUT_GROUP + "." + name: value for name, value in changes.items()},
+                    reset=(), expected_revision=owner.read(target, fields).revision, observed_at=NOW)
+
     def response(self, invocation, *, state="succeeded"):
         source = None
         images = ()
@@ -172,6 +185,24 @@ class GroupNativeImageToolTests(GroupImageToolFixture, unittest.IsolatedAsyncioT
         self.assertEqual({t.action for t in self.tools.catalog_for(self.context)},
                          group_memory_actions | self.tools.group_participation.actions)
 
+    async def test_group_switch_and_core_only_permission_remove_image_tools(self):
+        group_memory_actions = self.tools.group_memory.actions - {"group.memory.legacy.query"}
+        baseline = group_memory_actions | self.tools.group_participation.actions | {"image.generate", "image.edit"}
+        self.assertEqual({t.action for t in self.tools.catalog_for(self.context)}, baseline)
+
+        self.set_image_output(group_enabled=False)
+        self.assertEqual({t.action for t in self.tools.catalog_for(self.context)},
+                         group_memory_actions | self.tools.group_participation.actions)
+
+        self.set_image_output(group_enabled=True, request_permission="core_only")
+        self.assertEqual({t.action for t in self.tools.catalog_for(self.context)},
+                         group_memory_actions | self.tools.group_participation.actions)
+
+        core_context = self.member(self.core, self.context.scope)
+        for action in ("image.generate", "image.edit"):
+            self.consent(action, context=core_context)
+        self.assertEqual({t.action for t in self.tools.catalog_for(core_context)}, baseline)
+
     async def test_private_audience_cannot_open_group_image_catalog(self):
         forged = replace(self.context, audience=AudienceRef(self.context.scope, (self.context.actor.subject,)))
         self.assertEqual(self.tools.catalog_for(forged), ())
@@ -232,16 +263,26 @@ class GroupNativeImageToolTests(GroupImageToolFixture, unittest.IsolatedAsyncioT
         visible = next(m for m in self.view(self.context, batch).context.materials if m.purpose == "actual_tool_results")
         self.assertEqual(json.loads(visible.payload)[0]["result"], json.loads(exchange.result_json))
 
-    async def test_changed_provider_invalidates_old_group_history(self):
+    async def test_changed_provider_binding_remaps_without_hiding_group_image_history(self):
         self.model_uses(call())
         batch = await self.generate()
         await self.deliver_next(batch)
         other, next_batch = self.later_group_request()
         self.bindings["image.generate"] = replace(self.bindings["image.generate"], generation="replacement")
+        self.assertIn("image.generate", {t.action for t in self.tools.catalog_for(self.context)})
+        self.assertTrue(self.view(other, next_batch))
+        self.assertEqual(len(self.invocations), 1)
+
+    async def test_removed_image_provider_still_hides_the_tool_and_blocks_history(self):
+        self.model_uses(call())
+        batch = await self.generate()
+        await self.deliver_next(batch)
+        other, next_batch = self.later_group_request()
+        self.bindings.pop("image.generate")
+        self.assertNotIn("image.generate", {t.action for t in self.tools.catalog_for(self.context)})
         with self.assertRaises(TaskError) as error:
             self.view(other, next_batch)
         self.assertEqual(error.exception.code, "external_provider_changed")
-        self.assertNotIn("image.generate", {t.action for t in self.tools.catalog_for(self.context)})
         self.assertEqual(len(self.invocations), 1)
 
     async def assert_generated_revocation_blocks_text_history(self, target):

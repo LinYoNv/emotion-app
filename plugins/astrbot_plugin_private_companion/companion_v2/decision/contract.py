@@ -1,4 +1,8 @@
-"""The small, numeric-free contract returned by the Laya decision model."""
+"""The small, numeric-free decision contract returned by the Laya model.
+
+Answer confidence is transport metadata used by host-side gates; it is not
+part of the versioned decision document and never grants an action by itself.
+"""
 
 from __future__ import annotations
 
@@ -50,6 +54,10 @@ class LayaDecision:
     segment_mode: str
     tool_need: str
     reason_codes: tuple[str, ...]
+    # Probability mass on the chosen `action`, copied from Laya's calibrated
+    # `answer_confidence` (or `probabilities[choice]` on strict SystemOne).
+    # Kept outside `document()` so the decision contract remains numeric-free.
+    action_confidence: float | None = None
 
     def document(self) -> dict[str, Any]:
         return {

@@ -168,7 +168,9 @@ class ReplyManagementTests(HostFixture, unittest.IsolatedAsyncioTestCase):
         settings = status["settings"]
         self.assertFalse(settings["enable_private_image_self_recognition"])
         self.assertTrue(settings["enable_private_image_vision_cache"])
+        self.assertTrue(settings["astrbot_animated_image_understanding_enabled"])
         changes = {"enable_private_image_self_recognition": True,
+                   "astrbot_animated_image_understanding_enabled": False,
                    "private_image_vision_custom_prompt": "优先描述清晰可读的文字。",
                    "private_image_vision_max_chars": 600,
                    "private_image_vision_wait_seconds": 4,

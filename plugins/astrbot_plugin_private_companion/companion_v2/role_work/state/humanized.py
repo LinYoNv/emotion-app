@@ -164,7 +164,7 @@ def _sleep_execution_text(simulation):
 
 
 def is_sleepy(simulation):
-    """True when the role simulation indicates active sleep, recent waking inertia, or drowsiness."""
+    """Pacing from physical sleep execution only; prose is interpreted in prompts."""
     if not isinstance(simulation, dict):
         return False
     execution = simulation.get("sleep_execution")
@@ -176,16 +176,6 @@ def is_sleepy(simulation):
             awake_minutes = execution.get("awake_minutes")
             if type(awake_minutes) is int and awake_minutes <= 25:
                 return True
-            if awake_minutes is None and execution.get("ended_at"):
-                return True
-    values = simulation.get("values")
-    if isinstance(values, dict):
-        sleep_text = str(values.get("sleep") or "")
-        conditions = [str(c.get("text") or "") for c in (values.get("conditions") or ())
-                      if isinstance(c, dict)]
-        if any(any(token in text for token in ("困", "睡", "熬夜", "疲", "乏", "迷糊"))
-               for text in (sleep_text, *conditions) if text):
-            return True
     return False
 
 

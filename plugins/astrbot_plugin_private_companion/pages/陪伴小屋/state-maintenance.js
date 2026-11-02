@@ -548,7 +548,7 @@ window.CompanionStateMaintenance = (() => {
     }
     if(draft.kind==="weather")return `<div class="state-weather-settings-form">
       ${configGroup(1,"天气感知","同一角色的所有私聊共用此开关；按授权按需读取所在地实况。",`${configField("planning_weather_enabled",values,e)}<div class="state-config-grid state-config-weather-grid">${weatherLocationFields(values,e)}${configField("planning_weather_max_age_minutes",values,e,{tile:true,help:"取值为 5–120 分钟；超时会按授权重新读取。"})}</div>`)}
-      <p class="state-planning-note">配置和风凭据时使用和风；未配置时自动使用免密 Open-Meteo。V1 的 OpenWeatherMap 与高德来源在 V2 没有等价项。此处不保存 API 凭据。</p>
+      <p class="state-planning-note">配置和风凭据时使用和风；未配置时自动使用免密 Open-Meteo。此处不保存 API 凭据。</p>
     </div>`;
     if(draft.kind==="health"||draft.kind==="hunger") {
       const name=draft.kind==="health"?"健康感受":"饥饿感受";

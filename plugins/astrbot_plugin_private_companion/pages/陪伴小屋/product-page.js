@@ -1,5 +1,23 @@
 /* Navigation and status for capabilities owned by the V2 plugin. */
 "use strict";
+/* Mobile dashboards are often served over plain HTTP, where crypto.randomUUID
+   is not exposed.  Every editor uses it for idempotency keys; without this
+   fallback a save can throw after marking the editor busy and leave it stuck. */
+(() => {
+  const target = globalThis.crypto;
+  if (!target || typeof target.randomUUID === "function") return;
+  const randomUUID = () => {
+    const bytes = new Uint8Array(16);
+    if (typeof target.getRandomValues === "function") target.getRandomValues(bytes);
+    else for (let index = 0; index < bytes.length; index++) bytes[index] = Math.floor(Math.random() * 256);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = [...bytes].map(value => value.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  };
+  try { Object.defineProperty(target, "randomUUID", {value: randomUUID, configurable: true}); }
+  catch { target.randomUUID = randomUUID; }
+})();
 window.CompanionProduct = (() => {
   const HOST = "astrbot_plugin_private_companion", PREFIX = "/" + HOST + "/";
   const bundledExtensions = {content:"content", reality:"reality", together:"together", game:"game", live:"live", image:"image", screen:"companion.screen.native"};
@@ -11,6 +29,10 @@ window.CompanionProduct = (() => {
     written:"已保存", proposed:"待确认", achieved:"已达成", retired:"已归档", running:"运行中", new:"尚未启动", stopped:"已停止"};
   const errors = {staging_not_initialized:"角色数据尚未就绪，请在「账号与会话」保存角色映射；首次设置已保留，已保存可重新读取状态。", staging_host_terminated:"角色已停止，重新打开插件页面即可恢复。",
     dashboard_identity_required:"请从已登录的 AstrBot 管理界面打开陪伴小屋。", core_access_required:"当前账号没有管理权限。",
+    perception_request_invalid:"感知设置内容无效，请核对当前设置后再保存。",
+    perception_provider_unavailable:"感知服务尚未就绪，请核对模块运行状态。",
+    perception_save_failed:"感知设置未能完成保存，请刷新核对。",
+    integration_request_invalid:"家具清单读取请求无效，请重新读取状态。",
     bridge_timeout:"连接超时，请刷新核对。", invalid_response:"数据不完整，请刷新核对。", scope_changed:"对象已切换，请重新打开工作区。",
     /* labels 是「这一项现在能不能用」，不是开发进度。
      写「已接入」的那种说法回答的是「这一块做到哪一步了」，用户不关心；
@@ -29,6 +51,10 @@ window.CompanionProduct = (() => {
     setup_conversation_unavailable:"还没有跟它说过话，先在这个对象的私聊里发一条消息。",
     setup_test_confirmation_invalid:"测试记录已变化，请刷新后确认收到的是本次测试消息。",
     setup_test_non_replayable:"这次测试已经发送过，请在收到后确认；本次不会重发。",
+    /* 引导没走完和「测试已经跑过」是两件无关的事：前者要做的是去补步骤，
+       后者要做的才是去确认已经发出去的那条。少了这一行，新码会落进
+       fail() 的兜底「暂不可读取，请刷新核对。」——用户会以为页面读不到数据。 */
+    setup_steps_incomplete:"还有引导步骤没有完成，请先完成（或跳过）剩下的步骤，再做这次测试。",
     staging_delivery_not_enabled:"这个运行实例没有可用的 OneBot 私聊通道。请核对绑定的 Bot 账号、私聊对象和人格。",
     staging_delivery_window_invalid:"当前 OneBot 投递通道配置无效，请核对账号与目标。",
     staging_delivery_profile_required:"这个窗口的角色配置尚未就绪，请重新读取账号与会话。",
@@ -61,10 +87,10 @@ window.CompanionProduct = (() => {
     staging_settings_incomplete:"运行设置尚未填写完整，请补齐账号、私聊对象、人格与模型。",
     /* V1 迁移：每个码说清「卡在哪、下一步做什么」。迁移块自己会先把缺的生效范围
        列出来，所以这几句多半出现在「数据变过了」或「V1 目录不在了」这类真实意外上。 */
-    legacy_root_missing:"没有找到 V1 的数据目录。它通常与 V2 的数据目录平级；也可以在插件配置的「兼容｜从 V1 迁移数据」里直接填绝对路径。",
-    legacy_root_invalid:"这个路径不是目录，请改填 V1 的数据目录。",
-    legacy_plan_stale:"V1 的数据在这次试算之后变过，请重新试算再执行——这样写入的才是你看到的那一份。",
-    legacy_nothing_to_migrate:"这份 V1 数据里没有可以自动迁移的来源。",
+    legacy_root_missing:"没有找到旧版数据目录。它通常与当前版本的数据目录平级；也可以在插件配置的「兼容｜旧版资料迁入」里直接填绝对路径。",
+    legacy_root_invalid:"这个路径不是目录，请改填旧版数据目录。",
+    legacy_plan_stale:"旧版数据在这次试算之后变过，请重新试算再执行，这样写入的才是你看到的那一份。",
+    legacy_nothing_to_migrate:"这份旧版数据里没有可以自动迁移的来源。",
     legacy_scope_unavailable:"这份角色设置里没有要写入的配置分组，这一组会跳过，其余照常。",
     legacy_apply_failed:"迁移没有写入任何设置，请重新试算后再试一次。",
     legacy_request_invalid:"这次操作缺少必要的信息，请重新走一遍迁移的三步。"};
@@ -258,6 +284,58 @@ window.CompanionProduct = (() => {
   let followLight = false;
   try { followLight = localStorage.getItem(themeLightKey) === "on"; } catch (_) {}
   let lastSceneLight = "";
+  /* AstrBot 把插件页放在 sandbox="allow-scripts" 的 iframe 里，没有
+     allow-same-origin。这个 iframe 是 opaque origin，localStorage 会直接抛
+     SecurityError。以前只写 localStorage，于是每次刷新网页外观都回到默认；
+     桥接 API 走宿主同源请求，所以把同一组偏好按 Dashboard 账号存到插件数据。
+     localStorage 仍然保留：页面直接打开、或未来宿主放开 same-origin 时它仍是
+     零延迟的首屏缓存。 */
+  let preferencesTouched = 0, preferencesApplying = false, preferenceSaveTimer = null;
+  const displayPreferencesSnapshot = () => ({
+    appearance:{...appearance},
+    followLight:Boolean(followLight),
+    largeText:Boolean(window.CompanionDisplayPreferences?.largeText?.()),
+  });
+  const preferencesAreDefault = () => Object.entries(dimensions).every(([name, spec]) => appearance[name] === spec.fallback)
+    && !followLight && !window.CompanionDisplayPreferences?.largeText?.();
+  function scheduleDisplayPreferencesSave() {
+    if (preferencesApplying || !bridgeReady) return;
+    if (preferenceSaveTimer) clearTimeout(preferenceSaveTimer);
+    preferenceSaveTimer = setTimeout(() => {
+      preferenceSaveTimer = null;
+      if (preferencesApplying || !bridgeReady) return;
+      api("POST", "page/display-preferences", displayPreferencesSnapshot()).catch(error => {
+        const code = error?.code || "display_preferences_unavailable";
+        /* 外观页承诺「同一账号换设备同步」。只写 console 的话用户以为已保存，
+           换设备才发现回到默认；这里保留诊断，同时走现有 changed() 通道让外壳
+           用 toast 给出可见失败提示。成功路径不变。 */
+        console.warn("[CompanionV2] Display preferences were not saved", {code});
+        if (typeof changed === "function") changed({kind:"display-preferences-error", code,
+          message:"外观偏好没有保存成功；刷新或换设备后可能仍是旧设置。"});
+      });
+    }, 120);
+  }
+  function applyDisplayPreferences(saved) {
+    if (!saved || typeof saved !== "object" || !saved.appearance || typeof saved.appearance !== "object") return false;
+    preferencesApplying = true;
+    try {
+      for (const [name, spec] of Object.entries(dimensions)) {
+        if (spec.values.includes(saved.appearance[name])) appearance[name] = saved.appearance[name];
+      }
+      followLight = saved.followLight === true;
+      applyAppearance();
+      sendWorkspace({kind:"appearance",appearance:{...appearance}});
+      if (typeof saved.largeText === "boolean") {
+        window.CompanionDisplayPreferences?.setLargeText?.(saved.largeText);
+      }
+    } finally { preferencesApplying = false; }
+    return true;
+  }
+  function displayPreferencesChanged() {
+    if (preferencesApplying) return;
+    preferencesTouched += 1;
+    scheduleDisplayPreferencesSave();
+  }
   function applyAppearance() {
     const root = document.documentElement;
     for (const [name, spec] of Object.entries(dimensions)) root.dataset[spec.dataset] = appearance[name];
@@ -302,13 +380,16 @@ window.CompanionProduct = (() => {
     appearance[name] = value;
     if (name !== "theme") applyAppearance();
     try { localStorage.setItem(spec.key, value); } catch (_) {}
+    displayPreferencesChanged();
     if (name === "theme") sendWorkspace({kind:"theme",theme:value});
     else sendWorkspace({kind:"appearance",name,value});
     return appearance[name];
   }
   function setFollowLight(on) {
-    followLight = !!on;
+    const next = !!on, changed = followLight !== next;
+    followLight = next;
     try { localStorage.setItem(themeLightKey, followLight ? "on" : "off"); } catch (_) {}
+    if (changed) displayPreferencesChanged();
     return followLight;
   }
   /* 小屋光照变化时调用。跟随时段开着才会切主题，
@@ -336,11 +417,20 @@ window.CompanionProduct = (() => {
     }
   }
   const target = () => catalog?.targets.find(item => item.target_id === selected.target_id);
+  const targetPreference = item => [
+    item.scope_kind === "private" ? 1 : 0,
+    item.scope_kind === "private" && item.participant_id && item.participant_id !== "*" ? 1 : 0,
+    item.display_name ? 1 : 0,
+  ];
+  const prefersTarget = (candidate, current) => {
+    const left = targetPreference(candidate), right = targetPreference(current);
+    return left.some((value, index) => value !== right[index] && value > right[index]);
+  };
   const roleChoices = () => {
     const choices = new Map();
     for (const item of catalog?.targets || []) for (const persona of item.roles || []) {
       const previous = choices.get(persona.role_id);
-      if (!previous || item.scope_kind === "private" && previous.target.scope_kind !== "private") {
+      if (!previous || prefersTarget(item, previous.target)) {
         choices.set(persona.role_id, {target:item, role:persona});
       }
     }
@@ -349,14 +439,15 @@ window.CompanionProduct = (() => {
   };
   const roleTarget = () => {
     const current = target();
-    if (current?.scope_kind === "private" && current.roles.some(item => item.role_id === selected.role_id)) return current;
+    if (current?.scope_kind === "private" && current.participant_id !== "*"
+        && current.roles.some(item => item.role_id === selected.role_id)) return current;
     return roleChoices().find(item => item.role.role_id === selected.role_id)?.target || null;
   };
   const role = () => {
     const current = target()?.roles.find(item => item.role_id === selected.role_id);
     const owner = roleTarget()?.roles.find(item => item.role_id === selected.role_id);
-    if (!current) return owner;
-    if (target()?.scope_kind !== "group" || !owner || owner === current) return current;
+    if (!owner) return current;
+    if (target()?.scope_kind !== "group" || owner === current) return owner;
     return {...owner, reply_api:current.reply_api || owner.reply_api,
       group_memory_api:current.group_memory_api || null};
   };
@@ -378,13 +469,14 @@ window.CompanionProduct = (() => {
     && ["ok", "error"].includes(value.status) && hasOwn(value, "data")
     && Object.keys(value).every(name => ENVELOPE_KEYS.has(name));
   function unwrap(response) {
-    const wrapped = isEnvelope(response) ? response : isEnvelope(response?.data) ? response.data : null;
+    const dataOnly = response && typeof response === "object" && !Array.isArray(response)
+      && Object.keys(response).length === 1 && hasOwn(response, "data");
+    const wrapped = isEnvelope(response) ? response : dataOnly && isEnvelope(response.data) ? response.data : null;
     if (wrapped?.status === "error") throw fail(codeOf(wrapped) || "invalid_response", true);
     let value = wrapped ? wrapped.data : response;
     /* A bridge shim may preserve one anonymous data layer without the
        envelope fields.  Only unwrap the exact {data: ...} shape. */
-    if (!wrapped && response && typeof response === "object" && !Array.isArray(response)
-        && !hasOwn(response, "status") && hasOwn(response, "data")
+    if (!wrapped && dataOnly
         && response.data && typeof response.data === "object" && !Array.isArray(response.data)) value = response.data;
     if (!value || typeof value !== "object" || Array.isArray(value)) throw fail("invalid_response");
     return value;
@@ -447,6 +539,36 @@ window.CompanionProduct = (() => {
     return value;
   }
 
+  /* 工作区空态要说得准：桥没到、目录没读、还没有窗口目标、有目标但没角色、
+     有角色但没有模型路由——这五种情况的下一步完全不同，用一句「请选择已关联
+     角色的私聊窗口」盖住，用户就会以为映射白做了（4.29 上就是这么报的）。 */
+  function workspaceState() {
+    if (!bridgeReady || !bridge) return {code:"bridge"};
+    if (!catalog) return {code:"catalog"};
+    const targets = catalog.targets || [];
+    if (!targets.length) return {code:"targets"};
+    const current = role();
+    if (!current) return {code:"role", targets:targets.length};
+    if (typeof current.model_api !== "string" || !current.model_api) {
+      return {code:"model_api", targets:targets.length};
+    }
+    if (!catalog.operator_id) return {code:"operator", targets:targets.length};
+    return {code:"ready", targets:targets.length};
+  }
+  const workspaceMessages = {
+    bridge: "正在连接 AstrBot 管理界面…",
+    catalog: "正在读取账号与会话…",
+    targets: "还没有选定窗口目标：到「账号与会话」勾选要交给插件处理的窗口并保存目标。",
+    role: "这个账号下还没有已映射的角色：到「账号与会话」保存角色映射。",
+    model_api: "当前窗口没有模型路由：回到「账号与会话」重新保存角色映射后再读取。",
+    operator: "Dashboard 身份还没就绪，请重新登录管理界面后再打开。",
+  };
+  function workspaceHint() {
+    const state = workspaceState();
+    return state.code === "ready" ? "" : (workspaceMessages[state.code] || "工作区暂时读不到，请重新读取。");
+  }
+  const workspaceDiagnosis = () => ({...workspaceState(), hint: workspaceHint(),
+    targets: (catalog?.targets || []).length});
   function chooseDefault() {
     const choices = roleChoices();
     const choice = choices.find(item => item.role.role_id === selected.role_id) || choices[0];
@@ -456,7 +578,51 @@ window.CompanionProduct = (() => {
     selected = {target_id:context?.target_id ?? null, role_id:choice?.role.role_id ?? null};
   }
   let summaryRequest = 0;
-  async function loadSummary(ticket) {
+  const SUMMARY_CACHE_MS = 45000;
+  const SUMMARY_CACHE_KEY = "companion-product-summary.v2";
+  const summaryCache = new Map();
+  function summaryCacheKey() {
+    return [catalog?.installation_id || "", selected.target_id || "", selected.role_id || ""].join(":");
+  }
+  function readSummaryCache(key) {
+    const memory = summaryCache.get(key);
+    if (memory && Date.now() - memory.at <= SUMMARY_CACHE_MS) return memory;
+    try {
+      const all = JSON.parse(window.sessionStorage?.getItem(SUMMARY_CACHE_KEY) || "{}");
+      const value = all?.[key];
+      if (value && Date.now() - Number(value.at || 0) <= SUMMARY_CACHE_MS) {
+        summaryCache.set(key, value);
+        return value;
+      }
+    } catch {}
+    return null;
+  }
+  function writeSummaryCache(key, value) {
+    summaryCache.set(key, value);
+    try {
+      const all = JSON.parse(window.sessionStorage?.getItem(SUMMARY_CACHE_KEY) || "{}");
+      all[key] = value;
+      const entries = Object.entries(all).filter(([, item]) => item && Date.now() - Number(item.at || 0) <= SUMMARY_CACHE_MS).slice(-8);
+      window.sessionStorage?.setItem(SUMMARY_CACHE_KEY, JSON.stringify(Object.fromEntries(entries)));
+    } catch {}
+  }
+  function paintCachedSummary(cached) {
+    data = {...(cached.data || {})};
+    failures = {...(cached.failures || {})};
+    failureCodes = {...(cached.failureCodes || {})};
+    changed({kind:"state-refresh"});
+  }
+  async function loadSummary(ticket, {force=false} = {}) {
+    const key = summaryCacheKey();
+    const cached = force ? null : readSummaryCache(key);
+    if (cached) {
+      paintCachedSummary(cached);
+      setTimeout(() => {
+        if (ticket !== generation) return;
+        loadSummary(ticket, {force:true}).then(ok => { if (ok && ticket === generation) changed({kind:"state-refresh"}); }).catch(() => {});
+      }, 0);
+      return true;
+    }
     const request = ++summaryRequest;
     const current = role();
     const names = ["life","state","growth"].filter(name => current?.[name+"_api"]);
@@ -475,12 +641,15 @@ window.CompanionProduct = (() => {
       }
     });
     data = fresh; failures = rejected; failureCodes = rejectedCodes;
+    if (Object.keys(fresh).length) {
+      writeSummaryCache(key, {at: Date.now(), data: fresh, failures: rejected, failureCodes: rejectedCodes});
+    }
     return true;
   }
   async function refreshSummary() {
     if(!bridgeReady||!catalog||!role())return false;
     const ticket=generation;
-    const refreshed=await loadSummary(ticket);
+    const refreshed=await loadSummary(ticket,{force:true});
     if(!refreshed||ticket!==generation)return false;
     changed({kind:"state-refresh"});
     return true;
@@ -509,15 +678,33 @@ window.CompanionProduct = (() => {
       };
       releaseAppearanceContext = bridge.onContext?.(restoreAppearance) || null;
       restoreAppearance();
-      const results = await Promise.allSettled([api("GET","integration/manifest"),api("GET","page/targets")]);
+      const settle = promise => promise.then(value => ({status:"fulfilled",value}), reason => ({status:"rejected",reason}));
+      const preferencesRevision = preferencesTouched, preferencesChangedBeforeLoad = preferencesRevision > 0;
+      const preferencesTask = settle(api("GET","page/display-preferences"));
+      const manifestTask = settle(api("GET","integration/manifest"));
+      const directoryTask = settle(api("GET","page/targets"));
+      preferencesTask.then(result => {
+        if (ticket !== generation || preferencesRevision !== preferencesTouched) return;
+        if (result.status !== "fulfilled") return;
+        if (preferencesChangedBeforeLoad) { scheduleDisplayPreferencesSave(); return; }
+        const saved = result.value?.preferences;
+        if (saved) applyDisplayPreferences(saved);
+        else if (!preferencesAreDefault()) scheduleDisplayPreferencesSave();
+      });
+      const directoryResult = await directoryTask;
       if (ticket !== generation) return;
-      manifest = results[0].status === "fulfilled" ? results[0].value : null;
-      if (results[1].status === "fulfilled") {
-        const directory = results[1].value;
+      let summaryTask = null;
+      if (directoryResult.status === "fulfilled") {
+        const directory = directoryResult.value;
         if (!Array.isArray(directory.targets) || !directory.installation_id || directory.targets.some(t => !Array.isArray(t.roles))) throw fail("invalid_response");
         catalog = directory; chooseDefault(); notice = "";
-        await loadSummary(ticket);
-      } else notice = errors[results[1].reason?.code] || "暂时无法读取授权对象。请在账号与会话中检查连接。";
+        loading = false; changed();
+        summaryTask = loadSummary(ticket);
+      } else notice = errors[directoryResult.reason?.code] || "暂时无法读取授权对象。请在账号与会话中检查连接。";
+      const manifestResult = await manifestTask;
+      if (ticket !== generation) return;
+      manifest = manifestResult.status === "fulfilled" ? manifestResult.value : null;
+      if (summaryTask) await summaryTask;
       if (!manifest && !notice) notice = "核心工作区已连接，插件能力目录暂不可读取。";
     } catch(error) {if(ticket === generation) {notice = errors[error.code] || "连接失败，请刷新核对。";catalog = manifest = null;data = {};failures = {};failureCodes = {};}}
     finally {if(ticket === generation) {loading = false; changed();}}
@@ -540,6 +727,7 @@ window.CompanionProduct = (() => {
     else chooseDefault();
     growthPage = null; growthCursor = null;
     rebindWorkspaceContexts();
+    loading = false; changed();
     await loadSummary(ticket);
     if (ticket !== generation) return;
     loading = false;
@@ -556,6 +744,10 @@ window.CompanionProduct = (() => {
         || typeof operationKey !== "string" || !operationKey) throw fail("integration_lifecycle_request_invalid");
     const result = await api("POST", "integration/lifecycle", {
       extension_id: item.extension_id, action, expected_revision: expectedRevision, operation_key: operationKey,
+      // 装配后由服务端补一次角色启用；装配按钮开在当前角色的小屋里，所以把
+      // 当前选中的角色和目标一起送过去，避免多角色安装时猜默认角色。
+      ...(selected.role_id && selected.target_id
+        ? {role_id: selected.role_id, target_id: selected.target_id} : {}),
     });
     await refreshIntegrations();
     return result;
@@ -578,8 +770,10 @@ window.CompanionProduct = (() => {
     rebindWorkspaceContexts();
     loading = true;
     if (!quiet) changed();
+    loading = false;
+    if (!quiet) changed();
     await loadSummary(ticket);
-    if(ticket === generation) {loading = false; if(!quiet) changed(); else renderScope();}
+    if(ticket === generation) {if(!quiet) changed(); else renderScope();}
   }
   function chooseRole(roleId, quiet=false) {
     const current = target();
@@ -610,7 +804,7 @@ window.CompanionProduct = (() => {
   }
   const nativeId = value => /^\d+$/.test(String(value || "")) ? String(value) : "";
   const subjectLabel = item => item?.display_name || nativeId(item?.group_id || item?.participant_id) || "当前聊天对象";
-  const platformLabel = item => ({qq:"QQ · OneBot",default:"QQ · OneBot",aiocqhttp:"QQ · OneBot",onebot:"QQ · OneBot"})[item?.platform_id] || "当前平台";
+  const platformLabel = item => ({qq:"QQ · OneBot",default:"QQ · OneBot",aiocqhttp:"QQ · OneBot",onebot:"QQ · OneBot",qq_official:"QQ 官方机器人",qq_official_webhook:"QQ 官方机器人（Webhook）"})[item?.platform_name || item?.platform_id] || "当前平台";
   const accountLabel = item => {
     const id = nativeId(item.account_id);
     return item.account_name ? item.account_name + (id ? `（${id}）` : "") : id ? `QQ ${id}` : "当前账号";
@@ -978,17 +1172,29 @@ window.CompanionProduct = (() => {
       valid();
       const target=message.target;
       if(["group-reply","group-memory"].includes(target?.tab)){
+        const navigationFailure=text=>send({kind:"navigate-failed",tab:target.tab,message:text});
         const destination=catalog?.targets.find(item=>item.scope_kind==="group"
           &&item.platform_id===target.platform_id&&item.bot_id===target.bot_id
           &&item.account_id===target.account_id&&item.group_id===target.group_id);
         const role=destination?.roles.find(item=>item.role_id===target.role_id);
         const api=target.tab==="group-reply"?role?.reply_api:role?.group_memory_api;
-        if(typeof api!=="string")return;
-        await choose(destination.target_id,target.role_id,true);
-        if(selected.target_id===destination.target_id&&selected.role_id===target.role_id
-          &&typeof window.navigate==="function")window.navigate("manage",
-            target.tab==="group-reply"?"decision":"governance",
+        if(typeof api!=="string"){
+          navigationFailure("这个群的人格或角色映射已经变化，请重新读取群聊目录后再试。");
+          return;
+        }
+        try{
+          await choose(destination.target_id,role.role_id,true);
+        }catch{
+          navigationFailure("打开本群配置时未能切换角色，请重新读取群聊目录后重试。");
+          return;
+        }
+        if(selected.target_id===destination.target_id&&selected.role_id===role.role_id
+          &&typeof window.navigate==="function"){
+          window.navigate("manage",target.tab==="group-reply"?"decision":"governance",
             target.tab==="group-reply"?"":"relationship");
+        }else{
+          navigationFailure("未能进入该群的配置页，请重新读取群聊目录后重试。");
+        }
         return;
       }
       const routes={
@@ -1006,6 +1212,14 @@ window.CompanionProduct = (() => {
       if(typeof window.navigate==="function") window.navigate("manage", route.tab, route.subtab || "");
       return;
     }
+    if(message.kind==="open-settings"){
+      /* Only the identity directory may ask for its own settings dialog, and
+         only for the fixed key this build renders. */
+      if(context.kind!=="identity"||message.target!=="private-access")return;
+      try{ valid(); }catch{ return; }
+      window.CompanionIdentitySettings?.open?.(message.target);
+      return;
+    }
     if(message.kind!=="request"||typeof message.requestId!=="string"||message.requestId.length>80)return;
     const startedAt=Date.now();
     let method="",path="",timeoutMs=DEFAULT_API_TIMEOUT_MS;
@@ -1015,12 +1229,15 @@ window.CompanionProduct = (() => {
       if(!["GET","POST"].includes(method)||typeof path!=="string")throw fail("invalid_response");
       let mapped;
       if(context.kind==="host") {
-        const allowed=(method==="GET"&&path==="host/status") || path==="accounts"
+        const allowed=(method==="GET"&&path==="host/status")
+          || (method==="POST"&&path==="host/start") || path==="accounts"
+          || (method==="POST"&&path==="accounts/model-provider")
+          || (method==="POST"&&["accounts/window-link","accounts/window-unlink"].includes(path))
           || (method==="GET"&&path==="acquaintance"&&typeof catalog?.acquaintance_api==="string");
         if(!allowed)throw fail("invalid_response");
         mapped=path==="acquaintance"?relative(catalog.acquaintance_api):path;
       } else if(context.kind==="identity") {
-        const allowed=(method==="GET"&&["acquaintance","acquaintance/authorization","acquaintance/settings"].includes(path))
+        const allowed=(method==="GET"&&["acquaintance","acquaintance/authorization","acquaintance/settings","acquaintance/strangers"].includes(path))
            ||(method==="POST"&&["acquaintance/authorization","acquaintance/settings","acquaintance/identity","acquaintance/admin-name"].includes(path));
         if(!allowed)throw fail("invalid_response");
         mapped=relative(context.api)+path.slice("acquaintance".length);
@@ -1042,7 +1259,11 @@ window.CompanionProduct = (() => {
       const result=await bounded(method==="GET"?bridge.apiGet(mapped,message.body):bridge.apiPost(mapped,message.body),timeoutMs);valid();
       send({kind:"response",requestId:message.requestId,ok:true,data:result});
     } catch(error){
-      const code=typeof error?.code==="string"?error.code.slice(0,80):"";
+      /* 宿主页面桥对 status=error 只抛出 `new Error(message)`，不带 `code`；
+         后端偏偏把机器码放在 message 上。这里回填一次，否则工作区只能看到
+         一串英文码，无法翻译成来源级原因。 */
+      const messageCode=typeof error?.message==="string"&&CODE.test(error.message)?error.message.slice(0,80):"";
+      const code=(typeof error?.code==="string"&&error.code?error.code.slice(0,80):"")||messageCode;
       const rawReason=[error?.reason,error?.message].find(value=>typeof value==="string"&&value.trim());
       const reason=rawReason?rawReason.replace(/[\u0000-\u001f\u007f]/g," ").slice(0,1200):"";
       const expectedCode=code&&(Object.hasOwn(errors,code)||/(?:_invalid|_required|_denied|_conflict|_changed|_not_found|_unavailable|_running|_forbidden|_expired|_not_initialized)$/.test(code));
@@ -1050,9 +1271,17 @@ window.CompanionProduct = (() => {
         method,endpoint:diagnosticEndpoint(path),elapsed_ms:Date.now()-startedAt,
         timeout_ms:timeoutMs,code:code||"unknown",confirmed:false,
       });
+      /* 一次失败只属于实际请求的那条来源路由，不能拿主页面当前选中的
+         目标冒充；先从 endpoint 里的 target/role 反查标签，再退回当前选择。 */
+      const routeTarget=/(?:^|\/)targets\/([^/]+)\/roles\/([^/]+)(?:\/|$)/.exec(path||"");
+      const routeOwner=routeTarget?catalog?.targets?.find(item=>item.target_id===routeTarget[1]):null;
+      const routeRole=routeOwner?.roles?.find(item=>item.role_id===routeTarget[2]);
+      const sourceLabel=routeOwner?[targetLabel(routeOwner),routeRole?roleLabel(routeRole):""].filter(Boolean).join(" · ")
+        :[target()?targetLabel(target()):"",role()?roleLabel(role()):""].filter(Boolean).join(" · ");
       send({kind:"response",requestId:message.requestId,ok:false,
         error:errors[code]||reason||"请求未完成，请刷新核对当前状态后重试。",
-        code:code||undefined,reason:reason||undefined,confirmed:error?.confirmed===true});
+        code:code||undefined,reason:reason||undefined,sourceLabel:sourceLabel||undefined,
+        confirmed:error?.confirmed===true});
     }
   });
   function extensionsMarkup(ids) {
@@ -1157,17 +1386,24 @@ window.CompanionProduct = (() => {
   const unavailableReason = name => unavailable(name);
   return {hosted,unwrap,connect,refreshSummary,refreshIntegrations,manageExtension,choose,chooseRole,selection:()=>({...selected}),scopeKey,role,target,roleTarget,roleChoices,identity,connection,renderScope,scopeVisible,
     /* 首次使用引导走同一套桥接与错误翻译，别让它自己再实现一遍超时与判据。 */
-    request:api,acquaintanceDirectory,
+    request:api,acquaintanceDirectory,refreshDirectory:refreshDirectoryAfterMapping,
     errorLabel:code=>errors[code]||"当前设置未能确认，请刷新并核对账号、人格与模型。",
     theme:currentTheme,setTheme,appearance:()=>({...appearance}),setAppearance,resetAppearance,dimensions,
+    displayPreferences:displayPreferencesSnapshot,displayPreferencesChanged,
     themeLight,lightOf:id=>themeLight[id]||"day",followLight:()=>followLight,setFollowLight,syncLight,
-    targets:()=>catalog?.targets||[],targetLabel,subjectLabel,platformLabel,accountLabel,roleLabel,scopeLabel,actorLabel,executorLabel,
+    targets:()=>catalog?.targets||[],
+    directory:()=>catalog,
+    /* 账号和宿主人格是角色准备目录，不是聊天窗口目录。迁移向导用它们
+       展示多 Bot / 多角色拓扑，再用 targets 给可接收迁移的角色补上真实路由。 */
+    accounts:()=>catalog?.accounts||[], personas:()=>catalog?.personas||[],
+    targetLabel,subjectLabel,platformLabel,accountLabel,roleLabel,scopeLabel,actorLabel,executorLabel,
     get manifest(){return manifest;},get data(){return data;},stateCard,scheduleCard,capabilityCard,growthCard,memoryCard,
     workspace,unmountWorkspace,mountWorkspace,workspaceAddress,providerAddress,extensionsMarkup,providersMarkup,capabilitiesMarkup,providerDetail,growthMarkup,
     extension:id=>manifest?.extensions?.find(p=>p.capability_id===id),
     provider:id=>manifest?.providers?.find(p=>p.capability_id===id),
     capability:id=>manifest?.extensions?.find(p=>p.capability_id===id)||manifest?.providers?.find(p=>p.capability_id===id),
     statusLabel:id=>labels[id]||"状态未知",unavailable,
+    workspaceDiagnosis,workspaceHint,
     when,lifeActivities,lifeJournals,stateValues,stateLabel,unavailableReason,
     unavailableCode:name=>failureCodes[name]||"",
     /* 各页共用一个「等桥注进来」的实现。桥的注入晚于脚本执行是正常时序，

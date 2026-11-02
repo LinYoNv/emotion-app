@@ -14,7 +14,12 @@ from .types import fingerprint
 
 def build_provider(plugin, *, version: str):
     settings = plugin.config.get("native_v2", {})
-    if not plugin.enabled or not isinstance(settings, dict) or settings.get("enabled") is not True:
+    # This flag used to double as the output feature switch.  It must not gate
+    # provider construction: the management API has to remain reachable so a
+    # user can repair a disabled/migrated image configuration.  Output
+    # availability is expressed by ``native_v2.output.enabled`` and enforced by
+    # OutputRoutingBackend.operations/execute.
+    if not plugin.enabled or not isinstance(settings, dict):
         return None
     directory = Path(plugin.data_dir) / "native_v2"
     backend = OutputRoutingBackend(output_settings(plugin), directory / "transport")

@@ -87,7 +87,12 @@ async def prepare_file_text(locators, loader, preferences, *, client, scope, pay
                 logger.warning("[CompanionV2] 文件理解未完成 position=%s reason=host_file_timeout", locator.position)
             except Exception as error:
                 code = error.code if isinstance(error, TaskError) else "host_file_failed"
-                entry["status"] = errors.get(code, "文件读取失败，未取得正文")
+                if code == "host_file_decoder_unavailable":
+                    # 点名是哪种格式缺组件：泛化的「暂不可用」会让人以为是文件坏了。
+                    suffix = locator.name.rsplit(".", 1)[-1].upper() if "." in locator.name else "该格式"
+                    entry["status"] = f"{suffix} 解析组件未安装，未读取正文"
+                else:
+                    entry["status"] = errors.get(code, "文件读取失败，未取得正文")
                 logger.warning("[CompanionV2] 文件理解未完成 position=%s reason=%s", locator.position, code)
         payload = "\n[文件阅读材料]\n" + json.dumps(entry, ensure_ascii=False) + "\n"
         while len(payload) > payload_budget and entry.get("text"):

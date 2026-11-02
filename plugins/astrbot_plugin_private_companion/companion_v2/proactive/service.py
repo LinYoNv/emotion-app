@@ -33,8 +33,9 @@ from companion_v2.execution.service import outcome
 from companion_v2.expression.configuration import read_settings as expression_settings
 from companion_v2.foundation.outcome import Outcome
 from companion_v2.foundation.refs import OperationRef, VersionRef, normalize_utc
-from companion_v2.model_gateway.models import ModelTaskProfile
+from companion_v2.model_gateway.models import ModelTaskProfile, is_released
 from companion_v2.relationships.private_access import REVOCABLE_ABSENCE_CODES
+from companion_v2.role_work.state import humanized
 from companion_v2.sources.repositories import SourceRepository
 from companion_v2.storage.models import OperationState
 from companion_v2.storage.repositories import OperationRepository
@@ -62,6 +63,27 @@ _SEGMENTATION_SETTINGS_KEYS = _SEGMENTATION_KEYS | frozenset((
     "part_gap_ms", "part_gap_mode", "part_gap_min_ms", "part_gap_max_ms", "part_gap_log_base",
     "state_pacing_factor", "role_energy", "role_sleepy"))
 logger = logging.getLogger(__name__)
+
+
+def role_state_for_prompt(summary, purpose):
+    """Keep bodily status out of generic proactive contact prompts.
+
+    Hunger and health are useful to meal, care or environment contacts, but a
+    playful or chatty contact that receives "hungry" as a live field tends to
+    turn it into a status report and invent the user's eating habits. Keep the
+    rest of the already-reviewed state material intact so pacing and sleep
+    presentation continue to use the same contract.
+    """
+
+    if not isinstance(summary, dict) or purpose is None:
+        return summary
+    result = dict(summary)
+    purpose = str(purpose)
+    if purpose not in ("meal", "environment"):
+        result.pop("hunger", None)
+    if purpose not in ("meal", "care", "environment"):
+        result.pop("health", None)
+    return result or None
 
 
 def contact_profile(provider, *, max_output_tokens=1024):
@@ -168,9 +190,9 @@ class ProactiveContacts:
             sources = tuple(record.reference for record in records)
             session_key = "memory-contact-" + digest(job.request_hash)
             # The opportunity's own possibility and the exact selected source
-            # bodies are this contact's "current text", so topical recall and the
-            # "does this contact ask about eating" habit question see the same
-            # input a reply would see. The key stays bounded because it is
+            # bodies are this contact's current evidence, so topical recall and
+            # the habit candidates see the same source material a reply would
+            # see. The key stays bounded because it is
             # derived from the task itself, never from model text.
             snapshot = self.memory_context.contact_capture(job.context, session_key, sources, job.deadline_at)
             return self.memory_context.contact_contributions(snapshot, job.context)
@@ -234,6 +256,10 @@ class ProactiveContacts:
                       if isinstance(item, dict) and isinstance(item.get("text"), str) and item.get("text").strip()]
         if conditions:
             summary["conditions"] = conditions[:4]
+        sleep = state.get("sleep_execution")
+        if isinstance(sleep, dict):
+            summary["sleep_execution"] = {key: sleep[key] for key in (
+                "state", "awake_minutes", "sleep_pressure", "sleep_debt_minutes") if key in sleep}
         return summary or None
 
     def _recent_life_summary(self, context, at):
@@ -280,9 +306,13 @@ class ProactiveContacts:
             return False
         if limit > 0:
             start = local_day_start(at, preferences.values["quiet_timezone"])
+            # Count both sealed reaction images and judged drafts that have
+            # reserved a reaction intent. Otherwise two concurrent judgements
+            # can both observe zero and exceed the daily proactive-image cap.
             count = self.runtime.read_one("""SELECT COUNT(*) FROM proactive_contacts
                 WHERE origin_key = ? AND created_at >= ?
-                AND json_extract(record_json, '$.reaction') IS NOT NULL""",
+                AND (json_extract(record_json, '$.reaction') IS NOT NULL
+                     OR json_extract(record_json, '$.pending_reaction_intent') IS NOT NULL)""",
                 (context.key, stamp(start)))[0]
             if count >= limit:
                 return False
@@ -345,7 +375,7 @@ class ProactiveContacts:
             speech = re.sub(r"\s+", " ",
                 strip_voice_markup(strip_internal_expression_protocol(speech))).strip()
             if speech and len(speech) <= 2000:
-                voice = VoicePlan(speech, provider_id=policy.provider_for_language(),
+                voice = VoicePlan(speech, provider_id=policy.provider_for_language(context.scope.kind.value),
                     timeout_seconds=policy.timeout_seconds, position=policy.position)
             else:
                 logger.info("V2 proactive voice omitted: speech unavailable or too long language=%s", policy.language)
@@ -385,8 +415,34 @@ class ProactiveContacts:
         prefix = DIAGNOSTIC_TASK_PREFIX if administrator_test else "contact-task-"
         return prefix + digest([context.scope.key, opportunity.opportunity_id])
 
+    @staticmethod
+    def _origin_for_selected_intent(origin, purpose):
+        """Keep only candidate metadata that belongs to the selected thought.
+
+        A regular conversation slot may carry a relationship candidate alongside
+        its chat candidate.  The scheduler needs the full origin while it is
+        choosing, but once a thought wins, persisting the other candidate's
+        marker would make later prompt assembly and delivery diagnostics describe
+        a route that was never selected.
+        """
+        if not isinstance(origin, dict):
+            return origin
+        relationship = origin.get("relationship_event")
+        if not isinstance(relationship, dict):
+            return origin
+        purposes = relationship.get("purposes")
+        if isinstance(purposes, list):
+            if purpose not in purposes:
+                return {key: value for key, value in origin.items() if key != "relationship_event"}
+            narrowed = {**relationship, "purposes": [purpose]}
+            return {**origin, "relationship_event": narrowed}
+        marker_purpose = relationship.get("purpose")
+        if marker_purpose is not None and marker_purpose != purpose:
+            return {key: value for key, value in origin.items() if key != "relationship_event"}
+        return origin
+
     def _continuity(self, context, history, interaction, origin, at, *, last_reply=None,
-                    dialogue_history=None, diagnostic_origin=None):
+                    dialogue_history=None, diagnostic_origin=None, diagnostic_role_instruction=None):
         if history is not None:
             if self.history is None:
                 raise TaskError("delivery_history_unavailable", "contact requires its original history owner")
@@ -405,7 +461,8 @@ class ProactiveContacts:
             if self.schedule is None:
                 raise TaskError("contact_schedule_unavailable", "diagnostic contact requires its original scheduler")
             self.schedule.validate_diagnostic_origin(context, diagnostic_origin, at,
-                purpose=(diagnostic_origin.get("_diagnostic") or {}).get("purpose"))
+                purpose=(diagnostic_origin.get("_diagnostic") or {}).get("purpose"),
+                role_instruction=diagnostic_role_instruction)
         elif origin is not None:
             if self.schedule is None:
                 raise TaskError("contact_schedule_unavailable", "automatic contact requires its original scheduler")
@@ -440,6 +497,38 @@ class ProactiveContacts:
         if hashes is not None and tuple(record.content_hash for record in records) != hashes:
             raise TaskError("contact_source_changed", "contact evidence changed after selection")
         return tuple(records)
+
+    @staticmethod
+    def _dangling_after_own_reply(job, segments):
+        """True when a proactive turn only continues the role's own last reply.
+
+        ``contacts_since_last_input`` counts proactive contacts, not passive
+        replies.  After the role spoke last and the user stayed silent, a new
+        slot can therefore open immediately; starting it with ``哦？/那/照这么``
+        reads as the role answering itself instead of opening a new turn.
+        Such a message is skipped rather than sent as a dangling half-dialogue.
+        """
+        if not segments:
+            return False
+        last = job.last_reply or {}
+        interaction = job.interaction or {}
+        try:
+            replied_at = datetime.fromisoformat(last["observed_at"])
+            input_at = datetime.fromisoformat(interaction["last_input_at"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if replied_at <= input_at:
+            return False
+        openers = ("哦", "噢", "嗯", "啊", "唉", "那", "所以", "照这么", "这么说",
+                   "然后", "不过", "可是", "而且", "说到", "接着", "对", "是嘛",
+                   "真的", "确实", "也是", "还有")
+        for part in segments[:2]:
+            text = part.strip().strip("。，！？!?…~～、,.;:： ")
+            if not text or len(text) > 12:
+                continue
+            if any(text == opener or text.startswith(opener) for opener in openers):
+                return True
+        return False
 
     def _duplicate(self, context, body, preferences, at, *, purpose, contact_id="", origin=None,
                    administrator_test=False):
@@ -571,7 +660,7 @@ class ProactiveContacts:
                                    if self.history is not None and not administrator_test else None)
                     if diagnostic_origin is not None:
                         self.schedule.validate_diagnostic_origin(context, diagnostic_origin, at,
-                                                                 purpose=intents[0].purpose)
+                            purpose=intents[0].purpose, role_instruction=role_instruction)
                     else:
                         self._continuity(context, history, interaction, automatic_origin, at)
                     feasible, originals, records_by_id = [], {}, {}
@@ -604,9 +693,10 @@ class ProactiveContacts:
                         observed_at=at, selection_seed=selection_seed))
                     intent = originals[selection.selected.thought_id]
                     records = records_by_id[intent.thought.thought_id]
+                    selected_origin = self._origin_for_selected_intent(automatic_origin, intent.purpose)
                     job = ContactJob(context, intent, role_instruction, request_hash,
                         preferences.snapshot.resolution_token, tuple(record.content_hash for record in records),
-                        selection.feasible_count, selection.weight_used, history, interaction, automatic_origin,
+                        selection.feasible_count, selection.weight_used, history, interaction, selected_origin,
                         administrator_test=administrator_test,
                         diagnostic_source_backed=diagnostic_source_backed, diagnostic_origin=diagnostic_origin,
                         diagnostic_image_intent=diagnostic_image_intent)
@@ -618,9 +708,7 @@ class ProactiveContacts:
                         if state_summary is not None:
                             if "energy" in state_summary and "role_energy" not in segmentation_settings:
                                 segmentation_settings["role_energy"] = state_summary["energy"]
-                            sleep_texts = [state_summary.get("sleep") or "", *(state_summary.get("conditions") or ())]
-                            if any(any(token in text for token in ("困", "睡", "熬夜", "疲", "乏"))
-                                   for text in sleep_texts if isinstance(text, str)):
+                            if humanized.is_sleepy(state_summary):
                                 segmentation_settings.setdefault("role_sleepy", True)
                     task_deadline = min(opportunity.expires_at, at + timedelta(days=7))
                     job = replace(job, presentation_settings={key: presentation[key] for key in TEXT_DEFAULTS},
@@ -663,6 +751,27 @@ class ProactiveContacts:
             failure_code=receipt.failure_code if rejected else None,
             reset_failures=(receipt.status in ("delivered", "accepted")
                             or receipt.status == "not_sent" and not rejected))
+        if receipt.status == "delivered" and receipt.delivered_at is not None:
+            self._record_open_loop_receipt(request, receipt.delivered_at)
+
+    def _record_open_loop_receipt(self, request, delivered_at):
+        """Record the real send time only for a delivered open-loop follow-up."""
+        row = self.runtime.read_one("SELECT record_json FROM proactive_contacts WHERE contact_id = ?",
+                                    (request.source_ref,))
+        if row is None:
+            return
+        try:
+            origin = json.loads(row["record_json"]).get("automatic_origin") or {}
+            open_loop = origin.get("open_loop_event") or {}
+            memo_id = open_loop.get("memo_id")
+            if type(memo_id) is not str or not memo_id:
+                return
+            from companion_v2.agenda.service import AgendaService
+            AgendaService(self.runtime).repository.record_open_loop_followup_delivery(
+                memo_id, at=delivered_at)
+        except (TypeError, ValueError, KeyError):
+            # Delivery accounting must never make a confirmed platform receipt fail.
+            return
 
     @outcome
     def validate(self, spec, at):
@@ -678,8 +787,31 @@ class ProactiveContacts:
         self._records(job.context, job.intent.thought.evidence.sources, at, hashes=job.source_hashes)
         self._continuity(job.context, job.history, job.interaction, job.automatic_origin, at,
                          last_reply=job.last_reply, dialogue_history=job.dialogue_history,
-                         diagnostic_origin=job.diagnostic_origin)
+                         diagnostic_origin=job.diagnostic_origin,
+                         diagnostic_role_instruction=job.role_instruction)
         return True
+
+    def _contact_request_fits(self, run, request):
+        """Preflight the selected provider without inserting a model request.
+
+        The gateway records ``model_requests`` before it reserves the provider, so a
+        prompt that exceeds the model's input ceiling cannot be retried inside the
+        same task. Resolve the same route read-only and ask each provider to reserve
+        it first; only a fitting request reaches ``gateway.generate``.
+        """
+        plan = self.gateway.router.resolve(run, request)
+        if not plan.providers:
+            return True
+        try:
+            # Only the first route is reserved here. The fallback is a later
+            # execution route with its own model override; preflighting it with
+            # the primary envelope would reject a fitting primary for no reason.
+            plan.providers[0].reserve(plan.envelope)
+            return True
+        except Exception:
+            logger.debug("[CompanionV2] 主动联系提示超过模型档案 task=%s",
+                         run.task.task_id, exc_info=True)
+            return False
 
     async def _generate(self, run):
         job = self._pending[run.task.task_id]
@@ -732,6 +864,13 @@ class ProactiveContacts:
                              for kind, items in (("dialogue", dialogue), ("background", history))
                              for group in history_round_groups(items))
                 kept = sorted(kept, key=lambda group: (group["latest_at"], group["kind"]), reverse=True)
+                # Reserve the latest real user exchange within the same bounded
+                # budget. A run of our own proactive sends must not crowd out the
+                # user's last answer and turn an answered subject into unknown.
+                anchor = next((group for group in kept if group["kind"] == "dialogue"
+                    and any(dialogue[index].get("role") == "user" for index in group["indices"])), None)
+                if anchor is not None:
+                    kept = [anchor, *(group for group in kept if group is not anchor)]
                 selected, used, rounds_used = {"dialogue": set(), "background": set()}, 0, 0
                 for group in kept:
                     if rounds_used >= preferences.values["generation_history_limit"]:
@@ -756,24 +895,46 @@ class ProactiveContacts:
                 self._pending[run.task.task_id] = job
             presentation = text_policy(job.presentation_settings or {})
             segmentation = _segmentation_policy(job.segmentation_settings)
+            memory_materials = () if job.administrator_test else self._memory_materials(job, records)
+            expression_materials = self._expression_materials(job, contact_id)
+            rhythm_snapshot = (None if job.administrator_test else
+                               self.budget.rhythm_snapshot(job.context, preferences, at))
+            role_state = (None if job.administrator_test else role_state_for_prompt(
+                self._role_state_summary(job.context, at), job.intent.purpose))
+            recent_life = (None if job.administrator_test
+                           or (source_origin and any(k in source_origin for k in ("activity_event", "journal_event")))
+                           else self._recent_life_summary(job.context, at))
             request = request_for(job, records, preferences, history,
                 last_reply=last_reply, dialogue=dialogue,
                 reactions_available=reactions_available,
                 voice_available=voice_available, poke_available=poke_available,
-                memory=() if job.administrator_test else self._memory_materials(job, records),
-                expression=self._expression_materials(job, contact_id),
-                rhythm_snapshot=(None if job.administrator_test else
-                                 self.budget.rhythm_snapshot(job.context, preferences, at)),
-                role_state=None if job.administrator_test else self._role_state_summary(job.context, at),
-                recent_life=(None if job.administrator_test
-                             or (source_origin and any(k in source_origin for k in ("activity_event", "journal_event")))
-                             else self._recent_life_summary(job.context, at)))
+                memory=memory_materials, expression=expression_materials,
+                rhythm_snapshot=rhythm_snapshot, role_state=role_state, recent_life=recent_life)
             extra_instruction = "\n".join(text for text in
                 (segmentation.instruction, presentation.instruction,
                  news_presentation_instruction(segmentation) if job.intent.purpose == "news"
                  or source_origin is not None and "news_event" in source_origin else "") if text)
             if extra_instruction:
                 request = replace(request, instruction=request.instruction + "\n" + extra_instruction)
+            if not self._contact_request_fits(run, request):
+                # Optional memory and history are the first things a smaller
+                # context model must lose; the current event, source evidence
+                # and the role instruction remain authoritative.
+                compact = request_for(job, records, preferences, (),
+                    last_reply=None, dialogue=(),
+                    reactions_available=reactions_available,
+                    voice_available=voice_available, poke_available=poke_available,
+                    memory=(), expression=(), rhythm_snapshot=None,
+                    role_state=None, recent_life=None)
+                if extra_instruction:
+                    compact = replace(compact, instruction=compact.instruction + "\n" + extra_instruction)
+                if not self._contact_request_fits(run, compact):
+                    raise TaskError(
+                        "contact_model_profile_exceeded",
+                        "the proactive contact prompt exceeds the selected model input or output profile")
+                logger.warning("[CompanionV2] 主动联系上下文超过模型档案，已省略可选记忆/历史 task=%s",
+                               run.task.task_id)
+                request = compact
             completion = await self.gateway.generate(run, request)
             if completion.draft is None:
                 raise ValueError("contact generation requires a final decision")
@@ -849,6 +1010,11 @@ class ProactiveContacts:
                 body, reaction_intent = None, None
                 segments = ()
                 presentation_reason = "forbidden_word"
+            dangling_reason = None
+            if body is not None and self._dangling_after_own_reply(job, segments):
+                body, reaction_intent = None, None
+                segments = ()
+                dangling_reason = "continuation_after_silence"
             dedup_reason = None
             if body is not None and self._duplicate(job.context, body, preferences, self.tasks.now(),
                     purpose=job.intent.purpose, origin=source_origin,
@@ -865,7 +1031,9 @@ class ProactiveContacts:
                     presentation_reason = "persona_judge"
             skip_reason = None
             if body is None:
-                if dedup_reason:
+                if dangling_reason:
+                    skip_reason = dangling_reason
+                elif dedup_reason:
                     skip_reason = "duplicate"
                 elif confidence_skip:
                     skip_reason = "low_confidence"
@@ -880,17 +1048,22 @@ class ProactiveContacts:
                 else:
                     skip_reason = "no_sendable_content"
             offered = None
+            deferred_reaction_intent = None
             # An image offer publishes original bytes, so it is never chosen before a
-            # pending judgement: the judged payload stays body-only until it is allowed.
-            if (body is not None and reaction_intent and reactions_available and judge_task is None
+            # pending judgement: the judged payload stays body-only until it is allowed,
+            # and the chosen reaction_intent is resolved once the judge approves it.
+            if (body is not None and reaction_intent and reactions_available
                     and self._proactive_image_available(job.context, job, preferences, self.tasks.now())):
-                try:
-                    if self._reaction_available(job.context, contact_id,
-                            diagnostic=job.diagnostic_image_intent is not None):
-                        offered = await self.semantics.reactions.select_for_contact(job.context, reaction_intent)
-                except (TaskError, ValueError, OSError):
-                    offered = None
-            if body is not None and job.diagnostic_image_intent is not None and offered is None:
+                if judge_task is not None:
+                    deferred_reaction_intent = reaction_intent
+                else:
+                    try:
+                        if self._reaction_available(job.context, contact_id,
+                                diagnostic=job.diagnostic_image_intent is not None):
+                            offered = await self.semantics.reactions.select_for_contact(job.context, reaction_intent)
+                    except (TaskError, ValueError, OSError):
+                        offered = None
+            if body is not None and job.diagnostic_image_intent is not None and offered is None and deferred_reaction_intent is None:
                 raise TaskError("proactive_diagnostic_image_unavailable",
                                 "no authorized reaction image matched the diagnostic intent")
             run.validate()
@@ -909,6 +1082,9 @@ class ProactiveContacts:
                 "history": job.history, "interaction": job.interaction, "automatic_origin": job.automatic_origin,
                 "dialogue_history": job.dialogue_history,
                 "diagnostic_origin": job.diagnostic_origin,
+                "diagnostic_role_instruction": (job.role_instruction if job.diagnostic_origin is not None
+                    and (job.diagnostic_origin.get("_diagnostic") or {}).get("source_mode") == "no_conversation"
+                    else None),
                 "last_reply": job.last_reply, "dedup_reason": dedup_reason,
                 "skip_reason": skip_reason, "model_skip_reason": model_skip_reason,
                 "decision_confidence": decision_confidence,
@@ -962,6 +1138,8 @@ class ProactiveContacts:
                         images = (reaction["manifest"],) if reaction is not None and index == len(segments) - 1 else ()
                         part_documents.append({"text": text, "payload_hash": manifest_hash(text, images)})
                 document["parts"] = part_documents
+                if deferred_reaction_intent is not None:
+                    document["pending_reaction_intent"] = deferred_reaction_intent
                 if reaction is not None:
                     document["reaction"] = reaction
                 if voice is not None:
@@ -1144,7 +1322,11 @@ class ProactiveContacts:
         values = preferences.values
         if not values["enable_llm_proactive_persona_judge"]:
             return None, None
-        signature = signature_for(job.intent.purpose, body)
+        signature = signature_for(job.intent.purpose, body, review_context={
+            "role_instruction": job.role_instruction, "preference_token": job.preference_token,
+            "sources": job.intent.thought.evidence.sources, "source_hashes": job.source_hashes,
+            "thought": job.intent.thought.summary,
+            "dialogue_history": job.dialogue_history, "history": job.history, "last_reply": job.last_reply})
         if job.intent.purpose in exempt_purposes(preferences):
             return JudgeVerdict("send", 100, "该联系目的按配置豁免主动人格判定", signature, True), None
         cached = self.persona_judge.cached(job.context, signature, at,
@@ -1174,7 +1356,22 @@ class ProactiveContacts:
         if row is None or row["origin_key"] != spec.context.key:
             raise TaskError("contact_judge_unavailable", "judgement draft is unavailable")
         data = json.loads(row["record_json"])
-        if data.get("decision") != "judge_pending" or (data.get("judge") or {}).get("task_id") != spec.task_id:
+        judge = data.get("judge") or {}
+        if judge.get("task_id") != spec.task_id:
+            raise TaskError("contact_judge_unavailable", "judgement belongs to another task")
+        if data.get("decision") != "judge_pending":
+            # The same running attempt must be able to finish its atomic commit.
+            task = require(self.tasks.read(spec.context, spec.task_id))
+            receipt = self.operations.get("save-" + spec.task_id)
+            if (data.get("decision") in ("send", "skip") and judge.get("state") == "resolved"
+                    and judge.get("model_call_id") and not judge.get("failure")
+                    and task.state in ("running", "cancelling") and task.effect == "unknown"
+                    and task.attempt_id == judge.get("attempt_id") and receipt.is_success):
+                saved = receipt.unwrap()
+                if (saved.state is OperationState.COMPLETED and saved.operation.owner == JUDGE_KIND
+                        and saved.operation.scope == spec.context.scope
+                        and saved.parameter_hash == digest([spec.request_ref, judge["signature"]])):
+                    return True
             raise TaskError("contact_judge_unavailable", "draft already has a resolved judgement")
         return True
 
@@ -1194,24 +1391,45 @@ class ProactiveContacts:
             raise TaskError("contact_judge_persona_unavailable", "judgement needs the original accepted persona")
         if diagnostic_origin is not None:
             self.schedule.validate_diagnostic_origin(context, diagnostic_origin, at,
-                purpose=data["purpose"])
+                purpose=data["purpose"], role_instruction=data.get("diagnostic_role_instruction"))
             diagnostic = diagnostic_origin["_diagnostic"]
-            _, batch, _ = self.schedule._origin(context, diagnostic["batch_id"], at)
-            refs = tuple(source_from_document(item) for item in data.get("sources", ()))
-            self._records(context, refs, at, hashes=tuple(data.get("source_hashes", ())))
+            if diagnostic.get("source_mode") == "no_conversation":
+                role_instruction = data.get("diagnostic_role_instruction")
+                if not isinstance(role_instruction, str) or not role_instruction.strip():
+                    raise TaskError("contact_judge_persona_unavailable",
+                                    "judgement needs the original diagnostic persona")
+                batch = {"role_instruction": role_instruction}
+            else:
+                _, batch, _ = self.schedule._origin(context, diagnostic["batch_id"], at)
         else:
             if not isinstance(origin, dict) or not origin.get("batch_id"):
                 raise TaskError("contact_judge_persona_unavailable", "judgement needs the original accepted persona")
             self.schedule.validate_origin(context, origin, at)
             _, batch, _ = self.schedule._origin(context, origin["batch_id"], at)
+        refs = tuple(source_from_document(item) for item in data.get("sources", ()))
+        records = self._records(context, refs, at, hashes=tuple(data.get("source_hashes", ())))
         preferences = require(self.preferences.read(context, observed_at=at))
         preferences.require_contact(data["purpose"], ignore_time_restrictions=diagnostic_origin is not None,
                                     ignore_master_switch=data.get("administrator_test") is True)
+        history, dialogue, last_reply = (), (), None
+        if not data.get("administrator_test") and any(
+                data.get(key) is not None for key in ("history", "dialogue_history", "last_reply")):
+            if self.history is None:
+                raise TaskError("contact_judge_history_unavailable", "judgement needs its original history owner")
+            if data.get("history") is not None:
+                history = self.history.read(data["history"], context, at, action=GROUP, round_metadata=True)
+            if data.get("dialogue_history") is not None:
+                dialogue = self.history.conversation.read(data["dialogue_history"], context, at,
+                                                          round_metadata=True)
+            if data.get("last_reply") is not None:
+                last_reply = self.history.verify_reply(data["last_reply"], context, at)
         entry = {"context": context, "purpose": data["purpose"], "body": row["body"], "at": stamp(at),
                  "note": preferences.values["note"], "confidence": data.get("decision_confidence", 1.0),
                  "role_instruction": batch["role_instruction"], "observed_at": at,
-                 "cause_id": run.task.task_id,
-                 "role_state": self._role_state_summary(context, at)}
+                 "records": records, "thought": data.get("thought_summary"),
+                 "cause_id": run.task.task_id, "history": history, "dialogue": dialogue, "last_reply": last_reply,
+                 "role_state": role_state_for_prompt(
+                     self._role_state_summary(context, at), data["purpose"])}
         completion = await self.gateway.generate(run, judge_request(entry))
         if completion.draft is None:
             raise ValueError("persona judgement requires a final decision")
@@ -1222,22 +1440,67 @@ class ProactiveContacts:
             raise
         threshold = preferences.values["proactive_persona_judge_threshold"]
         allowed = decision == "send" and score >= threshold
+        pending_reaction_intent = data.get("pending_reaction_intent") if isinstance(data.get("pending_reaction_intent"), str) else None
+        diagnostic_image = data.get("diagnostic_image") is True
+        offered = None
+        if allowed and pending_reaction_intent:
+            try:
+                if self._reaction_available(context, contact_id, diagnostic=diagnostic_image):
+                    offered = await self.semantics.reactions.select_for_contact(context, pending_reaction_intent)
+            except (TaskError, ValueError, OSError):
+                offered = None
+        if allowed and diagnostic_image and pending_reaction_intent and offered is None:
+            raise TaskError("proactive_diagnostic_image_unavailable",
+                            "no authorized reaction image matched the diagnostic intent")
+        operation = OperationRef("save-" + run.task.task_id, JUDGE_KIND, context.scope,
+                                 VersionRef(contact_id, 1), run.task.task_id)
         with self.runtime.transaction() as connection:
             run.validate()
-            current = connection.execute("""SELECT record_json FROM proactive_contacts
+            current = connection.execute("""SELECT body, payload_hash, record_json FROM proactive_contacts
                 WHERE contact_id = ?""", (contact_id,)).fetchone()
             document = json.loads(current["record_json"])
             if (document.get("decision") != "judge_pending"
                     or (document.get("judge") or {}).get("task_id") != run.task.task_id):
                 raise TaskError("contact_judge_unavailable", "draft already has a resolved judgement")
+            document.pop("pending_reaction_intent", None)
+            reaction = None
+            if allowed and offered is not None and pending_reaction_intent:
+                try:
+                    if self._reaction_available(context, contact_id, diagnostic=diagnostic_image):
+                        with self.runtime.transaction():
+                            issued_at = self.tasks.now()
+                            evidence = tuple(source_from_document(ref) for ref in document.get("sources", ()))
+                            image = self.semantics.reactions.contact_image(context, contact_id, offered, issued_at,
+                                publish=True, evidence=evidence)
+                            reaction = {**offered, "intent": pending_reaction_intent, "issued_at": issued_at,
+                                        "manifest": image_manifest(image)}
+                except (TaskError, ValueError, OSError):
+                    reaction = None
+            if allowed and diagnostic_image and pending_reaction_intent and reaction is None:
+                raise TaskError("proactive_diagnostic_image_unavailable",
+                                "the authorized image changed or could not be sealed for delivery")
+            payload_hash = current["payload_hash"]
+            if reaction is not None:
+                body_text = current["body"] or ""
+                payload_hash = manifest_hash(body_text, (reaction["manifest"],))
+                parts = document.get("parts") or [{"text": body_text, "payload_hash": current["payload_hash"]}]
+                part_documents = []
+                for index, part in enumerate(parts):
+                    images = (reaction["manifest"],) if index == len(parts) - 1 else ()
+                    part_documents.append({"text": part["text"], "payload_hash": manifest_hash(part["text"], images)})
+                document["parts"] = part_documents
+                document["reaction"] = reaction
             document["decision"] = "send" if allowed else "skip"
             document["judge"] = {**judge, "state": "resolved", "decision": decision, "score": score,
                                  "reason": reason, "allowed": allowed, "cached": False,
+                                 "attempt_id": run.claim.attempt_id,
                                  "model_call_id": completion.call_id, "failure": None}
             document["skip_reason"] = None if allowed else "persona_review"
             run.begin_effect()
-            connection.execute("UPDATE proactive_contacts SET record_json = ? WHERE contact_id = ?",
-                               (encode(document), contact_id))
+            require(self.operations.reserve(operation,
+                parameter_hash=digest([run.task.spec.request_ref, judge["signature"]]), observed_at=self.tasks.now()))
+            connection.execute("UPDATE proactive_contacts SET record_json = ?, payload_hash = ? WHERE contact_id = ?",
+                               (encode(document), payload_hash, contact_id))
             if not allowed and isinstance(origin, dict):
                 open_loop = origin.get("open_loop_event")
                 if isinstance(open_loop, dict) and isinstance(open_loop.get("memo_id"), str):
@@ -1247,6 +1510,9 @@ class ProactiveContacts:
             if allowed:
                 require(self.delivery.queue(self._part_request(contact_id, context, document, 0,
                     datetime.fromisoformat(document["opened_at"]))))
+            require(self.operations.transition(operation.operation_id, expected_state=OperationState.ACCEPTED,
+                next_state=OperationState.COMPLETED, observed_at=self.tasks.now()))
+            run.record_operation(operation.operation_id)
         self.notify()
         if allowed:
             # 判定放行与直接发送是同一件事的两条互斥分支：草稿在此之前一直压着不发，
@@ -1254,7 +1520,7 @@ class ProactiveContacts:
             # 提前推过去，会让牢插件记得一句角色从没说过的话。
             await self._push_contact(context, contact_id, row["body"], data.get("purpose"))
         return TaskResult("succeeded", effect="committed", result_ref=contact_id,
-                          receipt_ref="proactive-judgement:" + run.task.task_id)
+                          operation_id=operation.operation_id, receipt_ref=operation.operation_id)
 
     async def _push_contact(self, context, contact_id, body, purpose):
         """把刚排进投递的主动消息推给对外表达记忆的一方；失败不影响这次投递。
@@ -1286,6 +1552,7 @@ class ProactiveContacts:
             ),
             confidence=0.92,
             importance=0.58,
+            context=context,
         )
         await push_memory(self.memory_push, record)
 
@@ -1327,7 +1594,8 @@ class ProactiveContacts:
                                    administrator_test=administrator_test)
         self._continuity(request.context, data.get("history"), data.get("interaction"), data.get("automatic_origin"), at,
                          last_reply=data.get("last_reply"), dialogue_history=data.get("dialogue_history"),
-                         diagnostic_origin=data.get("diagnostic_origin"))
+                         diagnostic_origin=data.get("diagnostic_origin"),
+                         diagnostic_role_instruction=data.get("diagnostic_role_instruction"))
         if data.get("diagnostic_origin") is not None:
             refs = tuple(source_from_document(item) for item in data.get("sources", ()))
             self._records(request.context, refs, at, hashes=tuple(data.get("source_hashes", ())))
@@ -1495,12 +1763,15 @@ class ProactiveContacts:
                 model_task_ids.append(judge_task_id)
             placeholders = ",".join("?" for _ in model_task_ids)
             model_rows = self.runtime.read_all(f"""SELECT state, actual_tokens, actual_cost,
-                    reserved_tokens, reserved_cost, latency_ms FROM model_calls
+                    reserved_tokens, reserved_cost, latency_ms, receipt_ref FROM model_calls
                 WHERE task_id IN ({placeholders})""", tuple(model_task_ids))
             provider_calls = sum(row["state"] in ("dispatched", "generated", "unknown", "discarded")
                                  for row in model_rows)
             confirmed_calls = sum(row["actual_tokens"] is not None for row in model_rows)
             latency_values = [row["latency_ms"] for row in model_rows if row["latency_ms"] is not None]
+            outstanding = tuple(row for row in model_rows
+                                if row["actual_tokens"] is None and row["state"] in ("reserved", "dispatched", "unknown")
+                                and not is_released(row["receipt_ref"]))
             model_metrics = {"provider_calls": provider_calls,
                 "pending_reservations": sum(row["state"] == "reserved" for row in model_rows),
                 "unknown_calls": sum(row["state"] == "unknown" for row in model_rows),
@@ -1508,10 +1779,8 @@ class ProactiveContacts:
                 "tokens": sum(row["actual_tokens"] or 0 for row in model_rows),
                 "cost_microusd": (sum(row["actual_cost"] or 0 for row in model_rows)
                     if any(row["actual_cost"] is not None for row in model_rows) else None),
-                "held_tokens": sum(row["reserved_tokens"] for row in model_rows
-                    if row["actual_tokens"] is None and row["state"] in ("reserved", "dispatched", "unknown")),
-                "held_cost_microusd": sum(row["reserved_cost"] for row in model_rows
-                    if row["actual_cost"] is None and row["state"] in ("reserved", "dispatched", "unknown")),
+                "held_tokens": sum(row["reserved_tokens"] for row in outstanding),
+                "held_cost_microusd": sum(row["reserved_cost"] for row in outstanding),
                 "avg_latency_ms": round(sum(latency_values) / len(latency_values)) if latency_values else None}
             delivery_metrics = {"expected_parts": expected_parts, "created_parts": len(deliveries),
                 "delivered_parts": sum(state == "delivered" for state in states),
@@ -1538,6 +1807,10 @@ class ProactiveContacts:
                     "image_attachment": {"state": "passed" if data.get("reaction") else
                                          "failed" if data.get("diagnostic_image") else "not_required",
                                          "attached": bool(data.get("reaction"))},
+                    "media": {"reaction": "attached" if data.get("reaction") else
+                                         "pending_review" if data.get("pending_reaction_intent") else "not_selected",
+                              "voice": "sealed" if data.get("voice") else "not_selected",
+                              "poke": "sealed" if data.get("poke") else "not_selected"},
                     "delivery": delivery_metrics}}
 
     @outcome

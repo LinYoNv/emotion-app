@@ -52,9 +52,33 @@ class SegmentationSettingsTests(unittest.TestCase):
                     "additional_providers", "fallback_provider_id", "replacement_rules", "fallback_on_refusal",
                     "forward_intake"):
             old_multi["common"].pop(key)
+        # _role_aliases is a legacy alias map, not part of the identity pin: the
+        # fingerprint projection drops it, so the reconstruction has to drop it too.
+        old_multi.pop("_role_aliases")
         old_multi.pop("_legacy_group_delivery_shape")
         old_multi.pop("_storage_installation_id")
         self.assertEqual(multi.fingerprint, digest(old_multi))
+
+        # An existing profile that chose a non-default node limit must not acquire
+        # a different pin just because the new nested parsing switch defaults True.
+        old_custom = multi_config()
+        old_custom["runtime"] = {"forward_max_nodes": 25}
+        custom = MultiHostSettings.parse(old_custom)
+        expected = asdict(custom)
+        expected.pop("group_targets")
+        expected.pop("group_delivery_mode")
+        expected["common"].pop("streaming")
+        expected["common"]["forward_intake"].pop("parse_nested")
+        expected["common"].pop("segmentation")
+        expected["common"].pop("voice_reply_enabled")
+        expected["common"].pop("voice_reply_policy")
+        expected["common"].pop("budget_soft")
+        for key in ("additional_providers", "fallback_provider_id", "replacement_rules", "fallback_on_refusal"):
+            expected["common"].pop(key)
+        expected.pop("_role_aliases")
+        expected.pop("_legacy_group_delivery_shape")
+        expected.pop("_storage_installation_id")
+        self.assertEqual(custom.fingerprint, digest(expected))
 
     def test_enabled_policies_survive_serialization_and_multi_host_assembly(self):
         policy = SegmentationPolicy(enabled=True, rules_enabled=True, max_segments=3, prompt="按需 {{split_marker}}")

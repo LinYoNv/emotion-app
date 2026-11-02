@@ -39,6 +39,7 @@ PAGES = ROOT / "pages" / "陪伴小屋"
 # 目前无 .css 形态的快照，留空常量是为了让将来加进来时有地方可写，
 # 而不是让"忘了排除"重新变成一屏误报。
 SNAPSHOT_CSS: set[str] = set()
+GENERATED_CSS: set[str] = {"bundle.css"}
 
 # 已迁移到尺度令牌的页面：这几页必须零写死。
 MIGRATED = ("memory-page.css", "learning-page.css", "contact-page.css",
@@ -66,7 +67,9 @@ MIGRATED = ("memory-page.css", "learning-page.css", "contact-page.css",
             "weather-source.css",
             # 2026-10-11：原生扩展管理面板使用同一套尺度令牌，纳入阈值判定。
             "native-extension-panel.css", "confirmation-dialog.css",
-            "workspace-loading.css")
+            "workspace-loading.css",
+            # 2026-10-24：旧版资料迁入的配置对照表随页面重构迁入尺度令牌。
+            "migration-config-table.css")
 # 仍在使用自有尺度的页面：只统计，不判定（逐步迁移）。
 # 2026-10-02：`shell.css` 迁入后这里是空的——`pages/陪伴小屋/*.css` 全部走尺度令牌。
 #
@@ -327,6 +330,8 @@ def scale_sources():
     owners = {}
     pat = re.compile(r"--(?:r|sp|fs)-[a-z0-9]+\s*:\s*[^;]+")
     for path in sorted(PAGES.glob("*.css")):
+        if path.name in GENERATED_CSS:
+            continue
         text = re.sub(r"/\*.*?\*/", " ", path.read_text(encoding="utf-8"), flags=re.S)
         # 只看自定义属性定义处（--x: ...），不看引用 var(--x)
         defs = set(re.findall(r"(--(?:r|sp|fs)-[a-z0-9]+)\s*:", text))
@@ -389,7 +394,7 @@ def main():
         print("      最小档 --fs-micro = %gpx（阈值从这里读出，不写死）" % floor)
         floor_hits = []
         for path in sorted(PAGES.glob("*.css")):
-            if path.name in SNAPSHOT_CSS:
+            if path.name in SNAPSHOT_CSS or path.name in GENERATED_CSS:
                 continue
             hits = audit_font_floor(path, floor)
             if hits:
@@ -416,7 +421,7 @@ def main():
     # 令牌定义本身（tokens.css）与只提到名字的注释不算「使用」。
     TOKEN_FILES = {"tokens.css"}
     for path in sorted(PAGES.glob("*.css")):
-        if path.name in MIGRATED or path.name in TOKEN_FILES:
+        if path.name in MIGRATED or path.name in TOKEN_FILES or path.name in GENERATED_CSS:
             continue
         text = re.sub(r"/\*.*?\*/", " ", path.read_text(encoding="utf-8"), flags=re.S)
         if re.search(r"var\(--fs-", text):

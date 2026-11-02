@@ -14,7 +14,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE_ID = "astrbot_plugin_private_companion"
-VERSION = "7.0.0"
+VERSION = "7.0.13"
 RELEASE_SCHEMA = "companion.v2.release.v2"
 NATIVE_EXTENSION_FILES = {
     "content": ("companion_v2/content/assembly.py", "companion_v2/content/provider.py",
@@ -30,6 +30,7 @@ NATIVE_EXTENSION_FILES = {
                 "astrbot_host/native_extensions/reality/runtime.py",
                 "astrbot_host/native_extensions/reality/_mihome_login_worker.py",
                 "astrbot_host/native_extensions/reality/_mihome_spec_worker.py",
+                "astrbot_host/native_extensions/reality/mihome_arc4_compat.py",
                 "astrbot_host/native_extensions/reality/settings-schema.json",
                 "astrbot_host/native_extensions/reality/settings-defaults.json",
                 "astrbot_host/native_extensions/reality/assets/reality_touch_device_test.mp3"),
@@ -93,14 +94,16 @@ LEGACY_PROVIDER_IDS = frozenset("astrbot_plugin_" + name + "_companion" for name
     ("content", "image", "reality", "screen", "together", "game", "live_stream"))
 CORE_DIRS = ("companion_v2", "astrbot_host", "pages", "docs", "tests", "fixtures", "tools")
 ROOT_FILES = {
-    "metadata.yaml", "_conf_schema.json", "README.md", "CHANGELOG.md",
+    "metadata.yaml", "_conf_schema.json", "README.md", "CHANGELOG.md", "CONTRIBUTING.md",
     "requirements.txt", "requirements-optional-input.txt", "requirements-optional-mic.txt",
     "pyproject.toml", "LICENSE", "NOTICE", "logo.png", ".editorconfig",
-    "手机陪伴终端从零配对说明书.md",
 }
 EXCLUDED_DIRS = {
     "data", ".git", "__pycache__", ".pytest_cache", "node_modules", "logs",
     "dist", "build", "_archive", "protected_model", "desktop_pet", ".codex-plugin", "%SystemDrive%",
+    # Design exports and expression-page design boards are development references,
+    # not runtime resources. RC22 shipped 13 of them (about 5.4 MB) by mistake.
+    "page-designs", "design-previews", "design-exports", "expression-redesign-20261007",
 }
 EXCLUDED_FILES = {
     # 生成物与开发快照：不是运行时资源。pages/ 下的这些文件此前有 14.06 MB
@@ -114,10 +117,14 @@ EXCLUDED_FILES = {
     "pages/陪伴小屋/_probe-timeline.html",
     # 文档侧的设计稿快照同样是生成物（contact-rhythm 例外：它是生成器读的模板）。
     "docs/V2_SURFACE_PREVIEW_20260928.html",
-    "docs/page-designs/learning-track-preview.html",
-    "docs/page-designs/memory-archive-preview.html",
-    "docs/page-designs/material-pool-preview.html",
+    "docs/RELEASE_V2_0.md",
+    "docs/INTEGRATION_ACCEPTANCE_V2_0.md",
+    # The migration acceptance note contains counts from a real private data set.
+    "docs/V670_TO_V700_MIGRATION_20261019.md",
     "fixtures/reply_efficiency_preview.json",
+    # This standalone mini-game is not part of the companion plugin release.
+    "tests/bubble_bonbon_smoke.mjs",
+    "tests/_trace_apply.py",
 }
 EXCLUDED_SUFFIXES = {".pyc", ".pyo", ".log", ".out", ".db", ".sqlite", ".sqlite3", ".bak", ".backup"}
 TEXT_SUFFIXES = {
@@ -190,6 +197,14 @@ def verify_native_baseline(version, hashes, baseline):
                          + ", ".join(changed) + "; bump the release version, then refresh the native baseline")
 
 
+def release_version_key(version):
+    """Order the repository's letter hotfixes after their numeric release."""
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)([a-z]?)", version)
+    if not match:
+        raise ValueError("native capability baseline requires major.minor.patch with an optional letter revision")
+    return (*map(int, match.groups()[:3]), match.group(4))
+
+
 def refresh_native_baseline(root, version):
     path = root / NATIVE_CAPABILITY_BASELINE
     current_hashes = native_artifact_hashes(native_artifact_source_files(root))
@@ -202,12 +217,8 @@ def refresh_native_baseline(root, version):
                 or type(baseline.get("artifact_hashes")) is not dict):
             raise ValueError("native capability baseline is invalid")
         previous_version = baseline["package_version"]
-        match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", previous_version)
-        current = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version)
-        if not match or not current:
-            raise ValueError("native capability baseline requires numeric major.minor.patch versions")
-        previous_key = tuple(map(int, match.groups()))
-        current_key = tuple(map(int, current.groups()))
+        previous_key = release_version_key(previous_version)
+        current_key = release_version_key(version)
         changed = baseline["artifact_hashes"] != current_hashes
         if current_key < previous_key or (changed and current_key <= previous_key):
             raise ValueError("native capability hashes changed; the release version must advance before refreshing")
@@ -402,16 +413,14 @@ def build(output, core_only=False):
     with TemporaryDirectory(prefix="companion-v2-package-") as temporary:
         stage = Path(temporary)
         packages = [build_plugin(ROOT, CORE_DIRS, stage)]
-        manifest = {"schema": RELEASE_SCHEMA, "product": "我会永远陪着你 V2.0", "version": VERSION,
+        manifest = {"schema": RELEASE_SCHEMA, "product": "我会永远陪着你", "version": VERSION,
                     "astrbot_version": packages[0]["astrbot_version"],
-                    "data_policy": "V2 独立数据，不打包或迁移 V1 用户数据",
-                    "provider_integration": "Seven native internal extensions are bundled and owned by the single V2 plugin",
+                    "data_policy": "隔离运行数据；仅在用户确认后读取旧版来源并写入新数据根",
+                    "provider_integration": "Seven native internal extensions are bundled and owned by one plugin",
                     "native_extensions": sorted(NATIVE_EXTENSION_FILES),
                     "external_plugin_dependencies": [],
                     "packages": packages}
         (stage / "release-manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
-        for filename in ("RELEASE_V2_0.md", "INTEGRATION_ACCEPTANCE_V2_0.md"):
-            (stage / filename).write_bytes(checked_payload(ROOT / "docs" / filename, ROOT))
         hashes = [(p.name, digest(p.read_bytes())) for p in sorted(stage.iterdir()) if p.is_file()]
         (stage / "SHA256SUMS.txt").write_text("".join(sha + "  " + name + "\n" for name, sha in hashes), encoding="utf-8", newline="\n")
         for path in stage.iterdir():

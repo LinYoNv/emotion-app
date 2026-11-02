@@ -13,14 +13,6 @@ PREFIX = "/astrbot_plugin_private_companion/extensions"
 
 
 class NativeExtensionWebAPI(PerceptionWebAPI):
-    @staticmethod
-    def _error(error):
-        # AstrBot's page bridge forwards only message on rejection. Keep the
-        # machine code there so the management page can explain the failure.
-        code = error.code if isinstance(error, TaskError) else "perception_request_invalid"
-        return {"status": "error", "message": code, "reason": str(error),
-                "data": {"code": code}}
-
     def routes(self):
         return [(PREFIX, self.status, ["GET"], "Read native V2 capability settings"),
                 (PREFIX + "/configure", self.configure, ["POST"], "Save and apply native V2 capability settings"),
@@ -112,11 +104,11 @@ class NativeExtensionWebAPI(PerceptionWebAPI):
                 result = await action(service, data['action'], data['payload'], current)
             else:
                 allowed = {'mihome_start_login', 'mihome_login_status', 'mihome_sync_devices',
-                    'mihome_logout', 'mihome_save_mappings', 'mihome_control_power',
+                    'mihome_logout', 'mihome_save_mappings', 'mihome_device_status', 'mihome_control_power',
                     'scan_camera', 'test_camera', 'consent_camera', 'update_camera_policy', 'update_audio_policy',
                     'scan_audio', 'select_audio', 'test_audio', 'request_audio_consent',
                     'revoke_audio_consent', 'save', 'disable', 'stop_session', 'test',
-                    'cancel_reminder'}
+                    'cancel_reminder', 'mobile_pairing_token'}
                 if data['action'] not in allowed or 'action' in data['payload']:
                     raise ValueError('unsupported native reality action')
                 current()

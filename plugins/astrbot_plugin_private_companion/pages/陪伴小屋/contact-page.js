@@ -51,7 +51,7 @@ window.CompanionContactPage = (() => {
       ["repair","关系修复"],["chat","日常话题"]]},
     {id:"daily", label:"日程",  hint:"由时刻或约定驱动", purposes:[
       ["greeting","问候与纪念"],["followup","接回旧话题"],["invitation","共同活动邀请"],
-      ["reminder","约定与提醒"],["meal","饭点问候"]]},
+      ["reminder","约定与提醒"],["meal","饭点话题"]]},
     {id:"share", label:"分享",  hint:"由外部素材驱动", purposes:[
       ["life","分享自己的生活"],["creation","作品与阅读"],["news","外部资讯"],
       ["environment","环境与状态变化"],["screen","已授权屏幕观察"]]},
@@ -86,7 +86,7 @@ window.CompanionContactPage = (() => {
       instruction:"可以从角色自己的想法、兴趣或真实对话里自然开口；事实才需要来源支持，不要求复述最近消息。",
       expect:"授权、空闲、额度、活动曲线和去重按真实配置生效；不合适或显得突兀时选择 skip。"},
     {id:"greeting", label:"问候与纪念", bucket:"日程", coverage:"ready",
-      source:"本地问候窗口、夜间窗口或管理员配置的纪念日期",
+      source:"本地问候窗口、夜间窗口、固定节日，以及角色档案和当前私聊资料中的生日与纪念日",
       setup:"分别构造早/午/晚窗口、夜间窗口和重要日期样例，并验证窗口边界。",
       instruction:"把日期或时段只当作开口机会；优先承接当前语境，不假设对方刚醒、吃饭、休息或正在等待。",
       expect:"只在有效窗口、静默和冷却规则允许时进入链路；不得机械套用固定问候。"},
@@ -105,11 +105,11 @@ window.CompanionContactPage = (() => {
       setup:"构造已接受且即将开始的约定；对照待确认、取消、过期和修订过的记录。",
       instruction:"只根据当前有效的已接受约定简短提醒，不说成已经发生，也不声称对方已收到或记得。",
       expect:"来源回执、版本、发生时间和配置窗口全部匹配才进入模型。"},
-    {id:"meal", label:"饭点问候", bucket:"日程", coverage:"ready",
-      source:"关系时区中的午餐或晚餐时间窗口",
-      setup:"按关系时区构造午餐、晚餐窗口；另测窗口边界、暂停和重复候选。",
-      instruction:"当地饭点只提供时间语境，不推断对方没吃饭、正在吃饭或需要提醒；没有自然话头就选择 skip。",
-      expect:"使用配置时区和原始窗口；不默认盘问饮食或要求报平安。"},
+    {id:"meal", label:"饭点话题", bucket:"日程", coverage:"ready",
+      source:"关系时区中的午餐或晚餐时间窗口，以及角色自己的生活节奏",
+      setup:"按关系时区构造午餐、晚餐窗口；另测窗口边界、暂停、重复候选和当天没有合适话头的对照组。",
+      instruction:"饭点只提供角色自己的生活时间背景，不推断对方没吃饭、正在吃饭或需要提醒；优先分享角色自己的念头或接回原话题，没有自然话头就选择 skip。",
+      expect:"使用配置时区和原始窗口；不默认盘问饮食、不把饭点变成每日打卡或要求报平安。"},
     {id:"life", label:"分享自己的生活", bucket:"分享", coverage:"ready",
       source:"仍有效且允许分享的角色活动回执或日记记录",
       setup:"构造真实活动完成回执或角色日记；另测素材撤回和修订版本变化。",
@@ -187,7 +187,7 @@ window.CompanionContactPage = (() => {
     proactive_contact_dates_invalid:"重要日期需要一个 JSON 数组，最多 32 条。",
     proactive_contact_source_invalid:"资讯来源填写有误，请核对类型、标识或地址。",
     proactive_contact_revision_conflict:"设置已有其他更新，已读取最新值。",
-    configuration_revision_conflict:"设置已有其他更新，请重新读取后再保存。",
+    configuration_revision_conflict:"设置已有其他更新。正在读取最新值，未保存的改动会保留。",
     contact_configuration_invalid:"请核对联系设置：提交的字段或操作不完整。",
     invalid_contact_preference:"请核对联系设置的格式或范围。",
     configuration_relationship_required:"这个对象还没有建立可写入的关系。",
@@ -201,6 +201,9 @@ window.CompanionContactPage = (() => {
     proactive_quiet_hours:"当前处于免打扰时段。", proactive_paused:"当前已暂停主动联系。",
     proactive_disabled:"主动联系总开关已关闭。", contact_automatic_disabled:"后台自动联系未开启。",
     model_task_unregistered:"请先登记主动联系模型。", host_not_running:"当前运行实例尚未启动。",
+    contact_model_profile_exceeded:"主动联系的上下文超过当前模型输入或输出上限。请减少历史长度，或在「模型与连接」换用上下文更大的模型。",
+    model_estimation_failed:"当前模型无法接受这次主动联系的上下文长度；请减少历史长度或换用上下文更大的模型。",
+    host_model_limit:"当前模型输入或输出上限不足；请减少历史长度或换用上下文更大的模型。",
   };
   const CODE = /^[a-z][a-z0-9_]{2,60}$/;
   const denied = new Set(["dashboard_identity_required","core_access_required","binding_revoked",
@@ -715,12 +718,33 @@ window.CompanionContactPage = (() => {
       }
       const unresolved = !!data.pendingWrite && !error.confirmed;
       notice(unresolved ? recoveryFailure(error) : reason(code), true);
-      if (["configuration_revision_conflict", "proactive_contact_revision_conflict",
-        "proactive_contact_target_changed"].includes(code)) {
+      if (["configuration_revision_conflict", "proactive_contact_revision_conflict"].includes(code)) {
+        /* A revision conflict rejects only the stale write.  Keep the fields
+           the user edited while refreshing the authoritative settings and
+           token, so a concurrent update cannot turn into lost UI work.  The
+           next save submits touched fields only, which preserves unrelated
+           changes made by the other writer. */
+        const conflictedDraft = {...data.draft};
+        const conflictedTouched = new Set(data.touched);
+        const conflictedTier = data.tierDraft;
+        await loadContract();
+        if (live(ticket)) {
+          data.draft = conflictedDraft;
+          data.touched = conflictedTouched;
+          data.tierDraft = conflictedTier;
+          notice(settingsAvailable() && data.configToken
+            ? "设置已有其他更新，已读取最新值；未保存的改动仍保留，请核对后再次保存。"
+            : "设置已有其他更新，但最新值暂时无法读取；未保存的改动仍保留，请重新读取后再保存。",
+          !(settingsAvailable() && data.configToken));
+          render();
+        }
+      } else if (code === "proactive_contact_target_changed") {
         data.touched.clear(); data.draft = {}; data.tierDraft = null;
         await loadContract();
-        if (live(ticket) && !data.error) {
-          notice("设置已有其他更新，已读取最新值。", false);
+        if (live(ticket)) {
+          notice(data.configToken
+            ? "联系配置目标已变化，已读取新目标设置；请核对后重新编辑。"
+            : "联系配置目标已变化，但新目标设置暂时无法读取；请重新读取。", !data.configToken);
           render();
         }
       } else {
@@ -904,7 +928,7 @@ window.CompanionContactPage = (() => {
   }
 
   /* ---- 渲染 ------------------------------------------------------------ */
-  const VIEWS = [["dial","节律盘",ICON.dial],["tests","消息测试",ICON.test],
+  const VIEWS = [["dial","节律盘",ICON.dial],["morning","晨间唤醒",ICON.bell],["tests","消息测试",ICON.test],
                  ["purposes","契机矩阵",ICON.seed],
                  ["gates","开口闸门",ICON.gate],["budgets","额度与去重",ICON.quota],
                  ["sources","外部触发源",ICON.source],["materials","主动检视",ICON.seed]];
@@ -1033,6 +1057,30 @@ window.CompanionContactPage = (() => {
       ], "is-ring-greet")}
     </div>`;
   }
+  function morningView() {
+    return `<div class="ct-rest">
+      ${fieldBlock("晨间流程", [
+        toggle("morning_chain_enabled", "启用晨间流程", "关闭后不会生成角色醒来问候或清醒确认提醒。"),
+        timeRow("wake_morning_start", "开始", "wake_morning_end", "结束", "使用全局免打扰时区；窗口外不补发过期消息。"),
+      ], "is-wide")}
+      ${fieldBlock("角色作息", [
+        toggle("morning_role_greeting_enabled", "角色醒来后先问候", "只判断角色自身醒来，不推断用户已经醒。"),
+        toggle("routine_learning_enabled", "学习角色的起床习惯", "根据近期有效样本调整角色的预测起床窗口。"),
+        numberRow("routine_window_days", "学习窗口", "天", 14, 180, "只使用最近这段时间的作息记录。"),
+        decimalRow("morning_wake_confidence_floor", "预测可信度下限", 0, 1, 0.05,
+          "预测把握低于此值时不生成晨间问候。"),
+      ])}
+      ${fieldBlock("清醒确认", [
+        toggle("morning_nudge_enabled", "允许轻声确认", "仅在清醒证据充分、窗口有效且没有新输入时提醒。"),
+        numberRow("morning_nudge_delay_minutes", "确认前等待", "分钟", 10, 90, "给对方自然开口的时间。"),
+        numberRow("morning_nudge_max_attempts", "每次起床最多提醒", "次", 0, 2, "0 表示不提醒；默认最多一次。"),
+        numberRow("wake_contact_window_minutes", "清醒后有效窗口", "分钟", 15, 240, "超时后不再翻旧账。"),
+        numberRow("wake_contact_min_confidence", "清醒迹象可信度", "%", 40, 100, "低于此值只保留诊断，不触发联系。"),
+        numberRow("wake_contact_max_daily", "每日确认上限", "次", 0, 3, "按免打扰时区的本地日期计数。"),
+        toggle("wake_require_device_evidence", "要求设备侧证据", "开启后只接受授权设备提供的清醒迹象。"),
+      ], "is-wide")}
+    </div>`;
+  }
   function fmtDuration(seconds) {
     if (!Number.isFinite(seconds)) return "—";
     if (seconds < 60) return seconds + " 秒";
@@ -1074,6 +1122,14 @@ window.CompanionContactPage = (() => {
       <span class="ct-field-label">${e(label)}<small>${e(min)}–${e(max)}</small></span>
       <span class="ct-input-unit"><input type="number" data-field="${e(name)}" value="${e(current ?? "")}"
         min="${min}" max="${max}" step="1" inputmode="numeric"><i>${e(unit)}</i></span>
+      ${help ? `<small class="ct-field-help">${e(help)}</small>` : ""}</label>`;
+  }
+  function decimalRow(name, label, min, max, step, help) {
+    const current = value(name);
+    return `<label class="ct-field ct-field-number${dirty(name) ? " is-dirty" : ""}">
+      <span class="ct-field-label">${e(label)}<small>${e(min)}–${e(max)}</small></span>
+      <input type="number" data-field="${e(name)}" value="${e(current ?? "")}"
+        min="${min}" max="${max}" step="${step}" inputmode="decimal">
       ${help ? `<small class="ct-field-help">${e(help)}</small>` : ""}</label>`;
   }
   /* 强度档位是一个**控件**，不是下拉：五档的差别是「更快 / 更多」，而这句话
@@ -1283,7 +1339,7 @@ window.CompanionContactPage = (() => {
     settings:"主动联系设置", purpose:"联系目的", trusted_candidate:"联系机会/来源", contact_admission:"主动联系准入",
     news_fetch:"真实资讯抓取", weather_fetch:"真实天气获取", screen_capture:"本次真实截图", screen_interpretation:"本次视觉分析",
     mobile_location_fetch:"手机地点读取", image_attachment:"主动图片素材与投递",
-    attempt_budget:"旧版本的主动模型调用上限",
+    attempt_budget:"主动模型调用次数上限",
     delivery_budget:"本窗口今日实际联系额度",
     model_route:"主动联系模型路由", model_generation:"模型生成", persona_review:"人格复核",
     delivery:"平台投递", receipt:"投递回执", execution:"端到端执行",
@@ -1294,6 +1350,7 @@ window.CompanionContactPage = (() => {
   };
   const TEST_SKIP_REASONS = {
     duplicate:"与近期已发送内容重复", low_confidence:"模型把握不足，按沉默阈值暂缓发送",
+    continuation_after_silence:"刚回复过且用户未再发言，这次主动只是在接自己的话，已跳过",
     persona_review:"人格复核未放行", framework_guard:"正文含框架标记，发送前检查拦截",
     presentation_empty:"文字清理后正文为空", forbidden_word:"命中当前禁用词规则",
     source_coverage:"来源材料不足以支持当前表述", no_sendable_content:"处理后没有可发送正文",
@@ -1308,6 +1365,11 @@ window.CompanionContactPage = (() => {
     delivered:"平台已确认投递", failed:"平台明确返回失败", unknown:"平台投递结果未知",
     accepted:"平台已接收请求，但尚无最终投递回执", pending:"等待平台投递回执",
     dispatched:"已提交平台，等待投递回执",
+  };
+  const TEST_MEDIA_STATES = {
+    reaction: {attached:"已附表情图", pending_review:"待人格复核后附表情图", not_selected:"未选表情图"},
+    voice: {sealed:"已封装语音", not_selected:"未选语音"},
+    poke: {sealed:"已封装戳一戳", not_selected:"未选戳一戳"},
   };
   function testStageMarkup(result) {
     const stages = Array.isArray(result.stages) ? result.stages.filter(item =>
@@ -1333,6 +1395,12 @@ window.CompanionContactPage = (() => {
     }
     if (delivery && Number.isFinite(Number(delivery.expected_parts))) {
       stageLines.push(`本轮投递：${Number(delivery.delivered_parts || 0)} / ${Number(delivery.expected_parts)} 段已确认 · ${Number(delivery.unresolved_parts || 0)} 段待确认 · ${Number(delivery.failed_parts || 0)} 段失败`);
+    }
+    const media = metrics?.media;
+    if (media && typeof media === "object") {
+      const mediaText = Object.entries(TEST_MEDIA_STATES).map(([key, labels]) =>
+        labels[media[key]] ? `${labels[media[key]]}` : "").filter(Boolean);
+      if (mediaText.length) stageLines.push(`本轮表达：${mediaText.join(" · ")}`);
     }
     const summary = result.usage_summary;
     const sessionDecision = summary?.decisions?.session;
@@ -1672,14 +1740,14 @@ window.CompanionContactPage = (() => {
         srcToggle("news_daily_hot_read_enabled", "每日热点", ""),
         srcText("news_hot_sources", "热点来源", "weibo,hackernews", "逗号分隔，可选 weibo / hackernews。"),
       ]},
-      {id:"meal", icon:ICON.meal, title:"三餐与纪念日", hint:"饭点问候与重要日期的提前量。", body:[
-        srcToggle("meal_checkin_enabled", "饭点问候", ""),
-        srcText("meal_lunch_time", "午餐时刻", "12:00", ""),
-        srcText("meal_dinner_time", "晚餐时刻", "18:00", ""),
-        srcNumber("meal_care_followup_minutes", "饭后追问窗口", "分钟", 1, 240, "吃到一半问完就不追问了。"),
-        srcToggle("date_checkin_enabled", "纪念日问候", ""),
+      {id:"meal", icon:ICON.meal, title:"饭点与生日纪念日", hint:"饭点只是可选话题；生日和纪念日自动读取资料。", body:[
+        srcToggle("meal_checkin_enabled", "饭点话题", "系统会按当天语境在跳过、单时段或双时段中选择，不保证每餐都联系。"),
+        srcText("meal_lunch_time", "午餐大致时刻", "12:00", "实际机会会在参考时刻前后小幅浮动。"),
+        srcText("meal_dinner_time", "晚餐大致时刻", "18:00", "实际机会会在参考时刻前后小幅浮动。"),
+        srcNumber("meal_care_followup_minutes", "饭点后可接话窗口", "分钟", 1, 240, "超出窗口就不再跟进；语境不合适时可以直接跳过。"),
+        srcToggle("date_checkin_enabled", "生日与纪念日问候", ""),
         srcText("date_checkin_time", "问候时刻", "09:00", ""),
-        srcNumber("important_date_lookahead_days", "提前几天开始留意", "天", 0, 30, "0 表示只在当天问候。"),
+        srcNumber("important_date_lookahead_days", "提前几天开始留意", "天", 0, 30, "0 表示只在当天问候；角色生日、对方资料日期和每日反思记下的重要互动纪念日会自动读取，无需再填日期清单；可在聊天中用「陪伴 日期列表」查看或删除。"),
       ]},
       {id:"explore", icon:ICON.compass, title:"网络探索与自关联", hint:"她自己去网上找素材，并把外部事件关联回来。", body:[
         srcToggle("web_exploration_enabled", "网络探索", ""),
@@ -1711,7 +1779,7 @@ window.CompanionContactPage = (() => {
         srcToggle("enable_llm_proactive_persona_judge", "开口前先自评", "多一次模型调用，按阈值决定这条要不要发。"),
         srcNumber("proactive_persona_judge_threshold", "自评阈值", "", 0, 100, ""),
         srcNumber("proactive_persona_judge_cache_minutes", "自评缓存", "分钟", 0, 720, ""),
-        srcNumber("generation_history_limit", "近期对话轮数", "轮", 0, 8, "同一轮中的分段消息会合并计数。"),
+        srcNumber("generation_history_limit", "近期对话轮数", "轮", 0, 64, "同一轮中的分段消息会合并计数，并受上下文字数预算约束。"),
         srcNumber("history_max_chars", "历史字数上限", "字", 0, 8192, ""),
       ]},
       {id:"balance", icon:ICON.purse, title:"余额与其它", hint:"余额只影响说不说、说不说金额；两个阈值是绝对值与百分比双保险。", wide:true, body:[
@@ -1814,6 +1882,7 @@ window.CompanionContactPage = (() => {
     const usageLabels = {delivered:"已送达", partial:"部分送达", unconfirmed:"结果待确认", not_sent:"未发送",
       pending:"等待投递", failed:"投递失败", cancelled:"已取消", reviewing:"等待检视"};
     const skipLabels = {duplicate:"内容重复", low_confidence:"判断把握不足", persona_review:"人格复核未通过",
+      continuation_after_silence:"刚回复过且用户未再发言，避开自接话头",
       presentation_empty:"正文整理后为空", forbidden_word:"内容规则限制", model_decision:"模型选择暂不发送",
       source_coverage:"来源支撑不足", no_sendable_content:"没有可发送内容"};
     const modelSkipLabels = {insufficient_context:"上下文不足", no_natural_opening:"当前没有自然的开口",
@@ -1959,7 +2028,7 @@ window.CompanionContactPage = (() => {
     if (data.view === "tests") return testsView();
     if (data.view === "materials") return materialsView();
     if (!settingsAvailable()) return emptyMarkup();
-    return {"dial":dialView, "purposes":purposesView, "gates":gatesView,
+    return {"dial":dialView, "morning":morningView, "purposes":purposesView, "gates":gatesView,
       "budgets":budgetsView, "sources":sourcesView}[data.view]();
   }
   /* 换页。方向按轨道上的先后：往后（往下）点，新的一屏从右边进来；

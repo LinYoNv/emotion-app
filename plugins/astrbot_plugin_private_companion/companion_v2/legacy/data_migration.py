@@ -23,6 +23,7 @@ from companion_v2.legacy.profile_source import (
     read_json as _read_json,
     read_sqlite as _read_persona_sqlite,
 )
+from companion_v2.legacy.sqlite_snapshot import open_readonly_sqlite_snapshot
 
 
 MAX_REACTION_ASSETS = 1000
@@ -195,6 +196,11 @@ class LegacyDataPlan:
     reference_image_rejected: tuple[dict, ...] = ()
     wardrobe_items: tuple[LegacyWardrobeItem, ...] = ()
     wardrobe_rejected: tuple[dict, ...] = ()
+    expression_profiles: tuple[dict, ...] = ()
+    private_contacts: tuple[dict, ...] = ()
+    private_contact_rejected: tuple[dict, ...] = ()
+    relationship_profiles: tuple[dict, ...] = ()
+    relationship_profile_rejected: tuple[dict, ...] = ()
 
     def document(self, *, source_group_id="", existing_reaction_ids=(),
                  existing_journal_heads=None, existing_reference_hashes=(),
@@ -354,6 +360,10 @@ class LegacyDataPlan:
                 "samples": [item.document() for item in ready_wardrobe[:12]],
             },
             "profile_data": dict(self.profile_summary),
+            "private_contacts": {"total": len(self.private_contacts),
+                "rejected": list(self.private_contact_rejected)},
+            "relationship_profiles": {"total": len(self.relationship_profiles),
+                "rejected": list(self.relationship_profile_rejected)},
             "work_delivery": dict(self.work_delivery),
             "world_assets": dict(self.world_assets),
             "group_networks": [{key: value for key, value in item.items() if key not in ("members", "edges")}
@@ -666,12 +676,17 @@ def _selected_profile(root: Path, persona_id: str, persona_sources, primary):
     if info["state"] != "ready":
         return None, "persona_profile_ambiguous", ""
     directory = root / "persona_profiles"
-    candidates = [directory / (child.name) for child in directory.iterdir()
-                  if child.suffix.lower() in (".json", ".db")
-                  and _persona_id_from_filename(child.name[:-len(child.suffix)]) == persona_id]
+    try:
+        candidates = [directory / (child.name) for child in directory.iterdir()
+                      if child.suffix.lower() in (".json", ".db")
+                      and _persona_id_from_filename(child.name[:-len(child.suffix)]) == persona_id]
+    except OSError:
+        return None, "persona_profile_unreadable", ""
     if len(candidates) != 1:
         return None, "persona_profile_ambiguous", ""
     path = candidates[0]
+    if path.is_symlink() or not path.is_file():
+        return None, "persona_profile_unreadable", ""
     if path.suffix.lower() == ".json":
         payload = _read_json(path, max_bytes=MAX_PROFILE_JSON_BYTES)
         return (payload, "", str(path.relative_to(root))) if isinstance(payload, dict) \
@@ -687,6 +702,31 @@ def _profile_data(payload):
     if isinstance(nested, dict) and not any(key in payload for key in ("bot_diaries", "daily_dream", "groups")):
         return nested
     return payload
+
+
+def persona_profile_settings(root, configuration, persona_id):
+    """Return the V1 profile payload and source for one persona.
+
+    A secondary persona without its own profile inherits the primary store,
+    matching V1's ``inherit_primary`` contract. Ambiguous or unreadable
+    secondary profiles are reported instead of silently falling back.
+    """
+    root = Path(root)
+    primary = primary_profile(root, configuration)
+    if primary.payload is None:
+        return None, primary.error, ""
+    if not persona_id:
+        return _profile_data(primary.payload), "", str(primary.selected_path(root))
+    try:
+        inventory, _ = _persona_sources(root, primary)
+        selected, issue, relative = _selected_profile(root, persona_id, inventory, primary)
+    except OSError:
+        return None, "persona_profile_unreadable", ""
+    if selected is None and issue in ("persona_profile_ambiguous", "persona_profile_unreadable"):
+        return None, issue, ""
+    if selected is None:
+        return _profile_data(primary.payload), "", str(primary.selected_path(root))
+    return _profile_data(selected), "", relative
 
 
 def _date_key(value):
@@ -1549,7 +1589,7 @@ def _readonly_sqlite_summary(path: Path, *, state_columns=()):
             or info.st_size > 1024 * 1024 * 1024):
         return {"state": "unsafe_or_too_large", "tables": {}, "states": {}}
     try:
-        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+        connection = open_readonly_sqlite_snapshot(path, timeout=2)
         try:
             connection.execute("PRAGMA query_only=ON")
             names = {str(row[0]) for row in connection.execute(
@@ -1633,7 +1673,7 @@ def _profile_summary(payload):
             "worldbook_entries": len(world_entries),
             "diary_entries": len(diaries), "dream_fragments": len(data.get("dream_fragments", []))
                 if isinstance(data.get("dream_fragments"), list) else 0,
-            "non_equivalent_reason": "私人用户运行画像、关系分数、投递状态和定时缓存没有可验证的 V2 等价归属，不整库复制。成员线索、群资料、群互动汇总、日记及带日期的梦境碎片按各自作用域合同迁移。"}
+            "non_equivalent_reason": "用户目录与私聊往来汇总按已确认账号及角色迁入；旧关系分数、投递状态和定时缓存不恢复。成员线索、群资料、群互动汇总、日记及带日期的梦境碎片按各自作用域迁移。"}
 
 
 def build_data_plan(v1_root: str | Path, *, source_persona_id="", v1_configuration=None) -> LegacyDataPlan:
@@ -1665,6 +1705,12 @@ def build_data_plan(v1_root: str | Path, *, source_persona_id="", v1_configurati
     worldbook_rejected = tuple((*worldbook_rejected, *group_profile_rejected))
     member_profiles, member_profile_rejected = _member_profiles(profile)
     profile_data = _profile_data(profile)
+    from .private_contacts import private_contacts
+    contacts, contact_rejected = private_contacts(profile_data, v1_configuration=v1_configuration)
+    from .relationship_profiles import relationship_profiles
+    relation_profiles, relation_profile_rejected = relationship_profiles(profile_data)
+    from .expression_data import expression_profiles
+    learned_expressions = expression_profiles(profile_data, source_persona_id)
     reference_images, reference_image_rejected = _reference_assets(
         root, profile_data, v1_configuration, source_persona_id)
     wardrobe_items, wardrobe_rejected = _wardrobe_items(
@@ -1678,6 +1724,11 @@ def build_data_plan(v1_root: str | Path, *, source_persona_id="", v1_configurati
             "worldbook_entries": 0, "diary_entries": 0,
             "dream_fragments": 0, "non_equivalent_reason": profile_error}
     material = {
+        "private_contacts": contacts,
+        "private_contact_rejected": contact_rejected,
+        "relationship_profiles": relation_profiles,
+        "relationship_profile_rejected": relation_profile_rejected,
+        "expression_profiles": learned_expressions,
         "source_persona_id": source_persona_id,
         "selected_path": selected_path,
         "reactions": [{"sha256": item.sha256, "metadata": item.metadata, "size": item.size,
@@ -1720,7 +1771,8 @@ def build_data_plan(v1_root: str | Path, *, source_persona_id="", v1_configurati
         journal_rejected, worldbook_items, worldbook_rejected, member_profiles,
         member_profile_rejected, persona_sources, source_persona_id, profile_summary,
         work_delivery, world_assets, fingerprint, tuple(warnings + group_warnings),
-        reference_images, reference_image_rejected, wardrobe_items, wardrobe_rejected)
+        reference_images, reference_image_rejected, wardrobe_items, wardrobe_rejected, learned_expressions,
+        contacts, contact_rejected, relation_profiles, relation_profile_rejected)
 
 
 def load_reaction_asset(v1_root: str | Path, item: ReactionAsset) -> bytes:

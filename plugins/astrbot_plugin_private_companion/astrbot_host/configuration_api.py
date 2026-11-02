@@ -23,11 +23,13 @@ from companion_v2.configuration.management import (AcquaintanceManagement, BusyG
                                                    PrivateAccessManagement,
                                                    ReactionRetrievalManagement,
                                                    RecallManagement, ReferenceManagement,
+                                                   WebUnderstandingManagement,
                                                    RoleGrowthSkillsManagement,
                                                    ExpressionLearningManagement,
                                                    RoleProfileManagement,
                                                    RelationshipProfileManagement,
                                                    QzoneManagement,
+                                                   RelayManagement,
                                                    ScreenManagement, WardrobeManagement)
 from companion_v2.configuration.models import ConfigurationError
 from companion_v2.execution.models import TaskError
@@ -47,6 +49,8 @@ SECTIONS = {"quota": ImageQuotaManagement, "image_review": ImageReviewManagement
             "content.authoring": ContentAuthoringManagement,
             "reaction": ReactionRetrievalManagement, "budget": ModelBudgetManagement,
             "recall": RecallManagement, "screen": ScreenManagement,
+            "web_understanding": WebUnderstandingManagement,
+            "relay": RelayManagement,
             # QQ 空间拓展的角色级开关与节流；安装与逐会话同意不在这里，归能力安装路由。
             "qzone": QzoneManagement,
             "person": AcquaintanceManagement,

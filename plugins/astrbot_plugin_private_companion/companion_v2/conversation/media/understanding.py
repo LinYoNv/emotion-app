@@ -17,6 +17,7 @@ DEFAULTS = {
     "video_self_recognition_hint": "",
     "image_understanding_private_enabled": True,
     "image_understanding_group_enabled": True,
+    "astrbot_animated_image_understanding_enabled": True,
     "video_understanding_private_enabled": True,
     "video_understanding_group_enabled": True,
     "file_understanding_private_enabled": True,
@@ -60,6 +61,12 @@ FILE_INSTRUCTION = (
 )
 VIDEO_INSTRUCTION = (
     "以下视频转述由支持原生视频输入的模型直接读取本轮原视频后生成，属于临时辅助描述，不是独立核验。只依据该转述回应；不假定未提及的画面、动作或音轨内容已被检查，也不猜测拍摄者、人物身份、时间、地点或画外事实。转述失败、超时或未启用时，明确表示视频尚未读到并可请对方描述。"
+)
+ASTRBOT_ANIMATED_IMAGE_INSTRUCTION = (
+    "本轮原始消息包含 GIF 动图。AstrBot 原生输入兼容层可能把动图按 3×3 宫格抽取时间帧，拼成一张静态预览图后再交给你。"
+    "如果其中一张图片是 3×3 等分、各格主体相同或连续，请按从左到右、从上到下的顺序把它理解成同一段动画的连续帧，"
+    "不要描述成九个人、九张独立图片或同一动作重复九次。各格差异很小时概括整体动作和循环，不要逐格计数；"
+    "抽帧不等于看完整段动画，不补造未出现的帧间动作或其他细节。"
 )
 
 
@@ -121,9 +128,13 @@ class MediaScopeSettingsOwner(RoleSharedSettingsOwner):
 
 def intake_fields():
     """Use the registered group's layer contract; the owner handles role sharing."""
+    from ..reply_settings import ROLE_SHARED_FIELDS
+
     return tuple(FieldDefinition(GROUP + "." + key, GROUP, GROUP,
         {bool: ValueKind.BOOLEAN, int: ValueKind.INTEGER, str: ValueKind.TEXT}[type(default)], default,
-        layers=(ConfigLayer.WINDOW,), owner_id=GROUP,
+        layers=((ConfigLayer.ROLE, ConfigLayer.WINDOW)
+                if key in ROLE_SHARED_FIELDS else (ConfigLayer.WINDOW,)),
+        owner_id=GROUP,
         **(dict(zip(("minimum", "maximum"), LIMITS[key])) if key in LIMITS else {}))
         for key, default in DEFAULTS.items())
 

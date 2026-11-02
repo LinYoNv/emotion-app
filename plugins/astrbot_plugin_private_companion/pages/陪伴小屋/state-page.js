@@ -252,12 +252,12 @@ window.CompanionStatePage = (() => {
     weather:"让长期安排参考所在地实况；天气凭据由宿主管理。",
     datetime:"查看角色当地时间与日期，设置小屋时区与对话历法背景。",
     patrol:"每天在设定时刻巡视角色状态，保留一段时间的记录。",
-    presentation:"在 QQ 上展示「正在输入」与自定义短状态，需授权通过。",
+    presentation:"正在输入按当前私聊窗口，QQ 在线状态与自定义短状态按角色共享，需授权通过。",
   };
   /* 右端「生效范围」胶囊：与 workspaceOverview 的 scope 保持一致。 */
   const featureScopes={
     energy:"当前人格",health:"当前人格",hunger:"当前人格",sleep:"当前角色 · 共享作息",cycle:"当前人格 · 共享模拟",
-    busy:"只读",location:"只读",mood:"当前人格 · 跨窗口共享",planning:"当前角色 · 私聊隔离",weather:"当前角色 · 私聊共享",datetime:"当前人格",patrol:"当前人格",presentation:"当前 QQ 窗口",
+    busy:"只读",location:"只读",mood:"当前人格 · 跨窗口共享",planning:"当前角色 · 私聊隔离",weather:"当前角色 · 私聊共享",datetime:"当前人格",patrol:"当前人格",presentation:"当前角色 · QQ 展示",
   };
   function openFeatureEditor(feature) {
     const kind=featureEditors[feature];
@@ -293,7 +293,10 @@ window.CompanionStatePage = (() => {
       const detail=({timeout:"执行超时",worker_error:"执行出错",worker_lost:"执行任务失联",
         owner_unavailable:"原任务材料已不可用",state_foreground_active:"对话正在使用当前状态",
         model_budget_exhausted:"插件本地硬预算已触发，请查看治理与维护中的预算设置",
-        model_budget_soft_deferred:"插件本地软限额已触发，等待下一轮维护"})[code];
+        model_budget_soft_deferred:"插件本地软限额已触发，等待下一轮维护",
+        model_usage_unknown:"模型调用未完成确认，可能超时或返回格式不符；保留上次状态",
+        response_contract_rejected:"模型返回格式不符合状态要求，保留上次状态",
+        provider_wait_timed_out:"等待模型超时，保留上次状态"})[code];
       return {label:failed[result.state]+(detail?`：${detail}`:CODE.test(code||"")?`（${code}）`:""),tone:"is-warning",scheduled:true};
     }
     return {label:statusLabel(status.state?.state),tone:status.state?.state==="unknown"?"is-pending":"",scheduled:true};
@@ -542,7 +545,7 @@ window.CompanionStatePage = (() => {
       fresh.pendingMaintenance=cached.pendingMaintenance;fresh.ready=!!cached.catalog;}
     data=fresh; data.loading=true; render();
     try {
-      const catalog=await api("GET","page/targets");
+      const catalog=window.CompanionProduct?.directory?.() || await api("GET","page/targets");
       if(!live(ticket))return;
       if(!Array.isArray(catalog.targets)||!catalog.installation_id||catalog.targets.some(item=>!Array.isArray(item.roles))) throw Object.assign(new Error("invalid_response"),{code:"invalid_response"});
       data.catalog=catalog;data.ready=true;data.loading=false;
@@ -744,7 +747,7 @@ window.CompanionStatePage = (() => {
     if(window.CompanionProduct?.hosted()&&document.querySelector("[data-host-badge]"))return;
     const badge=document.querySelector(".preview-badge");
     if(badge)badge.innerHTML=active?"<span></span>角色状态读取正常 <b>V2</b>":"<span></span>角色状态读取待检查 <b>V2</b>";
-    if(active)document.title="角色状态维护 · 陪伴 V2";
+    if(active)document.title="陪伴小屋";
   }
   async function mount(element,options={}) {
     unmount();section=["contact","weather","patrol"].includes(options.section)?options.section:"state";activeFeature=Object.hasOwn(featureInfo,options.feature)?options.feature:null;root=element;stateScopeKey=currentStateScope();data=blank();root.addEventListener("click",click);root.addEventListener("keydown",keydown);root.addEventListener("change",change);

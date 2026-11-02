@@ -75,6 +75,40 @@ class NativeExtensionAPITests(unittest.IsolatedAsyncioTestCase):
             "action": "request_auth", "payload": {}})
         self.assertEqual(result["data"]["code"], "native_service_not_running")
 
+    async def test_mobile_pairing_token_enables_gateway_and_only_returns_new_secret_to_dashboard(self):
+        from astrbot_host.native_extensions.reality import activity_methods
+
+        service = await self.enable("reality")
+        denied = await self.call(PREFIX + "/action", body={"extension_id": "reality",
+            "action": "mobile_pairing_token", "payload": {"rotate": False}}, username="api_key:synthetic")
+        self.assertEqual(denied["data"]["code"], "dashboard_identity_required")
+        self.assertFalse(service._mobile_enabled())
+
+        async def start_gateway():
+            service._mobile_server_runner = NS(cleanup=AsyncMock())
+            service._mobile_server_site = NS(stop=AsyncMock())
+            service._mobile_server_bound_port = 6322
+            return True
+
+        with (patch.object(activity_methods.secrets, "token_urlsafe", return_value="synthetic-mobile-pairing-secret"),
+              patch.object(service, "_start_mobile_server", new=AsyncMock(side_effect=start_gateway)) as start):
+            generated = await self.call(PREFIX + "/action", body={"extension_id": "reality",
+                "action": "mobile_pairing_token", "payload": {"rotate": False}})
+            self.assertEqual(generated["status"], "ok", generated)
+            self.assertTrue(service._mobile_enabled())
+            self.assertEqual(service._mobile_pairing_token(), "synthetic-mobile-pairing-secret")
+            self.assertEqual(generated["data"]["result"]["pairing_token"], "synthetic-mobile-pairing-secret")
+            snapshot = {key: value for key, value in generated["data"].items() if key != "result"}
+            self.assertNotIn("synthetic-mobile-pairing-secret", json.dumps(snapshot))
+            self.assertTrue(snapshot["management"]["configuration"]["mobile"]["pairing_token_configured"])
+
+            repeated = await self.call(PREFIX + "/action", body={"extension_id": "reality",
+                "action": "mobile_pairing_token", "payload": {"rotate": False}})
+            self.assertEqual(repeated["status"], "ok", repeated)
+            self.assertEqual(repeated["data"]["result"]["pairing_token"], "")
+            self.assertEqual(start.await_count, 1)
+            await service._stop_mobile_server()
+
     async def test_vts_authorization_and_hotkeys_use_internal_service_without_holding_reply_lock(self):
         service = await self.enable("live")
         async def request_token():
@@ -145,6 +179,41 @@ class NativeExtensionAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refused["message"], "camera_consent_required")
         self.assertEqual(refused["data"]["code"], refused["message"])
         self.assertFalse(service._reality_touch_camera_consented(service._user("200")))
+
+    async def test_mihome_device_status_and_power_actions_reach_the_page_provider(self):
+        service = await self.enable("reality")
+        calls = []
+
+        class FakeMiHome:
+            async def extension_start_login(self): return {}
+            async def extension_login_status(self, qr_revision=""): return {}
+            async def extension_sync_devices(self): return {}
+            async def extension_logout(self): return {}
+            async def extension_save_mappings(self, mappings): return {}
+            async def terminate(self): return None
+
+            async def extension_read_device_status(self, alias):
+                calls.append(("status", alias))
+                return {"alias": alias, "available": True, "reason": "", "properties": {"on": True, "brightness": 42}}
+
+            async def extension_control_power(self, alias, is_on, *, native=False):
+                calls.append(("power", alias, is_on, native))
+                return {"alias": alias, "is_on": is_on, "confirmed": True}
+
+            def extension_snapshot(self):
+                return {"available": True, "auth": {"logged_in": True}, "login": {"status": "success"},
+                        "devices": [], "tool_settings": {}, "mappings": [], "snapshot_at": ""}
+
+        service.mihome_web_api = FakeMiHome()
+        status = await self.call(PREFIX + "/action", body={"extension_id": "reality",
+            "action": "mihome_device_status", "payload": {"alias": "desk-lamp"}})
+        self.assertEqual(status["status"], "ok", status)
+        self.assertEqual(status["data"]["result"]["properties"], {"on": True, "brightness": 42})
+        power = await self.call(PREFIX + "/action", body={"extension_id": "reality",
+            "action": "mihome_control_power", "payload": {"alias": "desk-lamp", "is_on": True}})
+        self.assertEqual(power["status"], "ok", power)
+        self.assertTrue(power["data"]["result"]["confirmed"])
+        self.assertEqual(calls, [("status", "desk-lamp"), ("power", "desk-lamp", True, False)])
 
     async def test_missing_mihome_is_unavailable_and_camera_consent_still_succeeds(self):
         service = await self.enable("reality")
@@ -232,6 +301,36 @@ class NativeExtensionAPITests(unittest.IsolatedAsyncioTestCase):
             "action": "select_audio", "payload": {
                 "device_id": "sd:unknown-device", "playback_volume": 24}})
         self.assertEqual(unknown["status"], "error")
+
+    async def test_management_errors_keep_codes_for_message_only_dashboard_bridge(self):
+        from astrbot_host.perception_api import PREFIX as perception_prefix
+        from astrbot_host.integration_api import PREFIX as integration_prefix
+
+        for path in (perception_prefix, integration_prefix + "/integration/manifest"):
+            for username in (None, "", "api_key:synthetic"):
+                denied = await self.call(path, username=username)
+                self.assertEqual(denied["message"], "dashboard_identity_required")
+                self.assertEqual(denied["data"]["code"], denied["message"])
+                self.assertTrue(denied["reason"])
+        invalid = await self.call(perception_prefix, body={"provider": "reality"})
+        self.assertEqual(invalid["message"], "perception_request_invalid")
+        invalid = await self.call(integration_prefix + "/integration/manifest", query="unexpected=1")
+        self.assertEqual(invalid["message"], "integration_request_invalid")
+
+    async def test_reminder_only_and_pending_consent_users_survive_snapshot_and_reload(self):
+        service = await self.enable("reality")
+        service.data["users"]["201"] = {"reality_touch_reminders": {"fixture-reminder": {
+            "id": "fixture-reminder", "status": "scheduled", "topic": "合成提醒"}}}
+        service.data["users"]["202"] = {"reality_touch_pending_consent": {
+            "capability": "local_audio", "expires_at": 1}}
+        service._save_data_sync()
+        service.data = service._load_data()
+        result = await self.call()
+        users = {row["user_id"]: row for row in result["data"]["extensions"]["reality"]["management"]["users"]}
+        self.assertIn("201", users)
+        self.assertIn("202", users)
+        self.assertEqual(users["201"]["custom_reminders"][0]["id"], "fixture-reminder")
+        self.assertFalse(users["202"]["consent"]["confirmed"])
 
     async def test_failed_reminder_cancel_does_not_report_completion(self):
         service = await self.enable("reality")

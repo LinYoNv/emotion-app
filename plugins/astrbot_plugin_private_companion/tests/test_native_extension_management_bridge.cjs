@@ -5,7 +5,14 @@ const fs = require("node:fs");
 const path = require("node:path");
 const {spawnSync} = require("node:child_process");
 const {test, before, after} = require("node:test");
-const {chromium} = require("playwright");
+/* 同 test_native_extension_panel.cjs：playwright 是可选的浏览器验收依赖，
+   缺它就跳过，不要把它报成桥接坏了。 */
+let chromium = null;
+try { ({chromium} = require("playwright")); } catch (error) { chromium = null; }
+if (!chromium) {
+  test("原生扩展宿主桥接验收", {skip: "未安装 playwright，跳过真实渲染检查"}, () => {});
+  return;
+}
 const root = path.resolve(__dirname, "..");
 const pageRoot = path.join(root, "pages/陪伴小屋");
 let browser, receipts, sdkSource;
@@ -27,20 +34,21 @@ before(async () => {
 });
 after(async () => { await browser?.close(); });
 
-async function harness() {
+async function harness(initial = "initial") {
   const page = await browser.newPage({viewport:{width:1050, height:1100}});
   page.setDefaultTimeout(5000);
   await page.setContent('<!doctype html><html><body><div id="management"></div></body></html>');
-  await page.evaluate(receipts => {
+  await page.evaluate(({receipts, initial}) => {
     window.receipts = receipts;
-    window.currentStatus = structuredClone(receipts.initial);
+    window.currentStatus = structuredClone(receipts[initial]);
     window.requests = [];
     window.addEventListener("message", event => {
       const message = event.data;
       if (message?.channel !== "astrbot-plugin-page" || message.kind !== "request") return;
       window.requests.push(message);
       let response;
-      if (message.endpoint === "page/targets") response = {status:"ok", data:{
+      if (window.endpointErrors?.[message.endpoint]) response = receipts[window.endpointErrors[message.endpoint]];
+      else if (message.endpoint === "page/targets") response = {status:"ok", data:{
         installation_id:"synthetic", targets:[{target_id:"private", scope_kind:"private", participant_id:"200",
           roles:[{role_id:"role", role_name:"测试角色"}]}]}};
       else if (message.endpoint === "integration/manifest") response = {status:"ok", data:{extensions:[], providers:[]}};
@@ -50,15 +58,19 @@ async function harness() {
         const key = action === "consent_camera" ? payload.user_id === "999" ? "ineligible"
           : payload.confirmed ? "consent" : "revoke" : action === "update_camera_policy"
           ? window.currentStatus.data.extensions.reality.management.users.length ? "policy" : "missing_user"
-          : "no_mihome_action";
+          : ({save:"audio_saved", update_audio_policy:"audio_policy", select_audio:"audio_output"}[action] || "no_mihome_action");
         response = receipts[key];
         if (response.status === "ok") window.currentStatus.data.extensions.reality = structuredClone(response.data);
       } else throw new Error("unexpected bridge endpoint: " + message.endpoint);
       // AstrBot's parent bridge resolves inner data and rejects with message only.
-      window.postMessage({channel:"astrbot-plugin-page", kind:"response", requestId:message.requestId,
-        ok:response.status === "ok", data:response.data, error:response.message}, "*");
+      const reply = {channel:"astrbot-plugin-page", kind:"response", requestId:message.requestId,
+        ok:response.status === "ok", data:response.data, error:response.message};
+      if (message.endpoint === "extensions" && window.holdExtensionRead) {
+        window.holdExtensionRead = false; window.heldExtensionReply = structuredClone(reply); return;
+      }
+      window.postMessage(reply, "*");
     });
-  }, receipts);
+  }, {receipts, initial});
   await page.addScriptTag({content:sdkSource});
   await page.evaluate(() => window.AstrBotPluginPage.__setInitialContext({pluginName:"astrbot_plugin_private_companion"}));
   for (const name of ["product-page.js", "native-extension-management.js"])
@@ -130,5 +142,97 @@ test("refresh shows persisted camera policy instead of default drafts when MiHom
     await page.getByRole("button", {name:"刷新管理状态", exact:true}).click();
     assert.equal(await page.locator("[data-native-camera-mode]").inputValue(), "ask", "real edits remain drafts");
     assert.equal(await page.evaluate(() => window.requests.filter(row => row.action === "api:post").length), 0);
+  } finally { await page.close(); }
+});
+
+test("perception and furniture failures keep their codes through the installed Dashboard SDK", async () => {
+  const page = await harness();
+  try {
+    const results = await page.evaluate(async () => {
+      const cases = [["perception", "perception_denied"], ["integration/manifest", "manifest_denied"],
+        ["perception", "perception_invalid"], ["integration/manifest", "manifest_invalid"]];
+      const results = [];
+      for (const [endpoint, receipt] of cases) {
+        window.endpointErrors = {[endpoint]:receipt};
+        try { await window.CompanionProduct.request("GET", endpoint); results.push({unexpected:true}); }
+        catch (error) { results.push({code:error.code, message:error.message}); }
+      }
+      return results;
+    });
+    assert.deepEqual(results.map(row => row.code), ["dashboard_identity_required", "dashboard_identity_required",
+      "perception_request_invalid", "integration_request_invalid"]);
+    assert.match(results[2].message, /感知设置内容无效/);
+    assert.match(results[3].message, /家具清单读取请求无效/);
+  } finally { await page.close(); }
+});
+
+test("audio refresh adopts persisted values and preserves only edited fields before saving", async () => {
+  const page = await harness("audio_before");
+  try {
+    await page.locator("[data-native-audio-details] > summary").click();
+    await page.evaluate(() => { window.currentStatus = structuredClone(window.receipts.audio_refreshed); });
+    await page.getByRole("button", {name:"刷新管理状态", exact:true}).click();
+    await page.locator("[data-native-action-notice]").filter({hasText:"管理状态已刷新"}).waitFor();
+    assert.equal(await page.locator('[data-native-audio-input="output_volume"]').inputValue(), "64");
+    assert.equal(await page.locator('[data-native-audio-input="policy_volume"]').inputValue(), "47");
+    assert.equal(await page.locator("[data-native-audio-proactive]").isChecked(), true);
+    assert.equal(await page.locator("[data-native-alarm-time]").inputValue(), "08:45");
+    assert.equal(await page.locator('[data-native-audio-input="repeat_count"]').inputValue(), "3");
+    assert.equal(await page.evaluate(() => window.management.audioDraft), null);
+    await page.locator("[data-native-alarm-message]").fill("未保存的话题");
+    await page.locator("[data-native-alarm-message]").dispatchEvent("change");
+    await page.evaluate(() => { window.currentStatus = structuredClone(window.receipts.audio_later); });
+    await page.getByRole("button", {name:"刷新管理状态", exact:true}).click();
+    await page.waitForFunction(() => window.management.record.management.users.find(row => row.user_id === "200").alarm.time === "09:20");
+    assert.equal(await page.locator("[data-native-alarm-time]").inputValue(), "09:20");
+    assert.equal(await page.locator('[data-native-audio-input="repeat_count"]').inputValue(), "4");
+    assert.equal(await page.locator("[data-native-alarm-message]").inputValue(), "未保存的话题");
+    assert.deepEqual(await page.evaluate(() => window.management.audioDraft), {alarm:{message:"未保存的话题"}});
+    await page.getByRole("button", {name:"保存叫醒安排", exact:true}).click();
+    await page.locator("[data-native-action-notice]").filter({hasText:"保存叫醒安排已完成"}).waitFor();
+    const payload = await page.evaluate(() => window.requests.findLast(row => row.endpoint === "extensions/action").body.payload);
+    assert.equal(payload.time, "09:20");
+    assert.equal(payload.repeat_count, 4);
+    assert.equal(payload.message, "未保存的话题");
+    assert.equal(await page.locator("[data-native-alarm-message]").inputValue(), "未保存的话题");
+    assert.equal(await page.evaluate(() => window.requests.filter(row => row.action === "api:post").length), 1);
+  } finally { await page.close(); }
+});
+
+test("an older refresh cannot overwrite a completed audio save", async () => {
+  const page = await harness("audio_before");
+  try {
+    await page.locator("[data-native-audio-details] > summary").click();
+    await page.evaluate(() => {
+      window.holdExtensionRead = true; window.pendingManagementRead = window.management.read();
+    });
+    await page.waitForFunction(() => !!window.heldExtensionReply);
+    await page.locator('[data-native-audio-input="output_volume"]').fill("64");
+    await page.getByRole("button", {name:"保存音频输出", exact:true}).click();
+    await page.locator("[data-native-action-notice]").filter({hasText:"保存音频输出已完成"}).waitFor();
+    await page.evaluate(async () => {
+      window.postMessage(window.heldExtensionReply, "*"); await window.pendingManagementRead;
+    });
+    assert.equal(await page.locator('[data-native-audio-input="output_volume"]').inputValue(), "64");
+    assert.equal(await page.evaluate(() => window.management.record.management.audio_output.playback_volume), 64);
+    assert.match(await page.locator("[data-native-action-notice]").textContent(), /保存音频输出已完成/);
+  } finally { await page.close(); }
+});
+
+test("legitimate business data survives both direct and wrapped bridge responses", async () => {
+  const page = await harness();
+  try {
+    const result = await page.evaluate(() => {
+      const unwrap = window.CompanionProduct.unwrap;
+      const payload = {state:"ready", data:{nested:true}, revision:7};
+      const nested = {kind:"diagnostic", data:{status:"ok", data:{value:2}}};
+      return {direct:unwrap(payload), wrapped:unwrap({status:"ok", message:"", data:payload}),
+        anonymous:unwrap({data:payload}), nested:unwrap(nested)};
+    });
+    const payload = {state:"ready", data:{nested:true}, revision:7};
+    assert.deepEqual(result.direct, payload);
+    assert.deepEqual(result.wrapped, payload);
+    assert.deepEqual(result.anonymous, payload);
+    assert.deepEqual(result.nested, {kind:"diagnostic", data:{status:"ok", data:{value:2}}});
   } finally { await page.close(); }
 });

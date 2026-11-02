@@ -432,16 +432,30 @@ class RoleToolLoopTests(ToolLoopFixture, unittest.IsolatedAsyncioTestCase):
         self.assert_reply_usage(spent=60)
         self.assertEqual(self.parts(batch)[0]["text"], "All three tool results were received.")
 
-    async def test_tool_catalog_rejects_a_selected_provider_without_tool_capability(self):
+    async def test_tool_catalog_is_withheld_from_a_selected_provider_without_tool_capability(self):
+        """没有 ``tools`` 能力：本轮不给目录，文本回复照常发出（宿主同语义）。
+
+        改动前这里抛 ``model_capability_mismatch`` 并让整条回复失败；宿主在
+        ``modalities`` 不含 ``tool_use`` 时只是把本轮 ``tools`` 清空。目录被丢弃
+        的原因写进 ``model_requests.plan_json`` 的 ``tool_filters``，可观测。
+        """
         providers = tuple(replace(provider, capabilities=("text",)) for provider in self.providers)
         router = ModelRouter(self.configuration, self.profiles, providers)
         router.start(expected_generation=self.router.generation)
         gateway = LocalModelGateway(router, self.ledger, self.tasks)
         _, run = await self.manual_run()
-        with self.assertRaises(TaskError) as failure:
-            gateway.open_session(run, self.messages.request(run), tools=self.tools.catalog)
-        self.assertEqual(failure.exception.code, "model_capability_mismatch")
-        self.assertEqual(self.called, [])
+        request = self.messages.request(run)
+        session = gateway.open_session(run, request, tools=self.tools.catalog)
+
+        completion = await session.generate(request)
+
+        self.assertIsNotNone(completion.draft)
+        self.assertEqual(completion.tool_calls, ())
+        self.assertEqual(self.called[0][1].tools, ())
+        plan = json.loads(self.runtime.read_one(
+            "SELECT plan_json FROM model_requests WHERE task_id = ?", (run.task.task_id,))["plan_json"])
+        self.assertEqual(plan["tool_actions"], [])
+        self.assertEqual(plan["tool_filters"][-1], {"action": "*", "reason": "provider_without_tool_use"})
 
     async def test_restart_without_the_original_tool_owner_cannot_queue_delivery(self):
         async def respond(envelope):
@@ -482,8 +496,8 @@ class RoleToolLoopTests(ToolLoopFixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_diagnostic_snapshot_detects_consumer_state_change_after_restart(self):
         async def respond(envelope):
-            return requested(call("check", "diagnostics.inspect", query=DiagnosticQuery(
-                target=self.window, group_id="model.conversation.reply").document())) if not envelope.tool_history else answered("Configuration checked.")
+            return requested(call("check", "diagnostics.inspect", check="configuration",
+                group_id="model.conversation.reply", configuration_target="current_window")) if not envelope.tool_history else answered("Configuration checked.")
         self.responses["primary"] = respond
         batch = await self.generate()
         runtime = self.open_runtime()

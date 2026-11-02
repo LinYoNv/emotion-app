@@ -14,7 +14,6 @@ GROUP = "role.profile"
 OWNER = "role.profile.settings"
 MAX_AVATAR_BYTES = 24 * 1024
 MAX_AVATAR_DATA_URL_CHARS = len("data:image/jpeg;base64,") + ((MAX_AVATAR_BYTES + 2) // 3) * 4
-WORLD_ADAPTATION_MODES = frozenset({"auto", "modern", "fantasy", "sci_fi", "custom", "off"})
 FIELD_LIMITS = {
     "name": 80,
     "species": 120,
@@ -54,14 +53,6 @@ FIELD_LIMITS = {
     "network": 750,
     "world_extra": 600,
     "world": 4200,
-    "platform_group_chat": 80,
-    "platform_screen": 80,
-    "platform_bilibili": 80,
-    "platform_qzone": 80,
-    "platform_library": 80,
-    "platform_names": 1200,
-    "world_adaptation_mode": 20,
-    "world_adaptation": 1200,
     "main_companion_subject": 256,
     "expression_private_source_mode": 16,
     "expression_private_source_subject_ids": 4000,
@@ -70,7 +61,6 @@ FIELD_LIMITS = {
     "avatar_data_url": MAX_AVATAR_DATA_URL_CHARS,
 }
 FIELD_DEFAULTS = {
-    "world_adaptation_mode": "auto",
     "expression_private_source_mode": "owner",
     "expression_private_source_subject_ids": "[]",
     "expression_private_application_mode": "all",
@@ -129,9 +119,6 @@ def validate_values(values):
         if (not image_bytes or len(image_bytes) > MAX_AVATAR_BYTES
                 or not image_bytes.startswith(b"\xff\xd8\xff") or not image_bytes.endswith(b"\xff\xd9")):
             raise ConfigurationError("role_profile_configuration_invalid", "avatar_data_url is not a bounded JPEG image")
-    if values["world_adaptation_mode"] not in WORLD_ADAPTATION_MODES:
-        raise ConfigurationError("role_profile_configuration_invalid",
-                                  "world_adaptation_mode must be a supported mode")
     for name in ("expression_private_source_mode", "expression_private_application_mode"):
         if values[name] not in ("owner", "selected", "all"):
             raise ConfigurationError("role_profile_configuration_invalid", f"{name} is unsupported")

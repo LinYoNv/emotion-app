@@ -22,8 +22,10 @@ from astrbot_host.identity_derivation import (
     derive_bot_id,
     derive_role_id,
     derived_identity,
+    derive_core_target_id,
     normalize_persona_id,
     persona_label,
+    role_display_name,
 )
 from astrbot_host.settings import HostControlError
 
@@ -81,11 +83,25 @@ class DerivationTests(unittest.TestCase):
             identity(account_id="10002", participant_id="10002")
         self.assertEqual(caught.exception.code, "host_identity_invalid")
 
-    def test_an_account_that_is_not_a_number_is_refused(self):
-        for bad in ("", "   ", "alice", "10002 ", "1.0", None, 10002):
+    def test_an_invalid_native_account_is_refused(self):
+        for bad in ("", "   ", "alice!", "10002 ", "1.0", None, 10002):
             with self.subTest(value=bad):
                 with self.assertRaises(HostControlError):
                     derive_bot_id(bad)
+
+    def test_an_opaque_official_account_is_accepted(self):
+        self.assertTrue(derive_bot_id("607097777B7E7FE3E162A8F56825F8521").startswith("bot-"))
+
+    def test_unicode_native_account_is_accepted_with_an_ascii_storage_id(self):
+        value = identity(account_id="官方实例", participant_id="用户一")
+        self.assertEqual(value["account_id"], "官方实例")
+        self.assertTrue(value["bot_id"].isascii())
+        self.assertTrue(value["role_id"].isascii())
+
+    def test_unicode_native_binding_gets_a_stable_ascii_target_id(self):
+        target = derive_core_target_id("官方平台", "官方实例", "用户一")
+        self.assertEqual(target, derive_core_target_id("官方平台", "官方实例", "用户一"))
+        self.assertRegex(target, r"^setup-core-[0-9a-f]{24}$")
 
     def test_a_missing_platform_is_refused(self):
         for bad in ("", "   ", None):
@@ -119,6 +135,17 @@ class PersonaNormalizationTests(unittest.TestCase):
     def test_the_label_falls_back_to_the_conversation_persona(self):
         self.assertEqual(persona_label(""), "随会话当前人格")
         self.assertEqual(persona_label("晚星"), "晚星")
+
+    def test_role_display_name_removes_only_channel_suffixes_with_optional_spaces(self):
+        for value in ("星缘-私聊", "星缘 - 私聊", "星缘_群聊", "星缘 _ 群聊",
+                      "星缘·私聊", "星缘 · 群聊", "星缘－群聊"):
+            with self.subTest(value=value):
+                self.assertEqual(role_display_name(value), "星缘")
+        self.assertEqual(role_display_name("深夜-来信"), "深夜-来信")
+
+    def test_generated_role_display_name_uses_normalized_persona_labels(self):
+        self.assertEqual(role_display_name("role-account-persona", ["星缘 - 私聊"]), "星缘")
+        self.assertEqual(role_display_name("role-account-persona", ["星缘·私聊", "星缘·群聊"]), "星缘")
 
 
 if __name__ == "__main__":

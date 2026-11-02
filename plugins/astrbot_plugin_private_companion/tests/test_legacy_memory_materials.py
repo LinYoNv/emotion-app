@@ -148,6 +148,22 @@ class LegacyMemoryMaterialsTests(MemoryFixture, unittest.TestCase):
         self.assertEqual((source_count, atom_count), (0, 0))
         self.assertEqual(result["profile"], "memory.legacy-materials.v1")
 
+    def test_archived_wal_database_stays_byte_exact_without_creating_sidecars(self):
+        self.source.execute("PRAGMA journal_mode=WAL")
+        self.add_memory("private-archive", "一条归档历史资料")
+        self.source.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self.source.close()
+        def files():
+            return {path.name: (path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest())
+                    for path in self.source_root.iterdir() if path.is_file()}
+        before = files()
+        self.assertNotIn("memory_companion.db-wal", before)
+        self.assertNotIn("memory_companion.db-shm", before)
+        self.assertEqual(len(self.legacy.inspect_snapshot(self.snapshot)["owners"]), 1)
+        self.assertEqual(self.import_materials(preview=True)["imported"]["memories"], 1)
+        self.assertEqual(self.import_materials()["imported"]["memories"], 1)
+        self.assertEqual(files(), before)
+
     def test_pending_rejected_withdrawn_policy_denied_and_unbound_records_are_excluded(self):
         self.source.executescript("""
             CREATE TABLE review_queue(id TEXT PRIMARY KEY, memory_id TEXT, status TEXT);

@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import logging
 
 from companion_v2.adapters.astrbot.native import account_number
 from companion_v2.conversation.quotes.models import message_number
@@ -9,6 +10,9 @@ from companion_v2.conversation.recalls import MessageRecall
 from companion_v2.execution.models import TaskError
 from companion_v2.foundation.outcome import Outcome
 from companion_v2.foundation.refs import ScopeKind
+
+
+logger = logging.getLogger(__name__)
 
 
 def is_notice_event(event):
@@ -41,7 +45,7 @@ class NativeNoticeRoute:
 def authenticate_notice_route(controller, event, kind, *, expected_post="notice"):
     session = controller.session
     if (session is None or controller._terminated or session.application.state != "running"
-            or type(event) is not controller.native_types.event or not has_post_type(event, expected_post)):
+            or not isinstance(event, controller.native_types.event) or not has_post_type(event, expected_post)):
         return None
     message, meta, native_session = event.message_obj, event.platform_meta, event.session
     raw = message.raw_message
@@ -101,7 +105,7 @@ def capture_recall(controller, event):
         return None
     # SDK assigns the notice itself a UUID. Only the raw notice identifies the
     # withdrawn message; operator_id is the moderator, never the original author.
-    identifier = message_number(raw.get("message_id"), error_code="host_recall_invalid")
+    identifier = message_number(raw.get("message_id") or raw.get("msg_id"), error_code="host_recall_invalid")
     return MessageRecall(controller.session.runtime.installation_id, route.platform_id, route.bot_id,
                          route.login, route.kind, route.peer, identifier, route.sender)
 
@@ -112,7 +116,18 @@ async def receive_notice(controller, event):
     async with controller._control_lock:
         try:
             record = capture_recall(controller, event)
-            return controller.session.application.platform_recall(record) if record is not None else None
+            if record is None:
+                return None
+            result = controller.session.application.platform_recall(record)
+            if result.failure is None:
+                counts = result.unwrap()
+                logger.info(
+                    "[CompanionV2] 已记录消息撤回 notice=%s scope=%s message_id=%s "
+                    "withdrawn_inputs=%s revoked_quotes=%s recalled_replies=%s cancelled=%s",
+                    record.kind.value, record.native_scope_id, record.message_id,
+                    counts.get("withdrawn_inputs", 0), counts.get("revoked_quotes", 0),
+                    counts.get("recalled_replies", 0), counts.get("cancelled", 0))
+            return result
         except TaskError as error:
             return Outcome.failed(error.code, str(error))
         except (ValueError, TypeError, AttributeError, KeyError):

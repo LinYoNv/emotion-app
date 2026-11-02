@@ -65,7 +65,7 @@ function harness(responses) {
   };
   const window = {
     CompanionProduct: {
-      role: () => ({model_api: '/astrbot_plugin_private_companion_v2/model', role_id: 'role-a'}),
+      role: () => ({model_api: '/astrbot_plugin_private_companion/model', role_id: 'role-a'}),
       bridgeNow: () => bridge,
     },
     lucide: {createIcons() {}},
@@ -888,6 +888,62 @@ test('maintenance groups troubleshooting content by workflow and uses responsive
   h.page.unmount();
 });
 
+test('maintenance checks backup, disk and mobile gateway from host status', async () => {
+  const base = {generated_at: localStamp(), summary: {calls: 0, tokens: 0}, totals: {}, daily: [], history: [],
+    recent: [], budget: {}, runtime: {}};
+  const failing = harness({
+    maintenance: {...base, host_checks: {
+      backup: {available: true, configured: false, snapshot_count: 0, latest_success_at: null,
+        same_volume: true, backup_root: 'C:\\runtime\\backups', data_root: 'C:\\runtime',
+        problem_count: 0, free_bytes: 8 * 1024 ** 3, total_bytes: 100 * 1024 ** 3},
+      disk: {available: true, data_root: {free_bytes: 8 * 1024 ** 3, total_bytes: 100 * 1024 ** 3},
+        backup_root: {free_bytes: 8 * 1024 ** 3, total_bytes: 100 * 1024 ** 3}},
+      mobile: {available: true, enabled: true, pairing_token_configured: false,
+        module_state: 'running', host: '0.0.0.0', port: 6322},
+    }},
+    voice: {providers: []}, image: {actions: []}, model: {tasks: [], providers: []},
+  });
+  failing.page.mount(failing.root, {activeView: 'diagnostics'});
+  await flush();
+  assert.match(failing.root.innerHTML, /还没有可用的备份快照/);
+  assert.match(failing.root.innerHTML, /备份与运行资料在同一块磁盘/);
+  assert.match(failing.root.innerHTML, /手机网关已启用但缺少配对令牌/);
+  assert.match(failing.root.innerHTML, /运行资料所在磁盘余量偏低/);
+  assert.match(failing.root.innerHTML, /data-diagnostic-category="backup"/);
+  failing.root.click('[data-diagnostic-category]', {diagnosticCategory: 'backup'});
+  assert.match(failing.root.innerHTML, /备份与磁盘工作区/);
+  assert.match(failing.root.innerHTML, /0 份快照/);
+  failing.root.click('[data-diagnostic-category]', {diagnosticCategory: 'mobile'});
+  assert.match(failing.root.innerHTML, /手机网关工作区/);
+  assert.match(failing.root.innerHTML, /缺少令牌/);
+  failing.page.unmount();
+
+  const healthy = harness({
+    maintenance: {...base, host_checks: {
+      backup: {available: true, configured: true, snapshot_count: 2, latest_success_at: new Date().toISOString(),
+        same_volume: false, backup_root: 'D:\\backups', data_root: 'C:\\runtime',
+        problem_count: 0, free_bytes: 100 * 1024 ** 3, total_bytes: 500 * 1024 ** 3},
+      disk: {available: true, data_root: {free_bytes: 100 * 1024 ** 3, total_bytes: 500 * 1024 ** 3},
+        backup_root: {free_bytes: 300 * 1024 ** 3, total_bytes: 1000 * 1024 ** 3}},
+      mobile: {available: true, enabled: true, pairing_token_configured: true,
+        module_state: 'running', host: '0.0.0.0', port: 6322},
+    }},
+    voice: {providers: []}, image: {actions: []}, model: {tasks: [], providers: []},
+  });
+  healthy.page.mount(healthy.root, {activeView: 'diagnostics'});
+  await flush();
+  assert.doesNotMatch(healthy.root.innerHTML, /还没有可用的备份快照/);
+  assert.doesNotMatch(healthy.root.innerHTML, /备份与运行资料在同一块磁盘/);
+  assert.doesNotMatch(healthy.root.innerHTML, /缺少配对令牌/);
+  assert.doesNotMatch(healthy.root.innerHTML, /磁盘余量偏低/);
+  healthy.root.click('[data-diagnostic-category]', {diagnosticCategory: 'backup'});
+  assert.match(healthy.root.innerHTML, /2 份快照/);
+  assert.match(healthy.root.innerHTML, /跨盘/);
+  healthy.root.click('[data-diagnostic-category]', {diagnosticCategory: 'mobile'});
+  assert.match(healthy.root.innerHTML, /已配对/);
+  healthy.page.unmount();
+});
+
 test('prompt route opens the editor directly and internal tabs update the route state', async () => {
   const h = harness({
     maintenance: {generated_at: localStamp(), summary: {calls: 0, tokens: 0}, totals: {}, daily: [], history: [],
@@ -948,6 +1004,8 @@ test('maintenance offers today, total, date drilldown, ranked detail, cache and 
             reason_code: 'staging_not_accepting', observed_at: localStamp(), scope: 'current_role'},
           {event_ref: 'fedcba0987654321fedcba0987654321', channel: 'private',
             reason_code: 'conversation_task_failed', code: 'model_budget_exhausted', observed_at: localStamp(), scope: 'current_role'},
+          {event_ref: 'abcdef1234567890abcdef1234567890', channel: 'group',
+            reason_code: 'core_reply_send_denied', code: 'host_client_offline', observed_at: localStamp(), scope: 'current_role'},
         ],
         conversation: [{created_at: localStamp(), batch_state: 'closed', flow_state: 'blocked', flow_reason: 'provider_failure',
           input_count: 2, part_count: 2, delivered_parts: 1, failed_parts: 1, unknown_parts: 0, pending_parts: 0}],
@@ -984,6 +1042,8 @@ test('maintenance offers today, total, date drilldown, ranked detail, cache and 
   assert.match(root.innerHTML, /运行态势/);
   assert.match(root.innerHTML, /Token 统计管理/);
   assert.match(root.innerHTML, /V2 当前没有接收入站消息/);
+  assert.match(root.innerHTML, /已生成回复，发送前复核未通过/);
+  assert.match(root.innerHTML, /该账号的原生连接已断开/);
   assert.match(root.innerHTML, /当前角色 · 私聊/);
   assert.match(root.innerHTML, /120/);
   assert.match(root.innerHTML, /周期对比/);
@@ -1387,6 +1447,43 @@ test('proactive binding failure explains the separate administrator permission a
   page.unmount();
 });
 
+test('proactive authorization diagnostics distinguish Dashboard identity from core permission', async () => {
+  for (const [code, title, explanation] of [
+    ['dashboard_identity_required', 'Dashboard 登录身份不可用', 'API Key 不会被当作管理员账号使用'],
+    ['unbound_identity', 'Dashboard 身份尚未完成绑定', '还没有在这份 AstrBot 安装中完成绑定'],
+    ['binding_revoked', 'Dashboard 身份绑定已撤销', '绑定已被撤销'],
+    ['binding_expired', 'Dashboard 身份绑定已过期', '绑定已经过期'],
+    ['binding_not_active', 'Dashboard 身份绑定尚未生效', '绑定尚未到生效时间'],
+    ['binding_rebound', 'Dashboard 身份已重新绑定', '已经被重新绑定'],
+    ['scope_installation_mismatch', 'Dashboard 身份不属于当前安装', '属于另一份 AstrBot 安装'],
+    ['scope_not_granted', '当前 Dashboard 身份未获该配置范围授权', '没有本次主动测试所需的配置范围授权'],
+    ['core_access_required', '当前 Dashboard 身份没有核心管理权限', 'Dashboard 登录成功，但这个身份没有本体核心管理权限'],
+    ['authorization_denied', '当前 Dashboard 身份没有配置管理权限', '无法管理主动联系配置'],
+    ['authorization_revoked', '当前 Dashboard 身份的管理授权已撤销', '系统不会在测试时自动恢复'],
+    ['authorization_expired', '当前 Dashboard 身份的管理授权已过期', '管理授权已经过期'],
+    ['authorization_not_active', '当前 Dashboard 身份的管理授权尚未生效', '管理授权尚未生效'],
+  ]) {
+    const {page, root} = harness({
+      maintenance: {generated_at: localStamp(), summary: {calls: 0, tokens: 0}, totals: {}, daily: [], history: [],
+        windows: {}, providers: [], recent: [], budget: {}, runtime: {}},
+      voice: {providers: []}, image: {actions: []}, model: {tasks: [], providers: []},
+      posts: {'/setup/proactive-diagnostic': {state: 'failed', purpose: 'screen', purpose_label: '已授权屏幕观察',
+        stage: 'authorization', code, failure_title: title,
+        suggestion: explanation, error: code, stages: [{stage: 'authorization', state: 'failed'}]}},
+    });
+    page.mount(root);
+    await flush();
+    root.change('[data-proactive-purpose]', 'screen');
+    root.click('[data-proactive-test]');
+    root.click('[data-proactive-confirm]');
+    await flush();
+    assert.match(root.innerHTML, new RegExp('测试未通过 · ' + title));
+    assert.match(root.innerHTML, new RegExp(explanation));
+    assert.match(root.innerHTML, /Dashboard 身份与核心权限<\/span><strong>失败/);
+    page.unmount();
+  }
+});
+
 test('proactive diagnostic explains model skip and shows generation as completed', async () => {
   const {page, root} = harness({
     maintenance: {generated_at: localStamp(), summary: {calls: 0, tokens: 0}, totals: {}, daily: [], history: [],
@@ -1419,8 +1516,8 @@ test('proactive diagnostic localizes exhausted attempt budget and identifies the
     voice: {providers: []}, image: {actions: []}, model: {tasks: [], providers: []},
     posts: {'/setup/proactive-diagnostic': {state: 'failed', purpose: 'care', purpose_label: '情绪关怀',
       stage: 'attempt_budget', code: 'contact_attempt_budget',
-      failure_title: '旧版本的主动模型调用次数上限已触发',
-      suggestion: '当前版本已取消该独立上限。',
+      failure_title: '主动模型调用次数上限已触发',
+      suggestion: '该上限已不再单独限制；现在只按窗口每日实际联系额度限制发送。',
       error: 'contact model-call allowance is exhausted', stages: [
         {stage: 'authorization', state: 'passed'}, {stage: 'settings', state: 'passed'},
         {stage: 'purpose', state: 'passed'}, {stage: 'trusted_candidate', state: 'passed'},
@@ -1432,10 +1529,11 @@ test('proactive diagnostic localizes exhausted attempt budget and identifies the
   root.click('[data-proactive-test]');
   root.click('[data-proactive-confirm]');
   await flush();
-  assert.match(root.innerHTML, /测试未通过 · 旧版本的主动模型调用次数上限已触发/);
-  assert.match(root.innerHTML, /当前版本已取消该独立上限/);
+  assert.match(root.innerHTML, /测试未通过 · 主动模型调用次数上限已触发/);
+  assert.match(root.innerHTML, /该上限已不再单独限制/);
   assert.doesNotMatch(root.innerHTML, /模型决策调用额度已用 12 \/ 12/);
-  assert.match(root.innerHTML, /旧版本模型调用次数上限<\/span><strong>失败/);
+  assert.match(root.innerHTML, /模型调用次数上限<\/span><strong>失败/);
+  assert.doesNotMatch(root.innerHTML, /旧版本的主动模型调用/, 'diagnostics must not label the record as old-version data');
   assert.match(root.innerHTML, /展开技术详情/);
   page.unmount();
 });

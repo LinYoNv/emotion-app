@@ -1,12 +1,14 @@
 """Explicit account, participant and persona mappings for one shared installation."""
 
-from dataclasses import asdict, dataclass, field
+from collections import Counter
+from dataclasses import asdict, dataclass, field, replace
 
-from companion_v2.adapters.astrbot.native import HostAccount, account_number
+from companion_v2.adapters.astrbot.native import HostAccount, route_id
 from companion_v2.adapters.astrbot.staging_config import ALLOWED_CAPABILITIES, REQUIRED_CAPABILITIES
 from companion_v2.execution.models import digest
 from companion_v2.conversation.forwards.models import ForwardIntakePolicy
 from companion_v2.conversation.segmentation import SegmentationPolicy
+from .identity_derivation import role_display_name
 from .settings import HostControlError, HostSettings, PROFILE_PATTERN, _boolean, _section, _text
 from .group_settings import GroupTarget, parse_group_targets
 
@@ -31,6 +33,98 @@ class PersonaMapping:
     role_id: str
 
 
+def find_persona_mapping(mappings, bot_id, persona_id):
+    """Resolve a persona mapping, including a lone legacy follow-window entry."""
+    def value(row, key):
+        return row.get(key) if isinstance(row, dict) else getattr(row, key, None)
+
+    rows = [row for row in mappings if value(row, "bot_id") == bot_id
+            and value(row, "persona_id") == persona_id]
+    if rows:
+        return rows[0]
+    bot_rows = [row for row in mappings if value(row, "bot_id") == bot_id]
+    if len(bot_rows) == 1 and value(bot_rows[0], "persona_id") == "[%None]":
+        if isinstance(bot_rows[0], dict):
+            return {**bot_rows[0], "persona_id": persona_id}
+        return replace(bot_rows[0], persona_id=persona_id)
+    return None
+
+
+@dataclass(frozen=True)
+class WindowLink:
+    """One primary private window and the windows merged into it.
+
+    ``mode='role'`` shares the role/memory but keeps each native window for
+    replies.  ``mode='primary'`` additionally routes replies and proactive
+    contacts to the primary window.
+    """
+
+    primary_target_id: str
+    alias_target_ids: tuple[str, ...]
+    mode: str = "primary"
+
+
+def _shared_persona_roles(personas: tuple[PersonaMapping, ...]) -> tuple[PersonaMapping, ...]:
+    """Keep one role id when the same AstrBot persona uses the same character name.
+
+    AstrBot personas are global while V2 roles used to be account-scoped.  When
+    the same persona is mapped under several Bot accounts with the same visible
+    role name, that is one character that should keep one memory owner, not two
+    roles.  Differently named roles stay separate so an explicit split remains
+    possible.
+    """
+    by_persona = {}
+    role_counts = Counter(mapping.role_id for mapping in personas)
+    for mapping in personas:
+        by_persona.setdefault(mapping.persona_id, []).append(mapping)
+    canonical = {}
+    for persona_id, rows in by_persona.items():
+        role_ids = {row.role_id for row in rows}
+        if len(role_ids) <= 1:
+            continue
+        labels = {role_display_name(row.role_id, [persona_id]) for row in rows}
+        if len(labels) != 1:
+            continue
+
+        def rank(row):
+            explicit = not row.role_id.startswith(("role-", "staging-"))
+            return (role_counts[row.role_id], explicit, row.role_id)
+
+        canonical[persona_id] = max(rows, key=rank).role_id
+    if not canonical:
+        return personas
+    return tuple(replace(mapping, role_id=canonical.get(mapping.persona_id, mapping.role_id))
+                 for mapping in personas)
+
+
+def _parse_window_links(values, targets):
+    if values is None:
+        return ()
+    if type(values) is not list or len(values) > 64:
+        raise HostControlError("host_mappings_invalid", "window links must be a bounded list")
+    private = {target.target_id: target for target in targets}
+    links, claimed = [], set()
+    for row in values:
+        if (type(row) is not dict or set(row) - {"primary_target_id", "alias_target_ids", "mode"}
+                or not {"primary_target_id", "alias_target_ids"}.issubset(row)):
+            raise HostControlError("host_mappings_invalid", "window link fields are incomplete or unknown")
+        primary = row["primary_target_id"]
+        aliases, mode = row["alias_target_ids"], row.get("mode", "primary")
+        if (type(primary) is not str or primary not in private or type(aliases) is not list
+                or not aliases or len(aliases) > 128 or mode not in ("primary", "role")
+                or private[primary].participant_id == "*"):
+            raise HostControlError("host_mappings_conflict", "window links need private targets and a valid mode")
+        kept = []
+        for alias in aliases:
+            if (type(alias) is not str or alias not in private or alias == primary
+                    or private[alias].participant_id == "*" or alias in claimed or alias in kept):
+                raise HostControlError("host_mappings_conflict", "a private window can only be merged once")
+            kept.append(alias)
+            claimed.add(alias)
+        links.append(WindowLink(primary, tuple(kept), mode))
+    return tuple(sorted(links, key=lambda item: item.primary_target_id))
+
+
 @dataclass(frozen=True)
 class MultiHostSettings:
     enabled: bool
@@ -42,12 +136,39 @@ class MultiHostSettings:
     common: HostSettings
     group_targets: tuple[GroupTarget, ...] = ()
     group_delivery_mode: str = "onebot_group"
+    window_links: tuple[WindowLink, ...] = ()
+    _role_aliases: tuple[tuple[str, str], ...] = field(default=(), compare=False, repr=False)
     _legacy_group_delivery_shape: bool = field(default=False, compare=False, repr=False)
     _storage_installation_id: str | None = field(default=None, compare=False, repr=False)
 
     @property
     def all_targets(self):
         return self.targets + self.group_targets
+
+    @property
+    def role_aliases(self):
+        return dict(self._role_aliases)
+
+    def canonical_role_id(self, role_id):
+        """Follow role ids that were merged into a shared AstrBot persona role."""
+        value = str(role_id or "")
+        aliases = self.role_aliases
+        seen = set()
+        while value in aliases and value not in seen:
+            seen.add(value)
+            value = aliases[value]
+        return value
+
+    @property
+    def alias_target_ids(self):
+        return frozenset(alias for link in self.window_links for alias in link.alias_target_ids)
+
+    @property
+    def primary_targets(self):
+        """Private windows that may own proactive work and core binding."""
+        aliases = {alias for link in self.window_links if link.mode == "primary"
+                   for alias in link.alias_target_ids}
+        return tuple(target for target in self.targets if target.target_id not in aliases)
 
     @property
     def installation_id(self):
@@ -70,8 +191,12 @@ class MultiHostSettings:
             data["common"].pop("segmentation")
         if self.common.forward_intake == ForwardIntakePolicy():
             data["common"].pop("forward_intake")
-        if not self.common.budget_soft.enabled and not self.common.budget_soft.tokens:
-            data["common"].pop("budget_soft")  # A daily soft ceiling is not an identity pin.
+        elif self.common.forward_intake.parse_nested:
+            # The default predates this field. Preserve custom intake fingerprints
+            # written before the switch existed; an explicit False is serialized.
+            data["common"]["forward_intake"].pop("parse_nested")
+        if not self.common.budget_soft.enabled:
+            data["common"].pop("budget_soft")  # A disabled daily soft ceiling is not an identity pin.
         data["common"].pop("voice_reply_enabled")  # Delivery presentation can change without re-pinning identity.
         data["common"].pop("voice_reply_policy")
         # Routing is adopted at assembly/request boundaries, not an identity pin.
@@ -79,6 +204,7 @@ class MultiHostSettings:
             data["common"].pop(field)
         if not self.group_targets:
             data.pop("group_targets")  # Preserve already initialized private-only installations.
+        data.pop("_role_aliases")
         data.pop("_legacy_group_delivery_shape")
         data.pop("_storage_installation_id")
         if self._legacy_group_delivery_shape:
@@ -148,14 +274,14 @@ class MultiHostSettings:
                 if type(row) is not dict or set(row) != {"platform_id", "account_id", "bot_id"}:
                     raise ValueError()
                 account = HostAccount(_text(row["platform_id"], required=True),
-                    account_number(_text(row["account_id"], required=True)),
+                    route_id(_text(row["account_id"], required=True)),
                     _text(row["bot_id"], required=True))
                 route = account.platform_id, account.self_id
                 if route in account_by_route:
                     raise ValueError()
                 account_by_route[route] = account
             for target in (*targets, *groups):
-                account = HostAccount(target.platform_id, account_number(target.account_id), target.bot_id)
+                account = HostAccount(target.platform_id, route_id(target.account_id), target.bot_id)
                 route = account.platform_id, account.self_id
                 previous = account_by_route.setdefault(route, account)
                 if previous != account:
@@ -169,9 +295,9 @@ class MultiHostSettings:
         routes, ids, roles = set(), set(), {}
         try:
             for target in targets:
-                HostAccount(target.platform_id, account_number(target.account_id), target.bot_id)
+                HostAccount(target.platform_id, route_id(target.account_id), target.bot_id)
                 if target.participant_id != "*":
-                    account_number(target.participant_id)
+                    route_id(target.participant_id)
                 if not PROFILE_PATTERN.fullmatch(target.target_id) or target.target_id in ids or target.route_key in routes:
                     raise ValueError()
                 ids.add(target.target_id)
@@ -201,9 +327,24 @@ class MultiHostSettings:
                 or len(set(capabilities)) != len(capabilities)
                 or not REQUIRED_CAPABILITIES.issubset(capabilities) or not set(capabilities).issubset(ALLOWED_CAPABILITIES)):
             raise HostControlError("host_capabilities_invalid", "configure registered non-core capabilities including reply prerequisites")
+        window_links = _parse_window_links(section.get("window_links"), targets)
+        raw_personas = tuple(personas)
+        canonical_personas = _shared_persona_roles(raw_personas)
+        aliases_by_old = {}
+        for raw, canonical in zip(raw_personas, canonical_personas):
+            if not raw.role_id or not canonical.role_id:
+                continue
+            aliases_by_old.setdefault(raw.role_id, set()).add(canonical.role_id)
+        role_aliases = tuple(sorted(
+            (old_role, next(iter(destinations)))
+            for old_role, destinations in aliases_by_old.items()
+            if len(destinations) == 1 and old_role not in destinations
+        ))
         return cls(enabled, key, tuple(sorted(targets, key=lambda t: t.target_id)),
-                   tuple(sorted(personas, key=lambda p: (p.bot_id, p.persona_id))), account_bindings, tuple(sorted(capabilities)),
-                   common, groups, "onebot_group", legacy_group_delivery_shape or raw_group_mode == "preview")
+                   tuple(sorted(canonical_personas, key=lambda p: (p.bot_id, p.persona_id))), account_bindings,
+                   tuple(sorted(capabilities)), common, groups, "onebot_group", window_links,
+                   _role_aliases=role_aliases,
+                   _legacy_group_delivery_shape=legacy_group_delivery_shape or raw_group_mode == "preview")
 
     def require_ready(self):
         if not self.enabled:
@@ -216,6 +357,16 @@ class MultiHostSettings:
         if found is None:
             raise HostControlError("host_target_unavailable", "the conversation target is not configured")
         return found
+
+    def window_link_for_target(self, target_id):
+        return next((link for link in self.window_links if target_id in link.alias_target_ids), None)
+
+    def window_links_for_primary(self, target_id):
+        return tuple(link for link in self.window_links if link.primary_target_id == target_id)
+
+    def effective_private_target(self, target):
+        link = self.window_link_for_target(target.target_id)
+        return self.target(link.primary_target_id) if link is not None and link.mode == "primary" else target
 
     def private_target(self, platform_id, account_id, participant_id):
         exact = next((item for item in self.targets if item.route_key ==

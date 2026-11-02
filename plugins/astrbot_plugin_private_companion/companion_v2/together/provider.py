@@ -795,33 +795,7 @@ class NativeTogetherProvider:
         try:
             user_id = _user_id(value["context"])
             if action == "together.room.create":
-                if not bool(getattr(getattr(self.plugin, "room_server", None), "running", False)):
-                    raise NativeTogetherError("together_room_server_unavailable")
-                execution = value["host_execution"]
-                model = self.plugin._get_provider_by_id(execution["model_provider_id"])
-                if not callable(getattr(model, "text_chat", None)):
-                    raise NativeTogetherError("together_v2_model_unavailable")
-                self.store.update(scope, operation["id"], state="dispatching", effect="unknown")
-                persona = value["host_persona"]
-                native_scope = value["context"]["audience"]["scope"]
-                ticket = self.plugin.issue_room_ticket(
-                    mode=value["arguments"]["mode"], user_id=user_id,
-                    native_v2={"scope_key": scope, "bot_id": persona["bot_id"],
-                               "account_id": persona["account_id"], "persona_id": persona["persona_id"],
-                               "prompt": persona["prompt"],
-                               "model_provider_id": execution["model_provider_id"],
-                               "tts_provider_id": execution["tts_provider_id"],
-                               "tts_language": execution["tts_language"],
-                               "tts_timeout_seconds": execution["tts_timeout_seconds"],
-                               "platform": native_scope["platform"],
-                               "session_id": native_scope["session_id"],
-                               "scope_kind": native_scope["kind"]})
-                url = self.plugin._ticket_url(ticket)
-                result = {"room": {"mode": ticket.mode, "ticket_token": ticket.token,
-                                   "url": url, "created_at": ticket.created_at,
-                                   "expires_at": ticket.expires_at, "user_id": user_id,
-                                   "bot_id": persona["bot_id"], "persona_id": persona["persona_id"]}}
-                operation = self.store.update(scope, operation["id"], state="succeeded", effect="committed", result=result)
+                operation = await self._create_room(value, scope, operation, user_id=user_id)
             else:
                 async with self._room_lock:
                     try:
@@ -843,6 +817,53 @@ class NativeTogetherProvider:
             operation = self.store.update(scope, operation["id"], state="unknown" if dispatched else "failed",
                                           effect="unknown" if dispatched else "not_committed", error=code)
         return self._response(value, operation)
+
+    async def _create_room(self, value, scope, operation, *, user_id):
+        """Open one short-lived room and bind it to this V2 scope.
+
+        旧版插件的工具路径会先准备手机公网访问（必要时自动起隧道）；V2 这里原先
+        直接拼 ``_ticket_url``，没配公网地址时链接就是 ``http://127.0.0.1:6321/...``，
+        手机上根本打不开。这里补回那一步，并把公网访问状态一并返回。
+        """
+        if not bool(getattr(getattr(self.plugin, "room_server", None), "running", False)):
+            raise NativeTogetherError("together_room_server_unavailable")
+        native_scope = value["context"]["audience"]["scope"]
+        # 房间链接是短期凭证，群里公开出去等于把麦克风交给整个群。宿主侧没有可靠的
+        # 私发通道时宁可拒绝，也不让模型在群里贴链接。
+        if native_scope["kind"] == "group":
+            raise NativeTogetherError("together_private_room_required")
+        execution = value["host_execution"]
+        model = self.plugin._get_provider_by_id(execution["model_provider_id"])
+        if not callable(getattr(model, "text_chat", None)):
+            raise NativeTogetherError("together_v2_model_unavailable")
+        access = {"tunnel_started": False, "tunnel_ready": False, "fixed_public_url": False}
+        prepare = getattr(self.plugin, "_ensure_mobile_room_access", None)
+        if callable(prepare):
+            try:
+                access = await prepare()
+            except Exception:
+                raise NativeTogetherError("together_public_access_unavailable") from None
+        self.store.update(scope, operation["id"], state="dispatching", effect="unknown")
+        persona = value["host_persona"]
+        ticket = self.plugin.issue_room_ticket(
+            mode=value["arguments"]["mode"], user_id=user_id,
+            native_v2={"scope_key": scope, "bot_id": persona["bot_id"],
+                       "account_id": persona["account_id"], "persona_id": persona["persona_id"],
+                       "prompt": persona["prompt"],
+                       "model_provider_id": execution["model_provider_id"],
+                       "tts_provider_id": execution["tts_provider_id"],
+                       "tts_language": execution["tts_language"],
+                       "tts_timeout_seconds": execution["tts_timeout_seconds"],
+                       "platform": native_scope["platform"],
+                       "session_id": native_scope["session_id"],
+                       "scope_kind": native_scope["kind"]})
+        result = {"room": {"mode": ticket.mode, "ticket_token": ticket.token,
+                           "url": self.plugin._ticket_url(ticket), "created_at": ticket.created_at,
+                           "expires_at": ticket.expires_at, "user_id": user_id,
+                           "bot_id": persona["bot_id"], "persona_id": persona["persona_id"]},
+                  "access": {name: bool(access.get(name)) for name in
+                             ("tunnel_started", "tunnel_ready", "fixed_public_url")}}
+        return self.store.update(scope, operation["id"], state="succeeded", effect="committed", result=result)
 
     async def _close_latest(self, scope: str, user_id: str) -> dict[str, Any]:
         bound_rooms = {

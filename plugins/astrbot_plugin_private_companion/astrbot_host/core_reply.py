@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import is_dataclass
 from inspect import isawaitable
+import json
 from typing import Any
 
-from companion_v2.execution.models import TaskError, require
+from companion_v2.execution.models import TaskContext, TaskError, encode, require
 from companion_v2.foundation.outcome import Outcome
 
 
@@ -19,6 +21,30 @@ OnDenied = Callable[[Any, BaseException], Awaitable[Any] | Any]
 OnSent = Callable[[Any, str], Any]
 OnDelivery = Callable[[str], Any]
 PrepareSend = Callable[[Any, Any, Callable[..., Awaitable[Any]], int, int], Awaitable[Any] | Any]
+
+
+def _require_authorization_result(result: Any) -> None:
+    if not isinstance(result, Outcome):
+        raise TypeError("core reply authorization must return an Outcome")
+    require(result)
+
+
+def restore_core_reply_prepared(prepared: Mapping) -> Mapping:
+    """Reconstruct captured values after reload without choosing new settings."""
+    from companion_v2.conversation.voice_reply import VoiceReplyPolicy
+
+    restored = {}
+    context = prepared.get("context")
+    if is_dataclass(context) and not isinstance(context, TaskContext):
+        current = TaskContext.restore(json.loads(encode(context)))
+        if current.key != context.key:
+            raise TaskError("core_reply_context_changed", "reload changed the captured reply context")
+        restored["context"] = current
+    for name in ("voice_reply_policy", "configured_voice_reply_policy"):
+        policy = prepared.get(name)
+        if is_dataclass(policy) and not isinstance(policy, VoiceReplyPolicy):
+            restored[name] = VoiceReplyPolicy(**json.loads(encode(policy)))
+    return {**prepared, **restored} if restored else prepared
 
 
 def is_core_sendable_message(message: Any) -> bool:
@@ -89,6 +115,7 @@ def prepare_core_reply_event(
     on_reply_end: Callable[[], Any] | None = None,
     prepare_send: PrepareSend | None = None,
     media_submit: Callable | None = None,
+    owner: Any = None,
 ) -> None:
     """Attach reply authorization and guard final delivery on this event."""
     state = event.get_extra(CORE_REPLY_CONTEXT_EXTRA)
@@ -101,9 +128,10 @@ def prepare_core_reply_event(
         async def authorize_delivery() -> None:
             try:
                 result = await state["authorize"](state["prepared"])
-                if not isinstance(result, Outcome):
-                    raise TypeError("core reply authorization must return an Outcome")
-                require(result)
+                # Retained wrappers outlive their module during hot reload.
+                # Check the current owner's Outcome class, just as we call
+                # that owner's authorization callback through this state.
+                state["_require_authorization_result"](result)
             except BaseException as error:
                 callback = state.get("on_denied")
                 if not state.get("denial_notified"):
@@ -126,8 +154,13 @@ def prepare_core_reply_event(
                 raise
 
         async def guarded_send(message: Any, *args: Any, **kwargs: Any) -> Any:
-            if (not state.get("delivery_guard_active") or
-                    getattr(message, "type", None) in {"tool_call", "tool_result", "agent_stats", "reasoning", "break"}):
+            if getattr(message, "type", None) in {"tool_call", "tool_result", "agent_stats", "reasoning", "break"}:
+                return await state["_original_send"](message, *args, **kwargs)
+            if not state.get("delivery_guard_active"):
+                from .core_reply_presentation import strip_internal_expression_message
+                message = strip_internal_expression_message(message)
+                if message is None:
+                    return None
                 return await state["_original_send"](message, *args, **kwargs)
             if state.get("group_participation", {}).get("mode") == "skip":
                 return None
@@ -241,6 +274,7 @@ def prepare_core_reply_event(
             from .core_reply_segmentation import send_group_stream, uses_managed_group_stream
             from .core_reply_presentation import (
                 core_reply_presentation, present_core_reply_stream, presented_stream,
+                strip_internal_expression_stream,
             )
             managed_group_stream = hasattr(stream, "__aiter__") and uses_managed_group_stream(event)
             presentation = core_reply_presentation(event)
@@ -248,6 +282,8 @@ def prepare_core_reply_event(
             platform = (platform_getter() if callable(platform_getter)
                         else getattr(getattr(event, "platform_meta", None), "name", None))
             native_bubbles = presentation is not None and platform == "aiocqhttp"
+            if stream is not None and hasattr(stream, "__aiter__"):
+                stream = strip_internal_expression_stream(stream)
             prepared_stream = (presentation if not managed_group_stream and not native_bubbles
                                and hasattr(stream, "__aiter__") else None)
             if prepared_stream is not None:
@@ -320,12 +356,14 @@ def prepare_core_reply_event(
     state.update(
         prepared=prepared,
         authorize=authorize,
+        _require_authorization_result=_require_authorization_result,
         on_denied=on_denied,
         on_sent=on_sent,
         on_delivery=on_delivery,
         on_reply_end=on_reply_end,
         prepare_send=prepare_send,
         media_submit=media_submit,
+        owner=owner,
         delivery_guard_active=False,
         denial_notified=False,
         send_attempts=0,
@@ -354,6 +392,71 @@ def prepare_core_reply_event(
     prepare_core_reply_voice(event)
     if isinstance(prepared, Mapping) and prepared.get("reaction_reply_enabled"):
         event.set_extra("enable_streaming", False)
+
+
+def adopt_core_reply_event(
+    event: Any,
+    *,
+    owner: Any,
+    prepared: Any = None,
+    authorize: Authorize,
+    on_denied: OnDenied | None = None,
+    on_sent: OnSent | None = None,
+    on_delivery: OnDelivery | None = None,
+    on_reply_end: Callable[[], Any] | None = None,
+    prepare_send: PrepareSend | None = None,
+    media_submit: Callable | None = None,
+) -> bool:
+    """Move an in-flight reply guard to the current plugin instance.
+
+    The original send wrappers stay in place because they resolve callbacks
+    through ``state`` on every call.  Replacing those callbacks lets a newly
+    loaded host re-authenticate the same native event without replaying an
+    already attempted platform send.
+    """
+    state = event.get_extra(CORE_REPLY_CONTEXT_EXTRA)
+    if (not isinstance(state, dict) or "_original_send" not in state
+            or "_send_wrapper" not in state):
+        return False
+    if prepared is None:
+        prepared = state.get("prepared")
+    if not isinstance(prepared, Mapping):
+        return False
+    changed_owner = state.get("owner") is not owner
+    if changed_owner:
+        prepared = restore_core_reply_prepared(prepared)
+        old_task, old_callback = state.pop("_presence_owner_task", None), state.pop("_presence_task_done", None)
+        if old_task is not None and old_callback is not None:
+            old_task.remove_done_callback(old_callback)
+        # A previous host may have denied before reaching the platform.  A
+        # clean authorization from the new host can safely recover that send;
+        # unknown or already-attempted sends stay fenced by guarded_send.
+        if not state.get("send_unknown") and not state.get("send_attempts"):
+            state["denial_notified"] = False
+            state["_presence_finished"] = False
+            state.pop("_text_presentation", None)
+            state.pop("_text_presentation_removed", None)
+    state.update(
+        prepared=prepared,
+        owner=owner,
+        authorize=authorize,
+        _require_authorization_result=_require_authorization_result,
+        on_denied=on_denied,
+        on_sent=on_sent,
+        on_delivery=on_delivery,
+        on_reply_end=on_reply_end,
+        prepare_send=prepare_send,
+        media_submit=media_submit,
+    )
+    if changed_owner and on_reply_end is not None:
+        task = asyncio.current_task()
+        if task is not None:
+            def reply_task_done(_task):
+                if event.get_extra(CORE_REPLY_CONTEXT_EXTRA) is state:
+                    finish_core_reply_presence(event, force=True)
+            state["_presence_owner_task"], state["_presence_task_done"] = task, reply_task_done
+            task.add_done_callback(reply_task_done)
+    return True
 
 
 def activate_core_reply_delivery_guard(event: Any) -> None:
@@ -400,6 +503,47 @@ def finish_core_reply_presence(event: Any, *, force=False) -> None:
             callback()
         except Exception:
             pass  # Optional presentation must not turn a returned send into an error.
+
+
+def repair_tool_call_history(contexts: Any) -> int:
+    """Drop tool-call batches whose tool results are no longer in the history.
+
+    AstrBot keeps one shared context list; trimming, another plugin's history
+    cleanup or an interrupted tool batch can leave an assistant message with
+    ``tool_calls`` but no matching ``tool`` messages.  OpenAI-compatible
+    providers reject that whole request with a 400, so remove the orphan batch
+    (and its stray tool messages) while keeping the assistant's visible text.
+    """
+    if not isinstance(contexts, list):
+        return 0
+    output, removed, index = [], 0, 0
+    while index < len(contexts):
+        message = contexts[index]
+        if not (isinstance(message, dict) and message.get("role") == "assistant"
+                and message.get("tool_calls")):
+            output.append(message)
+            index += 1
+            continue
+        end = index + 1
+        while (end < len(contexts) and isinstance(contexts[end], dict)
+               and contexts[end].get("role") == "tool"):
+            end += 1
+        calls = [call for call in message["tool_calls"] if isinstance(call, dict)]
+        answered = {str(part.get("tool_call_id")) for part in contexts[index + 1:end]
+                    if isinstance(part, dict)}
+        identifiers = [str(call.get("id")) for call in calls if call.get("id") is not None]
+        if identifiers and set(identifiers) <= answered:
+            output.append(message)
+            output.extend(contexts[index + 1:end])
+            index = end
+            continue
+        removed += 1
+        if str(message.get("content") or "").strip():
+            output.append({key: value for key, value in message.items() if key != "tool_calls"})
+        index = end
+    if removed:
+        contexts[:] = output
+    return removed
 
 
 def inject_core_reply_prompt(event: Any, req: Any) -> None:

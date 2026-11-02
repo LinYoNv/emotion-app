@@ -6,6 +6,7 @@ from datetime import timedelta
 
 from companion_v2.agenda.models import AgendaTarget
 from companion_v2.conversation.flow import ConversationPolicy
+from companion_v2.execution.models import stamp
 from companion_v2.foundation.refs import OperationRef, VersionRef
 from companion_v2.storage.repositories import OperationRepository
 from tests.contact_schedule_support import ContactScheduleFixture
@@ -354,6 +355,42 @@ class OpenLoopContactEventTests(ContactScheduleFixture, unittest.IsolatedAsyncio
         self.assertIsNotNone(plan)
         self.assertIn("open_loop_event", plan[4])
         self.assertEqual(plan[1].expires_at, memo.expires_at)
+
+    async def test_delivered_open_loop_records_the_receipt_time_for_reply_review(self):
+        host = await self.start(self.host(policy=ConversationPolicy(0, 0, 180, 0)))
+        app = host.application
+        app.contact_schedule.advance = lambda: None
+        self.settings(app, {"enabled": True, "automatic_enabled": True, "idle_seconds": 60,
+            "chat.enabled": False, "contact_followup_after_minutes": 10}).unwrap()
+        for capability in ("memo.create", "memo.list", "memo.read"):
+            self.grant(self.important, self.contact_context().scope, capability)
+        context = self.contact_context()
+        target = AgendaTarget(context.scope, context.role_binding.role, context.actor.subject)
+        memo_id = "delivered-open-loop"
+        app.agenda.create_memo(context.actor, target=target, memo_id=memo_id, title="继续读那本书",
+            body="之后聊聊读到哪里", purpose="open_loop", operation=self.operation(target.scope, owner="agenda"),
+            expected_role_revision=context.role_binding.revision, observed_at=self.clock.now()).unwrap()
+        batch = host.receive(self.event("open-loop-delivery-origin", text="今天先这样吧")).unwrap()
+        await self.done(app, batch)
+
+        self.clock.advance(timedelta(minutes=10))
+        plan = app.contact_schedule._plan(self._latest_row(app, context), self.clock.now())
+        self.assertIsNotNone(plan)
+
+        async def delayed_receipt(envelope):
+            self.clock.advance(timedelta(seconds=7))
+            return self.receipt(envelope)
+        self.send_behavior = delayed_receipt
+        await app.contact_schedule._run(plan)
+        await self.automatic_delivery(app)
+
+        contact = self.contacts(app)[0]
+        delivery = app.proactive._delivery_row(contact["task_id"])
+        memo = app.agenda.read_memo(context.actor, target=target, memo_id=memo_id,
+            observed_at=self.clock.now()).unwrap()
+        self.assertEqual(memo.followup_count, 1)
+        self.assertIsNotNone(memo.last_followup_at)
+        self.assertEqual(stamp(memo.last_followup_at), delivery["delivered_at"])
 
     async def test_skipped_open_loop_releases_followup_claim_for_later_revision(self):
         host = await self.start(self.host(policy=ConversationPolicy(0, 0, 180, 0)))

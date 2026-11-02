@@ -14,17 +14,19 @@ window.CompanionReplyPage = (() => {
   /* 枚举选项：注册表里这些字段是 TEXT，约束在 reply_settings.validate 里。
      选项必须与后端常量一致，否则保存会被拒绝。 */
   const choices = {
+    group_tool_profile: {full: "完整工具", standard: "常用工具", lean: "精简工具"},
       streaming_mode: {buffered: "收齐后分段发送", incremental: "边生成边分段发送"},
       rule_mode: {words: "词列表", regex: "正则表达式", sentences: "按句子", paragraphs: "按段落"},
       part_gap_mode: {fixed: "固定", random: "随机", log: "按文本长度"},
     prompt_style_mode: {constraint: "约束", free: "自由", guided: "引导"},
     content_cleanup_mode: {words: "按清理词", regex: "按正则"},
-    content_cleanup_scope: {all: "整段回复", trailing: "仅句尾（每段末尾）"},
+    content_cleanup_scope: {leading: "句首", middle: "句中", trailing: "句尾"},
     recall_forbidden_scope: {bot_only: "角色自己的回复", group_only: "群聊回复", bot_and_group: "角色回复与群聊"},
     image_position: {after_text: "文字后", before_text: "文字前"},
     voice_trigger_mode: {always: "每轮", request: "按请求", adaptive: "模型择句"},
     voice_generation_mode: {plain: "朗读正文", model_tag: "模型语音标签"},
-    voice_segment_mode: {each: "每一段", first: "仅首段", last: "仅末段"},
+    voice_conversion_scope: {full: "完整口述", partial: "选择适合口述的短句"},
+    voice_segment_mode: {whole: "整段语音", each: "每一段", first: "仅首段", last: "仅末段"},
     voice_delivery_mode: {voice_and_text: "文字与语音", voice_only: "仅语音（完整覆盖时）"},
     voice_position: {before_text: "文字前", after_text: "文字后", after_media: "所有组件后"},
     voice_language: {zh: "中文", ja: "日语", en: "英语"},
@@ -57,6 +59,7 @@ window.CompanionReplyPage = (() => {
       recall_forbidden_word_case_sensitive: "区分大小写",
       reply_diagnostic_limit: "近期回复诊断条数",
       group_wakeup_enabled: "启用群聊回应判断",
+      group_tool_profile: "群聊工具档位",
       group_wakeup_direct_words: "直呼词", group_wakeup_context_words: "上下文关联词",
       group_wakeup_interest_keywords: "兴趣关键词",
       group_wakeup_question_enabled: "识别问题与求助",
@@ -64,7 +67,7 @@ window.CompanionReplyPage = (() => {
       group_wakeup_bot_name: "角色在群里的名称",
       group_wakeup_primary_member_ids: "主要成员账号 ID",
       group_wakeup_owner_direct_words: "主要成员专属直呼词",
-      group_wakeup_interest_probability: "兴趣话题参与概率",
+      group_wakeup_interest_probability: "兴趣候选抽取概率",
       group_wakeup_question_threshold: "问题与求助阈值",
       group_wakeup_cold_group_enabled: "启用冷群重启判断",
       group_wakeup_cold_group_threshold: "冷群重启阈值",
@@ -76,10 +79,23 @@ window.CompanionReplyPage = (() => {
       group_wakeup_topic_interest_max_boost: "话题兴趣加权上限（%）",
       group_wakeup_debounce_pending_penalty: "待回复期间兴趣降权（%）",
       group_wakeup_image_enabled: "考虑本轮图片相关性",
-      group_wakeup_image_weight: "图片相关性权重",
+      group_wakeup_image_weight: "图片候选抽取概率",
+      group_wakeup_image_default_guidance_enabled: "图片唤醒默认克制提示",
       group_wakeup_short_text_wait_ms: "短消息合并等待（毫秒）",
       group_wakeup_log_limit: "近期判定记录上限",
       group_air_guard_enabled: "启用空气护栏",
+      group_high_intensity_enabled: "启用高强度硬收口",
+      recall_silence_enabled: "启用撤回沉默",
+      private_closing_guard_enabled: "启用私聊收尾沉默",
+      private_closing_guard_window_seconds: "收尾判断窗口（秒）",
+      private_closing_guard_prompt_enabled: "同时提示模型自然收尾",
+      private_debounce_enabled: "启用私聊连续输入防抖",
+      private_debounce_min_ms: "最短静默（毫秒）",
+      private_debounce_max_ms: "最长静默（毫秒）",
+      private_debounce_total_ms: "单轮总上限（毫秒）",
+      group_conversation_followup_enabled: "允许非点名续接",
+      group_conversation_followup_seconds: "续接有效时间（秒）",
+      group_conversation_followup_max_turns: "每次唤醒最多自动续接轮数",
       group_air_guard_window_seconds: "接话统计窗口（秒）",
       group_air_guard_max_bot_replies: "窗口内连续回复参考上限",
       group_air_guard_cooldown_seconds: "密集接话收口期（秒）",
@@ -92,6 +108,7 @@ window.CompanionReplyPage = (() => {
       enable_private_image_self_recognition: "启用当前窗口图片转述增强",
       image_understanding_private_enabled: "图片理解 · 私聊",
       image_understanding_group_enabled: "图片理解 · 群聊",
+      astrbot_animated_image_understanding_enabled: "AstrBot 原生动图理解优化",
       enable_private_image_vision_cache: "复用重复图片转述",
       private_image_vision_cache_max_items: "缓存条目上限",
       private_image_self_recognition_hint: "角色自我识别线索",
@@ -121,16 +138,31 @@ window.CompanionReplyPage = (() => {
       reply_quote_first_part_only: "只在第一段引用", reply_quote_skip_chars: "短回复字数门槛",
       reply_mention_speaker_enabled: "群聊回复时 @ 发言者",
       voice_enabled: "启用语音", voice_trigger_mode: "触发方式", voice_generation_mode: "朗读内容",
-      voice_segment_mode: "朗读段落", voice_delivery_mode: "发送形式", voice_position: "语音位置",
+      voice_conversion_scope: "语音转换范围",
+      voice_segment_mode: "朗读段落（整段会等文字收齐后合成一次）", voice_delivery_mode: "发送形式", voice_position: "语音位置",
       voice_language: "语音语言", voice_foreign_text_mode: "外语文字",
       voice_provider_id: "通用 TTS 扩展", voice_zh_provider_id: "中文 TTS 扩展",
       voice_ja_provider_id: "日语 TTS 扩展", voice_en_provider_id: "英语 TTS 扩展",
+      voice_private_zh_provider_id: "私聊 · 中文 TTS", voice_private_ja_provider_id: "私聊 · 日语 TTS",
+      voice_private_en_provider_id: "私聊 · 英语 TTS", voice_group_zh_provider_id: "群聊 · 中文 TTS",
+      voice_group_ja_provider_id: "群聊 · 日语 TTS", voice_group_en_provider_id: "群聊 · 英语 TTS",
       voice_probability: "触发概率", voice_cooldown_seconds: "冷却时间（秒）",
       voice_max_speech_chars: "单段朗读上限（字）", voice_timeout_seconds: "合成超时（秒）",
       voice_trigger_keywords: "触发关键词", voice_extra_prompt: "语音表达偏好",
       voice_primary_mention_keywords: "核心用户提及语音词",
       voice_primary_mention_probability: "核心用户提及概率",
       voice_primary_mention_prompt: "核心用户提及提示",
+      voice_enabled: "核心管理员可以在本轮消息中直接指定语音模型、音色或语种；该次回复会临时覆盖保存的语音绑定。",
+      voice_provider_id: "角色级 TTS 绑定，私聊与群聊共用；触发概率和冷却才按渠道分别覆盖。",
+      voice_zh_provider_id: "中文语音优先使用此扩展；留空则跟随通用 TTS 扩展。",
+      voice_ja_provider_id: "日语语音优先使用此扩展；留空则跟随通用 TTS 扩展。",
+      voice_en_provider_id: "英语语音优先使用此扩展；留空则跟随通用 TTS 扩展。",
+      voice_private_zh_provider_id: "可选：私聊中文语音专用 TTS；优先于通用和语种绑定。",
+      voice_private_ja_provider_id: "可选：私聊日语语音专用 TTS；优先于通用和语种绑定。",
+      voice_private_en_provider_id: "可选：私聊英语语音专用 TTS；优先于通用和语种绑定。",
+      voice_group_zh_provider_id: "可选：群聊中文语音专用 TTS；优先于通用和语种绑定。",
+      voice_group_ja_provider_id: "可选：群聊日语语音专用 TTS；优先于通用和语种绑定。",
+      voice_group_en_provider_id: "可选：群聊英语语音专用 TTS；优先于通用和语种绑定。",
     },
     helps: {
       enabled: "让一轮回复自然地分成多条消息。",
@@ -155,8 +187,8 @@ window.CompanionReplyPage = (() => {
       enable_humanized_expression: "勾选后，下面的额外表达提示会与所选风格叠加；自由模式下关闭即可移除这段提示。",
       humanized_expression_prompt: "最多 4000 字。约束模式使用此正文；留空使用内置默认文本。勾选“追加拟人表达提示”后，在自由或引导模式也会额外注入。本对象与群聊各自保存。",
       content_cleanup_enabled: "用于主动消息和普通私聊、群聊的文字回复，默认开启。发送前按所选方式整理文字；关闭时不执行清理。需要调整说法时优先补充上方提示词。",
-      content_cleanup_scope: "选择“仅句尾”时只清理每段消息末尾的匹配项，保留句中标点；选择“整段回复”时清理整段的匹配项。",
-      content_cleanup_words: "按所选范围逐字清理词条。例如填入“。”和“，”并选择“仅句尾”，即可保留句中标点、清理每段末尾；也可添加空格、换行或制表符。",
+      content_cleanup_scope: "可多选：句首处理每段开头，句中处理不贴首尾的匹配，句尾处理每段末尾；勾选需要的位置即可，支持任意组合。",
+      content_cleanup_words: "按所选位置逐字清理词条。例如填入“。”和“，”并选择“句尾”，即可保留句中标点、清理每段末尾；也可添加空格、换行或制表符。",
       content_cleanup_rule: "仅在清理方式选为正则时使用；最多 512 字。",
       content_replacements: "逐项填写原词和替换文本。",
       framework_error_guard_enabled: "清理插件与框架内部标记，避免把内部格式带入回复。",
@@ -173,6 +205,7 @@ window.CompanionReplyPage = (() => {
       reply_quote_skip_chars: "回复去空白后不超过此字数时不附引用；0 表示不跳过。",
       reply_mention_speaker_enabled: "只在群聊中 @ 本轮发言者。",
       voice_trigger_mode: "决定这一轮要不要朗读，以及由谁挑句子。",
+      voice_segment_mode: "整体朗读会等本轮所有文字段落准备完后合成一次，语气和上下文更完整；每一段会在每段发送前分别合成，出音更早但会切碎语义。",
       voice_delivery_mode: "仅语音只在语音完整覆盖文字时才会替代文字，否则仍发文字。",
       voice_language: "明确要求用英语、日语或中文回复时，只覆盖本轮语音语种与对应 TTS Provider；配置页保存值不会改变。翻译请求不会被当成语种切换。",
       voice_probability: "按百分比编辑，后端按 0–1 的小数保存。",
@@ -190,7 +223,8 @@ window.CompanionReplyPage = (() => {
       group_wakeup_bot_name: "填写角色在群聊中使用的名称；同一角色的群聊共用，最多 40 字。",
       group_wakeup_primary_member_ids: "只接受平台账号数字 ID；同一角色的群聊共用这份主要成员名单。",
       group_wakeup_owner_direct_words: "只对上方主要成员账号生效。",
-      group_wakeup_interest_probability: "兴趣话题通过相关性判断后的参与概率。",
+      group_wakeup_interest_probability: "命中兴趣关键词后，按此概率进入模型参与判断；未抽中时不为该线索调用模型。0 表示关闭，1 表示全部进入，进入后仍可旁听。",
+      group_tool_profile: "完整保留可用工具；常用只挂群聊常用能力；精简会移除其他插件提供的工具，包括外部记忆与搜索。选择精简可减少工具开销，也会减少模型可调用的能力。",
       group_wakeup_question_threshold: "答疑开启时，问题与求助候选评分需达到此值才进入决策。其他成员正在交流、已有回答及近期已接话会降权；达到阈值仍可旁听。范围 0–100。",
       group_wakeup_cold_group_enabled: "开启后，群聊长时间安静时可把重新开场作为判断材料。",
       group_wakeup_cold_group_threshold: "冷群重新开场所需的参与强度参考值，范围 0–100。",
@@ -202,10 +236,23 @@ window.CompanionReplyPage = (() => {
       group_wakeup_topic_interest_max_boost: "话题记忆对兴趣相关性的最大加权比例。",
       group_wakeup_debounce_pending_penalty: "群聊已有回复等待发送时，兴趣话题参与倾向的降权比例。",
       group_wakeup_image_enabled: "开启后，只有本轮确实提供图片材料时才把图片相关性纳入判断。",
-      group_wakeup_image_weight: "图片相关性对群聊参与判断的权重，范围 0–1。",
+      group_wakeup_image_weight: "本轮有图时，按此概率进入模型参与判断，范围 0–1。0 表示关闭，1 表示全部进入；抽中仍不代表必须回复。明确 @、直呼等信号独立生效。",
+      group_wakeup_image_default_guidance_enabled: "开启后，本轮只有图片、表情包或没有可读文字时，提示模型不要仅凭图片接话：只有图中清楚直呼角色，或图片本身是成员明确提出的问题、请求、求助才考虑参与；有文字时以文字为主。抽中候选只表示可以判断，不代表一定要接话。关闭后只保留概率说明。",
       group_wakeup_short_text_wait_ms: "短文本触发后等待后续消息再判断；0 表示不等待。",
       group_wakeup_log_limit: "回复工作台最多读取的近期群聊判定记录数，不改变参与规则。",
       group_air_guard_enabled: "开启后将近期连续回复与礼貌收尾次数作为群聊提示参考，不机械截断回复。",
+      group_high_intensity_enabled: "达到下方窗口轮数后，未点名、非直接接续的群消息本轮直接旁听；明确 @、直呼角色和有效接续仍可回应。沿用空气护栏的窗口、轮数和冷却，不另设旧版收口期合并队列。",
+      recall_silence_enabled: "触发消息被撤回时，取消尚未发出的回复并停止输入状态。关闭后仍记录撤回、仍让来源失效，但不再因撤回取消本轮回复；已经发出的消息无法收回。",
+      private_closing_guard_enabled: "开启后，对方只是道晚安、道别、感谢或简短应声，而角色上一轮已经收尾时，本轮不再调用模型回复，避免互相道晚安。带问题、请求、图片或新内容的消息不静默。",
+      private_closing_guard_window_seconds: "只在这个时间窗口内判断收尾；超过窗口后仍按普通消息回复。范围 60–7200 秒。",
+      private_closing_guard_prompt_enabled: "未触发静默时，把收尾语境作为本轮提示，提醒模型不要另起话题、追问或再补一条同义道别。",
+      private_debounce_enabled: "仅纯文本私聊生效：第一条消息立即开始准备，短线补充并入同一轮，只触发一次模型请求。图片、语音、视频、文件、引用和命令立即处理。",
+      private_debounce_min_ms: "长消息靠近这个下限；与最长静默相同时使用固定等待，推荐从 1500 毫秒起调整。",
+      private_debounce_max_ms: "短消息靠近这个上限；实际窗口还受单轮总上限约束，默认 4000 毫秒。",
+      private_debounce_total_ms: "从第一条消息开始计算，达到该时间后不再等待新消息；默认 8000 毫秒，不能小于最长静默。",
+      group_conversation_followup_enabled: "开启后，可由决策模型判断是否回应上一轮互动后的非点名发言；关闭后仅按独立唤醒策略参与。",
+      group_conversation_followup_seconds: "距上次实际回复多久内可以续接，默认 120 秒。等待补充或选择旁听不会延长已回复链的有效时间。",
+      group_conversation_followup_max_turns: "默认最多自动续接 3 轮，最初唤醒的回复不计入。按宿主发送调用正常返回的回复事件计数，分段与工具循环只算一轮；等待、旁听、失败或结果未知不消耗轮数。到限后停止自动续接及弱触发，明确 @、引用或直呼可重新开启；仅调整窗口时不影响其他群。",
       group_air_guard_window_seconds: "统计群聊连续回复和礼貌收尾次数的时间窗口。",
       group_air_guard_max_bot_replies: "短窗口内达到该回复轮数后，提示模型降低弱候选参与倾向。",
       group_air_guard_cooldown_seconds: "达到连续回复参考值后，持续旁听的时间；明确 @、直呼和有效接续仍可回应。",
@@ -218,6 +265,7 @@ window.CompanionReplyPage = (() => {
       enable_private_image_self_recognition: "在当前选中的私聊或群聊窗口启用图片转述增强。回复模型与识图模型一致时，增强提示会直接交给主模型；原图仍是主要依据。",
       image_understanding_private_enabled: "角色级权限，适用于该角色绑定的所有私聊窗口。关闭后不做额外视觉转述或历史图片摘要；本轮原图仍由主回复模型处理。",
       image_understanding_group_enabled: "角色级权限，适用于该角色绑定的所有群聊窗口。关闭后不做额外视觉转述或历史图片摘要；本轮原图仍由主回复模型处理。",
+      astrbot_animated_image_understanding_enabled: "开启后，本轮识别到 GIF 时向主模型注入宫格拼图说明：把 3×3 抽帧按从左到右、从上到下理解成同一段动画的连续帧，不数成九张图或九次动作。该提示仅在本轮含动图时加入，不改变原图或额外识图权限。",
       enable_private_image_vision_cache: "相同图片与提示词会复用当前运行进程中的描述，缓存不会写入长期记忆；设为关闭后每轮重新识图。",
       private_image_vision_cache_max_items: "运行期最多保留的描述数量；设为 0 时不保留条目。",
       private_image_self_recognition_hint: "最多 1200 字，填写角色的头像、昵称、签名、水印或二创别名等线索；角色外貌优先使用已登记的人格资料。只把线索作为可能匹配，不确认画中人或发送者身份，也不要填写用户资料。",
@@ -235,7 +283,7 @@ window.CompanionReplyPage = (() => {
       file_understanding_enabled: "开启后读取当前窗口允许格式的正文；附件正文不会写入长期存储。",
       file_understanding_private_enabled: "角色级权限，适用于该角色绑定的所有私聊窗口。关闭后不读取私聊附件正文。",
       file_understanding_group_enabled: "角色级权限，适用于该角色绑定的所有群聊窗口。关闭后不读取群聊附件正文。",
-      file_understanding_formats: "旧版兼容项；请使用下方格式类别多选。",
+      file_understanding_formats: "兼容项；请使用下方格式类别多选。",
       file_understanding_format_groups: "可多选。文本包括 .txt、.md、.csv、.json、.log、.py、.js、.ts、.yaml、.yml、.xml、.html、.ini、.toml、.sql；另支持 PDF、DOCX、XLSX、PPTX 的文字提取。扫描件不做 OCR。",
       file_understanding_max_size_mb: "超过大小限制的文件会标记为未读取。",
       file_understanding_max_chars: "所有附件共用本轮正文预算；超出部分会标记为部分正文。",
@@ -255,11 +303,12 @@ window.CompanionReplyPage = (() => {
                 "content_cleanup_rule", "content_cleanup_words", "content_replacement_enabled",
                 "content_replacements"]},
       {id: "wakeup_direct", title: "明确参与信号", help: "",
-       fields: ["group_wakeup_enabled", "group_wakeup_direct_words", "group_wakeup_context_words",
+       fields: ["group_wakeup_enabled", "group_tool_profile", "group_wakeup_direct_words", "group_wakeup_context_words",
                 "group_wakeup_question_enabled", "group_wakeup_question_threshold"]},
       {id: "wakeup_interest", title: "兴趣与概率参与", help: "",
        fields: ["group_wakeup_interest_keywords", "group_wakeup_interest_probability",
-                "group_wakeup_image_enabled", "group_wakeup_image_weight"]},
+                "group_wakeup_image_enabled", "group_wakeup_image_weight",
+                "group_wakeup_image_default_guidance_enabled"]},
       {id: "wakeup_members", title: "直呼与成员", help: "",
        fields: ["group_wakeup_bot_name_enabled", "group_wakeup_bot_name",
                 "group_wakeup_primary_member_ids", "group_wakeup_owner_direct_words"]},
@@ -271,9 +320,20 @@ window.CompanionReplyPage = (() => {
                 "group_wakeup_cooldown_seconds", "group_wakeup_generated_keyword_limit",
                 "group_wakeup_topic_interest_max_boost", "group_wakeup_debounce_pending_penalty",
                 "group_wakeup_log_limit"]},
-      {id: "group_air_guard", title: "空气护栏 · 挡说太多", help: "",
-       fields: ["group_air_guard_enabled", "group_air_guard_window_seconds", "group_air_guard_max_bot_replies",
+      {id: "group_continuation", title: "连续对话与熔断", help: "续接由模型判断是否需要回应，轮数上限防止无限跟答。",
+       fields: ["group_conversation_followup_enabled", "group_conversation_followup_seconds",
+                "group_conversation_followup_max_turns"]},
+      {id: "private_debounce", title: "私聊节奏 · 连续输入", help: "第一条消息到达即开始准备，后续文本并入同一轮；总等待不超过配置上限。",
+       fields: ["private_debounce_enabled", "private_debounce_min_ms", "private_debounce_max_ms",
+                "private_debounce_total_ms"]},
+      {id: "silence_policy", title: "沉默策略", help: "统一管理哪些情况允许自动沉默；具体窗口与阈值仍在下方各分区调整。忙碌与休息闸门使用下方独立设置，它们只延期、不取消。Laya 的 wait/silent 与未点名群聊旁听仍由决策和群聊参与设置控制。",
+       fields: ["recall_silence_enabled", "private_closing_guard_enabled", "group_air_guard_enabled"]},
+      {id: "group_air_guard", title: "空气护栏 · 细则", help: "",
+       fields: ["group_high_intensity_enabled", "group_air_guard_window_seconds", "group_air_guard_max_bot_replies",
                 "group_air_guard_cooldown_seconds", "group_air_guard_polite_loop_limit"]},
+      {id: "private_closing", title: "私聊收尾 · 细则", help: "",
+       fields: ["private_closing_guard_window_seconds",
+                "private_closing_guard_prompt_enabled"]},
       {id: "group_content_safety", title: "内容护栏 · 挡说错话", help: "",
        fields: ["enable_group_injection_guard", "enable_group_privacy_guard",
                 "enable_group_reality_promise_guard"]},
@@ -283,6 +343,8 @@ window.CompanionReplyPage = (() => {
                 "file_understanding_private_enabled", "file_understanding_group_enabled"]},
       {id: "context_image", title: "上下文图片描述", help: "",
        fields: ["enable_context_image_captioning", "context_image_caption_max_items"]},
+      {id: "native_image", title: "AstrBot 原生动图理解", help: "",
+       fields: ["astrbot_animated_image_understanding_enabled"]},
       {id: "image_narration", title: "图片视觉转述", help: "",
        fields: ["enable_private_image_self_recognition", "enable_private_image_vision_cache",
                 "private_image_vision_cache_max_items", "private_image_self_recognition_hint",
@@ -299,13 +361,16 @@ window.CompanionReplyPage = (() => {
       {id: "forwards", title: "合并转发理解", help: "",
        fields: ["forward_message_adaptation_enabled"]},
       {id: "voice", title: "语音与朗读", help: "",
-       fields: ["voice_enabled", "voice_trigger_mode", "voice_generation_mode", "voice_segment_mode",
+       fields: ["voice_enabled", "voice_trigger_mode", "voice_generation_mode", "voice_conversion_scope", "voice_segment_mode",
                 "voice_delivery_mode", "voice_language", "voice_foreign_text_mode",
                 "voice_provider_id", "voice_probability", "voice_cooldown_seconds",
                 "voice_max_speech_chars", "voice_timeout_seconds", "voice_zh_provider_id",
                 "voice_ja_provider_id", "voice_en_provider_id", "voice_trigger_keywords", "voice_position",
                 "voice_extra_prompt", "voice_primary_mention_keywords", "voice_primary_mention_probability",
                 "voice_primary_mention_prompt"]},
+      {id: "voice_channels", title: "私聊 / 群聊语音覆盖", help: "同一语种可为私聊和群聊指定不同的 TTS；留空时沿用上面的语种绑定。",
+       fields: ["voice_private_zh_provider_id", "voice_private_ja_provider_id", "voice_private_en_provider_id",
+                "voice_group_zh_provider_id", "voice_group_ja_provider_id", "voice_group_en_provider_id"]},
       {id: "components", title: "引用与消息组件", help: "",
        fields: ["component_order", "reply_quote_enabled", "reply_quote_group_enabled",
                  "reply_quote_first_part_only", "reply_quote_skip_chars", "reply_mention_speaker_enabled",
@@ -316,12 +381,17 @@ window.CompanionReplyPage = (() => {
     ],
     segmentedChoices: ["rule_mode", "part_gap_mode", "streaming_mode", "prompt_style_mode"],
     inputs: {
+      content_cleanup_scope: "chips",
       split_words: "word-list", content_cleanup_words: "word-list", recall_forbidden_words: "word-list",
       content_replacements: "replacement-list", component_order: "order-list",
       group_wakeup_direct_words: "word-list", group_wakeup_context_words: "word-list",
       group_wakeup_interest_keywords: "word-list", group_wakeup_primary_member_ids: "word-list",
       group_wakeup_owner_direct_words: "word-list",
       file_understanding_format_groups: "word-list",
+    },
+    chipOptions: {
+      content_cleanup_scope: {mode: "multi", options: ["leading", "middle", "trailing"],
+        labels: {leading: "句首", middle: "句中", trailing: "句尾"}, hideInput: true},
     },
     visibility: {
       streaming_mode: {streaming: true},
@@ -335,6 +405,11 @@ window.CompanionReplyPage = (() => {
       part_gap_min_ms: {part_gap_mode: "random"},
       part_gap_max_ms: {part_gap_mode: "random"},
       part_gap_log_base: {part_gap_mode: "log"},
+      private_closing_guard_window_seconds: {private_closing_guard_enabled: true},
+      private_closing_guard_prompt_enabled: {private_closing_guard_enabled: true},
+      private_debounce_min_ms: {private_debounce_enabled: true},
+      private_debounce_max_ms: {private_debounce_enabled: true},
+      private_debounce_total_ms: {private_debounce_enabled: true},
     },
     listFields: {
       split_words: {maxItems: 80, maxLength: 40, unique: "exact", trim: true,
@@ -357,19 +432,20 @@ window.CompanionReplyPage = (() => {
       private_image_self_recognition_hint: 3, video_self_recognition_hint: 3},
   };
   const decisionSectionIds = new Set(["wakeup_direct", "wakeup_interest", "wakeup_members",
-    "wakeup_cold_group", "wakeup_fatigue", "group_air_guard", "group_content_safety"]);
+    "wakeup_cold_group", "wakeup_fatigue", "group_continuation", "private_debounce",
+    "silence_policy", "group_air_guard", "private_closing", "group_content_safety"]);
   const decisionViewSections = {
     response: ["wakeup_direct", "wakeup_interest", "wakeup_members"],
-    tempo: ["wakeup_cold_group", "wakeup_fatigue"],
-    safety: ["group_air_guard", "group_content_safety"],
+    tempo: ["group_continuation", "private_debounce", "wakeup_cold_group", "wakeup_fatigue"],
+    safety: ["silence_policy", "group_air_guard", "private_closing", "group_content_safety"],
   };
   const decisionSectionViews = Object.fromEntries(Object.entries(decisionViewSections)
     .flatMap(([view, sections]) => sections.map(section => [section, view])));
-  const perceptionSectionIds = new Set(["media_permissions", "context_image", "image_narration",
+  const perceptionSectionIds = new Set(["media_permissions", "context_image", "native_image", "image_narration",
     "video_narration", "file_understanding", "forwards"]);
   const perceptionModuleSections = {
     overview: ["media_permissions"],
-    image: ["context_image", "image_narration"],
+    image: ["context_image", "native_image", "image_narration"],
     video: ["video_narration"],
     file: ["file_understanding"],
     forwards: ["forwards"],
@@ -430,7 +506,7 @@ window.CompanionReplyPage = (() => {
 
   const expressionModuleSections = {
     "expression-text": ["segment", "style", "cleanup"],
-    "expression-voice": ["voice"],
+    "expression-voice": ["voice", "voice_channels"],
     "expression-platform": ["components", "checks"],
   };
   const expressionModuleDefaults = {
@@ -467,14 +543,48 @@ window.CompanionReplyPage = (() => {
     diagnostics: root?.querySelector('[data-reply-part="diagnostics"]'),
   });
 
+  /* 摘要行是这张面板唯一一眼能看到的信息，必须直接回答「为什么没有发出去」，
+     失败码、回退和等待时长不再只藏在展开后的细节里。 */
+  function diagnosticTime(value) {
+    if (!value) return "时间未知";
+    /* 宿主与 V2 的时间都带 +00:00 偏移、微秒级小数；截到毫秒后交给本地时区渲染，
+       不再把 UTC 原样当成本地时间。 */
+    const date = new Date(String(value).replace(/(\.\d{3})\d+/, "$1"));
+    if (!Number.isFinite(date.getTime())) return "时间未知";
+    const pad = number => String(number).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+      + `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  }
+
+  function waitingText(value) {
+    const started = Date.parse(String(value || "").replace(/(\.\d{3})\d+/, "$1"));
+    if (!Number.isFinite(started)) return "";
+    const minutes = Math.floor((Date.now() - started) / 60000);
+    if (minutes < 1) return "刚开始";
+    if (minutes < 60) return `已等待 ${minutes} 分钟`;
+    if (minutes < 1440) return `已等待 ${Math.floor(minutes / 60)} 小时`;
+    return `已等待 ${Math.floor(minutes / 1440)} 天`;
+  }
+
   function renderDiagnostics() {
     const host = parts().diagnostics;
     if (!host) return;
     const recent = Array.isArray(state.status?.recent) ? state.status.recent : [];
     const stateLabels = {complete: "已完成", blocked: "受阻", closed: "已关闭", ready: "待投递",
-      sealed: "已封存", collecting: "收集中", generating: "生成中", delivering: "投递中",
-      failed: "未完成", completed: "生成完成", awaiting_request: "等待宿主请求"};
+      sealed: "已封存", collecting: "收集中", generating: "生成中", running: "生成中", delivering: "投递中",
+      failed: "未完成", completed: "生成完成", awaiting_request: "等待宿主请求", prepared: "已准备"};
     const responseLabels = {no_reply: "未发送", image_only: "仅图片", text_or_mixed: "文字或混合内容", native_reply: "宿主回应"};
+    const deliveryLabels = {not_started: "未发送", started: "正在发送", returned: "发送已返回",
+      partial: "部分返回", failed: "发送失败", unknown: "结果未知"};
+    const failureLabels = {UnprocessableEntityError: "模型线路拒绝请求 422", ClientError: "模型调用被拒绝",
+      provider_request_failed: "模型请求失败", model_request_failed: "模型请求失败",
+      native_response_parse_failed: "宿主回复解析失败", response_parse_failed: "回复解析失败",
+      response_contract_rejected: "回复格式校验失败", stream_rejected: "流式校验失败",
+      provider_timeout: "模型请求超时", model_timeout: "模型请求超时"};
+    const failureShort = {UnprocessableEntityError: "422", ClientError: "4xx",
+      provider_timeout: "超时", model_timeout: "超时"};
+    const failureText = code => failureLabels[code] || `请求失败 ${code}`;
+    const failureTag = code => failureShort[code] || code;
     const parseLabels = {not_received: "未收到完整响应", raw_observed: "已收到原始响应",
       native_parsed: "宿主已解析", native_rejected: "宿主解析失败", stream_rejected: "流式校验失败",
       contract_rejected: "回复格式校验失败", validated: "回复已通过校验", tools: "工具请求已通过校验",
@@ -491,18 +601,31 @@ window.CompanionReplyPage = (() => {
       const materials = Array.isArray(item.injected_materials) ? item.injected_materials : [];
       const tools = Array.isArray(item.tool_calls) ? item.tool_calls : [];
       const filtered = Array.isArray(item.filtered_tools) ? item.filtered_tools : [];
-      const failures = (Array.isArray(item.calls) ? item.calls : []).filter(call => call.failure_code);
-      const responses = (Array.isArray(item.calls) ? item.calls : []).filter(call => call.response_diagnostics);
-      const when = item.created_at ? e(String(item.created_at).replace("T", " ").slice(0, 19)) : "时间未知";
+      const calls = Array.isArray(item.calls) ? item.calls : [];
+      const failures = calls.filter(call => call.failure_code);
+      const responses = calls.filter(call => call.response_diagnostics);
+      const sent = Number(item.send_returns) || 0;
+      const waiting = item.state === "generating" || item.state === "awaiting_request";
+      const failure = failures.length ? failures[0] : null;
+      const note = waiting ? waitingText(item.created_at)
+        : failure ? (sent > 0 ? `首次请求失败 ${failureTag(failure.failure_code)} · 已回退`
+          : failureText(failure.failure_code))
+        : item.response_type === "no_reply"
+          ? (item.execution_path === "astrbot_core" ? "本轮未发言" : "本轮未生成分段")
+          : "";
+      const when = e(diagnosticTime(item.created_at));
       return `<details class="reply-record"><summary><span>${e(stateLabels[item.state] || "状态未知")}</span>`
-        + `<span>${e(responseLabels[item.response_type] || "回应类型未知")}</span><time>${when}</time></summary>`
+        + `<span>${e(responseLabels[item.response_type] || "回应类型未知")}</span>`
+        + (note ? `<span class="reply-record-note${failure ? " is-warn" : ""}">${e(note)}</span>` : "")
+        + `<time>${when}</time></summary>`
         + `<p>任务 ${e(item.turn_type || "conversation.reply")} · 有效输入 ${Number(item.current_inputs) || 0} 条 · 轮次 ${rounds.length} · 群历史 ${Number(item.group_history_items) || 0} 条 · 注入材料 ${materials.length} 项</p>`
         + `<p>提供工具：${actionList(item.offered_tools)}</p>`
         + (filtered.length ? `<p>未提供：${filtered.map(tool => `${e(tool.action || "未知工具")} · ${e(tool.reason || "原因未知")}`).join("；")}</p>` : "")
         + (rounds.length ? `<ul>${rounds.map(round => `<li>第 ${Number(round.round_no) + 1} 轮 · ${e(round.state || "状态未知")} · 请求 ${actionList(round.tool_actions)}</li>`).join("")}</ul>` : "")
         + (tools.length ? `<ul>${tools.map(tool => `<li>${e(tool.action || "未知工具")} · ${e(tool.state || "状态未知")} · ${e(tool.effect || "效果未知")}</li>`).join("")}</ul>` : "")
         + (materials.length ? `<p>材料：${materials.map(item => `${e(item.owner || "未知来源")} / ${e(item.purpose || "未分类")} · ${e(item.state || "状态未知")}`).join("；")}</p>` : "")
-        + (failures.length ? `<p>模型失败分类：${failures.map(call => e(call.failure_code)).join("、")}</p>` : "")
+        + (failures.length ? `<p>模型失败分类：${failures.map(call => e(call.failure_code)
+          + (call.provider ? `（${e(call.provider)}）` : "")).join("、")}</p>` : "")
         + (responses.length ? `<ul>${responses.map(call => {
           const diagnostic = call.response_diagnostics;
           const hashes = ["raw", "parsed", "visible"].map((name, index) => diagnostic[name]?.sha256
@@ -513,10 +636,14 @@ window.CompanionReplyPage = (() => {
             + (hashes.length ? `<details><summary>内容指纹</summary><p>${hashes.join("<br>")}</p></details>` : "") + "</li>";
         }).join("")}</ul>` : "")
         + (item.execution_path === "astrbot_core"
-          ? `<p>宿主发送返回 ${Number(item.send_returns) || 0} 次 · ${e(item.delivery_state || "未观察发送")} · 不含提示词正文与消息原文</p></details>`
+          ? `<p>宿主发送返回 ${sent} 次 · ${e(deliveryLabels[item.delivery_state] || "未观察发送")} · 不含提示词正文与消息原文</p></details>`
           : `<p>分段 ${Array.isArray(item.parts) ? item.parts.length : 0} 条 · 不含提示词正文与消息原文</p></details>`);
     }).join("") : '<p class="reply-empty">暂无近期回复记录。</p>';
-    host.innerHTML = `<section class="reply-diagnostics"><header><h3>回复诊断</h3><span>${recent.length} 轮</span></header>${html}</section>`;
+    host.innerHTML = `<section class="reply-diagnostics"><header><h3>回复诊断</h3>`
+      + `<span>最近 ${recent.length} 轮 · 本地时间</span></header>`
+      + (recent.length ? '<p class="reply-diag-note">「未发送」表示这一轮没有发出任何消息，'
+        + "不等于发送失败。展开任意一行可以看模型请求、工具调用与分段回执。</p>" : "")
+      + html + `</section>`;
   }
 
   function summary(v) {
@@ -548,6 +675,13 @@ window.CompanionReplyPage = (() => {
       if (!value || typeof value !== "object" || Array.isArray(value)) throw error("invalid_response");
       return value;
     } finally { clearTimeout(timer); }
+  }
+
+  /* 旧版整段清理迁成三项全选；其余单值保持原样，避免无改动也变脏。 */
+  function normalizeReplyDraft(draft) {
+    if (draft?.content_cleanup_scope === "all") {
+      draft.content_cleanup_scope = "leading、middle、trailing";
+    }
   }
 
   /* 读取由工作台负责；这里只订阅它的结果，用来渲染预览与保存摘要。 */
@@ -644,6 +778,21 @@ window.CompanionReplyPage = (() => {
       ...remaining.slice(insertion)];
   }
 
+  function previewOrderedKinds(declared, present) {
+    const kinds = [...new Set(present)].filter(Boolean);
+    if (Array.isArray(declared) && declared.length) {
+      const defaults = ["voice", "at", "text", "face", "image"];
+      const rank = [...declared, ...defaults.filter(kind => !declared.includes(kind))];
+      return rank.filter(kind => kinds.includes(kind));
+    }
+    const ordered = kinds.filter(kind => kind !== "at" && kind !== "face");
+    if (kinds.includes("at")) {
+      const textIndex = ordered.indexOf("text");
+      ordered.splice(textIndex >= 0 ? textIndex : 0, 0, "at");
+    }
+    if (kinds.includes("face")) ordered.push("face");
+    return ordered;
+  }
   function previewSummaryMarkup(p, settings) {
     const quote = p.quote || {};
     const quoteEnabled = quote.enabled ?? settings.reply_quote_enabled;
@@ -658,11 +807,18 @@ window.CompanionReplyPage = (() => {
     const voiceLabel = ({before: "文字前", request: "按请求插入", after: "文字后", last: "所有组件后"})
       [state.previewPositions.voice] || "未知位置";
     const session = state.previewSession === "group" ? "群聊" : "私聊";
+    const quotePolicy = !quoteEnabled ? "引用关闭"
+      : session === "group" && quoteGroupEnabled
+        ? `引用：${quoteFirstOnly ? "首段" : "每段"}`
+        : "引用：私聊不发送";
+    const mentionPolicy = !mentionSpeaker ? "不添加 @"
+      : session === "group" ? `@：${positionLabel(state.previewPositions.mention)}` : "@：私聊不发送";
     const componentPolicy = [
+      `预览会话：${session}`,
       `图片：${imageCount ? `${imageCount} 张 · ` : "无样本 · "}${imageTarget}${imageSide}`,
       `语音位置：${p.voice?.enabled ? voiceLabel : `未启用 · ${voiceLabel}`}`,
-      quoteEnabled ? `引用：${quoteGroupEnabled ? `群聊${quoteFirstOnly ? "首段" : "每段"}` : "群聊关闭"}` : "引用关闭",
-      mentionSpeaker ? `@：${session === "group" ? positionLabel(state.previewPositions.mention) : "仅群聊"}` : "不添加 @",
+      quotePolicy,
+      mentionPolicy,
       `平台表情：${positionLabel(state.previewPositions.reaction)}`,
       `表情包/附件：${state.previewPositions.media === "single" ? "独立消息" : positionLabel(state.previewPositions.media)}`,
     ].join(" · ");
@@ -710,24 +866,46 @@ window.CompanionReplyPage = (() => {
         const mediaApplies = mediaMode !== "single" && index === mediaTargetIndex;
         const imageSide = imageMode === "before" ? "文字前" : imageMode === "after" ? "文字后"
           : p.image_position === "before_text" ? "文字前" : "文字后";
-        const voiceApplies = Boolean(p.voice?.enabled && c.speech);
         const voiceLabel = ({before: "文字前", request: "按请求插入", after: "文字后", last: "所有组件后"})
           [state.previewPositions.voice] || "未知位置";
         const protectedUrl = state.previewProtection
           ? (text.match(/https?:\/\/[^\s<>]+/g) || []).find(url => p.parts.some(part => part.includes(url)))
           : "";
-        const placements = [];
-        if (quoteApplies) placements.push(`<span class="reply-preview-position-tag is-quote">${quoteFirstOnly ? "引用 · 固定第一段" : "引用 · 每一段"}</span>`);
-        if (mentionApplies) placements.push(`<span class="reply-preview-position-tag is-mention">@ · ${e(positionLabel(state.previewPositions.mention))}</span>`);
-        if (reactionApplies) placements.push(`<span class="reply-preview-position-tag is-reaction">平台表情 · ${e(positionLabel(state.previewPositions.reaction))}</span>`);
-        if (partImages) placements.push(`<span class="reply-preview-position-tag is-image">${partImages} 张图片 · ${imageSide}</span>`);
-        if (mediaApplies) placements.push(`<span class="reply-preview-position-tag is-media">表情包/附件 · ${e(positionLabel(mediaMode))}</span>`);
-        if (voiceApplies) placements.push(`<span class="reply-preview-position-tag is-voice">语音 · ${e(voiceLabel)}</span>`);
-        if (protectedUrl) placements.push(`<span class="reply-preview-position-tag is-protection">网址保护 · 链接整段保留</span>`);
         const successOrder = previewComponentOrder(c.success_order, {index, p, count: partCount});
         const fallbackOrder = previewComponentOrder(c.fallback_order, {index, p, count: partCount});
-        const placementMarkup = placements.length
-          ? `<div class="reply-preview-placements" aria-label="组件位置">${placements.join("")}</div>` : "";
+        const baseOrder = p.voice?.enabled && c.speech ? successOrder : fallbackOrder;
+        const quoteUnavailable = quoteEnabled && !quoteApplies
+          && (!quoteGroupEnabled || state.previewSession !== "group");
+        const mentionUnavailable = mentionSpeaker && !mentionApplies && state.previewSession !== "group";
+        const voiceUnavailable = !p.voice?.enabled;
+        const present = [...baseOrder];
+        if (partImages && !present.includes("image")) present.push("image");
+        if ((mentionApplies || mentionUnavailable) && !present.includes("at")) present.push("at");
+        if (reactionApplies && !present.includes("face")) present.push("face");
+        if (voiceUnavailable && !present.includes("voice")) {
+          const textIndex = present.indexOf("text");
+          if (state.previewPositions.voice === "before") present.splice(textIndex >= 0 ? textIndex : 0, 0, "voice");
+          else if (state.previewPositions.voice === "after") present.splice(textIndex >= 0 ? textIndex + 1 : present.length, 0, "voice");
+          else present.push("voice");
+        }
+        const orderedKinds = previewOrderedKinds(p.component_order, present);
+        const placementTags = {
+          text: () => `<span class="reply-preview-position-tag is-text">文字</span>`,
+          voice: () => `<span class="reply-preview-position-tag is-voice${voiceUnavailable ? " is-unavailable" : ""}">语音 · ${voiceUnavailable ? "未启用 · " : ""}${e(voiceLabel)}</span>`,
+          image: () => `<span class="reply-preview-position-tag is-image">${partImages} 张图片 · ${imageSide}</span>`,
+          at: () => `<span class="reply-preview-position-tag is-mention${mentionUnavailable ? " is-unavailable" : ""}">@ · ${mentionUnavailable ? "私聊不发送" : e(positionLabel(state.previewPositions.mention))}</span>`,
+          face: () => `<span class="reply-preview-position-tag is-reaction">平台表情 · ${e(positionLabel(state.previewPositions.reaction))}</span>`,
+        };
+        const sequence = [];
+        if (quoteApplies) sequence.push(`<span class="reply-preview-position-tag is-quote">${quoteFirstOnly ? "引用 · 固定第一段" : "引用 · 每一段"}</span>`);
+        else if (quoteUnavailable) sequence.push(`<span class="reply-preview-position-tag is-quote is-unavailable">引用 · ${quoteGroupEnabled ? "私聊不发送" : "群聊关闭"}</span>`);
+        sequence.push(...orderedKinds.map(kind => placementTags[kind]?.()).filter(Boolean));
+        if (mediaApplies) sequence.push(`<span class="reply-preview-position-tag is-media">表情包/附件 · ${e(positionLabel(mediaMode))}</span>`);
+        const sequenceMarkup = sequence.length
+          ? `<div class="reply-preview-placements is-sequence" aria-label="发送顺序">${sequence.join('<span class="reply-preview-position-arrow" aria-hidden="true">→</span>')}</div>` : "";
+        const protectionMarkup = protectedUrl
+          ? `<div class="reply-preview-placements is-protection-note" aria-label="保护提示"><span class="reply-preview-position-tag is-protection">网址保护 · 链接整段保留</span></div>` : "";
+        const placementMarkup = sequenceMarkup + protectionMarkup;
         return `<article class="reply-preview-part">`
           + `<header><strong>第 ${index + 1} 条</strong><span>${Array.from(text).length} 字</span></header>`
           + `<pre>${e(text)}</pre>`
@@ -990,8 +1168,8 @@ window.CompanionReplyPage = (() => {
   function selectSection(id, {scroll = true} = {}) {
     if (!root) return false;
     if (root.dataset?.replyView === "perception") {
-      const module = {media_permissions: "overview", context_image: "image", image_narration: "image",
-        video_narration: "video", file_understanding: "file", forwards: "forwards"}[id];
+      const module = {media_permissions: "overview", context_image: "image", native_image: "image",
+        image_narration: "image", video_narration: "video", file_understanding: "file", forwards: "forwards"}[id];
       if (module) return setPerceptionModule(module);
     }
     if (root.dataset?.replyView === "decision" && decisionSectionViews[id]) {
@@ -1115,7 +1293,7 @@ window.CompanionReplyPage = (() => {
     const diagnostics = [undefined, "expression", "decision"].includes(options.view)
       ? '<div data-reply-part="diagnostics"></div>' : "";
     const scopeNote = options.view === "decision"
-      ? '<aside class="reply-scope-note" role="note"><strong>基础唤醒后才进行决策</strong><p>答疑默认关闭，弱相关词默认留空。群唤醒设置跟随角色，同一角色的群窗口共用；在私聊窗口调整也会更新该角色的群设置。明确 @、引用或直接呼唤优先，其他候选由 Laya 结合有效开关与近期群历史判断是否旁听。</p></aside>' : options.view === "perception"
+      ? '<aside class="reply-scope-note" role="note"><strong>基础唤醒后才进行决策</strong><p>答疑默认关闭，弱相关词默认留空。群唤醒设置跟随角色，同一角色的群窗口共用；在私聊窗口调整也会更新该角色的群设置。明确 @、引用或直接呼唤优先，其他候选由 Laya 结合有效开关与近期群历史判断是否旁听。私聊收尾沉默只处理纯道别、致谢或简短应声，且角色上一轮已经收尾；带问题、请求、图片或新内容的消息不受影响。私聊纯文本防抖与合并总窗口在「参与节奏 → 私聊节奏 · 连续输入」中配置；图片、语音、视频、文件、引用和命令不参与合并。</p></aside>' : options.view === "perception"
       ? '<aside class="reply-scope-note" role="note"><strong>普通聊天的媒体理解在 AstrBot 中配置</strong>' +
         '<p>普通聊天的图片、视频和文件由 AstrBot 及已启用的扩展处理。本页的转述和文件读取设置用于 V2 独立任务及历史兼容。</p></aside>'
       : '<aside class="reply-scope-note" role="note" data-reply-part="scope">' +
@@ -1138,17 +1316,25 @@ window.CompanionReplyPage = (() => {
       rows: pageSpec.rows,
       segmentedChoices: spec.segmentedChoices,
       inputs: spec.inputs,
+      chipOptions: spec.chipOptions,
       visibility: spec.visibility,
       listFields: spec.listFields,
       order: pageSpec.order,
       endpoint: PREFIX + route,
       resetKey: "reset_to_inherit",
+      normalizeDraft: normalizeReplyDraft,
       /* TTS 扩展目录要等读取之后才知道，所以选项由函数现取。 */
       catalogs: {
         voice_provider_id: () => providerOptions("跟随 AstrBot"),
         voice_zh_provider_id: () => providerOptions("使用通用扩展"),
         voice_ja_provider_id: () => providerOptions("使用通用扩展"),
         voice_en_provider_id: () => providerOptions("使用通用扩展"),
+        voice_private_zh_provider_id: () => providerOptions("跟随语种绑定"),
+        voice_private_ja_provider_id: () => providerOptions("跟随语种绑定"),
+        voice_private_en_provider_id: () => providerOptions("跟随语种绑定"),
+        voice_group_zh_provider_id: () => providerOptions("跟随语种绑定"),
+        voice_group_ja_provider_id: () => providerOptions("跟随语种绑定"),
+        voice_group_en_provider_id: () => providerOptions("跟随语种绑定"),
       },
       mount: () => parts().settings,
       /* 工作台拿到新快照后，预览跟着重画。 */
@@ -1168,7 +1354,8 @@ window.CompanionReplyPage = (() => {
   function providerOptions(fallback) {
     const options = {"": fallback};
     for (const item of state.status?.tts?.providers || []) {
-      if (typeof item?.id === "string" && item.id) options[item.id] = item.id;
+      if (typeof item?.id !== "string" || !item.id) continue;
+      options[item.id] = [item.id, item.model, item.voice].filter(Boolean).join(" · ");
     }
     return options;
   }

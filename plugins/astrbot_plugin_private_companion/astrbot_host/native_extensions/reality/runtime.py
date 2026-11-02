@@ -103,6 +103,10 @@ class RealityRuntime(NativeService, RealitySettingsMethods, RealitySpeechMethods
                 raise RuntimeError('移动端网关启动失败，请检查配对令牌和端口配置')
             await self._set_official_reminders_paused(False)
             self._alarm_task = self._create_lifecycle_background_task(self._alarm_loop(), label='alarms')
+            # 旧版运行记录（音响输出、摄像头设备目录、按用户的摄像头授权）只补一次；
+            # 关掉这个开关时不再重复尝试。
+            if not self.data.get('legacy_migration_completed'):
+                self._create_lifecycle_background_task(self._migration_loop(), label='legacy-migration')
 
     async def _set_official_reminders_paused(self, paused):
         manager = self._official_cron_manager()

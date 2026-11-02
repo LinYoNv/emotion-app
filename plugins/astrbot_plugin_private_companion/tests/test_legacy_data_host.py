@@ -29,6 +29,32 @@ from tests.native_adapter_support import FakeEvent, FakeProvider, FakeReverseApi
 from tests.test_management_access import NOW
 
 
+class LegacyDataPlanTokenTests(unittest.TestCase):
+    def test_group_selection_order_preserves_plan_but_binding_changes_invalidate_it(self):
+        api = LegacyMigrationWebAPI.__new__(LegacyMigrationWebAPI)
+        data = SimpleNamespace(source_fingerprint="source", reaction_assets=())
+        scope = SimpleNamespace(installation_id="installation", platform="qq", bot_id="bot",
+            account_id="100", kind="private", native_scope_id="200")
+        context = SimpleNamespace(scope=scope,
+            role_binding=SimpleNamespace(role=SimpleNamespace(subject_id="role")))
+        service = SimpleNamespace(reaction_owner=lambda _context: "reaction-owner")
+        mappings = [{"owner_id": "b" * 64, "target_id": "group-b", "role_id": "role-b"},
+                    {"owner_id": "a" * 64, "target_id": "group-a", "role_id": "role-a"}]
+
+        def token(selected):
+            return api._data_plan_token(data, context, service, "", "",
+                memory_group_mappings=selected)
+
+        preview_token = token(mappings)
+        self.assertEqual(preview_token, token(list(reversed(mappings))))
+        self.assertNotEqual(preview_token, token(mappings[:1]))
+        for field, value in (("owner_id", "c" * 64), ("target_id", "another-group"),
+                             ("role_id", "another-role")):
+            with self.subTest(changed_binding=field):
+                changed = [{**mappings[0], field: value}, mappings[1]]
+                self.assertNotEqual(preview_token, token(changed))
+
+
 class LegacyJournalMigrationHostTests(unittest.IsolatedAsyncioTestCase):
     async def test_data_plan_sync_inventory_runs_off_the_event_loop(self):
         import astrbot_host.legacy_api as legacy_api_module

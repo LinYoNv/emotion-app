@@ -28,6 +28,7 @@ class ReplyWebAPI:
                 (PREFIX + "/expression/configure", self.expression_configure, ["POST"],
                  "Save the expression-learning bounds"),
                 (PREFIX + "/style", self.style, ["GET"], "Review learned expression signals"),
+                (PREFIX + "/style/revise", self.style_revise, ["POST"], "Edit a learned expression rule"),
                 (PREFIX + "/style/samples", self.style_samples, ["GET"], "Review original expression samples"),
                 (PREFIX + "/style/samples/command", self.style_sample_command, ["POST"], "Decide an expression sample"),
                 (PREFIX + "/style/learn", self.style_learn, ["POST"], "Learn from this window's eligible samples"),
@@ -42,24 +43,8 @@ class ReplyWebAPI:
                  "Read this window's withdrawn messages within the configured bound")]
 
     def _tts_catalog(self):
-        try:
-            providers = tuple(self.controller.context.get_all_tts_providers())
-        except Exception:
-            return {"state": "unavailable", "providers": []}
-        entries = {}
-        for provider in providers:
-            try:
-                metadata = provider.meta()
-                identifier = metadata.id
-            except Exception:
-                continue
-            if type(identifier) is str and identifier.strip() and len(identifier) <= 128:
-                item = {"id": identifier}
-                model = getattr(metadata, "model", None)
-                if type(model) is str and model.strip():
-                    item["model"] = model.strip()
-                entries[identifier] = item
-        return {"state": "ready", "providers": [entries[identifier] for identifier in sorted(entries)]}
+        from .voice import tts_provider_catalog
+        return tts_provider_catalog(self.controller.context)
 
     async def _run(self, action):
         from .web_api import outcome_response
@@ -111,6 +96,15 @@ class ReplyWebAPI:
                 if result.is_success and action in ("status", "configure"):
                     status = result.value if action == "status" else result.value["status"]
                     status["tts"] = self._tts_catalog()
+                    # 附件解析器是否装好，直接随设置一起下发，理解页不用另开接口。
+                    from .files.parsing import parser_availability
+                    status["documents"] = parser_availability()
+                    try:
+                        from companion_v2.conversation.web_understanding import WebUnderstandingSettings
+                        status["web"] = WebUnderstandingSettings(
+                            session.application.configuration).read(session.profile.target, controller.now())
+                    except Exception:
+                        status["web"] = {}
                 return outcome_response(result)
         except (TaskError, ConfigurationError) as error:
             return outcome_response(Outcome.failed(error.code, str(error)))
@@ -199,11 +193,11 @@ class ReplyWebAPI:
         except (ValueError, TypeError):
             return outcome_response(Outcome.failed("expression_query_invalid", "invalid sample query"))
 
-    async def _sample_action(self, fields, method):
+    async def _sample_action(self, fields, method, *, max_bytes=8192):
         from .web_api import outcome_response
         try:
             raw = await request.body()
-            if len(raw) > 8192 or request.query:
+            if len(raw) > max_bytes or request.query:
                 raise ValueError
             data = json.loads(raw.decode("utf-8"), object_pairs_hook=self._unique_json_pairs,
                               parse_constant=self._reject_nonfinite_json)
@@ -218,6 +212,10 @@ class ReplyWebAPI:
 
     async def style_learn(self):
         return await self._sample_action(set(), "learn")
+
+    async def style_revise(self):
+        return await self._sample_action({"signal_id", "view_token", "operation_key", "changes"}, "revise",
+                                         max_bytes=32768)
 
     @staticmethod
     def _unique_json_pairs(pairs):

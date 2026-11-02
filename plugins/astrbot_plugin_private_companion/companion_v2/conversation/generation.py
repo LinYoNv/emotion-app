@@ -53,30 +53,45 @@ def _without_expression_style_materials(request):
                       if material.purpose not in ("expression_style_context", "expression_style_rule"))
     instruction = request.instruction
     suffix = "\n" + EXPRESSION_STYLE_INSTRUCTION
-    if instruction.endswith(suffix):
-        instruction = instruction[:-len(suffix)]
+    instruction = instruction.replace(suffix, "", 1)
     return replace(request, instruction=instruction, context=replace(request.context, materials=materials))
 
 
-def _filter_expression_style_materials(request, decision):
+def _filter_expression_style_materials(request, decision, *, max_rules=None, allowed_ids=None):
     materials = []
+    selected = 0
     for material in request.context.materials:
         if material.purpose != "expression_style_rule":
             materials.append(material)
             continue
+        if max_rules is not None and selected >= max_rules:
+            continue
         try:
             payload = json.loads(material.payload)
+            if allowed_ids is not None and payload.get("signal_id") not in allowed_ids:
+                continue
             applicability = style_learning.normalize_applicability(payload.get("applicability"))
         except (TypeError, ValueError, AttributeError):
             continue
         if style_learning.laya_intent_matches(applicability, decision):
             materials.append(material)
-    if not any(material.purpose == "expression_style_rule" for material in materials):
+            selected += 1
+    if not selected:
         materials = [material for material in materials if material.purpose != "expression_style_context"]
         suffix = "\n" + EXPRESSION_STYLE_INSTRUCTION
-        if request.instruction.endswith(suffix):
-            return replace(request, instruction=request.instruction[:-len(suffix)],
-                           context=replace(request.context, materials=tuple(materials)))
+        return replace(request, instruction=request.instruction.replace(suffix, "", 1),
+                       context=replace(request.context, materials=tuple(materials)))
+    else:
+        updated = []
+        for material in materials:
+            if material.purpose == "expression_style_context" and material.payload:
+                details = json.loads(material.payload)
+                details["rules_injected"] = selected
+                details["selection_partial"] = selected < details.get("rules_available", selected)
+                material = replace(material, payload=json.dumps(details, ensure_ascii=False,
+                    sort_keys=True, separators=(",", ":")))
+            updated.append(material)
+        materials = updated
     return replace(request, context=replace(request.context, materials=tuple(materials)))
 
 
@@ -280,7 +295,7 @@ class LocalReplyGenerator:
                            + ("\n" + voice.instruction if voice.instruction else "")).strip()
         return replace(request, instruction=instruction + "\n" + request.instruction) if instruction else request
 
-    async def generate(self, run):
+    async def generate(self, run, *, attention_note: str = ""):
         if run.supervisor is not self.messages.tasks:
             raise ValueError("reply generation must use the original supervisor")
         started = perf_counter()
@@ -323,7 +338,13 @@ class LocalReplyGenerator:
             if silent_result is not None:
                 return silent_result
             laya = None
-        request = _filter_expression_style_materials(request, decision if laya is not None else {})
+        captured_style = sealed.get("expression_style") or {}
+        rule_limit = min(captured_style.get("rules_per_turn", expression_policy.rules_per_turn),
+                         expression_policy.rules_per_turn)
+        request = _filter_expression_style_materials(request, decision if laya is not None else {},
+                                                     max_rules=rule_limit)
+        selected_style_ids = frozenset(json.loads(material.payload)["signal_id"]
+            for material in request.context.materials if material.purpose == "expression_style_rule")
         expression_review = (sealed.get("expression_style", {}).get("style_review_enabled", True)
             and expression_policy.style_review_enabled
             and any(item.purpose == "expression_style_rule" for item in request.context.materials))
@@ -458,15 +479,28 @@ class LocalReplyGenerator:
         # Laya can change presentation policy after the first request was
         # assembled. Keep the session's sealed request aligned with the
         # continuation fields used by the generation loop.
+        if attention_note:
+            request = replace(request, instruction=request.instruction + "\n" + attention_note)
         request = replace(request, streaming=streaming, streaming_mode=segmentation.streaming_mode)
         tools = self.messages.tools
         participation = getattr(tools, "group_participation", None)
         tool_catalog, tool_filters = (tools.catalog_for_with_diagnostics(
             run.task.spec.context, run.task.spec.request_ref) if tools else ((), ()))
+        # Pass the catalog unchanged.  ``gateway.open_session()`` is the single
+        # authority on whether this round may offer tools: it decides from the
+        # authoritative resolved plan (not a second route prediction), records
+        # the degradation in the plan audit, and returns the effective catalog
+        # in the session.  Do not pre-filter here: a prediction that sees a
+        # different provider chain can silently remove tools from a plan that
+        # actually supports them (and would read the configuration twice).
         stream_reply = None
         history = ()
         completion = None
         local_failure_notice = False
+        # The exact request of the last model round. Reviews and delivery must
+        # judge the materials the model actually received, not a later rebuild
+        # of the sealed turn (which offers the whole candidate pool).
+        turn_request = request
         try:
             try:
                 session = self.gateway.open_session(run, request, tools=tool_catalog, tool_filters=tool_filters)
@@ -476,6 +510,9 @@ class LocalReplyGenerator:
                     raise
                 local_failure_notice = True
                 voice = None
+                # 这一轮没有进入模型循环，所以循环里的 current 从未赋值。
+                # 兜底文案仍要按本轮封存的请求判断可用的 expression action。
+                current = turn_request
             if (not local_failure_notice and segmentation.enabled and segmentation.streaming_mode == "incremental"
                     and self.send_stream_part is not None and captured is not None and streaming is not False
                     and not (voice is not None and eligible(voice, input_text=input_text,
@@ -531,12 +568,22 @@ class LocalReplyGenerator:
                     current = _prepend_instruction(current, video_service.reply_instruction(captured["settings"]))
                     current = replace(current, native_video_input=True)
                 current = _preserve_turn_instruction(current, request)
+                current = _filter_expression_style_materials(current, decision if laya is not None else {},
+                                                             max_rules=rule_limit,
+                                                             allowed_ids=selected_style_ids)
                 if session.round_no == 8:
                     current = replace(current, instruction=current.instruction +
                         "\n本轮工具已结束。按已有实际结果自然回复，说明未完成部分；不要声称未执行的操作已成功。")
                 if tools is not None:
                     history = tools.refresh_history(self.messages.batch(run.task.spec.request_ref), run.task.spec.context,
                                                     current, history, self.messages.tasks.now())
+                expression_context = self.messages.expression_style_context
+                if expression_context is not None:
+                    try:
+                        expression_context.stage_request(current, run.task.spec.context,
+                            batch_id=run.task.spec.request_ref, at=self.messages.tasks.now())
+                    except Exception as error:
+                        logger.warning("[CompanionV2] 表达使用记录暂未写入 error_type=%s", type(error).__name__)
                 model_started = perf_counter()
                 round_no = session.round_no + 1
                 logger.debug("[CompanionV2][开发者追踪] 回复提示词 batch=%s round=%d role_instruction=%r instruction=%r materials=%r history=%r",
@@ -544,6 +591,7 @@ class LocalReplyGenerator:
                              tuple(material.payload for material in current.context.materials), history)
                 logger.info("[CompanionV2] 回复模型调用开始 batch=%s round=%d preparation_ms=%d",
                             run.task.spec.request_ref, round_no, round((model_started - started) * 1000))
+                turn_request = current
                 generating = session.generate(current, history=history,
                     on_reply_prefix=stream_reply.observe if stream_reply is not None else None,
                     reply_prefix_ready=stream_reply.ready if stream_reply is not None else None,
@@ -596,7 +644,9 @@ class LocalReplyGenerator:
                 review = getattr(self.messages, "expression_draft_review", None)
                 if review is not None:
                     before_review = draft_text
-                    draft_text = await review.review(run, current, completion.draft)
+                    # Only the rules this round actually carried may shape the review;
+                    # the whole candidate pool is not part of the reply.
+                    draft_text = await review.review(run, turn_request, completion.draft)
                     logger.debug("[CompanionV2][开发者追踪] 正文处理 batch=%s stage=expression_review before=%r after=%r",
                                  run.task.spec.request_ref, before_review, draft_text)
             action = getattr(completion.draft, "action", "text")
@@ -718,9 +768,9 @@ class LocalReplyGenerator:
                         connection.execute("""INSERT INTO conversation_voice_parts
                             (part_id, speech, provider_id, delivery_mode, position, timeout_seconds, cooldown_seconds)
                             VALUES (?, ?, ?, ?, ?, ?, ?)""", (part_id, speech[sequence - 1],
-                            policy.provider_for_language(), "voice_only" if action == "voice_only" else policy.delivery_mode,
+                            policy.provider_for_language(run.task.spec.context.scope.kind.value), "voice_only" if action == "voice_only" else policy.delivery_mode,
                             policy.position,
-                            policy.timeout_seconds, policy.cooldown_seconds))
+                            policy.timeout_seconds, policy.cooldown(run.task.spec.context.scope.kind.value)))
                 if images:
                     image_part_id = "part-" + digest([batch_id, image_sequence])
                     self.messages.reply_images.publish(row, run.task.spec.context, image_part_id, images,

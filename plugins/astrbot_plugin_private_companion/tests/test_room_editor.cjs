@@ -242,7 +242,9 @@ test("布局样式与右栏重绘共同守住工作台位置", () => {
   const html = fs.readFileSync(path.join(PAGE, "index.html"), "utf8");
   assert.match(html, /data-detail="arrange"/);
   assert.match(html, /room-editor\.js\?v=/);
-  assert.match(html, /styles\.css\?v=room-editor-v1-cards-/);
+  /* 只要求带缓存戳，不钉死某一轮的名字：布局改版时版本号本来就会换，
+     钉死它会让这条断言在下一次改版时红在一个和「工作台位置」无关的地方。 */
+  assert.match(html, /styles\.css\?v=[\w][\w.-]*/);
   assert.match(html, /app\.js\?v=/);
 });
 

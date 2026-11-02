@@ -1,6 +1,8 @@
 "use strict";
 (() => {
   const $ = (id) => document.getElementById(id);
+  const escapeHTML = value => String(value ?? "").replace(/[&<>"']/g,
+    character => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[character]));
   const candidates = [
     { mode: "multi", prefix: "host" },
   ];
@@ -50,7 +52,7 @@
     host_mappings_required: "请先绑定至少一个 Bot 账号与人格。",
     host_group_delivery_invalid: "群聊发送设置无效，请检查插件的群聊设置。",
     host_capabilities_invalid: "角色能力设置无效，请检查插件的能力配置。",
-    host_provider_required: "请先选择可用的模型连接。",
+    host_provider_required: "AstrBot 暂无可用的文本模型；请先在 AstrBot 模型配置中启用 Provider。",
     host_provider_changed: "模型连接在准备期间发生变化，请刷新状态后重试。",
     host_target_unavailable: "目标窗口不在当前配置中，请刷新并核对角色映射。",
     host_terminated: "插件正在停止或已停止，请重新加载插件后重试。",
@@ -58,13 +60,15 @@
     account_config_running: "角色映射正在应用，请稍候再读取状态。",
     account_config_invalid: "绑定配置不完整或会话来源已变化，请重新核对。",
     account_config_save_failed: "保存失败，请检查插件数据目录是否可写后重试。",
+    account_model_provider_invalid: "共享启动模型请求没有通过校验（与角色映射、会话来源无关），请刷新后重试；若仍失败，请到插件配置里设置模型。",
+    account_model_provider_failed: "共享启动模型保存失败，请刷新状态并检查插件配置后重试。",
     account_session_unavailable: "这个会话已切换或不在当前目录中，请刷新。",
     account_session_persona_pinned: "AstrBot 已固定此会话人格，请在角色映射中调整。",
     account_session_persona_unmapped: "这个人格尚未绑定到当前 Bot，请先添加人格绑定。",
     account_core_window_required: "已确认的核心管理员窗口需要保留。",
     host_must_stop: "当前任务仍在收尾，请稍后保存映射。",
     setup_targets_unavailable: "会话目录暂时不可读取。",
-    host_provider_unavailable: "所选模型连接暂不支持此操作。",
+    host_provider_unavailable: "所选共享启动模型当前不可用，请重新选择。",
     host_control_failed: "角色运行环境准备失败，请查看 AstrBot 日志中的 CompanionV2 异常详情。",
     host_module_unavailable: "插件模块加载失败，请重新加载 V2 插件；若仍失败，请检查安装包并查看 AstrBot 日志。",
     host_native_lookup_timeout: "AstrBot 读取原生状态超时，请刷新状态后重试。",
@@ -134,6 +138,8 @@
   let topologySessionPage = 0;
   let topologySessionFilter = "all";
   let bindingConfig = null;
+  let modelConfig = null;
+  let modelSaving = false;
   let bindingsDirty = false;
   let groupTargetsDirty = false;
   let groupTargetDraft = null;
@@ -143,6 +149,10 @@
   const accountApi = "accounts";
   const TOPOLOGY_SESSION_PAGE_SIZE = 5;
   const TOPOLOGY_PIN_STORAGE_KEY = "astrbot_plugin_private_companion.topology.pinned_sessions";
+  /* One stable colour per AstrBot account keeps two account chains legible. */
+  const TOPOLOGY_ACCOUNT_COLORS = Object.freeze([
+    "#5964d8", "#2f9488", "#c8792f", "#a45bb7", "#c05462", "#3d84c7", "#7b9438",
+  ]);
   let topologyPinnedSessions = readPinnedTopologySessions();
 
   function readPinnedTopologySessions() {
@@ -172,13 +182,17 @@
     const text = String(value ?? "").trim();
     return text || fallback;
   };
-  const platformLabel = value => ({qq:"QQ · OneBot",default:"QQ · OneBot",aiocqhttp:"QQ · OneBot",onebot:"QQ · OneBot"})[value] || "当前平台";
-  const nativeId = value => /^\d+$/.test(String(value || "")) ? String(value) : "";
+  const platformLabel = value => ({qq:"QQ · OneBot",default:"QQ · OneBot",aiocqhttp:"QQ · OneBot",onebot:"QQ · OneBot",qq_official:"QQ 官方机器人",qq_official_webhook:"QQ 官方机器人（Webhook）"})[value] || "当前平台";
+  const nativeId = value => String(value ?? "").trim();
+  const numericId = value => /^\d+$/.test(nativeId(value)) ? nativeId(value) : "";
   const topologyScope = (target) => {
-    const kind = target?.scope_kind === "group" || target?.group_id ? "群" : "私聊";
+    const kind = target?.scope_kind === "group" || target?.group_id ? "群聊" : "私聊";
     const id = nativeId(target.group_id || target.participant_id);
     const name = groupDisplayName(target) || (kind === "私聊" ? String(target.display_name || "").trim() : "");
-    return `${kind} ${name ? name + (id ? `（${id}）` : "") : id || "当前对象"}`;
+    // Numeric OneBot ids are useful beside a nickname; opaque QQ Official
+    // openids are shown only when no human-readable window name is available.
+    const suffix = numericId(id) || (name ? "" : id);
+    return `${kind} ${name ? name + (suffix ? `（${suffix}）` : "") : suffix || "当前对象"}`;
   };
   const accountChoiceLabel = item => {
     const id = nativeId(item.account_id || item.account);
@@ -191,6 +205,29 @@
   };
   const personaName = name => name === "[%None]" ? "未指定人格" : !name ? "未确定人格" : name;
   const personaLabel = item => personaName(item.name || item.personaId);
+  const stripRoleChannel = value => String(value || "").replace(/\s*[-_]\s*(?:私聊|群聊)\s*$/, "").trim();
+  const roleDisplayName = (roleId, personaLabels = []) => {
+    const key = String(roleId || "").trim();
+    if (key && !/^(role-|staging-|dashboard:|onebot-user:)/.test(key))
+      return stripRoleChannel(key) || "当前角色";
+    const labels = [...new Set(personaLabels.map(label =>
+      stripRoleChannel(personaName(label))).filter(Boolean))];
+    return labels.join("、") || key || "当前角色";
+  };
+  const personaSourceLabels = Object.freeze({
+    v2_window_override: "V2 窗口覆盖",
+    astrbot_selection: "AstrBot 当前选择",
+    role_mapping: "仅按角色映射",
+    unresolved: "未确定",
+  });
+  function personaSourceLabel(row) {
+    if (personaSourceLabels[row?.persona_source]) return personaSourceLabels[row.persona_source];
+    if (row?.persona_override) return personaSourceLabels.v2_window_override;
+    if (!row || row.details_available === false || !(row.persona_id || row.persona_override))
+      return personaSourceLabels.unresolved;
+    if (row.persona_pinned === true) return personaSourceLabels.role_mapping;
+    return row.native === true ? personaSourceLabels.astrbot_selection : personaSourceLabels.unresolved;
+  }
   const topologySessionPinKey = row => row?.session_key ? `session:${row.session_key}`
     : row?.managed && row.target_id ? `target:${row.target_id}` : "";
   function personaChoiceLabel(item) {
@@ -215,6 +252,40 @@
       .map(account => [bindingAccountKey(account), {platform_id: account.platform_id,
         account_id: account.account_id, bot_id: account.bot_id}])).values()];
   }
+  function mergeSharedRolePersonas(snapshot) {
+    const personas = new Map(snapshot.personas.map(persona => [persona.key, persona]));
+    const canonicalByKey = new Map();
+    const groups = new Map();
+    for (const persona of personas.values()) {
+      if (!persona.roleId || !persona.personaId) continue;
+      const key = JSON.stringify([persona.roleKey, persona.personaId]);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(persona);
+    }
+    for (const group of groups.values()) {
+      if (group.length < 2) continue;
+      group.sort((left, right) => left.key.localeCompare(right.key));
+      const canonical = group[0];
+      for (const duplicate of group.slice(1)) {
+        canonical.accountKeys = new Set([...canonical.accountKeys, ...duplicate.accountKeys]);
+        canonical.sessionKeys = new Set([...canonical.sessionKeys, ...duplicate.sessionKeys]);
+        canonicalByKey.set(duplicate.key, canonical.key);
+        personas.delete(duplicate.key);
+      }
+    }
+    if (canonicalByKey.size) {
+      const remap = keys => [...new Set([...keys].map(key => canonicalByKey.get(key) || key))];
+      snapshot.roles.forEach(role => { role.personaKeys = new Set(remap(role.personaKeys)); });
+      snapshot.accounts.forEach(account => { account.personaKeys = new Set(remap(account.personaKeys)); });
+      snapshot.sessions.forEach(session => { session.personaKeys = remap(session.personaKeys); });
+      personas.forEach(persona => {
+        persona.accountKeys = new Set(remap(persona.accountKeys));
+        persona.sessionKeys = new Set(remap(persona.sessionKeys));
+      });
+    }
+    return {...snapshot, personas: [...personas.values()]};
+  }
+
   function makeTopologySnapshot() {
     const discovered = bindingConfig?.discovered || {};
     const inventory = Array.isArray(discovered.targets)
@@ -226,11 +297,15 @@
     const personas = new Map();
     const mappedPersonas = new Map();
     const sessions = [];
+    const primaryLinks = (bindingConfig?.window_links || []).filter(link => link.mode === "primary");
+    const hiddenWindowIds = new Set(primaryLinks.flatMap(link => link.alias_target_ids || []));
     const accountKey = target => `account:${JSON.stringify([target.platform_id || "", target.account_id || "", target.bot_id || ""])}`;
     const ensureAccount = target => {
       const key = accountKey(target);
       if (!accounts.has(key)) accounts.set(key, {key, platform_id: target.platform_id || "",
-        account_id: target.account_id || "", bot_id: target.bot_id || "", account_name: target.account_name || "",
+        platform_name: target.platform_name || "", account_id: target.account_id || "",
+        bot_id: target.bot_id || "", account_name: target.account_name || "",
+        color: TOPOLOGY_ACCOUNT_COLORS[accounts.size % TOPOLOGY_ACCOUNT_COLORS.length],
         roleKeys: new Set(), personaKeys: new Set(), sessionKeys: new Set()});
       return accounts.get(key);
     };
@@ -242,7 +317,7 @@
       return personas.get(key);
     };
     const ensureRole = (botId, roleId, name = roleId, mapped = true) => {
-      const key = `role:${JSON.stringify([botId, roleId])}`;
+      const key = roleId ? `role:${roleId}` : `role:unassigned:${botId}`;
       if (!roles.has(key)) roles.set(key, {key, botId, roleId, name, mapped,
         personaKeys: new Set(), accountKeys: new Set(), sessionKeys: new Set()});
       return roles.get(key);
@@ -271,7 +346,12 @@
         role.accountKeys.add(account.key);
       }
     }
+    for (const role of roles.values()) {
+      role.name = roleDisplayName(role.roleId, [...role.personaKeys]
+        .map(key => personas.get(key)?.label || personas.get(key)?.personaId));
+    }
     targets.forEach((target, targetIndex) => {
+      if (hiddenWindowIds.has(String(target.target_id))) return;
       const account = ensureAccount(target);
       const personaId = String(target.persona_override || target.persona_id || "");
       const detailsAvailable = target.details_available !== false;
@@ -281,10 +361,13 @@
       const sessionKey = ["session", displayValue(target.session_key || target.target_id, `${target.scope_kind || "target"}-${targetIndex}`)].join(":");
       const session = {key: sessionKey, targetId: displayValue(target.target_id, `窗口 ${targetIndex + 1}`),
         label: topologyScope(target), scopeKind: target.scope_kind === "group" || target.group_id ? "group" : "private",
-        accountKey: account.key, accountLabel: accountChoiceLabel(account), personaKeys: persona ? [persona.key] : [],
+        accountKey: account.key, accountColor: account.color,
+        accountLabel: accountChoiceLabel(account), platformName: account.platform_name || "",
+        personaKeys: persona ? [persona.key] : [],
         roleKey: mapping?.roleKey || "",
         roleId: mapping?.roleId || "", registered: Boolean(mapping) && target.managed === true && !bindingsDirty,
         draft: Boolean(mapping) && bindingsDirty,
+        mergedAliases: primaryLinks.find(link => link.primary_target_id === String(target.target_id))?.alias_target_ids?.length || 0,
         pinKey: topologySessionPinKey(target), platform: account.platform_id, raw: target};
       sessions.push(session);
       if (persona) persona.sessionKeys.add(sessionKey);
@@ -307,9 +390,11 @@
         if (session) session.roleKey = role.key;
       }
     }
-    sessions.sort((left, right) => Number(topologyPinnedSessions.has(right.pinKey))
+    const snapshot = mergeSharedRolePersonas({accounts: [...accounts.values()], roles: [...roles.values()],
+      personas: [...personas.values()], sessions});
+    snapshot.sessions.sort((left, right) => Number(topologyPinnedSessions.has(right.pinKey))
       - Number(topologyPinnedSessions.has(left.pinKey)));
-    return {accounts: [...accounts.values()], roles: [...roles.values()], personas: [...personas.values()], sessions};
+    return snapshot;
   }
 
   function topologyItems(data) {
@@ -418,11 +503,11 @@
     badge.className = `topology-node-badge${item.scopeKind === "group" ? " group" : ""}${isPinned ? " pinned" : ""}`;
     badge.textContent = kind === "account" ? `${mappedRoleCount(item)} 个角色`
       : kind === "persona" ? `${item.sessionKeys.size} 个窗口`
-        : `${isPinned ? "置顶 · " : ""}${item.scopeKind === "group" ? "群聊" : "私聊"}`;
+        : `${isPinned ? "置顶 · " : ""}${item.scopeKind === "group" ? "群聊" : "私聊"}${item.mergedAliases ? ` · 已合并 ${item.mergedAliases}` : ""}`;
     head.append(title, badge);
     const meta = document.createElement("span");
     meta.className = "topology-node-meta";
-    if (kind === "account") meta.textContent = `${platformLabel(item.platform_id)} · Bot ${item.bot_id || "未标记"}`;
+    if (kind === "account") meta.textContent = `${platformLabel(item.platform_name || item.platform_id)} · Bot ${item.bot_id || "未标记"}`;
     else if (kind === "persona") meta.textContent = "AstrBot 人格";
     else meta.textContent = item.raw.unified_msg_origin?.split(":").pop().includes("_") ? "分成员会话" : item.scopeKind === "group" ? "群聊窗口" : "私聊窗口";
     const detail = document.createElement("span");
@@ -430,12 +515,26 @@
     if (kind === "account") detail.textContent = `${item.sessionKeys.size} 个原生会话窗口`;
     else if (kind === "persona") detail.textContent = item.roleId
       ? bindingsDirty ? "角色映射尚未保存" : "随角色自动接入窗口" : "归入角色后自动运行";
-    else detail.textContent = item.raw.details_available === false
-      ? "详情暂未读到；账号与人格未推断"
-      : `${item.draft ? "角色映射尚未保存" : item.registered ? "随角色自动运行" : "等待归入角色"}${item.raw.native
-        ? item.raw.session_enabled === false ? " · 会话已停用" : item.raw.llm_enabled === false ? " · 回复已关闭" : " · 回复已开启" : ""}`;
+    else {
+      const row = item.raw;
+      const selectedPersona = item.personaKeys.map(key =>
+        topologySnapshot?.personas.find(persona => persona.key === key)).find(Boolean);
+      const persona = row.details_available === false ? "未确定人格"
+        : personaLabel(selectedPersona || {personaId: row.persona_override || row.persona_id});
+      const role = item.roleId
+        ? topologySnapshot?.roles.find(entry => entry.key === item.roleKey)?.name || roleDisplayName(item.roleId)
+        : "未归入角色";
+      const mapping = item.draft ? "角色映射未保存" : item.registered ? "随角色运行"
+        : row.details_available === false ? "详情未读到" : "等待归入角色";
+      const runtime = row.native
+        ? row.session_enabled === false ? "会话已停用" : row.llm_enabled === false ? "回复已关闭" : "回复已开启"
+        : "尚未建立 AstrBot 会话";
+      detail.textContent = `人格 ${persona} → 角色 ${role} · 来源：${personaSourceLabel(row)} · ${mapping} · ${runtime}`;
+    }
     button.append(head, meta, detail);
     button.style.setProperty("--node-index", String(index));
+    const accountColor = kind === "account" ? item.color : kind === "session" ? item.accountColor : "";
+    if (accountColor) button.style.setProperty("--account-color", accountColor);
     wireTopologyControl(button, item, kind);
     return button;
   }
@@ -483,6 +582,7 @@
     count.textContent = `${personas.length} 个人格`;
     heading.append(title, count);
     wireTopologyControl(heading, role, "role");
+    if (role.mapped && role.name !== role.roleId) heading.title += " · 内部标识 " + role.roleId;
     const list = document.createElement("div");
     list.className = "topology-personas";
     list.append(...personas.map((persona, personaIndex) => topologyNode(persona, "persona", index + personaIndex)));
@@ -490,7 +590,7 @@
     return group;
   }
 
-  function renderTopologySessions(data) {
+  function renderTopologySessions(data, {resetScroll = false} = {}) {
     const list = $("topology-sessions");
     const pagination = $("topology-session-pagination");
     const previous = $("topology-session-prev");
@@ -517,6 +617,7 @@
       empty.textContent = topologySessionFilter === "group" ? "没有群聊窗口" : "没有私聊窗口";
       list.replaceChildren(empty);
     }
+    if (resetScroll) list.scrollTop = 0;
     const paged = pageCount > 1;
     pagination.hidden = !paged;
     pageLabel.textContent = paged
@@ -539,7 +640,7 @@
     topologySessionPage = nextPage;
     topologyHover = null;
     if (topologySelection?.startsWith("session:")) topologySelection = null;
-    renderTopologySessions(topologySnapshot);
+    renderTopologySessions(topologySnapshot, {resetScroll: true});
     scheduleTopologyLinks();
   }
 
@@ -552,15 +653,33 @@
     const width = Math.max(1, canvasRect.width);
     const height = Math.max(1, canvasRect.height);
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-    svg.replaceChildren();
     const nodes = [...canvas.querySelectorAll(".topology-node")];
     const find = (key) => nodes.find((node) => node.dataset.topologyKey === key);
+    const existing = new Map([...svg.querySelectorAll(".topology-line")].map(line =>
+      [JSON.stringify([line.dataset.topologySource, line.dataset.topologyTarget]), line]));
+    const retained = new Set();
+    const visibleRect = node => {
+      const rect = node.getBoundingClientRect();
+      const list = node.closest(".topology-session-list");
+      if (!list) return rect;
+      const viewport = list.getBoundingClientRect();
+      const left = Math.max(rect.left, viewport.left);
+      const right = Math.min(rect.right, viewport.right);
+      const top = Math.max(rect.top, viewport.top);
+      const bottom = Math.min(rect.bottom, viewport.bottom);
+      // A card can exist on this page while being clipped by the scroll list.
+      if (right <= left || bottom <= top) return null;
+      return {left, right, top, bottom, width: right - left, height: bottom - top};
+    };
+    const accountColors = new Map((data.accounts || []).map(account => [account.key, account.color]));
     const connections = [];
     data.personas.forEach((persona) => {
-      persona.accountKeys.forEach((key) => connections.push([key, persona.key]));
+      persona.accountKeys.forEach((key) => connections.push({sourceKey: key, targetKey: persona.key,
+        accountKey: key}));
     });
     data.sessions.forEach((session) => {
-      session.personaKeys.forEach(key => connections.push([key, session.key]));
+      session.personaKeys.forEach(key => connections.push({sourceKey: key, targetKey: session.key,
+        accountKey: session.accountKey}));
     });
     const port = (from, to) => {
       const horizontalRight = to.left >= from.right - 4;
@@ -574,24 +693,35 @@
       return [[from.left - canvasRect.left + from.width / 2, from.top - canvasRect.top],
         [to.left - canvasRect.left + to.width / 2, to.bottom - canvasRect.top], true];
     };
-    connections.forEach(([sourceKey, targetKey], lineIndex) => {
+    connections.forEach(({sourceKey, targetKey, accountKey}, lineIndex) => {
       const source = find(sourceKey);
       const target = find(targetKey);
       if (!source || !target) return;
-      const [start, end, vertical] = port(source.getBoundingClientRect(), target.getBoundingClientRect());
+      const sourceRect = visibleRect(source);
+      const targetRect = visibleRect(target);
+      if (!sourceRect || !targetRect) return;
+      const [start, end, vertical] = port(sourceRect, targetRect);
       const distance = vertical ? Math.max(18, Math.abs(end[1] - start[1]) * .42)
         : Math.max(22, Math.abs(end[0] - start[0]) * .42);
-      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-      path.classList.add("topology-line");
-      path.dataset.topologySource = sourceKey;
-      path.dataset.topologyTarget = targetKey;
-      path.setAttribute("pathLength", "1");
-      path.style.setProperty("--line-delay", `${Math.min(lineIndex * 48, 240)}ms`);
+      const key = JSON.stringify([sourceKey, targetKey]);
+      let path = existing.get(key);
+      if (!path) {
+        path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        path.classList.add("topology-line");
+        path.dataset.topologySource = sourceKey;
+        path.dataset.topologyTarget = targetKey;
+        path.setAttribute("pathLength", "1");
+        path.style.setProperty("--line-delay", `${Math.min(lineIndex * 48, 240)}ms`);
+        svg.append(path);
+      }
+      path.style.setProperty("--topology-account-color",
+        accountColors.get(accountKey) || "var(--accent)");
+      retained.add(path);
       path.setAttribute("d", vertical
         ? `M ${start[0]} ${start[1]} C ${start[0]} ${start[1] + distance}, ${end[0]} ${end[1] - distance}, ${end[0]} ${end[1]}`
         : `M ${start[0]} ${start[1]} C ${start[0] + distance} ${start[1]}, ${end[0] - distance} ${end[1]}, ${end[0]} ${end[1]}`);
-      svg.append(path);
     });
+    for (const line of existing.values()) if (!retained.has(line)) line.remove();
     paintTopologySelection(false);
   }
 
@@ -615,6 +745,7 @@
     topologyHover = null;
     const hasTopology = data.accounts.length > 0 || data.roles.length > 0 || data.sessions.length > 0;
     mode.textContent = "账号与会话链路";
+    mode.title = hasTopology ? "连线与账号卡片的侧边色条对应不同 AstrBot 账号" : "";
     mode.dataset.state = hasTopology ? "ready" : "empty";
     counts.textContent = hasTopology
       ? `${data.accounts.length} 个账号 · ${data.roles.filter(role => role.mapped).length} 个角色 · ${data.sessions.length} 个窗口`
@@ -650,9 +781,90 @@
       : topologySnapshot.sessions.filter(item => item.scopeKind === topologySessionFilter);
     const index = filtered.findIndex((row) => row.key === key);
     topologySessionPage = Math.max(0, Math.floor(index / TOPOLOGY_SESSION_PAGE_SIZE));
-    renderTopologySessions(topologySnapshot);
+    renderTopologySessions(topologySnapshot, {resetScroll: true});
     scheduleTopologyLinks();
     paintTopologySelection();
+  }
+
+  let windowLinkTargetId = "";
+  function windowLinkFor(targetId) {
+    return (bindingConfig?.window_links || []).find(link =>
+      link.primary_target_id === targetId || (link.alias_target_ids || []).includes(targetId)) || null;
+  }
+  function renderWindowLink(item) {
+    const panel = $("session-window-link");
+    if (!panel) return;
+    const isPrivate = item.kind === "session" && item.scopeKind === "private";
+    panel.hidden = !isPrivate;
+    if (!isPrivate) { windowLinkTargetId = ""; return; }
+    const targetId = String(item.targetId || "");
+    windowLinkTargetId = targetId;
+    const link = windowLinkFor(targetId);
+    const primaryMode = link?.mode === "primary";
+    const select = $("window-link-aliases");
+    const mode = $("window-link-mode");
+    const save = $("window-link-save");
+    const unlink = $("window-link-unlink");
+    const state = $("window-link-state");
+    const aliases = (topologySnapshot?.sessions || []).filter(row => row.scopeKind === "private"
+      && String(row.targetId || "") !== targetId
+      && !((bindingConfig?.window_links || []).some(other => other.primary_target_id !== targetId
+        && (other.alias_target_ids || []).includes(row.targetId))));
+    select.replaceChildren(...aliases.map(row => {
+      const option = document.createElement("option");
+      option.value = row.targetId;
+      option.textContent = row.label;
+      return option;
+    }));
+    save.disabled = !aliases.length || busy;
+    if (link) {
+      const primary = topologySnapshot?.sessions.find(row => row.targetId === link.primary_target_id);
+      const names = (link.alias_target_ids || []).map(alias =>
+        topologySnapshot?.sessions.find(row => row.targetId === alias)?.label || alias);
+      if (link.primary_target_id === targetId) {
+        state.textContent = `当前窗口是主窗口，已合并 ${names.length} 个窗口：${names.join("、") || "—"}。${primaryMode ? "回复统一到当前窗口。" : "只共享角色，回复仍回各自窗口。"}`;
+        unlink.hidden = false;
+      } else {
+        state.textContent = `当前窗口已合并到「${primary?.label || link.primary_target_id}」， ${primaryMode ? "消息由主窗口统一回复。" : "角色和记忆共享，回复仍在当前窗口。"}`;
+        unlink.hidden = false;
+      }
+    } else {
+      state.textContent = aliases.length ? "选择要合并的窗口和合并方式。" : "没有其他可合并的私聊窗口。";
+      unlink.hidden = true;
+    }
+    mode.disabled = Boolean(link && link.primary_target_id !== targetId);
+    select.disabled = Boolean(link && link.primary_target_id !== targetId);
+    save.hidden = Boolean(link && link.primary_target_id !== targetId);
+    unlink.dataset.primaryTargetId = link?.primary_target_id || "";
+  }
+  async function saveWindowLink() {
+    if (busy || !windowLinkTargetId) return;
+    const aliases = [...($("window-link-aliases")?.selectedOptions || [])].map(option => option.value);
+    const mode = $("window-link-mode")?.value || "role";
+    if (!aliases.length) { notice("请选择至少一个要合并的窗口。", "error"); return; }
+    setBusy(true);
+    try {
+      await api("POST", `${accountApi}/window-link`, {primary_target_id: windowLinkTargetId,
+        alias_target_ids: aliases, mode}, 60000);
+      await readBindingConfig();
+      try { await readStatus(); } catch { /* configuration is already saved */ }
+      notice(mode === "primary" ? "窗口已合并，回复和主动联系将由主窗口接管。" : "窗口已合并，只共享角色与记忆。", "success");
+    } catch (error) {
+      notice(`窗口合并未完成：${publicError(error)}`, "error");
+    } finally { setBusy(false); renderTopology(); }
+  }
+  async function unlinkWindow() {
+    const primary = $("window-link-unlink")?.dataset.primaryTargetId;
+    if (busy || !primary) return;
+    setBusy(true);
+    try {
+      await api("POST", `${accountApi}/window-unlink`, {primary_target_id: primary}, 60000);
+      await readBindingConfig();
+      try { await readStatus(); } catch { /* configuration is already saved */ }
+      notice("窗口合并已解除。", "success");
+    } catch (error) {
+      notice(`解除合并未完成：${publicError(error)}`, "error");
+    } finally { setBusy(false); renderTopology(); }
   }
 
   function renderSessionManager() {
@@ -669,14 +881,15 @@
     pinButton.textContent = isPinned ? "取消置顶" : "置顶窗口";
     pinButton.setAttribute("aria-pressed", String(isPinned));
     pinButton.disabled = busy;
+    renderWindowLink(item);
     const related = $("session-manager-related");
     related.replaceChildren();
     renderGroupNetwork(item.kind === "session" ? item.raw : null);
     $("session-manager-state").textContent = "";
     if (item.kind !== "session") {
       $("session-manager-meta").textContent = item.kind === "account"
-        ? `${platformLabel(item.platform_id)} · ${mappedRoleCount(item)} 个角色 · ${item.sessionKeys.size} 个原生会话`
-        : item.kind === "persona" ? `${item.roleId ? `角色 ${item.roleId}` : "未归入角色"} · ${item.sessionKeys.size} 个会话窗口`
+        ? `${platformLabel(item.platform_name || item.platform_id)} · ${mappedRoleCount(item)} 个角色 · ${item.sessionKeys.size} 个原生会话`
+        : item.kind === "persona" ? `${item.roleId ? `角色 ${topologySnapshot.roles.find(role => role.key === item.roleKey)?.name || item.roleId}` : "未归入角色"} · ${item.sessionKeys.size} 个会话窗口`
           : `${item.personaKeys.size} 个 AstrBot 人格 · ${item.accountKeys.size} 个账号 · ${item.sessionKeys.size} 个会话窗口`;
       const appendRelated = (label, key) => {
         const button = document.createElement("button");
@@ -708,10 +921,18 @@
     }
     const row = item.raw;
     const account = topologySnapshot.accounts.find(entry => entry.key === item.accountKey);
-    $("session-manager-meta").textContent = `${platformLabel(item.platform)} · ${accountChoiceLabel(account || {})}`;
-    $("session-manager-state").textContent = !row.native ? "尚未建立 AstrBot 会话"
+    const selectedPersona = item.personaKeys.map(key =>
+      topologySnapshot.personas.find(persona => persona.key === key)).find(Boolean);
+    const persona = row.details_available === false ? "未确定人格"
+      : personaLabel(selectedPersona || {personaId: row.persona_override || row.persona_id});
+    const mappedRole = item.roleId
+      ? topologySnapshot.roles.find(entry => entry.key === item.roleKey)?.name || roleDisplayName(item.roleId)
+      : "未归入角色";
+    $("session-manager-meta").textContent = `${platformLabel(item.platformName || item.raw?.platform_name || item.platform)} · ${accountChoiceLabel(account || {})} · ${item.label}`;
+    const mappingState = !row.native ? "尚未建立 AstrBot 会话"
       : item.draft ? "角色映射尚未保存" : item.registered ? "已归入角色，随角色自动运行"
         : "AstrBot 已发现，等待账号下的人格归入角色";
+    $("session-manager-state").textContent = `人格 ${persona} → 角色 ${mappedRole} · 来源：${personaSourceLabel(row)} · ${mappingState}`;
   }
 
   function renderGroupNetwork(row) {
@@ -1034,7 +1255,99 @@
     element.hidden = !text;
   }
   function stateLabel(value) {
+    if (value === "uninitialized" && isEnabled()) {
+      return hasSavedRoleMappings() ? "角色已映射，等待准备" : "等待角色映射";
+    }
     return ({ running: "运行中", new: "正在准备", stopped: "已停止", uninitialized: "等待角色映射", unloaded: "正在准备" })[value] || "状态待核对";
+  }
+  function hasSavedRoleMappings() {
+    return (status?.targets || []).some(target => Array.isArray(target?.roles) && target.roles.length > 0);
+  }
+  function modelProviderName(providerId) {
+    const config = modelConfig || {};
+    return config.providers?.find(item => item.id === providerId)?.name || providerId || "未选择";
+  }
+  function renderSharedModel() {
+    const select = $("shared-model-provider"), save = $("save-shared-model"), note = $("shared-model-note");
+    if (!select || !save || !note) return;
+    if (!modelConfig) {
+      select.innerHTML = `<option value="">正在读取模型连接…</option>`;
+      select.disabled = true; save.disabled = true;
+      note.textContent = "正在读取已加载的模型连接…";
+      note.dataset.kind = "info";
+      return;
+    }
+    const providers = Array.isArray(modelConfig?.providers) ? modelConfig.providers : [];
+    const current = String(modelConfig?.provider_id || "");
+    const configured = String(modelConfig?.configured_provider_id || "");
+    const source = String(modelConfig?.provider_source || "");
+    const previous = select.value;
+    select.innerHTML = `<option value="">请选择已加载的文本模型</option>${providers.map(provider => {
+      const name = String(provider.name || "");
+      const label = name && name !== provider.id
+        ? `${escapeHTML(name)}（${escapeHTML(provider.id)}）` : escapeHTML(provider.id);
+      return `<option value="${escapeHTML(provider.id)}">${label}</option>`;
+    }).join("")}`;
+    const desired = providers.some(item => item.id === previous) ? previous
+      : providers.some(item => item.id === current) ? current : "";
+    select.value = desired;
+    select.disabled = busy || modelSaving || !providers.length;
+    save.disabled = busy || modelSaving || !providers.length || !select.value;
+    save.textContent = source === "auto" ? "固定启动模型" : "保存启动模型";
+    if (!providers.length) {
+      note.textContent = "AstrBot 没有读取到已加载的文本模型。请先在 AstrBot 模型配置中添加并启用一个 Provider。";
+      note.dataset.kind = "error";
+    } else if (!current) {
+      note.textContent = "尚未选择插件启动模型。先在这里保存，角色映射才能准备启动；启动后再到「模型与连接」细调任务路由。";
+      note.dataset.kind = "info";
+    } else if (source === "fallback") {
+      note.textContent = "已保存的启动模型不可用，已自动改用 AstrBot 当前模型。";
+      note.dataset.kind = "info";
+    } else if (source === "auto") {
+      note.textContent = "已自动跟随 AstrBot 当前模型；无需手动保存，可直接准备并启动。";
+      note.dataset.kind = "info";
+    } else if (!providers.some(item => item.id === current)) {
+      note.textContent = `已保存的启动模型 ${current} 当前不可用，请重新选择。`;
+      note.dataset.kind = "error";
+    } else {
+      const running = isAccepting() || status?.state === "running";
+      note.textContent = running
+        ? `当前启动模型：${modelProviderName(current)}。宿主已在运行，保存后将在下次启动或重载时生效。`
+        : `当前启动模型：${modelProviderName(current)}。保存角色映射后即可点「准备并启动」。`;
+      note.dataset.kind = "info";
+    }
+  }
+  async function saveSharedModel() {
+    if (busy || modelSaving) return;
+    const select = $("shared-model-provider"), button = $("save-shared-model");
+    const providerId = String(select?.value || "");
+    if (!providerId) { notice("请先选择一个已加载的文本模型。", "error"); return; }
+    modelSaving = true;
+    setLoading(button, true);
+    setBusy(true);
+    notice("正在保存共享模型连接…", "info");
+    try {
+      const result = await api("POST", `${accountApi}/model-provider`, {provider_id: providerId}, 60000);
+      if (result?.model) modelConfig = result.model;
+      let refreshed = true;
+      try { await readStatus(); } catch { refreshed = false; }
+      if (!refreshed) {
+        notice("共享模型已保存；运行状态暂未读到，请点「刷新状态」核对后再准备启动。", "info");
+      } else if (result?.prepared) {
+        notice("共享模型已保存，角色运行环境已准备。现在可以点「准备并启动」。", "success");
+      } else if (result?.initialization_error) {
+        notice(`共享模型已保存；角色运行环境尚未就绪：${failureMessage(result.initialization_error)}。请先完成角色映射，再点「准备并启动」。`, "info");
+      } else {
+        notice("共享模型已保存。请点「准备并启动」完成角色准备。", "success");
+      }
+    } catch (error) {
+      notice(`共享模型保存未完成：${publicError(error)}`, "error");
+    } finally {
+      modelSaving = false;
+      setBusy(false);
+      setLoading(button, false);
+      renderSharedModel();
+    }
   }
   function isAccepting() { return Boolean(status?.accepting); }
   function isEnabled() {
@@ -1053,9 +1366,7 @@
     if (!personaId) return false;
     return targets.some(target => target?.native && String(target.bot_id || "") === String(persona.bot_id || "")
       && (!account || (target.platform_id === account.platform_id && target.account_id === account.account_id))
-      && (String(target.persona_id ?? "") === personaId
-        || String(target.persona_override || "") === personaId
-        || (target.roles || []).some(role => (role.persona_ids || []).map(String).includes(personaId))));
+      && String(target.persona_override || target.persona_id || "") === personaId);
   }
 
   function roleBindingCard(account, roleId = "", mappings = []) {
@@ -1072,6 +1383,7 @@
     input.value = roleId;
     input.placeholder = "角色名";
     input.setAttribute("aria-label", "角色名");
+    input.title = roleId;
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "button button-quiet binding-remove";
@@ -1080,7 +1392,23 @@
       const owner = card.closest(".account-binding-card");
       card.remove(); markBindingsDirty(owner);
     });
-    heading.append(input, remove);
+    const personaLabels = mappings.map(row => {
+      const native = (bindingConfig?.discovered?.personas || []).find(choice =>
+        choice.bot_id === row.bot_id && choice.persona_id === row.persona_id);
+      return native?.label || row.persona_id;
+    });
+    const displayName = roleDisplayName(roleId, personaLabels);
+    if (roleId && displayName !== roleId) {
+      const identity = document.createElement("div");
+      identity.className = "role-binding-identity";
+      const name = document.createElement("strong");
+      name.textContent = displayName;
+      const hint = document.createElement("small");
+      hint.textContent = "内部标识 · 保留以继续关联已有资料";
+      input.setAttribute("aria-label", "内部角色标识");
+      identity.append(name, input, hint);
+      heading.append(identity, remove);
+    } else heading.append(input, remove);
     const choices = document.createElement("div");
     choices.className = "role-persona-choices";
     const selected = new Set(mappings.map(row => nativePersonaKey(row.bot_id, row.persona_id)));
@@ -1135,7 +1463,7 @@
     const title = document.createElement("strong");
     title.textContent = accountChoiceLabel(account);
     const meta = document.createElement("small");
-    meta.textContent = `${platformLabel(account.platform_id)} · Bot ${account.bot_id || "未标记"}`;
+    meta.textContent = `${platformLabel(account.platform_name || account.platform_id)} · Bot ${account.bot_id || "未标记"}`;
     const add = document.createElement("button");
     add.type = "button";
     add.className = "button button-quiet";
@@ -1216,6 +1544,7 @@
   function renderBindingEditor(data) {
     if (!data) return;
     bindingConfig = data;
+    if (data.model) modelConfig = data.model;
     const discovered = data.discovered || {}, accounts = discovered.accounts || data.accounts || [];
     const accountByKey = new Map(accounts.map(x => [`${x.platform_id}|${x.account_id}|${x.bot_id}`, x]));
     bindingConfig._accountByKey = accountByKey;
@@ -1237,6 +1566,7 @@
     updateBindingCheck();
     renderGroupTargets();
     renderTopology();
+    renderSharedModel();
   }
 
   const groupRouteKey = row => JSON.stringify([row.platform_id || "", row.account_id || "",
@@ -1279,9 +1609,13 @@
       || left.group_id.localeCompare(right.group_id, undefined, {numeric: true}));
   }
   function selectedGroupTargets() {
-    return [...$("group-target-list").querySelectorAll("[data-group-target-choice]:checked")]
+    const explicit = [...$("group-target-list").querySelectorAll("[data-group-target-choice]:checked")]
       .map(input => ({platform_id: input.dataset.platformId, account_id: input.dataset.accountId,
         bot_id: input.dataset.botId, group_id: input.dataset.groupId}));
+    const wildcard = [...$("group-target-list").querySelectorAll("[data-group-wildcard-choice]:checked")]
+      .map(input => ({platform_id: input.dataset.platformId, account_id: input.dataset.accountId,
+        bot_id: input.dataset.botId, group_id: "*"}));
+    return [...wildcard, ...explicit];
   }
   const sameGroupTargets = (left, right) => JSON.stringify(left.map(groupRouteKey).sort())
     === JSON.stringify(right.map(groupRouteKey).sort());
@@ -1292,19 +1626,20 @@
     updateGroupTargetControls();
   }
   function updateGroupTargetControls() {
-    const inputs = [...$("group-target-list").querySelectorAll("[data-group-target-choice]")];
+    const inputs = [...$("group-target-list").querySelectorAll(
+      "[data-group-target-choice],[data-group-wildcard-choice]")];
     const selected = selectedGroupTargets();
     const current = (bindingConfig?.groups || []).map(row => ({platform_id: row.platform_id,
       account_id: row.account_id, bot_id: row.bot_id, group_id: row.group_id}));
     const changed = !sameGroupTargets(selected, current);
-    const wildcard = current.some(row => row.group_id === "*");
+    const wildcard = selected.some(row => row.group_id === "*");
     const unresolvedSelection = inputs.some(input => input.checked && input.dataset.routeReady !== "true");
     $("group-target-count").textContent = `${selected.length} / ${inputs.length} 个已选`;
     $("group-target-state").textContent = bindingsDirty
       ? "先保存角色映射，再修改群目标。"
       : groupTargetsDirty ? "群目标选择尚未保存。"
-        : wildcard ? "当前含通配群目标；保存后将只保留明确选择的群。"
-        : `${current.filter(row => row.group_id !== "*").length} 个群目标已启用。`;
+        : wildcard ? "当前包含通配群目标：该账号下所有群都会接入 V2。"
+        : selected.length ? `${selected.length} 个群目标已启用。` : "当前没有启用群目标。";
     $("save-group-targets").disabled = busy || bindingsDirty || !changed || unresolvedSelection;
     $("save-group-targets").textContent = `保存群目标${selected.length ? `（${selected.length}）` : ""}`;
     for (const input of inputs) input.disabled = busy || bindingsDirty || input.dataset.routeReady !== "true";
@@ -1315,27 +1650,62 @@
     if (!panel || !list) return;
     const configured = bindingConfig?.groups || [];
     const rows = groupTargetRows();
+    const wildcardRows = (bindingConfig?.accounts || []).map(account => ({
+      platform_id: account.platform_id, account_id: account.account_id, bot_id: account.bot_id,
+      group_id: "*", display_name: "该账号下所有群", group_name: "该账号下所有群",
+      account, native: false, wildcard: true,
+    })).filter(row => row.platform_id && row.account_id && row.bot_id);
     if (groupTargetsDirty) {
       const keys = new Set(rows.map(groupRouteKey));
       for (const row of groupTargetDraft || []) {
-        if (!keys.has(groupRouteKey(row))) rows.push({...row, native: false});
+        if (row.group_id !== "*" && !keys.has(groupRouteKey(row))) rows.push({...row, native: false});
       }
     }
-    panel.hidden = !rows.length && !configured.length;
+    panel.hidden = !rows.length && !wildcardRows.length && !configured.length;
     if (panel.hidden) return;
-    const selected = new Set((groupTargetsDirty ? groupTargetDraft || []
-      : configured.filter(row => row.group_id !== "*")).map(groupRouteKey));
-    const wildcard = configured.some(row => row.group_id === "*");
-    $("group-target-note").textContent = wildcard
-      ? "当前配置包含通配群目标。勾选要接入的群并保存后，其他群将不再接入。"
+    const selectedRows = groupTargetsDirty ? groupTargetDraft || [] : configured;
+    const selected = new Set(selectedRows.filter(row => row.group_id !== "*").map(groupRouteKey));
+    const wildcardSelected = new Set(selectedRows.filter(row => row.group_id === "*").map(groupRouteKey));
+    $("group-target-note").textContent = wildcardRows.length
+      ? "勾选「该账号下所有群」后，这个账号下新出现的群也会自动接入；勾选明确群目标会取消同一账号的通配。"
       : rows.length ? "未勾选的群不会接入 V2 群聊。" : "没有已发现的群；保存空列表可移除现有群目标。";
-    if (!rows.length) {
+    const children = [];
+    for (const row of wildcardRows) {
+      const label = document.createElement("label");
+      label.className = "group-target-row group-target-wildcard";
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.dataset.groupWildcardChoice = "";
+      input.dataset.platformId = row.platform_id;
+      input.dataset.accountId = row.account_id;
+      input.dataset.botId = row.bot_id;
+      input.dataset.groupId = "*";
+      input.dataset.routeReady = "true";
+      input.checked = wildcardSelected.has(groupRouteKey(row));
+      const copy = document.createElement("span");
+      copy.className = "group-target-copy";
+      appendText(copy, "strong", "该账号下所有群（通配）");
+      appendText(copy, "small", `${row.account ? accountChoiceLabel(row.account) : "账号待确认"} · 含后续新建或改名的群`);
+      input.addEventListener("change", () => {
+        if (input.checked) {
+          for (const peer of list.querySelectorAll("[data-group-target-choice]")) {
+            if (peer.dataset.platformId === input.dataset.platformId
+                && peer.dataset.accountId === input.dataset.accountId
+                && peer.dataset.botId === input.dataset.botId) peer.checked = false;
+          }
+        }
+        markGroupTargetsDirty();
+      });
+      label.append(input, copy);
+      children.push(label);
+    }
+    if (!rows.length && !wildcardRows.length) {
       const empty = document.createElement("p");
       empty.className = "group-target-empty";
       empty.textContent = "当前没有可选群会话。";
-      list.replaceChildren(empty);
+      children.push(empty);
     } else {
-      list.replaceChildren(...rows.map(row => {
+      for (const row of rows) {
         const label = document.createElement("label");
         label.className = "group-target-row";
         const input = document.createElement("input");
@@ -1352,11 +1722,21 @@
         const name = groupDisplayName(row);
         appendText(copy, "strong", name ? `群 ${name}` : `群 ${row.group_id}`);
         appendText(copy, "small", `${name ? `群号 ${row.group_id} · ` : ""}${row.account ? accountChoiceLabel(row.account) : "账号待确认"} · ${row.native ? "已发现" : "当前已启用，暂未发现"}`);
+        input.addEventListener("change", () => {
+          if (input.checked) {
+            for (const wildcard of list.querySelectorAll("[data-group-wildcard-choice]")) {
+              if (wildcard.dataset.platformId === input.dataset.platformId
+                  && wildcard.dataset.accountId === input.dataset.accountId
+                  && wildcard.dataset.botId === input.dataset.botId) wildcard.checked = false;
+            }
+          }
+          markGroupTargetsDirty();
+        });
         label.append(input, copy);
-        input.addEventListener("change", markGroupTargetsDirty);
-        return label;
-      }));
+        children.push(label);
+      }
     }
+    list.replaceChildren(...children);
     updateGroupTargetControls();
   }
   async function saveGroupTargets() {
@@ -1389,7 +1769,9 @@
       groupTargetsDirty = false;
       groupTargetDraft = null;
       renderGroupTargets();
-      notice(`群目标已保存并启用 ${groups.length} 个群。`, "success");
+      notice(groups.some(row => row.group_id === "*")
+        ? "群目标已保存：该账号下所有群都会接入 V2。"
+        : `群目标已保存并启用 ${groups.length} 个群。`, "success");
     } catch (error) {
       notice(`群目标保存未完成：${publicError(error)}`, "error");
     } finally {
@@ -1450,6 +1832,18 @@
       window.parent?.postMessage?.({channel: "companion-workspace", kind: "host-mappings-updated"}, "*");
       try { await readStatus(); }
       catch { notice("角色映射已保存；运行状态暂未读到，可重新读取。", "info"); return; }
+      if (result.startup_error) {
+        const modelPending = ["host_provider_required", "host_provider_unavailable"].includes(result.startup_error);
+        const message = modelPending
+          ? "角色映射已经保存。共享启动模型会自动跟随 AstrBot 当前模型；如无可用模型，请先在 AstrBot 模型配置中启用 Provider，再点「准备并启动」。"
+          : `运行未启动：${failureMessage(result.startup_error)}`;
+        notice(`角色映射已保存。${message}`, modelPending ? "info" : "error");
+        return;
+      }
+      if (result.requires_initialize) {
+        notice("角色映射已保存；点「准备并启动」完成角色准备。", "info");
+        return;
+      }
       notice(result.started ? "角色映射已保存并自动加载。" : "角色映射已保存，运行状态已更新。", "success");
     } catch (error) { notice(`保存未完成：${publicError(error)}`, "error"); }
     finally { setBusy(false); updateBindingCheck(); }
@@ -1465,7 +1859,8 @@
     paintStatusValue("accepting", isAccepting() ? "正在运行" : "未运行");
     $("safety-note").textContent = isAccepting()
       ? "已归入角色的人格自动处理其会话；主动消息按各窗口权限发送。"
-      : "保存角色映射后，插件自动准备并运行对应窗口。";
+      : hasSavedRoleMappings() ? "角色映射已保存；准备并启动后开始处理对应会话。"
+        : "保存角色映射后，插件会自动准备并运行对应窗口。";
     $("safety-note").hidden = !$("safety-note").textContent;
     if (status.last_failure?.code || status.settings_error) {
       const code = status.last_failure?.code || status.settings_error;
@@ -1478,6 +1873,38 @@
   }
   function updateControls() {
     $("refresh").disabled = busy;
+    const hasProvider = typeof modelConfig !== "undefined" && Boolean(modelConfig?.provider_id);
+    const start = $("start-host");
+    if (start) {
+      start.hidden = !isEnabled() || isAccepting();
+      start.disabled = busy || start.hidden || !hasProvider;
+      start.title = hasProvider ? "" : "AstrBot 暂无可用的文本模型";
+    }
+    if (typeof renderSharedModel === "function") renderSharedModel();
+  }
+  async function startHost() {
+    if (busy || !host || !isEnabled() || isAccepting()) return;
+    const button = $("start-host");
+    setLoading(button, true);
+    setBusy(true);
+    try {
+      const result = await api("POST", `${host.prefix}/start`, {}, 120000);
+      await readStatus();
+      if (isAccepting() || result?.state === "running") {
+        notice("角色已准备并开始接收消息。", "success");
+      } else if (status?.last_failure?.code || status?.settings_error) {
+        notice(failureMessage(status.last_failure?.code || status.settings_error), "error");
+      } else {
+        notice("启动结果暂未确认，请查看运行状态。", "info");
+      }
+    } catch (error) {
+      try { await readStatus(); } catch { /* Keep the operation error visible below. */ }
+      if (isAccepting()) notice("角色已准备并开始接收消息。", "success");
+      else notice(publicError(error), "error");
+    } finally {
+      setBusy(false);
+      setLoading(button, false);
+    }
   }
   async function readStatus() {
     let lastError = null;
@@ -1549,6 +1976,9 @@
     catch (error) { notice(publicError(error), "error"); }
     finally { setBusy(false); setLoading($("refresh"), false); }
   });
+  $("start-host")?.addEventListener("click", startHost);
+  $("shared-model-provider")?.addEventListener("change", renderSharedModel);
+  $("save-shared-model")?.addEventListener("click", saveSharedModel);
   $("topology-session-prev").addEventListener("click", () => changeTopologySessionPage(-1));
   $("topology-session-next").addEventListener("click", () => changeTopologySessionPage(1));
   $("topology-session-filters").addEventListener("click", event => {
@@ -1563,10 +1993,12 @@
       renderSessionManager();
       paintTopologySelection(false);
     }
-    renderTopologySessions(topologySnapshot);
+    renderTopologySessions(topologySnapshot, {resetScroll: true});
     scheduleTopologyLinks();
   });
   $("topology-pin-session").addEventListener("click", toggleTopologyPin);
+  $("window-link-save")?.addEventListener("click", saveWindowLink);
+  $("window-link-unlink")?.addEventListener("click", unlinkWindow);
   $("close-session-manager").addEventListener("click", () => { topologySelection = null; paintTopologySelection(); });
   $("hide-unlinked-personas")?.addEventListener("change", () => {
     refreshPersonaVisibility();
@@ -1589,6 +2021,16 @@
     paintTopologySelection();
   });
   window.addEventListener("resize", scheduleTopologyLinks, {passive: true});
+  $("topology-sessions").addEventListener("scroll", scheduleTopologyLinks, {passive: true});
+  $("topology-canvas").addEventListener("animationend", event => {
+    if (event.target.matches(".topology-column, .topology-node")) scheduleTopologyLinks();
+  });
+  if (typeof ResizeObserver === "function") {
+    const observer = new ResizeObserver(scheduleTopologyLinks);
+    for (const id of ["topology-canvas", "topology-accounts", "topology-roles", "topology-sessions"]) {
+      observer.observe($(id));
+    }
+  }
   boot();
   setInterval(() => {
     if (host && !busy && !bindingsDirty && !groupTargetsDirty

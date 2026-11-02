@@ -6,7 +6,7 @@ import json
 import logging
 
 from companion_v2.execution.models import TaskContext, TaskError, digest, encode, require, stamp
-from companion_v2.foundation.refs import AudienceRef, ScopeRef, SubjectKind, SubjectRef
+from companion_v2.foundation.refs import AudienceRef, ReferenceValidationError, ScopeRef, SubjectKind, SubjectRef
 from companion_v2.identity_policy.models import AuthenticatedHostPrincipal, AuthorizationTier, GrantState
 from companion_v2.identity_policy.personas import ConversationRoute, PersonaBinding, PersonaDirectory, SelectorKind
 from companion_v2.identity_policy.repository import PersistentIdentityDirectory
@@ -14,6 +14,7 @@ from companion_v2.identity_policy.grants import PERSON_PERMISSION_GRANT_PREFIX
 from companion_v2.relationships.private_access import (DEFAULT_FOR_CAPABILITY, REVOCABLE_ABSENCE_CODES,
                                                         REVOCABLE_CAPABILITIES)
 from companion_v2.storage.codec import scope_values
+from companion_v2.adapters.astrbot.native import native_user_subject_id
 from .group_settings import GroupTarget
 
 
@@ -27,8 +28,9 @@ DELIVERY = "message.delivery"
 
 
 class MultiAuthority:
-    def __init__(self, runtime, settings, *, now):
+    def __init__(self, runtime, settings, *, now, platform_name=None):
         self.runtime, self.settings, self.now = runtime, settings, now
+        self.platform_name = platform_name
         self.identities, self.personas = PersistentIdentityDirectory(runtime), PersonaDirectory(runtime)
         # 私聊权限默认值的读取器；由会话在应用装配好之后挂上。没挂上时保持旧行为
         # （配置能力表里有的就签发），不让"没挂"变成"新用户全都没权限"。
@@ -95,7 +97,31 @@ class MultiAuthority:
     def _binding_differences(pinned, current):
         labels = {"accounts": "account", "private_targets": "private_target",
                   "group_targets": "group_target", "personas": "persona"}
-        return tuple(label for field, label in labels.items() if pinned.get(field) != current.get(field))
+        differences = []
+        for field, label in labels.items():
+            left, right = pinned.get(field), current.get(field)
+            if field == "personas":
+                left, right = (MultiAuthority._normalized_personas(left),
+                               MultiAuthority._normalized_personas(right))
+            if left != right:
+                differences.append(label)
+        return tuple(differences)
+
+    @staticmethod
+    def _normalized_personas(rows):
+        """Compare old account-scoped role ids by the shared character they became."""
+        if not isinstance(rows, (list, tuple)):
+            return rows
+        try:
+            from .multi_settings import PersonaMapping, _shared_persona_roles
+            mappings = tuple(PersonaMapping(str(row["bot_id"]), str(row["persona_id"]), str(row["role_id"]))
+                             for row in rows if isinstance(row, dict)
+                             and all(key in row for key in ("bot_id", "persona_id", "role_id")))
+            if len(mappings) != len(rows):
+                return rows
+            return [asdict(mapping) for mapping in _shared_persona_roles(mappings)]
+        except (ImportError, KeyError, TypeError, ValueError):
+            return rows
 
     def _legacy_binding_differences(self, stored_identities):
         """Validate older manifests that pinned only the full configuration hash."""
@@ -127,7 +153,14 @@ class MultiAuthority:
 
     def subject(self, target, participant_id=None):
         participant = participant_id if participant_id is not None else target.participant_id
-        return SubjectRef(self.runtime.installation_id, SubjectKind.HUMAN, "onebot-user:" + participant)
+        name = self.platform_name(target.platform_id) if callable(self.platform_name) else ""
+        try:
+            subject_id = native_user_subject_id(name, participant)
+        except ValueError:
+            # Older externally constructed authorities retained the OneBot
+            # projection; keep that fallback for compatibility.
+            subject_id = "onebot-user:" + participant
+        return SubjectRef(self.runtime.installation_id, SubjectKind.HUMAN, subject_id)
 
     def identity_id(self, target, participant_id=None):
         return "host-multi-person:" + digest(self.principal(target, participant_id))
@@ -227,11 +260,19 @@ class MultiAuthority:
             raise TaskError("host_target_unavailable", "the native conversation route is unavailable")
 
     def _scope(self, target, scope, role):
+        local_role = any(p.bot_id == target.bot_id and p.role_id == role.subject_id
+                         for p in self.settings.personas)
+        if not local_role:
+            link = self.settings.window_link_for_target(target.target_id)
+            if link is not None and link.mode == "role":
+                primary = self.settings.target(link.primary_target_id)
+                local_role = any(p.bot_id == primary.bot_id and p.role_id == role.subject_id
+                                 for p in self.settings.personas)
         if (scope.installation_id != self.runtime.installation_id or scope.kind.value != "private"
                 or (scope.platform, scope.account_id, scope.bot_id, scope.native_scope_id, scope.session_id)
                 != (target.platform_id, target.account_id, target.bot_id, target.participant_id, target.participant_id)
                 or role.installation_id != self.runtime.installation_id
-                or not any(p.bot_id == target.bot_id and p.role_id == role.subject_id for p in self.settings.personas)):
+                or not local_role):
             raise TaskError("host_target_mismatch", "scope and role must come from this configured private target")
 
     def provision_scope(self, target, scope, role):
@@ -247,6 +288,16 @@ class MultiAuthority:
             route = self.personas.register_route(ConversationRoute(scope, user=actor.subject), observed_at=self.now(),
                 adopt_exact_revision=exact["revision"] if exact is not None else None)
             identifier = self.binding_id(scope)
+            current_binding = self.personas.binding(identifier)
+            if current_binding is not None and current_binding.role != role:
+                link = self.settings.window_link_for_target(target.target_id)
+                configurable = (current_binding.source == "astrbot-multi-host"
+                                and current_binding.authority == "configured-private-target")
+                if (link is not None and link.mode == "role") or configurable:
+                    self.personas.set_binding(replace(
+                        current_binding, role=role, revision=current_binding.revision + 1,
+                        source="astrbot-multi-host", authority="configured-private-target"),
+                        expected_revision=current_binding.revision, observed_at=self.now())
             if self.personas.binding(identifier) is None:
                 existing = self.personas.resolve(scope, observed_at=self.now())
                 if existing.failure is None:
@@ -299,6 +350,8 @@ class MultiAuthority:
                         self.identities.issue_grant(grant_id=self.grant_id(scope, capability), subject=actor.subject,
                             scope=scope, capability=capability, tier=AuthorizationTier.STANDARD, valid_from=at,
                             expected_revision=self.identities.revision)
+            from companion_v2.identity_policy.legacy_import import apply_pending_private_authorization
+            apply_pending_private_authorization(self.runtime, actor, scope, role.subject_id, self.now())
             self.write(self.context_key(target, role.subject_id), scope.document())
             template = self.settings.template_for(target)
             if template is not None and template.target_id != target.target_id:
@@ -319,10 +372,18 @@ class MultiAuthority:
                     self.personas.set_binding(replace(binding, revision=binding.revision + 1),
                         expected_revision=binding.revision, observed_at=self.now())
             self.write(key, scope.document())
-            return self.context(target.target_id, role.subject_id)
+            context = self.context(target.target_id, role.subject_id)
+            from .image_access import ensure_image_access
+            ensure_image_access(self.runtime, context, observed_at=self.now())
+            from companion_v2.role_work.state.configuration import ensure_window_presentation_grants
+            ensure_window_presentation_grants(self.runtime, context, observed_at=self.now())
+            # Provisioning a missing tool grant advances the policy revision.
+            # Life and proactive workers must bind the same fresh actor as intake.
+            return replace(context, actor=self.actor(target))
 
     def context(self, target_id, role_id):
         target = self.target(target_id)
+        role_id = self.settings.canonical_role_id(role_id)
         if isinstance(target, GroupTarget):
             raise TaskError("host_group_context_requires_event", "a group context requires its actual authenticated speaker")
         stored = self.read(self.context_key(target, role_id))
@@ -350,7 +411,9 @@ class MultiAuthority:
                             and scope.native_scope_id != target.participant_id)):
                     continue
                 resolution = self.personas.resolve(scope, observed_at=self.now())
-                if resolution.failure is None and resolution.unwrap().binding.role.subject_id == role_id:
+                if (resolution.failure is None
+                        and self.settings.canonical_role_id(
+                            resolution.unwrap().binding.role.subject_id) == role_id):
                     stored = candidate
                     break
         if stored is None:
@@ -373,9 +436,28 @@ class MultiAuthority:
             raise TaskError("host_context_unavailable", "the private conversation no longer belongs to this account mapping")
         self._scope(resolved_target, scope, role)
         actor = self.actor(resolved_target, scope.native_scope_id)
-        binding = require(self.personas.resolve(scope, observed_at=self.now())).binding
+        resolution = require(self.personas.resolve(scope, observed_at=self.now()))
+        binding = resolution.binding
         if binding.role != role:
-            raise TaskError("host_persona_binding_changed", "the private persona binding changed")
+            if self.settings.canonical_role_id(binding.role.subject_id) != role.subject_id:
+                raise TaskError("host_persona_binding_changed", "the private persona binding changed")
+            # Existing runtime bindings may still carry the pre-merge role id.
+            # Persist the shared role before returning the context: management
+            # APIs re-resolve the binding and compare it with TaskContext, so a
+            # read-only substitute would make every legacy window look changed.
+            selected = resolution.selected
+            try:
+                self.personas.set_binding(
+                    replace(selected, role=role, revision=selected.revision + 1),
+                    expected_revision=selected.revision, observed_at=self.now())
+            except ReferenceValidationError:
+                latest = self.personas.binding(selected.binding_id)
+                if latest is None or latest.role != role:
+                    raise TaskError("host_persona_binding_changed", "the private persona binding changed") from None
+            binding = require(self.personas.resolve(scope, observed_at=self.now())).binding
+            if binding.role != role:
+                raise TaskError("host_persona_binding_changed", "the private persona binding changed")
+            self.write(self.context_key(target, role_id), scope.document())
         return TaskContext(actor, binding, AudienceRef(scope, (actor.subject,)))
 
     def authorize_delivery(self, target_id, expires_at):

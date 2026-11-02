@@ -128,7 +128,14 @@ def event_identity(event: object) -> dict[str, str] | None:
     meta = getattr(event, "platform_meta", None)
     message = getattr(event, "message_obj", None)
     platform_id = getattr(meta, "id", None)
+    platform_name = str(getattr(meta, "name", "") or "").casefold()
     account_id = _native_id(getattr(message, "self_id", None))
+    # QQ Official exposes a synthetic self id on C2C/direct events. The platform
+    # instance id is the stable account key used by the setup account list.
+    official = platform_name in {"qq_official", "qqofficial"} or str(platform_id or "").casefold().startswith(
+        ("qq_official", "qqofficial"))
+    if account_id in {"unknown_selfid", "qq_official"} or (not account_id and official):
+        account_id = _native_id(platform_id)
     sender = getattr(message, "sender", None)
     participant_id = _native_id(getattr(sender, "user_id", None))
     if not platform_id or not account_id or not participant_id:
@@ -173,11 +180,23 @@ def message_text(event: object) -> str:
 
 
 def _native_id(value: object) -> str:
-    """OneBot ids arrive as ints or strings depending on the transport."""
+    """Read native ids without assuming OneBot's numeric shape.
+
+    OneBot uses decimal QQ numbers, but QQ Official / Satori / other adapters use
+    opaque ids such as ``607097777B7E7FE3...``.  Rejecting those before the
+    binding parser sees them made the first-run command fail with
+    ``host_identity_unreadable`` on those platforms.
+    """
     if value is None:
         return ""
     text = str(value).strip()
-    return text if text.isdigit() else ""
+    if not text or len(text) > 128:
+        return ""
+    if any(char.isspace() or ord(char) < 32 for char in text):
+        return ""
+    if not all(char.isalnum() or char in "._:-@" for char in text):
+        return ""
+    return text
 
 
 def is_private_message(event: object) -> bool:

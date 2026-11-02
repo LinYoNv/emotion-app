@@ -6,7 +6,7 @@ const {chromium} = require("playwright");
 const ROOT = path.resolve(process.env.COMPANION_SOURCE_ROOT || path.join(__dirname, ".."));
 const PAGE = path.join(ROOT, "pages", "陪伴小屋");
 const HOST_ROOT = process.env.COMPANION_HOST_ROOT || path.resolve(__dirname, "../../../..");
-const HOST = "astrbot_plugin_private_companion_v2", TOKEN = "synthetic-output-qa";
+const HOST = "astrbot_plugin_private_companion", TOKEN = "synthetic-output-qa";
 const PREFIX = "/api/plugin/page/content/" + HOST + "/" + encodeURIComponent("陪伴小屋") + "/";
 const ROLE = "host/targets/first/roles/role-a";
 const ok = data => ({status: "ok", data});
@@ -21,6 +21,7 @@ from types import SimpleNamespace
 with tempfile.TemporaryDirectory(prefix="output-page-qa-") as data_root:
     os.environ["ASTRBOT_ROOT"] = data_root
     from astrbot.dashboard.services.plugin_page_service import PluginPageService
+    from tools.host_page_render import render_css, render_html
     from companion_v2.configuration.registry import FieldRegistry
     from companion_v2.configuration.contract import contract_of
     from companion_v2.conversation.media import output_settings, quota, review
@@ -29,10 +30,10 @@ with tempfile.TemporaryDirectory(prefix="output-page-qa-") as data_root:
     root, sections = Path.cwd(), {}
     page = root / "pages" / "陪伴小屋"
     service = PluginPageService(SimpleNamespace(plugin_store_path=str(root.parent)))
-    query, args = {"asset_token":"synthetic-output-qa"}, ("astrbot_plugin_private_companion_v2","陪伴小屋")
-    assets = {"index.html":service.rewrite_plugin_page_html((page/"index.html").read_text(encoding="utf-8"),*args,"index.html",theme="light",extra_query_params=query)}
+    query, args = {"asset_token":"synthetic-output-qa"}, ("astrbot_plugin_private_companion","陪伴小屋")
+    assets = {"index.html":render_html(service,(page/"index.html").read_text(encoding="utf-8"),*args,file_name="index.html",theme="light",extra_query_params=query)}
     for css in page.glob("*.css"):
-        assets[css.name] = service.rewrite_plugin_page_css(css.read_text(encoding="utf-8"),*args,css.name,extra_query_params=query)
+        assets[css.name] = render_css(service,css.read_text(encoding="utf-8"),*args,file_name=css.name,extra_query_params=query)
     for name,module in {"image.output":output_settings,"quota":quota,"image_review":review,"photo.reference":configuration,"wardrobe":wardrobe,"content.authoring":authoring_service}.items():
         fields = module.configuration_fields()
         registry, group = FieldRegistry(version="output-qa.v1",fields=fields), fields[0].group_id

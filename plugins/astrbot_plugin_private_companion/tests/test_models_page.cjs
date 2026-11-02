@@ -67,7 +67,7 @@ function harness() {
   const window = {
     CompanionProduct: {
       hosted: () => true,
-      role: () => ({model_api: '/astrbot_plugin_private_companion_v2/model'}),
+      role: () => ({model_api: '/astrbot_plugin_private_companion/model'}),
       identity: () => ({installation_id: 'inst', operator_id: 'operator'}),
       /* 页面取桥先问 bridgeNow()，没有再 await bridgeFor()。
          这里两者都给，保持同步路径不被打断。 */
@@ -129,6 +129,36 @@ function harness() {
   }
   return {page: window.CompanionModelsPage, requests, root, store, audioBlobs, revokedAudioUrls};
 }
+
+test('embedded migration models read and save through the explicit destination endpoint', async () => {
+  const h = harness(), node = h.root();
+  const endpoint = '/astrbot_plugin_private_companion/host/targets/import/roles/destination/model';
+  h.page.mount(node, {endpoint});
+  assert.equal(h.requests[0].route, 'host/targets/import/roles/destination/model');
+  h.requests[0].resolve(status());
+  await flush();
+  node.click('[data-model-open]', {modelOpen: 'memory.reflect'});
+  node.change('[data-model-field]', {modelField: 'provider', modelKind: 'memory.reflect', value: 'secondary'});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved, 'the destination task should be editable');
+  assert.equal(h.page.isBusy(), true, 'the embedded guide must wait for an in-flight save');
+  assert.equal(saved.route, 'host/targets/import/roles/destination/model/configure');
+  assert.equal(h.requests.some(request => request.route === 'model' || request.route === 'model/configure'), false);
+  saved.resolve({replayed: false, task: task('memory.reflect', 'secondary', ['text'], 'background')});
+  await flush();
+  assert.equal(h.page.isBusy(), false);
+  h.page.unmount();
+});
+
+test('an invalid explicit migration model endpoint cannot fall back to another role', () => {
+  for (const endpoint of ['', '/other-plugin/model', '/astrbot_plugin_private_companion/model?role=other']) {
+    const h = harness(), node = h.root();
+    h.page.mount(node, {endpoint});
+    assert.equal(h.requests.length, 0);
+    assert.match(node.innerHTML, /没有模型配置工作区/);
+  }
+});
 
 test('registered review, media and authoring tasks have searchable Chinese names in every model view', async () => {
   const h = harness(), node = h.root(), data = status();
@@ -209,7 +239,7 @@ test('the routing matrix lists every registered task with its provider', async (
   assert.match(node.innerHTML, /任务/);
   assert.match(node.innerHTML, /对话回复/);
   assert.match(node.innerHTML, /记忆整理/);
-  assert.match(node.innerHTML, /2<\/strong><span>可用模型提供方/);
+  assert.match(node.innerHTML, /2<\/b><span>可用模型/);
   assert.match(node.innerHTML, /前台/);
   assert.doesNotMatch(node.innerHTML, /保存本任务/);
 });
@@ -220,6 +250,7 @@ test('loaded AstrBot providers are immediately available without a registration 
   page.mount(node);
   requests[0].resolve(status());
   await flush();
+  node.click('[data-model-sub]', {modelSub: 'cfg'});
 
   assert.match(node.innerHTML, /<option value="secondary"/);
   assert.doesNotMatch(node.innerHTML, /模型通道|data-pool-/);
@@ -246,6 +277,7 @@ test('switching a provider inline raises one queued change and posting saves tha
   page.mount(node);
   requests[0].resolve(status());
   await flush();
+  node.click('[data-model-sub]', {modelSub: 'cfg'});
   node.change('[data-model-field]', {modelField: 'provider', modelKind: 'memory.reflect', value: 'secondary'});
   assert.match(node.innerHTML, /1<\/b> 项改动待保存/);
   node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
@@ -265,6 +297,7 @@ test('multi-select assigns one provider to several tasks and keeps capability mi
   page.mount(node);
   requests[0].resolve(status());
   await flush();
+  node.click('[data-model-sub]', {modelSub: 'cfg'});
   node.click('[data-model-pick]', {modelPick: 'conversation.reply'});
   node.click('[data-model-pick]', {modelPick: 'memory.reflect'});
   assert.match(node.innerHTML, /已选 <strong>2<\/strong> 项任务/);
@@ -281,6 +314,7 @@ test('restoring inheritance resets explicit fields through the reset list', asyn
   explicit.tasks[0].fields.provider = {value: 'secondary', inherited_value: 'primary', source: 'window', inherited_source: 'installation', explicit: true};
   requests[0].resolve(explicit);
   await flush();
+  node.click('[data-model-sub]', {modelSub: 'cfg'});
   node.click('[data-model-pick]', {modelPick: 'conversation.reply'});
   node.click('[data-model-action]', {modelAction: 'inherit'});
   assert.match(node.innerHTML, /已把 1 项任务改为跟随上级配置/);
@@ -298,6 +332,7 @@ test('the precise editor keeps provider filtering compact and localizes capabili
   page.mount(node);
   requests[0].resolve(status());
   await flush();
+  node.click('[data-model-sub]', {modelSub: 'cfg'});
   assert.doesNotMatch(node.innerHTML, /class="model-mlgd"/);
   assert.match(node.innerHTML, /data-model-provider-filter/);
   assert.match(node.innerHTML, /主模型提供方/);
@@ -365,6 +400,7 @@ test('a lower-capacity provider adjusts the draft output limit before saving', a
   constrained.providers[1].max_output_tokens = 2048;
   requests[0].resolve(constrained);
   await flush();
+  node.click('[data-model-sub]', {modelSub: 'cfg'});
   node.change('[data-model-field]', {modelField: 'provider', modelKind: 'memory.reflect', value: 'secondary'});
   assert.match(node.innerHTML, /输出上限已调整为 2048/);
   node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
@@ -402,6 +438,7 @@ test('an uncertain save keeps its original operation and blocks further edits un
   page.mount(node);
   requests[0].resolve(status());
   await flush();
+  node.click('[data-model-sub]', {modelSub: 'cfg'});
   node.change('[data-model-field]', {modelField: 'provider', modelKind: 'memory.reflect', value: 'secondary'});
   node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
   const first = requests.find(request => request.method === 'POST');
@@ -409,10 +446,25 @@ test('an uncertain save keeps its original operation and blocks further edits un
   assert.equal(requests.filter(request => request.method === 'POST').length, 1);
   first.reject(new Error('network interrupted'));
   await flush();
+  node.click('[data-model-action]', {modelAction: 'refresh'});
+  const latest = status();
+  latest.tasks[1].edit_token = 'b'.repeat(64);
+  latest.tasks[1].fields.prompt.value = 'new remote prompt';
+  requests.at(-1).resolve(latest);
+  await flush();
+  assert.equal(requests.filter(request => request.method === 'POST').length, 1,
+    'reading fresh status must not replay an uncertain write');
   node.change('[data-model-field]', {modelField: 'provider', modelKind: 'memory.reflect', value: 'primary'});
   node.click('[data-model-open]', {modelOpen: 'memory.reflect'});
   assert.match(node.innerHTML, /上次保存结果未确认/);
-  node.click('[data-model-action]', {modelAction: 'retry', modelKind: 'memory.reflect'});
+  assert.match(node.innerHTML, /1<\/b> 项保存结果待核对/);
+  assert.match(node.innerHTML, /data-model-action="save-all"[^>]*>核对保存/);
+  const uncertainCard = node.innerHTML.split('data-fncard="memory.reflect"')[1].split('</article>')[0];
+  assert.match(uncertainCard, /data-model-action="save-one"[^>]*>核对保存/);
+  assert.doesNotMatch(uncertainCard, /data-model-action="save-one"[^>]*\sdisabled(?:\s|>)/);
+  assert.match(uncertainCard, /data-model-field="provider"[^>]*disabled/);
+  assert.doesNotMatch(uncertainCard, /data-model-action="retry"/);
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
   const second = requests.filter(request => request.method === 'POST')[1];
   assert.deepEqual(JSON.parse(JSON.stringify(second.values)), JSON.parse(JSON.stringify(first.values)));
   second.resolve({replayed: true, task: task('memory.reflect', 'secondary', ['text'], 'background')});
@@ -421,6 +473,29 @@ test('an uncertain save keeps its original operation and blocks further edits un
   assert.doesNotMatch(node.innerHTML, /上次保存结果未确认/);
 });
 
+test('a bridge timeout automatically re-sends the same idempotent save once', async () => {
+  const {page, requests, root} = harness();
+  const node = root();
+  page.mount(node);
+  requests[0].resolve(status());
+  await flush();
+  node.click('[data-model-sub]', {modelSub: 'cfg'});
+  node.change('[data-model-field]', {modelField: 'provider', modelKind: 'memory.reflect', value: 'secondary'});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
+  const first = requests.find(request => request.method === 'POST');
+  first.reject(Object.assign(new Error('bridge_timeout'), {code: 'bridge_timeout'}));
+  await flush();
+  const posts = requests.filter(request => request.method === 'POST');
+  assert.equal(posts.length, 2, 'one timed-out save should be reconciled automatically');
+  assert.equal(posts[1].values.operation_key, first.values.operation_key,
+    'the retry must reuse the idempotency key');
+  posts[1].resolve({replayed: true, task: task('memory.reflect', 'secondary', ['text'], 'background')});
+  await flush();
+  assert.match(node.innerHTML, /原保存已确认/);
+  assert.equal(page.isBusy(), false);
+  assert.doesNotMatch(node.innerHTML, /项保存结果待核对/);
+  page.unmount();
+});
 test('switching to the voice tab lazily loads, saves, and plays a synthesized sample result', async () => {
   const {page, requests, root, audioBlobs, revokedAudioUrls} = harness();
   const node = root();
@@ -431,16 +506,25 @@ test('switching to the voice tab lazily loads, saves, and plays a synthesized sa
   const get = requests.find(r => r.method === 'GET' && r.route === 'model/voice');
   assert.ok(get, 'voice tab should trigger a GET to model/voice');
   const voice = {languages: [{k: 'zh', n: '中文', bind: ''}, {k: 'ja', n: '日语', bind: ''}, {k: 'en', n: '英语', bind: ''}],
-    providers: [{id: 'tts-live'}], timeout_seconds: 30, voice_enabled: true, edit_token: TOKEN};
+    channels: [{k: 'private', n: '私聊', bindings: {zh: '', ja: '', en: ''}},
+      {k: 'group', n: '群聊', bindings: {zh: '', ja: '', en: ''}}],
+    providers: [{id: 'tts-live', model: 's2.1-pro-free', voice: '高木さん'}], timeout_seconds: 30,
+    voice_enabled: true, edit_token: TOKEN};
   get.resolve(voice);
   await flush();
   assert.match(node.innerHTML, /语音模型/);
   assert.match(node.innerHTML, /按语种配置语音合成/);
+  assert.match(node.innerHTML, /私聊 \/ 群聊 TTS 总览/);
+  assert.match(node.innerHTML, /data-voice-matrix-lang="zh"/);
   node.change('[data-voice-provider]', {value: 'tts-live'});
+  node.change('[data-voice-channel]', {voiceChannel: 'private', value: 'tts-live'});
+  node.change('[data-voice-channel]', {voiceChannel: 'group', voiceMatrixLang: 'en', value: 'tts-live'});
   node.click('[data-voice-save]');
   const post = requests.find(r => r.method === 'POST' && r.route === 'model/voice/save');
   assert.ok(post, 'voice save should POST to model/voice/save');
   assert.equal(post.values.changes.voice_ja_provider_id, 'tts-live');
+  assert.equal(post.values.changes.voice_private_ja_provider_id, 'tts-live');
+  assert.equal(post.values.changes.voice_group_en_provider_id, 'tts-live');
   post.resolve({...voice, languages: voice.languages.map(item => item.k === 'ja' ? {...item, bind: 'tts-live'} : item)});
   await flush();
   assert.match(node.innerHTML, /语音配置已保存/);
@@ -457,6 +541,66 @@ test('switching to the voice tab lazily loads, saves, and plays a synthesized sa
   node.click('[data-voice-lang]', {voiceLang: 'en'});
   assert.doesNotMatch(node.innerHTML, /blob:preview-1/);
   assert.deepEqual(revokedAudioUrls, ['blob:preview-1']);
+});
+
+test('a busy host preserves the voice draft and leaves save available', async () => {
+  const h = harness(), node = h.root();
+  h.page.mount(node);
+  h.requests[0].resolve(status());
+  await flush();
+  node.click('[data-model-tab]', {modelTab: 'voice'});
+  const voice = {languages: [{k: 'ja', n: '日语', bind: ''}], providers: [],
+    timeout_seconds: 30, voice_enabled: true, edit_token: TOKEN};
+  h.requests.find(r => r.route === 'model/voice').resolve(voice);
+  await flush();
+  node.change('[data-voice-timeout]', {value: '45', valueAsNumber: 45});
+  node.click('[data-voice-save]');
+  h.requests.at(-1).resolve({status: 'error', message: 'host_busy', data: {code: 'host_busy'}});
+  await flush();
+  assert.match(node.innerHTML, /本次没有写入，草稿已保留/);
+  assert.doesNotMatch(node.innerHTML, /data-voice-retry/);
+  assert.match(node.innerHTML, /data-voice-timeout value="45"/);
+  assert.doesNotMatch(node.innerHTML, /data-voice-save[^>]*disabled/);
+  node.click('[data-voice-save]');
+  const retry = h.requests.at(-1);
+  assert.equal(retry.values.changes.voice_timeout_seconds, 45);
+  retry.resolve({...voice, timeout_seconds: 45});
+  await flush();
+  assert.equal(h.page.isDirty(), false);
+  h.page.unmount();
+});
+
+test('a timed-out voice save reconciles with the same operation and retains uncertainty if the host is busy', async () => {
+  const h = harness(), node = h.root();
+  h.page.mount(node);
+  h.requests[0].resolve(status());
+  await flush();
+  node.click('[data-model-tab]', {modelTab: 'voice'});
+  const voice = {languages: [{k: 'ja', n: '日语', bind: ''}], providers: [],
+    timeout_seconds: 30, voice_enabled: true, edit_token: TOKEN};
+  h.requests.find(r => r.route === 'model/voice').resolve(voice);
+  await flush();
+  node.change('[data-voice-timeout]', {value: '45', valueAsNumber: 45});
+  node.click('[data-voice-save]');
+  const original = h.requests.at(-1);
+  original.reject(Object.assign(new Error('bridge_timeout'), {code: 'bridge_timeout'}));
+  await flush();
+  const automatic = h.requests.at(-1);
+  assert.notEqual(automatic, original);
+  assert.equal(automatic.values.operation_key, original.values.operation_key);
+  automatic.resolve({status: 'error', message: 'host_busy', data: {code: 'host_busy'}});
+  await flush();
+  assert.match(node.innerHTML, /原保存结果仍待核对/);
+  assert.match(node.innerHTML, /data-voice-retry/);
+  node.click('[data-voice-retry]');
+  const reconciliation = h.requests.at(-1);
+  assert.deepEqual(reconciliation.values, original.values);
+  reconciliation.resolve({...voice, timeout_seconds: 45, replayed: true});
+  await flush();
+  assert.match(node.innerHTML, /原保存已确认/);
+  assert.doesNotMatch(node.innerHTML, /data-voice-retry/);
+  assert.equal(h.page.isDirty(), false);
+  h.page.unmount();
 });
 
 test('a dashboard bridge inner voice result with status ok is kept as the result', async () => {
@@ -610,6 +754,16 @@ test('image page separates generation and editing model queues and saves paramet
   node.click('[data-model-tab]', {modelTab: 'image'});
   const get = requests.find(r => r.method === 'GET' && r.route === 'model/image');
   assert.ok(get, 'image tab should trigger a GET to model/image');
+  const schemaRequest = requests.find(r => r.method === 'GET' && r.route.endsWith('/image-schema'));
+  assert.ok(schemaRequest, 'the image tab loads its backend field schema from the selected model route');
+  assert.match(schemaRequest.route, /^model\/image-schema$/);
+  schemaRequest.resolve({image_provider_group: {sd_webui: {label: 'SD WebUI', fields: {
+    endpoint: {kind: 'text', group: 'connection', label: '服务地址'},
+    model: {kind: 'text', group: 'connection', label: '模型名'},
+    steps: {kind: 'integer', group: 'sampling', storage: 'parameters', label: '采样步数', default: 28, min: 1, max: 150},
+    cfg_scale: {kind: 'number', group: 'sampling', storage: 'parameters', label: 'CFG', default: 7, min: 1, max: 30, step: 0.1},
+    sampler_name: {kind: 'text', group: 'sampling', storage: 'parameters', label: '采样器'},
+  }}}});
   const image = {actions: [
     {action: 'image.generate', enabled: true, owner: 'image-plugin', provider_id: 'native-image', loaded: true, current: true, registered: true, state: 'ready'},
     {action: 'image.edit', enabled: true, owner: 'image-plugin', provider_id: 'native-image', loaded: true, current: true, registered: true, state: 'ready'},
@@ -635,22 +789,47 @@ test('image page separates generation and editing model queues and saves paramet
       {id: 'primary', name: '主用模型', enabled: true, platform: 'openai', model: 'image-v1', width: 1024, height: 1024,
         base_url: 'https://api.example.test/v1', timeout_seconds: 180, api_key_set: true},
       {id: 'secondary', name: '备用模型', enabled: true, platform: 'openai', model: 'image-v2', width: 1024, height: 1024,
-        base_url: 'https://backup.example.test/v1', timeout_seconds: 180, api_key_set: false},
+        base_url: 'https://backup.example.test/v1', timeout_seconds: 180, api_key_set: false, max_reference_images: 0},
     ],
     sd_webui: {base_url: 'http://127.0.0.1:7860', timeout_seconds: 300, parameters: {}},
-    comfyui: {base_url: '', timeout_seconds: 300, workflows: {}},
-    operation_routes: {generate: ['online:primary', 'sd_webui'], edit: ['online:secondary', 'online:primary']},
+    comfyui: {base_url: 'http://127.0.0.1:8188', timeout_seconds: 300, workflows: {
+      generate: {workflow: {'1': {class_type: 'SaveImage', inputs: {}}}, mapping: {fields: {}, output_node: '1'}},
+    }},
+    legacy_options: {image_companion_selected_workflows: {generate: 'old-text.json'},
+      image_companion_extra_workflows: ['old-insert.json']},
+    operation_routes: {generate: ['online:primary', 'comfyui', 'sd_webui'], edit: ['online:secondary', 'online:primary']},
   }};
   configRequest.resolve(config);
   await flush();
+  assert.match(node.innerHTML, /<details class="model-img-route-details" open><summary data-img-route-expand="online:primary"/);
+  node.click('[data-img-route-expand]', {imgRouteExpand: 'online:primary'});
+  assert.match(node.innerHTML, /<details class="model-img-route-details"><summary data-img-route-expand="online:primary"/);
+  node.click('[data-img-route-expand]', {imgRouteExpand: 'online:primary'});
   assert.match(node.innerHTML, /文生图与改图/);
+  assert.match(node.innerHTML, /model-img-route-meta/);
+  assert.match(node.innerHTML, /model-img-route-toggle/);
+  assert.match(node.innerHTML, /展开配置|收起配置/);
   assert.match(node.innerHTML, /data-img-endpoint-test="primary"/,
     'saved enabled online models expose a real generation test');
   assert.equal((node.innerHTML.match(/class="model-imgconfig"/g) || []).length, 1,
     'the model editor stays inside one framed section');
   assert.match(node.innerHTML, /data-img-view="generate"/);
   assert.match(node.innerHTML, /data-img-view="edit"/);
+  assert.match(node.innerHTML, /class="model-img-route-name" data-img-config-field="endpoints\.0\.name" value="主用模型"/);
+  assert.match(node.innerHTML, /aria-label="自定义模型名称"/);
+  assert.doesNotMatch(node.innerHTML, /端点名称/);
   assert.match(node.innerHTML, /data-img-config-field="endpoints\.0\.model"/);
+  assert.match(node.innerHTML, /data-img-config-field="endpoints\.0\.quality"/);
+  assert.match(node.innerHTML, /data-img-config-field="endpoints\.0\.max_reference_images"/);
+  assert.match(node.innerHTML, /data-img-config-field="sd_webui\.parameters\.generate\.steps"/,
+    'SD sampling controls are rendered from the loaded schema');
+  assert.doesNotMatch(node.innerHTML, /data-img-config-field="sd_webui\.parameters\.generate\.(endpoint|model)"/,
+    'connection metadata must not be written into the SD sampling object');
+  assert.match(node.innerHTML, /<legend>连接<\/legend>/);
+  assert.match(node.innerHTML, /<legend>工作流<\/legend>/);
+  assert.match(node.innerHTML, /已绑定 · 1 个节点/);
+  assert.match(node.innerHTML, /工作流与网络选项/);
+  assert.match(node.innerHTML, /old-text\.json/);
   assert.match(node.innerHTML, /data-img-config-json="sd\.generate"/);
   assert.doesNotMatch(node.innerHTML, /data-img-view="mask_edit"/,
     'masked editing belongs to the edit workflow, not a third navigation item');
@@ -667,23 +846,45 @@ test('image page separates generation and editing model queues and saves paramet
 
   node.click('[data-img-view]', {imgView: 'edit'});
   assert.match(node.innerHTML, /普通改图与蒙版局部改图共用模型队列/);
+  assert.match(node.innerHTML, /未启用参考图改图/);
   assert.match(node.innerHTML, /image\.edit/);
   assert.match(node.innerHTML, /image\.mask_edit/);
   assert.match(node.innerHTML, /改图模型与优先级/);
   node.click('[data-img-route-move]', {imgRouteMove: 'up', imgRouteIndex: '1'});
+  node.input('[data-img-config-field]', {imgConfigField: 'endpoints.0.name', value: '  主力生图  '});
   node.change('[data-img-config-field]', {imgConfigField: 'endpoints.0.model', value: 'image-v3'});
+  node.change('[data-img-config-field]', {imgConfigField: 'endpoints.0.quality', value: 'hd'});
+  node.change('[data-img-config-field]', {imgConfigField: 'endpoints.0.max_reference_images', value: 4});
   node.click('[data-img-view]', {imgView: 'generate'});
-  node.input('[data-img-config-json]', {imgConfigJson: 'sd.generate', value: '{"steps":24,"cfg_scale":6.5}'});
-  node.click('[data-img-config-save]');
+  node.change('[data-img-config-field]', {imgConfigField: 'sd_webui.base_url', value: 'http://127.0.0.1:7861'});
+  node.change('[data-img-config-field]', {imgConfigField: 'sd_webui.parameters.generate.steps', value: 32});
+  node.change('[data-img-config-field]', {imgConfigField: 'sd_webui.parameters.generate.cfg_scale', value: 6.5});
+  node.input('[data-img-config-json]', {imgConfigJson: 'sd.generate', value: '{"steps":24,"cfg_scale":6.5,"sampler_name":"Euler"}'});
+  assert.equal(page.isDirty(), true);
+  const unsavedFields = Array.from(page.changedFields());
+  assert.ok(unsavedFields.includes('生图模型 · 调用顺序 · 改图'));
+  assert.ok(unsavedFields.includes('生图模型 · 主力生图 · 模型 ID'));
+  assert.ok(unsavedFields.includes('生图模型 · 主力生图 · 自定义名称'));
+  assert.ok(unsavedFields.includes('生图模型 · SD WebUI · 生图参数 · 文生图 · 采样步数'));
+  assert.doesNotMatch(unsavedFields.join('\n'), /image-v3|127\.0\.0\.1|Euler/,
+    'the leave prompt lists field labels without exposing configuration values');
+  const leaveSave = page.saveBeforeLeave();
   const configSave = requests.find(r => r.method === 'POST' && r.route.endsWith('/image/output/save'));
   assert.ok(configSave, 'saving model configuration uses the native image configuration API');
   assert.deepEqual(JSON.parse(JSON.stringify(configSave.values.changes.operation_routes.edit)),
     ['online:primary', 'online:secondary'], 'editing priority is independent and reorderable');
+  assert.equal(configSave.values.changes.endpoints[0].name, '主力生图');
   assert.equal(configSave.values.changes.endpoints[0].model, 'image-v3');
+  assert.equal(configSave.values.changes.endpoints[0].quality, 'hd');
+  assert.equal(configSave.values.changes.endpoints[0].max_reference_images, 4);
+  assert.equal(configSave.values.changes.sd_webui.base_url, 'http://127.0.0.1:7861');
   assert.deepEqual(JSON.parse(JSON.stringify(configSave.values.changes.sd_webui.parameters.generate)),
-    {steps: 24, cfg_scale: 6.5}, 'function-specific image parameters are saved with the model configuration');
+    {steps: 32, cfg_scale: 6.5, sampler_name: 'Euler'},
+    'function-specific sampling fields and advanced values are saved together');
   configSave.resolve({...config, revision: 'image-r2', settings: configSave.values.changes});
+  assert.equal(await leaveSave, true);
   await flush();
+  assert.equal(page.isDirty(), false);
   assert.match(node.innerHTML, /生图模型与优先级已保存/);
 
   node.click('[data-img-endpoint-test]', {imgEndpointTest: 'primary'});
@@ -802,6 +1003,7 @@ test('quick config fans a slot provider out to every task via model/configure', 
   page.mount(node);
   requests[0].resolve(status());
   await flush();
+  node.click('[data-model-sub]', {modelSub: 'cfg'});
   node.click('[data-model-cm]', {modelCm: 'quick'});
   assert.match(node.innerHTML, /覆盖/);
   node.change('[data-model-slot]', {modelSlot: '对话', value: 'secondary'});
@@ -811,6 +1013,144 @@ test('quick config fans a slot provider out to every task via model/configure', 
   posts.forEach(p => p.resolve({replayed: false, task: task('conversation.reply', 'secondary')}));
   await flush();
   assert.match(node.innerHTML, /已保存/);
+});
+
+test('quick config saves both image tasks sequentially from the same page snapshot', async () => {
+  const h = harness(), node = h.root(), data = status();
+  data.tasks = [task('conversation.context_image_caption', 'primary', ['text', 'image']),
+    task('conversation.image_narration', 'primary', ['text', 'image'])];
+  data.providers.forEach(provider => provider.capabilities.push('image'));
+  h.page.mount(node);
+  h.requests[0].resolve(data);
+  await flush();
+  node.click('[data-model-sub]', {modelSub: 'cfg'});
+  node.change('[data-model-slot]', {modelSlot: '对话', value: 'secondary'});
+  node.click('[data-model-slot-apply]', {modelSlotApply: '对话'});
+  for (const item of data.tasks) {
+    const post = h.requests.at(-1);
+    assert.equal(post.method, 'POST');
+    assert.equal(post.values.kind, item.kind);
+    assert.equal(post.values.edit_token, TOKEN);
+    assert.deepEqual({...post.values.changes}, {provider: 'secondary'});
+    post.resolve({replayed: false, task: editable(item.kind, 'secondary', ['text', 'image'])});
+    await flush();
+  }
+  assert.equal(h.requests.filter(request => request.method === 'POST').length, 2);
+  assert.match(node.innerHTML, /已保存 2 项/);
+  h.page.unmount();
+});
+
+test('a save conflict reloads current values and preserves only the fields edited locally', async () => {
+  const h = harness(), node = h.root();
+  h.page.mount(node);
+  h.requests[0].resolve(status());
+  await flush();
+  node.change('[data-model-field]', {modelField: 'provider', modelKind: 'memory.reflect', value: 'secondary'});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
+  h.requests[1].resolve({status: 'error', message: 'configuration_revision_conflict', data: null});
+  await flush();
+  assert.equal(h.requests[2]?.method, 'GET', 'a confirmed conflict must read the current configuration');
+  const latest = status();
+  latest.tasks[1].edit_token = 'b'.repeat(64);
+  latest.tasks[1].fields.prompt = {value: 'new remote prompt', explicit: true, source: 'role', inherited_value: '', inherited_source: 'default'};
+  h.requests[2].resolve(latest);
+  await flush();
+  assert.equal(h.requests.filter(r => r.method === 'POST').length, 1, 'refresh must not silently retry a write');
+  assert.equal(h.store.size, 0, 'a rejected operation is no longer uncertain');
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
+  const saved = h.requests[3];
+  assert.equal(saved?.values.edit_token, latest.tasks[1].edit_token);
+  assert.deepEqual({...saved.values.changes}, {provider: 'secondary'}, 'the remote prompt must not be overwritten by an untouched old value');
+  saved.resolve({replayed: false, task: editable('memory.reflect', 'secondary')});
+  await flush();
+  h.page.unmount();
+});
+
+test('a real field conflict shows both values and rereads before adopting a new save baseline', async () => {
+  const h = harness(), node = h.root(), initial = status();
+  initial.providers.push({id: 'third', capabilities: ['text'], max_output_tokens: 8192});
+  h.page.mount(node);
+  h.requests[0].resolve(initial);
+  await flush();
+  node.change('[data-model-field]', {modelField: 'provider', modelKind: 'memory.reflect', value: 'secondary'});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
+  h.requests[1].resolve({status: 'error', message: 'configuration_revision_conflict', data: null});
+  await flush();
+  const latest = structuredClone(initial);
+  latest.tasks[1].edit_token = 'b'.repeat(64);
+  latest.tasks[1].fields.provider.value = 'third';
+  assert.equal(h.requests[2]?.method, 'GET');
+  h.requests[2].resolve(latest);
+  await flush();
+  assert.match(node.innerHTML, /当前值[\s\S]*third[\s\S]*草稿[\s\S]*secondary/);
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
+  assert.equal(h.requests.length, 3, 'a conflicting draft must wait for review');
+  node.click('[data-model-action]', {modelAction: 'rebase', modelKind: 'memory.reflect'});
+  assert.equal(h.requests[3]?.method, 'GET', 'review must not reuse a stale cached token');
+  const freshest = structuredClone(latest);
+  freshest.tasks[1].edit_token = 'c'.repeat(64);
+  freshest.tasks[1].fields.prompt.value = 'changed during review';
+  freshest.tasks[1].fields.prompt.explicit = true;
+  h.requests[3].resolve(freshest);
+  await flush();
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
+  assert.equal(h.requests[4]?.values.edit_token, freshest.tasks[1].edit_token);
+  assert.deepEqual({...h.requests[4].values.changes}, {provider: 'secondary'});
+  h.requests[4].resolve({replayed: false, task: editable('memory.reflect', 'secondary')});
+  await flush();
+  h.page.unmount();
+});
+
+test('repeated conflict refreshes never turn untouched remote fields into local edits', async () => {
+  const h = harness(), node = h.root(), initial = status();
+  initial.providers.push({id: 'third', capabilities: ['text'], max_output_tokens: 8192});
+  initial.tasks[1].fields.prompt = {value: 'original', explicit: true, source: 'role', inherited_value: '', inherited_source: 'default'};
+  h.page.mount(node);
+  h.requests[0].resolve(initial);
+  await flush();
+  node.change('[data-model-field]', {modelField: 'provider', modelKind: 'memory.reflect', value: 'secondary'});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
+  h.requests[1].resolve({status: 'error', message: 'configuration_revision_conflict', data: null});
+  await flush();
+  const latest = structuredClone(initial);
+  latest.tasks[1].edit_token = 'b'.repeat(64);
+  latest.tasks[1].fields.provider.value = 'third';
+  latest.tasks[1].fields.prompt.value = 'remote change';
+  h.requests[2].resolve(latest);
+  await flush();
+  node.click('[data-model-action]', {modelAction: 'refresh'});
+  h.requests[3].resolve(structuredClone(latest));
+  await flush();
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
+  assert.equal(h.requests.length, 4, 'a refresh must not clear an unresolved field conflict');
+  node.click('[data-model-action]', {modelAction: 'rebase', modelKind: 'memory.reflect'});
+  const freshest = structuredClone(latest);
+  freshest.tasks[1].edit_token = 'c'.repeat(64);
+  freshest.tasks[1].fields.prompt.value = 'another remote change';
+  h.requests[4].resolve(freshest);
+  await flush();
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
+  assert.deepEqual({...h.requests[5].values.changes}, {provider: 'secondary'});
+  h.requests[5].resolve({replayed: false, task: editable('memory.reflect', 'secondary')});
+  await flush();
+  h.page.unmount();
+});
+
+test('a validation rejection leaves the task editable without a revision-conflict lock', async () => {
+  const h = harness(), node = h.root();
+  h.page.mount(node);
+  h.requests[0].resolve(status());
+  await flush();
+  node.change('[data-model-field]', {modelField: 'provider', modelKind: 'memory.reflect', value: 'secondary'});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
+  h.requests[1].resolve({status: 'error', message: 'model_provider_unavailable', data: null});
+  await flush();
+  assert.equal(h.requests.length, 2);
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
+  assert.equal(h.requests[2]?.method, 'POST', 'a validation error must allow a corrected save');
+  h.requests[2].resolve({replayed: false, task: editable('memory.reflect', 'secondary')});
+  await flush();
+  h.page.unmount();
 });
 
 test('replacement policy edits keyword rules into the task replacement_rules field', async () => {
@@ -1044,6 +1384,8 @@ test('search service binds and saves an AstrBot DeepSeek Provider id', async () 
   assert.match(node.innerHTML, /Search \/ Fetch API/);
 
   node.change('[data-search-provider]', {value: 'deepseek_main'});
+  assert.equal(page.isDirty(), true);
+  assert.ok(Array.from(page.changedFields()).includes('联网搜索凭据来源'));
   node.click('[data-search-save]');
   const save = requests.find(item => item.method === 'POST' && item.route === 'model/search/save');
   assert.deepEqual(JSON.parse(JSON.stringify(save.values)), {
@@ -1053,7 +1395,38 @@ test('search service binds and saves an AstrBot DeepSeek Provider id', async () 
     providers: [{id: 'deepseek_main', name: 'DeepSeek 主账号'}]});
   await flush();
   assert.match(node.innerHTML, /后续搜索立即生效/);
+  assert.equal(page.isDirty(), false);
   page.unmount();
+});
+
+test('Laya local page explains CPU-only torch and disables the broken test', async () => {
+  const {page, requests, root} = harness();
+  const node = root();
+  page.mount(node);
+  requests[0].resolve(status());
+  await flush();
+  node.click('[data-model-tab]', {modelTab: 'laya'});
+  requests.find(item => item.method === 'GET' && item.route === 'model/laya').resolve({
+    enabled: false, mode: 'local', endpoint: '', default_model: 'multilingual',
+    api_key_set: false, timeout_seconds: 20, followup_confidence_threshold: 0,
+    package_installed: true, package_version: '0.4.0',
+    decision_fields: {turn_state: true, action: true, reply_intent: true, reply_style: true,
+      reply_form: true, segment_mode: true, tool_need: true},
+    model_cache_ready: true, model_cache_path: 'C:/cache/huggingface/hub',
+    local_runtime_state: 'gpu_unavailable', torch_version: '2.14.1+cpu',
+    cuda_version: '', cuda_available: false,
+    python_executable: 'C:/AstrBot/python.exe',
+    install_command: "& 'C:/AstrBot/python.exe' -m pip install 'laya==0.4.0'",
+    remote_install_command: "& 'C:/AstrBot/python.exe' -m pip install 'laya[serve]==0.4.0'",
+    remote_start_command: "$env:LAYA_DEFAULT_MODEL='multilingual'; & 'C:/AstrBot/python.exe' -m laya.serve",
+    revision: 'laya-cpu'});
+  requests.find(item => item.method === 'GET' && item.route === 'model/laya/logs').resolve({events: []});
+  await flush();
+  assert.match(node.innerHTML, /CUDA 不可用/);
+  assert.match(node.innerHTML, /2\.14\.1\+cpu/);
+  assert.match(node.innerHTML, /安装与驱动匹配的 CUDA 版 PyTorch/);
+  assert.match(node.innerHTML, /data-laya-test[^>]*disabled/);
+  assert.doesNotMatch(node.innerHTML, /下载并验证模型[^<]*<\/button>/);
 });
 
 test('Laya page exposes official local install, first-run download, and SystemOne remote setup', async () => {
@@ -1066,7 +1439,8 @@ test('Laya page exposes official local install, first-run download, and SystemOn
   const statusRequest = requests.find(item => item.method === 'GET' && item.route === 'model/laya');
   assert.ok(statusRequest);
   statusRequest.resolve({enabled: false, mode: 'local', endpoint: '', default_model: 'multilingual',
-    api_key_set: false, timeout_seconds: 20, package_installed: true, package_version: '0.4.0',
+    api_key_set: false, timeout_seconds: 20, followup_confidence_threshold: 0,
+    package_installed: true, package_version: '0.4.0',
     decision_fields: {turn_state: true, action: true, reply_intent: true, reply_style: true,
       reply_form: true, segment_mode: true, tool_need: true},
     model_cache_ready: false, model_cache_path: 'C:/cache/huggingface/hub',
@@ -1096,6 +1470,8 @@ test('Laya page exposes official local install, first-run download, and SystemOn
   assert.doesNotMatch(node.innerHTML, /GGUF|OpenAI 兼容|chat\/completions/);
   assert.match(node.innerHTML, /判断回复形式/);
   assert.match(node.innerHTML, /判断分段倾向/);
+  assert.match(node.innerHTML, /连续接话置信阈值/);
+  assert.match(node.innerHTML, /0 关闭；仅约束非点名续接/);
   assert.match(node.innerHTML, /Laya 调用日志/);
   assert.match(node.innerHTML, /模型输入 · state 与分类问题/);
   assert.match(node.innerHTML, /模型原始响应/);
@@ -1106,13 +1482,17 @@ test('Laya page exposes official local install, first-run download, and SystemOn
   assert.match(node.innerHTML, /当时启用：判断是否说完 · 判断回复意图/);
 
   node.change('[data-laya-decision]', {layaDecision: 'tool_need', checked: false});
+  node.change('[data-laya-field]', {layaField: 'followup_confidence_threshold', value: 55});
   node.change('[data-laya-field]', {layaField: 'local_model_path', value: 'C:/models/laya-finetuned'});
+  assert.deepEqual(Array.from(page.changedFields()).sort(),
+    ['Laya · 判断能力需求', 'Laya · 连续接话置信阈值', 'Laya · 本地模型路径'].sort());
   node.click('[data-laya-save]');
   const saveRequest = requests.find(item => item.method === 'POST' && item.route === 'model/laya/save');
   assert.equal(saveRequest.values.changes.decision_fields.tool_need, false);
   assert.equal(saveRequest.values.changes.local_model_path, 'C:/models/laya-finetuned');
+  assert.equal(saveRequest.values.changes.followup_confidence_threshold, 55);
   saveRequest.resolve({enabled: false, mode: 'local', endpoint: '', default_model: 'multilingual',
-    local_model_path: 'C:/models/laya-finetuned',
+    local_model_path: 'C:/models/laya-finetuned', followup_confidence_threshold: 55,
     api_key_set: false, timeout_seconds: 20, decision_fields: {...saveRequest.values.changes.decision_fields},
     package_installed: true, package_version: '0.4.0', model_cache_ready: false,
     model_cache_path: 'C:/cache/huggingface/hub', python_executable: 'C:/AstrBot/python.exe',
@@ -1124,4 +1504,74 @@ test('Laya page exposes official local install, first-run download, and SystemOn
   assert.match(node.innerHTML, /\/v1\/systemone/);
   assert.match(node.innerHTML, /复制服务启动命令/);
   assert.match(node.innerHTML, /data-laya-save/);
+  assert.equal(page.isDirty(), true);
+  assert.equal(page.discardChanges(), true);
+  assert.equal(page.isDirty(), false);
+  page.mount(root());
+  requests.filter(item => item.method === 'GET' && item.route === 'model').at(-1).resolve(status());
+  await flush();
+  assert.equal(page.isDirty(), false, 'discarded cached model scopes cannot block later navigation');
+  page.unmount();
+});
+
+test('Laya page offers a Jev judgment backend with its own address, key and model name', async () => {
+  const {page, requests, root} = harness();
+  const node = root();
+  const layaStatus = overrides => ({enabled: true, mode: 'remote', endpoint: 'https://laya.test/v1',
+    remote_model: '', default_model: 'multilingual', api_key_set: true, timeout_seconds: 20,
+    followup_confidence_threshold: 0,
+    decision_fields: {turn_state: true, action: true, reply_intent: true, reply_style: true,
+      reply_form: true, segment_mode: true, tool_need: true},
+    package_installed: false, package_version: '', model_cache_ready: false,
+    model_cache_path: 'C:/cache/huggingface/hub', python_executable: 'C:/AstrBot/python.exe',
+    install_command: "& 'C:/AstrBot/python.exe' -m pip install 'laya==0.4.0'",
+    remote_install_command: '', remote_start_command: '', revision: 'laya-remote', ...overrides});
+
+  page.mount(node);
+  requests[0].resolve(status());
+  await flush();
+  node.click('[data-model-tab]', {modelTab: 'laya'});
+  requests.find(item => item.method === 'GET' && item.route === 'model/laya').resolve(layaStatus({}));
+  requests.find(item => item.method === 'GET' && item.route === 'model/laya/logs').resolve({events: []});
+  await flush();
+  assert.match(node.innerHTML, /<option value="jev"[^>]*>Jev 判断服务<\/option>/,
+    'the access-mode list offers the gateway backend');
+
+  node.change('[data-laya-field]', {layaField: 'mode', value: 'jev'});
+  assert.match(node.innerHTML, /判断服务地址/);
+  assert.match(node.innerHTML, /\/v1\/chat\/completions/);
+  assert.match(node.innerHTML, /判断模型名/);
+  assert.match(node.innerHTML, /留空使用 jev-latest/);
+  assert.match(node.innerHTML, /Jev 判断服务<\/h3>/);
+  assert.doesNotMatch(node.innerHTML, /pip install .*laya==0\.4\.0/, 'a gateway backend needs no local package');
+  assert.doesNotMatch(node.innerHTML, /data-laya-test[^>]*disabled/);
+
+  node.change('[data-laya-field]', {layaField: 'endpoint', value: 'https://jev.example.test/v1'});
+  node.change('[data-laya-field]', {layaField: 'remote_model', value: 'jev-1.14.0'});
+  node.change('[data-laya-field]', {layaField: 'api_key', value: 'jev-secret'});
+  assert.equal(page.isDirty(), true);
+  node.click('[data-laya-save]');
+  const saveRequest = requests.find(item => item.method === 'POST' && item.route === 'model/laya/save');
+  assert.equal(saveRequest.values.changes.mode, 'jev');
+  assert.equal(saveRequest.values.changes.endpoint, 'https://jev.example.test/v1');
+  assert.equal(saveRequest.values.changes.remote_model, 'jev-1.14.0');
+  assert.equal(saveRequest.values.changes.api_key, 'jev-secret');
+  saveRequest.resolve(layaStatus({mode: 'jev', endpoint: 'https://jev.example.test/v1',
+    remote_model: 'jev-1.14.0', default_model: 'jev-1.14.0', revision: 'laya-jev'}));
+  await flush();
+  assert.equal(page.isDirty(), false);
+  assert.match(node.innerHTML, /判断模型：<code>jev-1\.14\.0<\/code>/);
+
+  node.change('[data-laya-field]', {layaField: 'mode', value: 'local'});
+  assert.match(node.innerHTML, /pip install .*laya==0\.4\.0/);
+  assert.match(node.innerHTML, /本地检查点目录/);
+  assert.doesNotMatch(node.innerHTML, /判断服务地址/);
+  node.change('[data-laya-field]', {layaField: 'mode', value: 'jev'});
+
+  node.click('[data-laya-test]');
+  requests.find(item => item.method === 'POST' && item.route === 'model/laya/test')
+    .reject(new Error('laya_auth_failed'));
+  await flush();
+  assert.match(node.innerHTML, /判断服务鉴权失败/, 'a rejected key keeps its own actionable message');
+  page.unmount();
 });

@@ -8,6 +8,7 @@ from companion_v2.conversation.foreground import ContextContribution, Contributi
 from companion_v2.foundation.outcome import Outcome
 from tests.group_host_support import GroupFixture, group_config
 from tests.multi_host_support import MultiFixture
+from tests.native_adapter_support import FakeEvent
 
 
 class PrivateCoreReplyAdmissionTests(MultiFixture, unittest.IsolatedAsyncioTestCase):
@@ -53,7 +54,8 @@ class PrivateCoreReplyAdmissionTests(MultiFixture, unittest.IsolatedAsyncioTestC
     async def test_role_change_between_admission_and_send_is_rejected(self):
         event = self.event(identifier="core-reply-role-change")
         prepared = (await self.controller.prepare_core_reply(event)).unwrap()
-        self.window_personas[event.unified_msg_origin] = "second"
+        self.controller.session_topology.update_persona_selection_snapshot(
+            event.unified_msg_origin, "100", "bot-a", "second", "role-b", "conversation-a")
 
         authorized = await self.controller.authorize_core_reply(event, prepared)
 
@@ -120,6 +122,28 @@ class PrivateCoreReplyAdmissionTests(MultiFixture, unittest.IsolatedAsyncioTestC
 
         self.assertFalse(authorized.is_success)
         self.assertEqual(authorized.failure.code, "core_reply_instruction_changed")
+
+    async def test_send_time_denial_keeps_an_unconfigured_route_as_not_claimed(self):
+        event = self.event(identifier="core-reply-unconfigured-route")
+        prepared = (await self.controller.prepare_core_reply(event)).unwrap()
+        stranger = FakeEvent(NS(platform=self.native.platforms["qq-main"]),
+                             event_id="core-reply-unconfigured-route", sender="999", login="100")
+
+        authorized = await self.controller.authorize_core_reply(stranger, prepared)
+
+        self.assertFalse(authorized.is_success)
+        self.assertEqual(authorized.failure.code, "host_not_claimed")
+        self.assertIsNone(self.controller.target_for_event(stranger, connected=False))
+
+    async def test_send_time_denial_reports_a_host_that_stopped_accepting(self):
+        event = self.event(identifier="core-reply-not-accepting")
+        prepared = (await self.controller.prepare_core_reply(event)).unwrap()
+        self.controller._accepting = False
+
+        authorized = await self.controller.authorize_core_reply(event, prepared)
+
+        self.assertFalse(authorized.is_success)
+        self.assertEqual(authorized.failure.code, "host_not_accepting")
 
     async def test_first_conversation_creation_failure_can_fall_back_without_stopping_event(self):
         self.native.conversations["qq-main"] = None
@@ -257,6 +281,48 @@ class PrivateCoreReplyAdmissionTests(MultiFixture, unittest.IsolatedAsyncioTestC
             self.event(identifier="core-drama-direction"))).unwrap()
         self.assertEqual(prepared["voice_provider_instruction"], DRAMA_DIRECTION)
 
+    async def test_untriggered_voice_configuration_still_reaches_model_perception(self):
+        from astrbot_host.core_reply import CORE_REPLY_CONTEXT_EXTRA
+        from astrbot_host.core_reply_perception import inject_core_reply_perception_context
+        from companion_v2.conversation.reply_settings import (
+            GROUP, ReplyConfigurationOwner, target_for, voice_settings,
+        )
+        from companion_v2.conversation.voice_reply import VoiceReplyPolicy
+        from tests.test_core_reply_perception import perception_payload
+
+        seed = (await self.controller.prepare_core_reply(self.event(identifier="voice-perception-seed"))).unwrap()
+        policy = VoiceReplyPolicy(trigger_mode="request", generation_mode="model_tag", language="ja",
+                                  ja_provider_id="fish-ja", foreign_text_mode="translation")
+        owner = ReplyConfigurationOwner(self.app.runtime)
+        target = target_for(seed["context"])
+        fields = self.app.configuration.registry.group(GROUP)
+        current = owner.read(target, fields)
+        owner.write(target, fields,
+                    changes={GROUP + "." + key: value for key, value in voice_settings(policy).items()},
+                    reset=(), expected_revision=current.revision, observed_at=self.clock.now())
+        voice = NS(provider_config={"id": "fish-ja", "type": "fishaudio_tts_api", "model": "drama-3"},
+                   get_audio=AsyncMock())
+        self.native.get_provider_by_id = lambda key: voice if key == "fish-ja" else self.native.provider
+        self.native.get_all_tts_providers = lambda: [voice]
+        event = self.event(identifier="core-untriggered-voice", text="现在用的Drama 3是什么？")
+
+        prepared = (await self.controller.prepare_core_reply(event)).unwrap()
+        self.assertIsNone(prepared["voice_reply_policy"])
+        self.assertEqual(prepared["configured_voice_reply_policy"], policy)
+        self.assertEqual(prepared["voice_provider_instruction"], "")
+        event.set_extra(CORE_REPLY_CONTEXT_EXTRA, {"prepared": prepared})
+        request = NS(extra_user_content_parts=[])
+        await inject_core_reply_perception_context(event, request, native_context=self.native)
+        route = perception_payload(request)["environment"]["tts_route"]
+        self.assertEqual(route["status"], "available")
+        self.assertEqual(route["provider_id"], "fish-ja")
+        self.assertEqual(route["model"], "drama-3")
+        self.assertEqual(route["language"], "ja")
+        self.assertTrue(route["companion_voice_enabled"])
+        self.assertFalse(route["companion_voice_active_this_turn"])
+        self.assertTrue(route["drama_3_directions"])
+        voice.get_audio.assert_not_awaited()
+
     async def test_effective_task_prompt_is_used_without_resolving_model_route(self):
         group = self.app.router.profiles["conversation.reply"].group
         configuration_read = self.app.router.configuration.read
@@ -358,7 +424,7 @@ class PrivateCoreReplyAdmissionTests(MultiFixture, unittest.IsolatedAsyncioTestC
         self.assertNotIn("proactive_inspirations", prepared["context_sections"])
         contribution.assert_called_once()
 
-    async def test_private_denial_is_saved_for_the_notice_helper_without_retrying_receive(self):
+    async def test_private_denial_binds_notice_context_to_the_failed_preparation(self):
         event = self.event(identifier="core-reply-private-denied")
         context = self.controller.authority.context("first", "role-a")
         identity = self.controller.authority.identities
@@ -368,13 +434,19 @@ class PrivateCoreReplyAdmissionTests(MultiFixture, unittest.IsolatedAsyncioTestC
         result = await self.controller.prepare_core_reply(event)
 
         self.assertEqual(result.failure.code, "private_access_dialogue_denied")
-        self.assertEqual(self.controller.session.last_refusal.scope, context.scope)
+        self.assertIsInstance(result, Outcome)
+        self.assertFalse(hasattr(self.controller.session, "last_refusal"),
+                         "a shared refusal slot must not transport this event's context")
+        refusal = result.refusal
+        self.assertIsNotNone(refusal)
+        self.assertEqual(refusal.scope, context.scope)
+        self.assertEqual(refusal.actor.subject, context.actor.subject)
         receive = AsyncMock(side_effect=AssertionError("core refusal must not retry inbound receive"))
         self.controller.session.receive = receive
         with patch.object(self.controller, "_refuse_private", new=AsyncMock(return_value={"state": "sent"})) as refuse:
-            receipt = await self.controller.refuse_core_reply(event)
+            receipt = await self.controller.refuse_core_reply(event, refusal)
         self.assertEqual(receipt, {"state": "sent"})
-        refuse.assert_awaited_once_with(self.controller.session, event)
+        refuse.assert_awaited_once_with(self.controller.session, event, refusal)
         receive.assert_not_awaited()
 
     async def test_calendar_proxy_does_not_admit_ordinary_message_to_v2(self):
@@ -415,18 +487,127 @@ class GroupCoreReplyAdmissionTests(GroupFixture, unittest.IsolatedAsyncioTestCas
         self.assertFalse(rejected.is_success)
         self.assertEqual(rejected.failure.code, "group_admission_changed")
 
+    async def test_send_time_denial_names_a_disconnected_account_not_a_missing_target(self):
+        event = self.group_event(identifier="core-reply-client-offline")
+        prepared = (await self.controller.prepare_core_reply(event)).unwrap()
+        # OneBot drops the account's reverse-WebSocket API entry while the
+        # message route itself stays configured.
+        clients = self.native.platforms["qq-main"].client._wsr_api_clients
+        offline = clients.pop("100")
+        try:
+            self.assertIsNotNone(self.controller.target_for_event(event, connected=False))
+            self.assertIsNone(self.controller.target_for_event(event))
+            authorized = await self.controller.authorize_core_reply(event, prepared)
+        finally:
+            clients["100"] = offline
+
+        self.assertFalse(authorized.is_success)
+        self.assertEqual(authorized.failure.code, "host_client_offline")
+
     async def test_first_group_grants_policy_revision_change_does_not_change_identity(self):
         event = self.group_event(target="group-b", identifier="first-group-core-policy")
+        authority = self.controller.authority
+        old_actor = authority.actor(self.controller.target_for_event(event), "200")
 
         prepared = (await self.controller.prepare_core_reply(event)).unwrap()
         context = prepared["context"]
-        current = self.controller.authority.identities.resolve_authenticated(
+        current = authority.identities.resolve_authenticated(
             context.actor.principal, observed_at=self.clock.now()).unwrap()
         authorized = await self.controller.authorize_core_reply(event, prepared)
 
-        self.assertNotEqual(current.policy_revision, context.actor.policy_revision)
-        self.assertEqual(current.subject, context.actor.subject)
+        self.assertGreater(current.policy_revision, old_actor.policy_revision)
+        self.assertEqual(current.subject, old_actor.subject)
+        self.assertEqual(current.binding_id, old_actor.binding_id)
+        self.assertEqual(current.binding_revision, old_actor.binding_revision)
+        self.assertEqual(context.actor, current)
         self.assertTrue(authorized.is_success, authorized.failure)
+
+    async def test_first_group_authorization_uses_the_actor_refreshed_after_provisioning(self):
+        from companion_v2.adapters.astrbot.staging_config import REQUIRED_CAPABILITIES
+
+        event = self.group_event(target="group-b", identifier="first-group-fresh-actor")
+        identities = self.controller.authority.identities
+        observed = []
+        original = identities.authorize
+
+        def recording(resolved, *, scope, capability, observed_at):
+            if capability in REQUIRED_CAPABILITIES:
+                observed.append((capability, resolved.policy_revision, identities.revision))
+            return original(resolved, scope=scope, capability=capability, observed_at=observed_at)
+
+        identities.authorize = recording
+        try:
+            prepared = (await self.controller.prepare_core_reply(event)).unwrap()
+        finally:
+            identities.authorize = original
+
+        self.assertEqual({capability for capability, _resolved, _current in observed},
+                         set(REQUIRED_CAPABILITIES))
+        self.assertTrue(all(resolved == current for _capability, resolved, current in observed),
+                        "every grant check must use the actor resolved after provisioning")
+        self.assertEqual(len({resolved for _capability, resolved, _current in observed}), 1)
+        self.assertEqual(prepared["context"].actor.policy_revision, identities.revision)
+
+    async def test_first_group_grant_is_added_even_when_private_reply_grant_exists(self):
+        private_event = self.event(identifier="existing-private-reply")
+        private_prepared = (await self.controller.prepare_core_reply(private_event)).unwrap()
+        private_context = private_prepared["context"]
+        self.assertEqual(private_context.scope.kind.value, "private")
+
+        event = self.group_event(target="group-b", identifier="new-group-with-private-grant")
+        prepared = (await self.controller.prepare_core_reply(event)).unwrap()
+        context = prepared["context"]
+        self.assertEqual(context.scope.kind.value, "group")
+
+        identities = self.controller.authority.identities
+        grants = [grant for grant in identities.grants_for_subject(context.actor.subject)
+                  if grant.capability == "conversation.reply" and grant.state.value == "active"]
+        self.assertTrue(any(grant.scope == private_context.scope for grant in grants))
+        self.assertTrue(any(grant.scope == context.scope for grant in grants))
+        authorized = await self.controller.authorize_core_reply(event, prepared)
+        self.assertTrue(authorized.is_success, authorized.failure)
+
+    async def test_first_group_revoked_grant_is_not_reissued_by_preparation(self):
+        event = self.group_event(target="group-b", identifier="fresh-group-revocation")
+        prepared = (await self.controller.prepare_core_reply(event)).unwrap()
+        context = prepared["context"]
+        identities = self.controller.authority.identities
+        grant_id = self.controller.authority.groups.grant_id(
+            context.scope, context.actor.subject, "conversation.reply")
+        identities.revoke_grant(grant_id, revoked_at=self.clock.now(),
+                                expected_revision=identities.revision)
+        revision = identities.revision
+
+        again = await self.controller.prepare_core_reply(
+            self.group_event(target="group-b", identifier="fresh-group-after-revocation"))
+
+        self.assertFalse(again.is_success)
+        self.assertIn(again.failure.code, {"authorization_revoked", "host_grant_changed",
+                                           "scope_not_granted", "authorization_denied"})
+        grants = [grant for grant in identities.grants_for_subject(context.actor.subject)
+                  if grant.grant_id == grant_id]
+        self.assertEqual(len(grants), 1)
+        self.assertEqual(grants[0].state.value, "revoked")
+        self.assertEqual(identities.revision, revision,
+                         "preparation must not mint a replacement grant")
+
+    async def test_repeated_first_group_preparation_is_idempotent(self):
+        event = self.group_event(target="group-b", identifier="first-group-idempotent")
+        first = (await self.controller.prepare_core_reply(event)).unwrap()
+        identities = self.controller.authority.identities
+        revision = identities.revision
+        grants = tuple(grant.grant_id for grant in identities.grants_for_subject(
+            first["context"].actor.subject))
+
+        second = (await self.controller.prepare_core_reply(
+            self.group_event(target="group-b", identifier="first-group-idempotent"))).unwrap()
+
+        self.assertEqual(first["context"].key, second["context"].key)
+        self.assertEqual(first["context"].actor, second["context"].actor)
+        self.assertEqual(first["context"].role_binding, second["context"].role_binding)
+        self.assertEqual(identities.revision, revision)
+        self.assertEqual(tuple(grant.grant_id for grant in identities.grants_for_subject(
+            second["context"].actor.subject)), grants)
 
     async def test_group_revoked_permission_is_rechecked_after_stable_identity_match(self):
         event = self.group_event(identifier="core-group-permission-revoked")

@@ -227,3 +227,52 @@ def configured_balance_port(config=None):
         total_path=values["TOTAL_JSON_PATH"], used_path=values["USED_JSON_PATH"],
         divisor=values["VALUE_DIVISOR"] or "1", timeout_seconds=timeout,
         currency_label=values["CURRENCY_LABEL"] or "额度")
+
+
+BALANCE_KEYWORDS = ("余额", "额度", "欠费", "还剩多少")
+BALANCE_MATERIAL_INSTRUCTION = (
+    "这是 Bot 所用服务在观测时间的经费余额，不是用户的欠款、付款义务或对方账户余额。"
+    "被问到余额、额度时用它回答，并带上观测时间；state=unavailable 时说明这次没取到或还没接余额接口，"
+    "不要猜金额，也不要把这段材料说成对方的钱包。")
+
+
+def balance_keyword_material(application):
+    """登记「问余额时才去查一次」的材料。
+
+    映射面刻意很窄：只有主要陪伴对象本人的私聊、只有在余额源已配置时才登记；
+    关键词只认这四种说法，其余消息一次请求都不会多发。
+    """
+    from companion_v2.conversation.keyword_materials import KeywordMaterialSpec
+    from companion_v2.expression.configuration import source_subject_allowed_for_context
+    from companion_v2.foundation.refs import ScopeKind
+
+    async def prepare(context, text, at):
+        port = getattr(application, "balance_port", None)
+        if port is None:
+            return {"state": "unavailable", "code": "balance_source_unavailable"}
+        observation = await asyncio.wait_for(port.fetch(), timeout=8)
+        total = observation.total
+        try:
+            percent = round(float(observation.balance) * 100 / float(total), 1) if total else None
+        except (ArithmeticError, ValueError):
+            percent = None
+        return {"state": "ok",
+                "currency": getattr(port, "currency_label", "额度") or "额度",
+                "balance": display_amount(observation.balance),
+                "total": display_amount(total) if total is not None else None,
+                "percent": percent,
+                "observed_at": observation.observed_at.isoformat()}
+
+    def available(context):
+        if context.scope.kind is not ScopeKind.PRIVATE:
+            return False
+        if getattr(application, "balance_port", None) is None:
+            return False
+        try:
+            return bool(source_subject_allowed_for_context(application.runtime, context))
+        except Exception:
+            return False
+
+    return KeywordMaterialSpec(owner="service.balance", title="服务余额",
+        instruction=BALANCE_MATERIAL_INSTRUCTION, keywords=BALANCE_KEYWORDS,
+        prepare=prepare, available=available, ttl_seconds=300)

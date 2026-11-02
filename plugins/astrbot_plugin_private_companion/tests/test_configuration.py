@@ -117,6 +117,47 @@ class ConfigurationTests(unittest.TestCase):
         self.assertFalse(self.service.operations.get(operation.operation_id).is_success)
         self.assertEqual(self.read().values["output.prompt"], "default")
 
+    def test_other_groups_do_not_invalidate_an_open_editor(self) -> None:
+        before = self.read()
+        for target in (GLOBAL, ROLE_TARGET, WINDOW_TARGET):
+            self.save({"thought.weight": 2}, target, group="thought").unwrap()
+        self.assertEqual(self.read().edit_token, before.edit_token)
+        self.save({"output.prompt": "kept draft"}, snapshot=before).unwrap()
+        self.assertEqual(self.read().values["output.prompt"], "kept draft")
+
+    def test_unrelated_objects_and_other_users_permissions_do_not_expire_a_draft(self) -> None:
+        before = self.read()
+        self.service.policy.register_object("unrelated-note", owner=USER, scope=WINDOW, domain="memo")
+        other_user = SubjectRef(INSTALLATION, SubjectKind.HUMAN, "another-user")
+        self.identity.issue_grant(grant_id="unrelated-grant", subject=other_user,
+            scope=WINDOW, capability="configuration.read", tier=AuthorizationTier.STANDARD,
+            valid_from=NOW, expected_revision=self.identity.revision)
+        self.assertEqual(self.read().edit_token, before.edit_token)
+        self.save({"output.prompt": "still authorized"}, snapshot=before).unwrap()
+
+    def test_current_access_tier_change_still_requires_a_fresh_snapshot(self) -> None:
+        before = self.read()
+        self.service.policy.set_tier(USER, AuthorizationTier.IMPORTANT,
+            expected_revision=self.service.policy.revision, observed_at=NOW)
+        result = self.save({"output.prompt": "stale access tier"}, snapshot=before)
+        self.assertEqual(result.failure.code, "configuration_revision_conflict")
+
+    def test_set_then_reset_cannot_make_an_old_edit_token_current_again(self) -> None:
+        before = self.read()
+        self.save({"output.prompt": "temporary"}).unwrap()
+        self.save({}, reset=("output.prompt",)).unwrap()
+        self.assertEqual(self.read().values, before.values)
+        result = self.save({"output.prompt": "stale after reset"}, snapshot=before)
+        self.assertEqual(result.failure.code, "configuration_revision_conflict")
+
+    def test_overridden_parent_configuration_remains_an_edit_dependency(self) -> None:
+        self.save({"output.prompt": "window choice"}).unwrap()
+        before = self.read()
+        self.save({"output.prompt": "new parent choice"}, ROLE_TARGET).unwrap()
+        self.assertEqual(self.read().values, before.values)
+        result = self.save({"output.prompt": "late choice"}, snapshot=before)
+        self.assertEqual(result.failure.code, "configuration_revision_conflict")
+
     def test_two_connections_cannot_overwrite_each_others_saved_choice(self) -> None:
         other = ConfigurationService(self.open_runtime(), registry())
         stale = self.read()

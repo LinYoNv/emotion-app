@@ -20,6 +20,13 @@ from companion_v2.role_work.state.management import StateManagement
 from companion_v2.configuration.models import ConfigLayer, ConfigTarget
 from companion_v2.conversation.perception_settings import (PerceptionConfigurationOwner,
     configuration_fields as perception_fields, role_target_for, target_for as perception_window_target)
+from companion_v2.relationships import anniversaries
+from companion_v2.role_profile.configuration import (
+    GROUP as ROLE_PROFILE_GROUP,
+    RoleProfileConfigurationOwner,
+    configuration_fields as role_profile_fields,
+    target_for as role_profile_target_for,
+)
 
 
 class NativePerceptionAPITests(unittest.IsolatedAsyncioTestCase):
@@ -307,3 +314,23 @@ class NativePerceptionAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime["data"]["weather"]["temperature_c"], 22.0)
         self.assertEqual(runtime["data"]["calendar"]["status"], "available")
         self.assertEqual(weather.locations[0].name, "测试区域")
+
+        owner = RoleProfileConfigurationOwner(app.runtime)
+        target = role_profile_target_for(context)
+        fields = role_profile_fields()
+        snapshot = owner.read(target, fields)
+        owner.write(target, fields, changes={ROLE_PROFILE_GROUP + ".birthday": "9月23日"},
+                    reset=(), expected_revision=snapshot.revision, observed_at=support.NOW)
+        anniversaries.remember(app.runtime, context, {
+            "label": "第一次一起看星星", "reason": "用户原话明确说这是第一次一起看星星。",
+            "confidence": 0.9, "evidence_handle": "s1",
+            "occurred_at": support.NOW.isoformat(), "month": 9, "day": 23,
+            "timezone": "Asia/Shanghai",
+        }, source_run_id="perception-host-test", at=support.NOW)
+        status = (await self.call())["data"]["contact"]
+        dates = json.loads(status["dates"])
+        self.assertEqual(status["lookaheadDays"], 7)
+        self.assertTrue(any(row["label"] == "角色生日" and row["days_until"] == 2
+                            and row["basis"] == "profile_role_birthday" for row in dates))
+        self.assertTrue(any(row["label"] == "第一次一起看星星" and row["days_until"] == 2
+                            and row["basis"] == "auto_relationship_anniversary" for row in dates))

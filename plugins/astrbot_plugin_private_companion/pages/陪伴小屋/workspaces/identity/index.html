@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="style.css">
   <script src="../../embedded-bridge.js" defer></script>
   <script src="../../assets/lucide.min.js" defer></script>
-  <script src="member-editor.js?v=relationship-memory-separation-20261007" defer></script>
+  <script src="member-editor.js?v=cleanup-scope-contract-20261027" defer></script>
   <script src="app.js?v=private-members-20261002" defer></script>
 </head>
 <body>
@@ -19,6 +19,9 @@
       </div>
       <div class="heading-actions">
         <span class="sync-state" id="sync-state" role="status" aria-live="polite">正在连接</span>
+        <button id="open-private-access" class="secondary" type="button" title="新用户默认权限" hidden>
+          <i data-lucide="shield-check" aria-hidden="true"></i><span>新用户默认权限</span>
+        </button>
         <button id="refresh" class="secondary refresh-button" type="button" title="重新读取关系网">
           <i data-lucide="refresh-cw" aria-hidden="true"></i><span>重新读取</span>
         </button>
@@ -133,14 +136,23 @@
       </header>
       <div class="people-toolbar">
         <div class="filter-row" role="group" aria-label="按用户往来类型筛选">
-          <button class="chip active" type="button" data-filter="stable" aria-pressed="true">有私聊 <b id="chip-stable">0</b></button>
+          <button class="chip active" type="button" data-filter="stable" aria-pressed="true">私聊用户 <b id="chip-stable">0</b></button>
           <button class="chip" type="button" data-filter="temporary" aria-pressed="false">群聊用户 <b id="chip-temporary">0</b></button>
+          <button class="chip" type="button" data-filter="discovered" aria-pressed="false">其他会话 <b id="chip-discovered">0</b></button>
         </div>
         <label class="user-visibility-toggle" for="hide-idle-users">
           <input id="hide-idle-users" type="checkbox" checked>
           <span><strong>隐藏无往来用户</strong></span>
         </label>
       </div>
+      <section id="stranger-contacts" class="stranger-contacts" aria-label="近期私聊被拒" hidden>
+        <header class="panel-heading compact-heading">
+          <h2>近期私聊被拒</h2>
+          <div class="panel-heading-meta"><span class="result-count" id="stranger-count">0 人</span></div>
+        </header>
+        <p class="panel-note">这些账号给本插件的号发过私聊，但不在任何已配置的私聊窗口里。这里只记录账号与时间：不建身份、不写记忆、不签发对话权限。要把他们转成正式用户，请把私聊目标改为「任意私聊」或把该账号加为具体对象。</p>
+        <ul id="stranger-list" class="stranger-list"></ul>
+      </section>
       <div class="people-layout">
         <div id="people-grid" class="people-grid" aria-live="polite"></div>
         <section id="person-detail" class="person-detail" aria-label="成员资料和配置">

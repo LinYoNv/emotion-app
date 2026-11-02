@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from companion_v2.adapters.astrbot.native import HostAccount, account_number
+from companion_v2.adapters.astrbot.native import HostAccount, account_number, route_id
 from .settings import HostControlError, PROFILE_PATTERN, _text
 
 
@@ -19,6 +19,21 @@ class GroupTarget:
         return self.platform_id, self.account_id, self.group_id
 
 
+def group_session_matches(session_id, group_id):
+    """Accept one shared group id or a legacy OneBot ``sender_group`` id."""
+    if type(session_id) is not str or type(group_id) is not str or not session_id or not group_id:
+        return False
+    if session_id == group_id:
+        return True
+    parts = session_id.split("_")
+    if len(parts) != 2 or parts[-1] != group_id:
+        return False
+    try:
+        return all(account_number(part) == part for part in parts)
+    except ValueError:
+        return False
+
+
 def parse_group_targets(values):
     fields = ("target_id", "platform_id", "account_id", "bot_id", "group_id")
     if type(values) is not list:
@@ -31,7 +46,7 @@ def parse_group_targets(values):
         try:
             HostAccount(target.platform_id, target.account_id, target.bot_id)
             if target.group_id != "*":
-                account_number(target.group_id)
+                route_id(target.group_id)
             if not PROFILE_PATTERN.fullmatch(target.target_id) or target.route_key in routes:
                 raise ValueError()
         except ValueError:

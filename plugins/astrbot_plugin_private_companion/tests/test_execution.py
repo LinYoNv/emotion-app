@@ -91,13 +91,38 @@ class ExecutionTests(ExecutionFixture):
         limits = json.loads(self.runtime.read_one("SELECT limits_json FROM task_supervisor", ())['limits_json'])
         self.assertEqual(limits["retained_tasks"], expanded.retained_tasks)
 
-    def test_start_rejects_capacity_decrease_and_other_limit_changes(self):
+    def test_start_adopts_lane_and_queue_capacity_increases_without_clearing_work(self):
+        running = self.running(kind="fixture.effect")
+        self.tasks.begin_effect(running).unwrap()
+        self.tasks.record_operation(running, "original-operation").unwrap()
+        queued = self.submit("queued", kind="fixture.background")
+        expanded = replace(self.limits, foreground_slots=3, background_slots=3, queued_per_lane=16)
+        next_supervisor = self.supervisor(limits=expanded)
+
+        self.assertEqual(next_supervisor.start(expected_generation=1).unwrap(), 2)
+        self.assertEqual(next_supervisor.read(self.context, queued.task_id).unwrap(), queued)
+        self.assertEqual(self.tasks.check_generation().failure.code, "supervisor_fenced")
+        self.assertEqual(next_supervisor.recover().unwrap(), (running.task_id,))
+        retained = next_supervisor.read(self.context, running.task_id).unwrap()
+        self.assertEqual((retained.state, retained.operation_id, retained.effect),
+                         ("uncertain", "original-operation", "unknown"))
+        self.assertTrue(next_supervisor.observe(self.context, running.task_id).unwrap()["slot_held"])
+        self.assertEqual(next_supervisor.claim(Lane.BACKGROUND).unwrap().claim.task_id, queued.task_id)
+        attached = self.supervisor(limits=expanded)
+        self.assertEqual(attached.attach(expected_generation=2).unwrap(), 2)
+        self.assertEqual(self.supervisor().attach(expected_generation=2).failure.code,
+                         "supervisor_generation_conflict")
+
+    def test_start_rejects_capacity_decreases_even_when_another_capacity_increases(self):
         for changed in (replace(self.limits, retained_tasks=self.limits.retained_tasks - 1),
-                        replace(self.limits, background_slots=self.limits.background_slots + 1)):
+                        replace(self.limits, foreground_slots=self.limits.foreground_slots - 1),
+                        replace(self.limits, queued_per_lane=self.limits.queued_per_lane - 1,
+                                background_slots=self.limits.background_slots + 1)):
             with self.subTest(changed=changed):
                 next_supervisor = self.supervisor(limits=changed)
                 self.assertEqual(next_supervisor.start(expected_generation=1).failure.code,
                                  "supervisor_limits_changed")
+                self.assertEqual(self.tasks.check_generation().unwrap(), 1)
 
     def test_large_trusted_catalog_preserves_uniqueness_and_execution_limits(self):
         registrations = tuple(TaskRegistration(replace(self.foreground, kind=f"fixture.domain-{index}"),
@@ -450,6 +475,34 @@ class ExecutionTests(ExecutionFixture):
         self.assertEqual(self.runtime.read_one("SELECT COUNT(*) n FROM execution_attempts", ())["n"], 0)
         self.assertEqual(self.read_task().state, "created")
         self.assertIsNotNone(self.claim())
+
+
+class SelfReviewActionAdmissionTests(ExecutionFixture):
+    """The daily review's declared action must survive real task admission."""
+
+    def test_private_owner_enqueue_uses_the_registered_self_review_action(self):
+        from companion_v2.role_work.journal.self_review_evidence import READ_ACTION
+        definition = replace(self.foreground, kind="fixture.self-review", action=READ_ACTION)
+        tasks = self.supervisor(registrations=(*self.registrations,
+                                               TaskRegistration(definition, self.validate_inputs)))
+        tasks.start(expected_generation=1).unwrap()
+        now = self.clock.now()
+        self.assertIn(READ_ACTION, tasks.policy.registry.definitions)
+        self.assertTrue(tasks.check_context_access(self.context, action=READ_ACTION, observed_at=now).is_success)
+        saved = tasks.submit(self.spec(kind="fixture.self-review")).unwrap()
+        self.assertEqual(saved.spec.kind, "fixture.self-review")
+        self.assertEqual(saved.spec.context, self.context)
+
+        # Another person cannot act on this private window's review, and the
+        # refusal happens before any task row is written.
+        binding = self.identity.resolve_role(SCOPE, observed_at=now).unwrap()
+        foreign = TaskContext(self.standard, binding, AudienceRef(SCOPE, (self.standard.subject,)))
+        self.assertEqual(tasks.check_context_access(foreign, action=READ_ACTION, observed_at=now).failure.code,
+                         "private_task_required")
+        self.assertEqual(tasks.submit(self.spec("task-foreign", kind="fixture.self-review",
+                                                context=foreign)).failure.code, "private_task_required")
+        self.assertEqual(self.runtime.read_one(
+            "SELECT COUNT(*) n FROM execution_tasks WHERE task_id = 'task-foreign'", ())["n"], 0)
 
 
 if __name__ == "__main__":

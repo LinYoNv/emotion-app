@@ -8,6 +8,11 @@ def group_trigger_facts(event, account_id):
     raw = getattr(message, "raw_message", None)
     segments = raw.get("message") if isinstance(raw, Mapping) else None
     parts = segments if isinstance(segments, list) else getattr(message, "message", ())
+    platform_name = str(getattr(getattr(event, "platform_meta", None), "name", "") or "")
+    bot_ids = {str(account_id)}
+    if platform_name in {"qq_official", "qq_official_webhook"}:
+        bot_ids.update(value for value in (
+            str(getattr(message, "self_id", "") or ""), "qq_official") if value)
     mentioned, mentions_others, mentions_all, has_image, replies = False, False, False, False, []
     for part in parts:
         if isinstance(part, Mapping):
@@ -19,7 +24,7 @@ def group_trigger_facts(event, account_id):
             kind = getattr(getattr(part, "type", None), "value", getattr(part, "type", None))
             qq, identifier = getattr(part, "qq", None), getattr(part, "id", None)
         if kind in ("at", "At"):
-            if str(qq) == account_id:
+            if str(qq) in bot_ids:
                 mentioned = True
             elif str(qq) == "all":
                 mentions_all = True

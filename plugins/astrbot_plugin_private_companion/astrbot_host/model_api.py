@@ -4,6 +4,7 @@ import asyncio
 import base64
 import inspect
 import json
+import logging
 import re
 from copy import deepcopy
 from pathlib import Path
@@ -25,6 +26,7 @@ from .management_identity import dashboard_operator
 from .core_reply_configuration import CORE_MANAGED_FIELDS, project_core_reply_configuration
 from .memory_diagnostics import process_memory_snapshot
 from .memory_linkage import read_external_memory_summary
+from .maintenance_checks import read_host_checks
 from .native_extensions.image_settings import read_image_settings, write_image_settings
 from .settings import HostControlError
 from .native_extensions.images import IMAGE_ACTIONS
@@ -35,10 +37,28 @@ from .host_token_usage import read_astrbot_token_usage
 from .voice import _read_audio
 from .fish_audio import MODEL_OPTIONS as FISH_AUDIO_MODEL_OPTIONS
 
+logger = logging.getLogger(__name__)
+
+
+def _probe_error_summary(error):
+    """Return a bounded, URL/credential-free probe failure summary for logs."""
+    text = str(error)
+    text = re.sub(r"https?://[^\s]+", "[URL]", text, flags=re.I)
+    text = re.sub(r"(?i)\b(?:api[_-]?key|token|secret|password|authorization)\b\s*[:=]\s*\S+",
+                  "[REDACTED]", text)
+    text = re.sub(r"\bBearer\s+\S+", "Bearer [REDACTED]", text, flags=re.I)
+    return (type(error).__name__ + ": " + text.replace("\n", " ").replace("\r", " "))[:320]
 
 PREFIX = "/astrbot_plugin_private_companion/model"
 VOICE_FIELDS = {"zh": "voice_zh_provider_id", "ja": "voice_ja_provider_id", "en": "voice_en_provider_id"}
-VOICE_CHANGES = frozenset((*VOICE_FIELDS.values(), "voice_timeout_seconds"))
+VOICE_CHANNELS = {"private": "私聊", "group": "群聊"}
+CHANNEL_VOICE_FIELDS = {
+    channel: {lang: f"voice_{channel}_{lang}_provider_id" for lang in VOICE_FIELDS}
+    for channel in VOICE_CHANNELS
+}
+VOICE_CHANGES = frozenset((*VOICE_FIELDS.values(),
+    *(field for fields in CHANNEL_VOICE_FIELDS.values() for field in fields.values()),
+    "voice_timeout_seconds"))
 LANGUAGES = {"zh": "中文", "ja": "日语", "en": "英语"}
 IMAGE_SETTINGS = "model_image_routes.json"
 TTS_PROVIDER_SYSTEM_KEYS = frozenset({"id", "provider", "type", "provider_type", "enable", "hint", "provider_source_id"})
@@ -49,6 +69,8 @@ VOICE_AUDIO_MIME_TYPES = {
     ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".opus": "audio/ogg",
     ".wav": "audio/wav", ".webm": "audio/webm",
 }
+# 语音保存只写配置；宿主启停或切换时及时返回未写入，避免页面长时间等待。
+VOICE_SAVE_LOCK_WAIT_SECONDS = 2.0
 TTS_PROVIDER_LABELS = {
     "openai_tts_api": "OpenAI TTS(API)", "mimo_tts_api": "MiMo TTS(API)",
     "genie_tts": "Genie TTS", "edge_tts": "Edge TTS", "gsv_tts_selfhost": "GSV TTS(Local)",
@@ -285,6 +307,91 @@ def _document_optional(raw, required, optional=(), *, limit=32000):
     return data
 
 
+# 生图 provider 的字段声明。AstrBot 的 CONFIG_METADATA_2.provider_group 只覆盖
+# TTS/ASR，生图没有对应元数据，所以这里自己声明一组，供页面按 provider 类型渲染，
+# 不再让用户填自由文本。
+# kind: text | integer | boolean | select | textarea
+# 注意：超时不在这里声明——它由后端自己的配置（NativeClient.config）读取，
+# 写进生图参数只会被服务端忽略，宁可不在页面上给假控件。
+IMAGE_PROVIDER_GROUP = {
+    "comfyui": {
+        "label": "ComfyUI",
+        "fields": {
+            "endpoint": {"kind": "text", "group": "connection", "label": "服务地址",
+                         "help": "ComfyUI 的 HTTP 地址，例如 http://127.0.0.1:8188"},
+            "workflow": {"kind": "textarea", "group": "workflow", "label": "工作流 JSON",
+                         "help": "导出 API 格式的工作流；留空则使用内置模板"},
+            "steps": {"kind": "integer", "group": "sampling", "label": "采样步数",
+                      "default": 24, "min": 1, "max": 150},
+        },
+    },
+    "sd_webui": {
+        "label": "SD WebUI",
+        "fields": {
+            # Connection fields are edited from the same saved connection object above;
+            # only declare values that NativeTransportBackend accepts as request parameters.
+            "sampler_name": {"kind": "text", "group": "sampling", "storage": "parameters", "label": "采样器"},
+            "steps": {"kind": "integer", "group": "sampling", "storage": "parameters", "label": "采样步数",
+                      "default": 28, "min": 1, "max": 150},
+            "cfg_scale": {"kind": "number", "group": "sampling", "storage": "parameters", "label": "CFG",
+                          "default": 7, "min": 1, "max": 30, "step": 0.1},
+            "width": {"kind": "integer", "group": "sampling", "storage": "parameters", "label": "宽度",
+                      "default": 768, "min": 64, "max": 8192, "step": 64},
+            "height": {"kind": "integer", "group": "sampling", "storage": "parameters", "label": "高度",
+                       "default": 768, "min": 64, "max": 8192, "step": 64},
+            "batch_size": {"kind": "integer", "group": "sampling", "storage": "parameters", "label": "批量数量",
+                           "default": 1, "min": 1, "max": 4},
+            "seed": {"kind": "integer", "group": "sampling", "storage": "parameters", "label": "随机种子",
+                     "default": -1, "min": -1, "max": 4294967295},
+            "denoising_strength": {"kind": "number", "group": "sampling", "storage": "parameters", "label": "重绘幅度",
+                                   "default": 0.75, "min": 0, "max": 1, "step": 0.01},
+        },
+    },
+    "openai_images": {
+        "label": "OpenAI 兼容生图",
+        "fields": {
+            "api_base": {"kind": "text", "group": "connection", "label": "接口地址"},
+            "api_key": {"kind": "text", "group": "connection", "label": "密钥引用",
+                        "help": "填写环境变量名，不写明文密钥"},
+            "model": {"kind": "text", "group": "sampling", "label": "模型"},
+            "size": {"kind": "text", "group": "sampling", "label": "尺寸", "default": "1024x1024"},
+            "quality": {"kind": "select", "group": "sampling", "label": "质量",
+                        "choices": ["standard", "hd"], "default": "standard"},
+            "max_reference_images": {"kind": "integer", "group": "sampling",
+                                     "label": "最多参考图张数", "default": 1, "min": 0, "max": 8},
+        },
+    },
+}
+
+
+
+def text_provider_catalog(controller):
+    """Return the live AstrBot text providers shared by model pages and drafts."""
+    context = controller.context
+    from .bootstrap_provider import supported_text_provider, text_provider_predicate
+    expected_type = text_provider_predicate(getattr(controller, "native_types", None))
+    if expected_type is None:
+        raise TaskError("model_catalog_unavailable", "AstrBot text provider type is unavailable")
+    providers = []
+    for provider in list(context.get_all_providers() or []):
+        if not supported_text_provider(provider, expected_type):
+            continue
+        meta = provider.meta() if callable(getattr(provider, "meta", None)) else None
+        identifier = str(getattr(meta, "id", "") or getattr(provider, "id", "") or "").strip()
+        if not identifier:
+            continue
+        name = str(getattr(meta, "name", "") or getattr(meta, "label", "") or identifier)
+        providers.append({"id": identifier, "name": name[:120],
+                          "capabilities": sorted({"text", "conversation.reply"}),
+                          "loaded": True, "source": "astrbot"})
+    configured = getattr(getattr(context, "provider_manager", None), "providers_config", None) or []
+    configured_ids = {str(item.get("id")) for item in configured if isinstance(item, dict)}
+    for item in providers:
+        item["configured"] = item["id"] in configured_ids
+    providers.sort(key=lambda item: (not item["configured"], item["name"].lower(), item["id"]))
+    return providers
+
+
 class ModelWebAPI:
     def __init__(self, controller):
         self.controller = controller
@@ -299,6 +406,8 @@ class ModelWebAPI:
             (PREFIX + "/memory", self.memory_diagnostic, ["GET"], "Read current AstrBot process memory"),
             (PREFIX + "/balance", self.balance, ["GET"], "Read the configured upstream account balance"),
             (PREFIX + "/test/storage", self.storage_test, ["POST"], "Run read-only SQLite integrity diagnostics"),
+            (PREFIX + "/image-schema", self.image_schema, ["GET"],
+             "Read the declared image provider field groups"),
             (PREFIX + "/configure", self.configure, ["POST"], "Save one model task configuration"),
             (PREFIX + "/test", self.test, ["POST"], "Probe one registered text provider"),
             (PREFIX + "/laya", self.laya_status, ["GET"], "Read optional Laya decision model configuration"),
@@ -336,51 +445,35 @@ class ModelWebAPI:
                 raise TaskError("dashboard_identity_required", "sign in to the AstrBot Dashboard")
             if request.query:
                 raise TaskError("model_request_invalid", "model catalog does not accept query overrides")
-            context = self.controller.context
-            expected_type = getattr(getattr(self.controller, "native_types", None), "provider", None)
-            if expected_type is None:
-                raise TaskError("model_catalog_unavailable", "AstrBot text provider type is unavailable")
-            providers = []
-            for provider in list(context.get_all_providers() or []):
-                if type(provider) is not expected_type:
-                    continue
-                meta = provider.meta() if callable(getattr(provider, "meta", None)) else None
-                identifier = str(getattr(meta, "id", "") or getattr(provider, "id", "") or "").strip()
-                if not identifier:
-                    continue
-                name = str(getattr(meta, "name", "") or getattr(meta, "label", "") or identifier)
-                capabilities = sorted({"text", "conversation.reply"})
-                providers.append({"id": identifier, "name": name[:120], "capabilities": capabilities,
-                                  "loaded": True, "source": "astrbot"})
-            configured = getattr(getattr(context, "provider_manager", None), "providers_config", None) or []
-            configured_ids = {str(item.get("id")) for item in configured if isinstance(item, dict)}
-            for item in providers:
-                item["configured"] = item["id"] in configured_ids
-            providers.sort(key=lambda item: (not item["configured"], item["name"].lower(), item["id"]))
+            providers = text_provider_catalog(self.controller)
             return {"status": "ok", "data": {"providers": providers, "source": "astrbot.provider_manager"}}
         except TaskError as error:
             return outcome_response(Outcome.failed(error.code, str(error)))
         except Exception:
             return outcome_response(Outcome.failed("model_catalog_unavailable", "AstrBot provider list is unavailable"))
 
-    def _authorized(self, *, layer="role"):
+    def _authorized(self, *, layer="role", include_status=False, authorize=True,
+                    session=None, runtime=None):
         controller = self.controller
         username = request.username
         if type(username) is not str or not username.strip() or username.startswith("api_key:"):
             raise TaskError("dashboard_identity_required", "sign in to the AstrBot Dashboard")
         if layer not in ("role", "window"):
-            raise TaskError("model_request_invalid", "select role defaults or this private window")
+            raise TaskError("model_request_invalid", "select role defaults or this conversation window")
         if request.query and (set(request.query.keys()) != {"layer"} or request.query.get("layer") != layer
                 or callable(getattr(request.query, "getlist", None)) and len(request.query.getlist("layer")) != 1):
             raise TaskError("model_request_invalid", "model routes do not accept target overrides")
         if controller._terminated:
             raise TaskError("staging_host_terminated", "plugin is stopped")
-        session = controller.session or controller.last_session
-        if session is None or controller.runtime is None:
+        session = session if session is not None else (controller.session or controller.last_session)
+        runtime = runtime if runtime is not None else controller.runtime
+        if session is None or runtime is None:
             raise TaskError("staging_not_initialized", "load the V2 profile first")
-        operator = dashboard_operator(controller.runtime, username, at=controller.now())
+        operator = dashboard_operator(runtime, username, at=controller.now())
         manager = ModelManagement(session.application, session.profile.target)
-        status = require(manager.status(operator, layer=layer))
+        status = require(manager.status(operator, layer=layer)) if include_status else None
+        if authorize and not include_status:
+            require(manager.authorize(operator))
         return session, operator, manager, status
 
     @staticmethod
@@ -401,10 +494,25 @@ class ModelWebAPI:
                     raise TaskError("model_configuration_host_managed",
                                     "普通回复模型由 AstrBot 当前会话管理；此处只保存对话附加提示。")
             layer = data.get("layer", "role") if data is not None else request.query.get("layer", "role")
-            async with self.controller._control_lock:
-                _session, operator, manager, status = self._authorized(layer=layer)
-                result = (Outcome.success(status) if action == "status" else manager.maintenance(operator)
-                          if action == "maintenance" else manager.configure(operator, {**data, "layer": layer}))
+            # Capture the lifecycle-bound references under the control lock, but
+            # never run synchronous SQLite/projection work on the event loop.
+            # StorageRuntime already serialises its own read/write transactions.
+            controller = self.controller
+            async with controller._control_lock:
+                session = controller.session or controller.last_session
+                runtime = controller.runtime
+                if controller._terminated:
+                    raise TaskError("staging_host_terminated", "plugin is stopped")
+                if session is None or runtime is None:
+                    raise TaskError("staging_not_initialized", "load the V2 profile first")
+            _session, operator, manager, _status = await asyncio.to_thread(
+                self._authorized, layer=layer, authorize=False, session=session, runtime=runtime)
+            if action == "status":
+                result = await asyncio.to_thread(manager.status, operator, layer=layer)
+            elif action == "maintenance":
+                result = await asyncio.to_thread(manager.maintenance, operator)
+            else:
+                result = await asyncio.to_thread(manager.configure, operator, {**data, "layer": layer})
             if action in {"status", "configure"} and result.is_success:
                 result = Outcome.success(project_core_reply_configuration(result.unwrap()))
             if action == "maintenance" and result.is_success:
@@ -415,8 +523,18 @@ class ModelWebAPI:
                 if isinstance(memory_source, dict):
                     memory_source["linkage"] = await read_external_memory_summary(
                         self.controller, _session.profile.target)
-                async with self.controller._control_lock:
-                    self._authorized(layer=layer)
+                # Additive, read-only host facts.  They ride the existing
+                # maintenance read (the page already refreshes it) so no new
+                # polling path is introduced; a failure here must not hide the
+                # role-level accounting that already succeeded.
+                try:
+                    payload["host_checks"] = await asyncio.to_thread(
+                        read_host_checks, self.controller)
+                except Exception:
+                    logger.exception("[CompanionV2] 排障主机检查读取失败")
+                # External reads can take time; revalidate before returning the
+                # diagnostics rather than trusting the earlier authorization.
+                await asyncio.to_thread(manager.authorize, operator)
                 result = Outcome.success(payload)
             return self._response(result)
         except TaskError as error:
@@ -505,7 +623,7 @@ class ModelWebAPI:
             if type(provider_id) is not str or not provider_id or len(provider_id) > 128:
                 raise ValueError("invalid provider id")
             async with self.controller._control_lock:
-                _session, _operator, _manager, status = self._authorized()
+                _session, _operator, _manager, status = self._authorized(include_status=True)
                 if provider_id not in {item["id"] for item in status["providers"]}:
                     raise TaskError("model_provider_unavailable", "provider has no V2 adapter")
                 base = getattr(self.controller, "controller", self.controller)
@@ -519,7 +637,9 @@ class ModelWebAPI:
                 result, code = "ok", ""
             except asyncio.TimeoutError:
                 result, code = "unknown", "model_probe_timeout"
-            except Exception:
+            except Exception as error:
+                logger.warning("[CompanionV2] 模型探测失败 provider=%s error=%s",
+                               provider_id, _probe_error_summary(error))
                 result, code = "unknown", "model_probe_failed"
             async with self.controller._control_lock:
                 self._authorized()
@@ -672,10 +792,28 @@ class ModelWebAPI:
         settings = status["settings"]
         catalog = ReplyWebAPI(self.controller)._tts_catalog()
         return {"languages": [{"k": lang, "n": label, "bind": settings[field]}
-                              for lang, label in LANGUAGES.items() for field in (VOICE_FIELDS[lang],)],
+                               for lang, label in LANGUAGES.items() for field in (VOICE_FIELDS[lang],)],
+                "channels": [{"k": channel, "n": label,
+                              "bindings": {lang: settings[CHANNEL_VOICE_FIELDS[channel][lang]]
+                                           for lang in LANGUAGES}}
+                             for channel, label in VOICE_CHANNELS.items()],
                 "providers": catalog["providers"], "catalog_state": catalog["state"],
                 "timeout_seconds": settings["voice_timeout_seconds"],
                 "voice_enabled": settings["voice_enabled"], "edit_token": status["edit_token"]}
+
+    async def image_schema(self):
+        """按 provider 类型返回生图字段声明（只读，不涉及凭证）。
+
+        页面用它在生图配置旁渲染“该服务支持哪些字段、默认值是什么”，
+        让用户不必靠猜键名；真正的保存仍走既有配置接口。
+        """
+        try:
+            async with self.controller._control_lock:
+                self._authorized()
+                return self._response(Outcome.success({
+                    "image_provider_group": IMAGE_PROVIDER_GROUP}))
+        except TaskError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
 
     async def voice(self):
         try:
@@ -697,12 +835,20 @@ class ModelWebAPI:
                         raise ValueError("invalid voice timeout")
                 elif type(value) is not str or len(value) > 128:
                     raise ValueError("invalid voice binding")
-            async with self.controller._control_lock:
+            lock = self.controller._control_lock
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=VOICE_SAVE_LOCK_WAIT_SECONDS)
+            except TimeoutError:
+                return self._response(Outcome.failed(
+                    "host_busy", "the companion host is starting or switching; nothing was written"))
+            try:
                 session, operator, _manager, _status = self._authorized()
                 saved = require(ReplyManagement(session.application, session.profile.target,
                     layer=ConfigLayer.ROLE).configure(operator, data))
                 return self._response(Outcome.success({**self._voice_projection(session, operator),
                     "replayed": saved["replayed"]}))
+            finally:
+                lock.release()
         except TaskError as error:
             return self._response(Outcome.failed(error.code, str(error)))
         except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
@@ -822,6 +968,54 @@ class ModelWebAPI:
         except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
             return self._response(Outcome.failed("model_request_invalid", "invalid voice probe request"))
 
+    def _preferred_image_projection(self, registry):
+        """The first named model in the configured generate queue, not the native owner id."""
+        try:
+            getter = getattr(registry, "image_extension_api", None)
+            api = getter() if callable(getter) else None
+            reader = getattr(api, "output_configuration", None)
+            if not callable(reader):
+                return {}
+            projected = reader()
+            settings = projected.get("settings") if isinstance(projected, dict) else None
+            if not isinstance(settings, dict):
+                return {}
+            endpoints = {
+                item.get("id"): item for item in settings.get("endpoints", [])
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            }
+            routes = settings.get("operation_routes", {}).get("generate", [])
+            if not isinstance(routes, list):
+                return {}
+            first_configured = None
+            for route in routes:
+                if not isinstance(route, str) or not route.startswith("online:"):
+                    continue
+                endpoint = endpoints.get(route[7:])
+                if not isinstance(endpoint, dict):
+                    continue
+                model = endpoint.get("model")
+                if not isinstance(model, str) or not model.strip():
+                    continue
+                name = endpoint.get("name")
+                name = name.strip() if isinstance(name, str) else ""
+                candidate = {
+                    "model": model,
+                    "name": name or model,
+                    "route": route,
+                    "enabled": settings.get("enabled") is True and endpoint.get("enabled") is True,
+                }
+                if first_configured is None:
+                    first_configured = candidate
+                if candidate["enabled"]:
+                    return candidate
+            return first_configured or {}
+        except Exception:
+            # The status endpoint must still expose action readiness even when
+            # the image configuration cannot be projected.
+            return {}
+        return {}
+
     def _image_projection(self):
         registry = self.controller.native_extensions
         path = Path(self.controller.data_root) / IMAGE_SETTINGS
@@ -868,7 +1062,8 @@ class ModelWebAPI:
                   "declared_actions": sum(item.descriptor.package.extension_id == "image"
                                            for item in declarations)}
         return {"actions": rows, "enabled": dict(enabled), "module": module,
-                "authorization": "checked_for_each_invocation"}
+                "authorization": "checked_for_each_invocation",
+                "preferred_image": self._preferred_image_projection(registry)}
 
     async def image(self):
         try:
@@ -973,7 +1168,8 @@ class ModelWebAPI:
             templates.append(template)
             by_type[provider_type] = template
         templates.sort(key=lambda item: (item["name"].lower(), item["type"]))
-        return {"templates": templates, "by_type": by_type}
+        return {"templates": templates, "by_type": by_type,
+                "image_provider_group": IMAGE_PROVIDER_GROUP}
 
     def _tts_templates(self):
         bundle = self._tts_schema_bundle()

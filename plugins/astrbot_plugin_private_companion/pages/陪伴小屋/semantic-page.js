@@ -42,7 +42,7 @@ window.CompanionSemanticPage = (() => {
     ["reactions_collection_group_enabled","从群聊自动收录"],
     ["slang_enabled","群聊黑话目录"],["slang_learning","黑话自动学习"],
     ["slang_web_search_enabled","黑话联网参考"],["vision_review","识图复核"]];
-  const providerFields = [["embedding_provider","嵌入模型","embedding"],["rerank_provider","候选重排","rerank"],["analysis_provider","视觉与词义分析","analysis"]];
+  const providerFields = [["embedding_provider","向量模型（嵌入）","embedding"],["rerank_provider","候选重排","rerank"],["analysis_provider","视觉与词义分析","analysis"]];
   const semanticNumberFields = [["timeout_seconds","模型超时 / 秒",1,30],["batch_size","索引批次",1,64],
     ["learning_interval_seconds","群词义整理间隔 / 分钟",1,1440],
     ["slang_web_search_candidates","联网检索词数 / 个",1,12],["slang_web_search_results","每词参考条数",1,5]];
@@ -100,6 +100,17 @@ window.CompanionSemanticPage = (() => {
     if(kind==="reaction")html+='<button class="icon-button danger" type="button" data-semantic="delete" aria-label="删除表情素材" title="删除表情素材" '+(busy?"disabled":"")+'><i data-lucide="trash-2"></i></button>';
     return html+'<button class="button" type="button" data-semantic="close">取消</button></div></form></div>';
   }
+  function pendingAnalysis(item) {
+    const payload=item?.payload||{},itemKind=item?.kind||kind;
+    return itemKind==="reaction"&&payload.analysis==="pending";
+  }
+  function pendingAnalysisCount(){
+    return state?.catalog?.reaction?.pending??0;
+  }
+  function batchAnalyzeButton(){
+    const count=pendingAnalysisCount();
+    return '<button class="button" type="button" data-semantic="analyze-pending" '+(busy||!count?'disabled':'')+'>批量识别待补全'+(count?' ('+count+')':'')+'</button>';
+  }
   function renderLearning(cfg,group) {
     const current=shown=>draft?{...cfg,...draft}[shown]:cfg[shown];
     const catalog=state.catalog||{},slangCount=Number(catalog.slang?.total||0),reactionCount=Number(catalog.reaction?.total||0);
@@ -114,11 +125,13 @@ window.CompanionSemanticPage = (() => {
       html+='<div class="semantic-learning-toolbar"><form id="semanticSearch">';
       if(group)html+='<select name="kind" aria-label="素材类型"><option value="slang" '+(kind==="slang"?'selected':'')+'>群黑话</option><option value="reaction" '+(kind==="reaction"?'selected':'')+'>反应素材</option></select>';
       html+='<input name="query" type="search" maxlength="2000" placeholder="检索语义条目" aria-label="检索语义条目"><button class="button" '+(busy?'disabled':'')+'>检索</button></form>'+
-        '<label class="semantic-import button"><span>导入素材</span><input id="semanticFile" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif" '+(busy?'disabled':'')+'></label></div>';
+        '<label class="semantic-import button"><span>导入素材</span><input id="semanticFile" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif" '+(busy?'disabled':'')+'></label>'+
+        (kind==="reaction"?batchAnalyzeButton():"")+'</div>';
       if(result)html+='<div class="semantic-results"><strong>检索结果</strong><span>'+(result.embedded||0)+'/'+(result.eligible||0)+' 已建索引</span>'+(result.items||[]).map((item,index)=>'<button data-semantic-open="'+escape(item.id)+'" data-semantic-kind="'+escape(item.kind||kind)+'">'+escape(item.payload.name||item.payload.term||'未命名条目 '+(index+1))+'</button>').join('')+'</div>';
       const rows=(state.items||[]).map(item=>{
         const payload=item.payload||{},itemKind=item.kind||kind,slang=itemKind==="slang";
-        const source={private_capture:"私聊归纳",group_capture:"群聊归纳"}[payload.collection_source]||"手工收录";
+        const migrated=payload.collection_source==="legacy_migration"||Boolean(payload.legacy_source_id||payload.legacy_filename);
+        const source={private_capture:"私聊归纳",group_capture:"群聊归纳",legacy_migration:"V1 表情迁移"}[payload.collection_source]||(migrated?"V1 表情迁移":"手工收录");
         const title=payload.name||payload.term||"未命名";
         const detail=payload.meaning||payload.description||payload.usage||"";
         const sourceUrl=imageSource(item.thumbnail_url||item.image_url||payload.image_url||payload.url);
@@ -142,7 +155,8 @@ window.CompanionSemanticPage = (() => {
     const coreNumbers=semanticNumberFields.filter(([id])=>["timeout_seconds","batch_size"].includes(id));
     const memoryNumbers=semanticNumberFields.filter(([id])=>!coreNumbers.some(([field])=>field===id));
     const flagMarkup=items=>'<div class="semantic-flags">'+items.map(([id,label])=>toggle(id,label,current(id))).join('')+'</div>';
-    const providerMarkup='<div class="semantic-providers">'+providerFields.map(([id,label,type])=>'<label>'+label+'<select name="'+id+'">'+options(state.providers?.[type],current(id))+'</select></label>').join('')+'</div>';
+    const providerMarkup='<div class="semantic-providers">'+providerFields.map(([id,label,type])=>'<label>'+label+'<select name="'+id+'">'+options(state.providers?.[type],current(id))+'</select></label>').join('')+'</div>'
+      +(!(state.providers?.embedding||[]).length?'<p class="semantic-meta">没有读到向量模型。请先在 AstrBot 的模型服务页添加 embedding 类型的 Provider，再回到这里选择。</p>':'');
     const numberMarkup=items=>'<div class="semantic-providers">'+items.map(([id,label,min,max,step])=>{
       const raw=current(id),value=id==="learning_interval_seconds"&&Number.isFinite(Number(raw))?Math.round(Number(raw)/60):raw;
       return '<label>'+label+'<input name="'+id+'" type="number" min="'+min+'" max="'+max+'" step="'+(step||1)+'" value="'+escape(value??'')+'"></label>';
@@ -193,6 +207,7 @@ window.CompanionSemanticPage = (() => {
       html+='<label>'+label+'<input name="'+id+'" type="number" min="'+min+'" max="'+max+'" step="'+(step||1)+'" value="'+value+'"></label>';});
     currentViewSelects.forEach(([id,label,choices])=>html+='<label>'+label+'<select name="'+id+'">'+choices.map(([value,text])=>'<option value="'+escape(value)+'" '+(shown[id]===value?'selected':'')+'>'+escape(text)+'</option>').join('')+'</select></label>');
     if(currentViewProviders.length||currentViewNumbers.length||currentViewSelects.length)html+='</div>';
+    if(currentViewProviders.length&&!(state.providers?.embedding||[]).length)html+='<p class="semantic-meta">没有读到向量模型。请先在 AstrBot 的模型服务页添加 embedding 类型的 Provider，再回到这里选择。</p>';
     html+='<div class="semantic-actions"><button class="button primary" type="submit" '+(busy?"disabled":"")+'>'+(draft?'保存草稿':'保存配置')+'</button>';
     /* 冲突时更要能放弃：否则用户只剩「按新版本再存一次」一条路。 */
     if(draft)html+='<button class="button" type="button" data-semantic="discard">放弃草稿</button>';
@@ -216,10 +231,12 @@ window.CompanionSemanticPage = (() => {
       else html+='<div class="semantic-toolbar"><span class="semantic-kind-label">'+(kind==="reaction"?"表情素材":"当前群词义")+'</span>';
       html+='<form id="semanticSearch"><input name="query" type="search" maxlength="2000" placeholder="检索'+(kind==="reaction"?"表情":"群词义")+'" aria-label="检索素材"><button class="button" '+(busy?"disabled":"")+'>检索</button></form></div>';
       html+=`<div id="semantic-panel" role="tabpanel"${kinds.length>1?` aria-labelledby="semantic-tab-${kind}"`:""}>`;
-      if(kind==="reaction")html+='<label class="semantic-import button"><span>导入素材</span><input id="semanticFile" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif" '+(busy?"disabled":"")+'></label>';
+      if(kind==="reaction")html+='<label class="semantic-import button"><span>导入素材</span><input id="semanticFile" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif" '+(busy?"disabled":"")+'></label>'+batchAnalyzeButton();
       if(result)html+='<div class="semantic-results"><strong>检索结果 · '+(result.mode==="hybrid"?"语义与关键词":"关键词")+'</strong><span>'+(result.embedded||0)+'/'+(result.eligible||0)+' 已建索引'+(result.fallback_reason?" · 模型暂不可用":"")+'</span>'+(result.items||[]).map((item,index)=>'<button data-semantic-open="'+escape(item.id)+'">'+escape(item.payload.name||item.payload.term||'未命名素材 '+(index+1))+' · '+Number(item.score).toFixed(2)+'</button>').join("")+'</div>';
-      html+='<div class="semantic-list">'+(state.items||[]).map(item=>{const payload=item.payload||{};const source={private_capture:"私聊自动收录",group_capture:"群聊自动收录"}[payload.collection_source]||"手动收录";
-        const analysis={auto_reviewed:"已通过视觉审核",analyzed:"已识别",pending:"待识别",manual:"手工标注"}[payload.analysis]||"待标注";
+      html+='<div class="semantic-list">'+(state.items||[]).map(item=>{const payload=item.payload||{};const migrated=payload.collection_source==="legacy_migration"||Boolean(payload.legacy_source_id||payload.legacy_filename);const source={private_capture:"私聊自动收录",group_capture:"群聊自动收录",legacy_migration:"V1 表情迁移"}[payload.collection_source]||(migrated?"V1 表情迁移":"手动收录");
+        const analysisCode=migrated&&(!payload.analysis||payload.analysis==="pending")
+          ?(payload.manual_fields?.length?"legacy_imported":"legacy_pending"):payload.analysis;
+        const analysis={auto_reviewed:"已通过视觉审核",analyzed:"已识别",legacy_imported:"V1 迁移保留标注",legacy_pending:"V1 迁移 · 待补全",pending:"待识别",manual:"手工标注"}[analysisCode]||"待标注";
         const collectionState=payload.collection_state==="awaiting_confirmation"?"待人工确认":"";
         const sourceUrl=imageSource(item.thumbnail_url||item.image_url||payload.image_url||payload.url);
         const media=sourceUrl?'<img src="'+escape(sourceUrl)+'" alt="" loading="lazy">':'<span class="semantic-row-placeholder" aria-hidden="true"><i data-lucide="image"></i></span>';
@@ -338,6 +355,7 @@ window.CompanionSemanticPage = (() => {
       if(command==="reindex")run("reindex");
       if(command==="discard"){draft=null;conflict=false;message="已放弃草稿，显示当前已保存配置。";render();}
       if(command==="analyze"&&editing)run("analyze",{id:editing.id});
+      if(command==="analyze-pending")analyzePending();
       if(command==="delete"&&editing&&kind==="reaction"){
         const item=editing, selectedKind=kind;
         const ticket=generation;
@@ -378,6 +396,57 @@ window.CompanionSemanticPage = (() => {
     },{signal:abort.signal});
     load();
   }
+  async function analyzePending() {
+    if(busy||!current())return;
+    const ticket=++generation;
+    const candidates=new Map((state?.items||[]).filter(pendingAnalysis).map(item=>[item.id,item]));
+    const seen=new Set();
+    let cursor=after.reaction||"";
+    busy=true;conflict=false;message="正在扫描全部表情素材…";render();
+    try{
+      // The catalog is cursor-paginated. Reading only state.items misses all
+      // unloaded pages, including when page one has no pending entries.
+      while(cursor){
+        if(!active(ticket))return;
+        if(seen.has(cursor))throw new Error("semantic_pagination_loop");
+        seen.add(cursor);
+        const page=await api("GET",{...selection(),kind:"reaction",after:cursor});
+        if(!active(ticket))return;
+        if(!Array.isArray(page?.items))throw new Error("semantic_pagination_invalid");
+        for(const item of page.items)if(pendingAnalysis(item))candidates.set(item.id,item);
+        cursor=page.next_after||"";
+        message="正在扫描全部表情素材，已发现 "+candidates.size+" 张待补全…";render();
+      }
+    }catch(error){
+      if(!active(ticket))return;
+      busy=false;message="剩余素材读取失败，尚未开始批量识别，请重试。";render();return;
+    }
+    const total=candidates.size;
+    if(!total){busy=false;message="没有需要补全的表情素材。";render();return;}
+    let done=0,failed=0,lastError="";
+    message="正在批量识别 0/"+total+"…";render();
+    for(const item of candidates.values()){
+      if(!active(ticket))return;
+      try{
+        const data=await api("POST",{...selection(),action:"analyze",id:item.id});
+        if(!active(ticket))return;
+        if(data?.item)Object.assign(item,data.item);
+        done++;
+      }catch(error){
+        if(!active(ticket))return;
+        failed++;lastError=error?.code||error?.message||"";
+      }
+      message="正在批量识别 "+(done+failed)+"/"+total+"…";render();
+    }
+    if(!active(ticket))return;
+    busy=false;
+    const parts=[];
+    if(done)parts.push("已识别 "+done+" 张");
+    if(failed)parts.push("失败 "+failed+" 张");
+    message=parts.join("，")||"没有可识别的表情素材";
+    if(failed&&!done)message=localized({code:lastError},"批量识别失败，请核对视觉模型配置后重试。");
+    await load();
+  }
   async function importFiles(files) {
     if(busy||!current())return;
     const selected=files.slice(0,20),omitted=Math.max(0,files.length-selected.length);
@@ -398,6 +467,7 @@ window.CompanionSemanticPage = (() => {
     if(created)parts.push("新增 "+created+" 张");
     if(duplicates)parts.push("重复跳过 "+duplicates+" 张");
     if(failed)parts.push("失败 "+failed+" 张"+(omitted?"（超出每批 20 张）":""));
+    if(created)parts.push("可点「批量识别待补全」补全空白字段");
     busy=false;message=parts.join("，")||"没有可导入的图片";
     if(failed&&lastError&&!created&&!duplicates)message=localized({code:lastError},"批量导入失败，请检查图片格式和大小。");
     await load();
@@ -415,5 +485,14 @@ window.CompanionSemanticPage = (() => {
   /* 页面级未保存守卫（page-guards.js）：草稿存在就说明有未提交的改法。
      unmount 已经把 draft 之外的引用清掉，这里跟着 root 一起判断。 */
   function isDirty(){return !!draft&&!!root;}
-  return {mount,unmount,isDirty};
+  function changedFields(){return Object.keys(draft||{}).map(id=>
+    [...flags,...providerFields,...numberFields,...selectFields].find(item=>item[0]===id)?.[1]||id);}
+  async function saveBeforeLeave(){
+    if(!isDirty())return true;
+    if(busy)return {error:'语义配置正在处理，请稍后保存。'};
+    await run('configure',{changes:{...draft},revision:state.settings.revision});
+    return !isDirty()?true:{error:message||'语义配置未保存，草稿仍保留。'};
+  }
+  function discardChanges(){if(busy)return {error:'正在处理，请稍后切换。'};draft=null;conflict=false;return true;}
+  return {mount,unmount,isDirty,changedFields,saveBeforeLeave,discardChanges};
 })();

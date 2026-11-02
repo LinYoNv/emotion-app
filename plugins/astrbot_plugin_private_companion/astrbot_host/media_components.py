@@ -30,7 +30,8 @@ def group_components(event):
     """Restore original group media and text; STT output cannot replace their source."""
     group_event_route(event)
     message = event.message_obj
-    segments = message.raw_message.get("message")
+    raw = getattr(message, "raw_message", None)
+    segments = raw.get("message") if isinstance(raw, Mapping) else None
     if not isinstance(segments, list) or not any(
             isinstance(s, Mapping) and s.get("type") in ("record", "video", "file") for s in segments):
         return tuple(message.message)

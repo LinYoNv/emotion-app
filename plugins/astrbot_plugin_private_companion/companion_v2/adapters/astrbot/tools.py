@@ -5,7 +5,7 @@ An arbitrary function-manager entry is not sufficient permission to expose a too
 Identity, role and routing come exclusively from invocation.context, never arguments.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import inspect
 from typing import Protocol
@@ -66,6 +66,13 @@ class CompositeAstrBotToolPort:
             current = port.current_declaration(host_tool_id)
             if current is not None:
                 return current
+        return None
+
+    def provider_admission(self, host_tool_id):
+        for port in self.ports:
+            if any(item.host_tool_id == host_tool_id for item in port.declarations()):
+                factory = getattr(port, "provider_admission", None)
+                return factory(host_tool_id) if callable(factory) else None
         return None
 
     async def invoke(self, host_tool_id, invocation):
@@ -180,6 +187,22 @@ class QzoneToolPort:
             operation_id=operation_id, receipt_ref=receipt_ref)
 
 
+def _same_declaration(declaration, current):
+    """The host may rebind the same tool after a provider registry refresh.
+
+    Only the version/generation part of ``ProviderBinding`` is allowed to move;
+    every other declared field, including provider ID and capability, still has
+    to match the original declaration.
+    """
+    if current is None:
+        return False
+    if current == declaration:
+        return True
+    original, replacement = declaration.descriptor.binding, current.descriptor.binding
+    return ((original.provider, original.capability) == (replacement.provider, replacement.capability)
+            and replace(current.descriptor, binding=original) == declaration.descriptor)
+
+
 def map_tools(runtime, port: AstrBotToolPort) -> ExternalToolExecutor:
     if (not inspect.iscoroutinefunction(port.invoke) or not callable(port.declarations)
             or not callable(port.current_declaration) or inspect.iscoroutinefunction(port.declarations)
@@ -193,15 +216,18 @@ def map_tools(runtime, port: AstrBotToolPort) -> ExternalToolExecutor:
     providers = []
     for declaration in declarations:
         def current(declaration=declaration):
-            return declaration.descriptor.binding if port.current_declaration(declaration.host_tool_id) == declaration else None
+            replacement = port.current_declaration(declaration.host_tool_id)
+            return replacement.descriptor.binding if _same_declaration(declaration, replacement) else None
 
         async def invoke(invocation, declaration=declaration):
             if invocation.before_dispatch is not None:
                 invocation.before_dispatch()
-            if port.current_declaration(declaration.host_tool_id) != declaration:
+            if not _same_declaration(declaration, port.current_declaration(declaration.host_tool_id)):
                 # The core has already crossed its dispatch barrier; an exception remains unknown.
                 raise RuntimeError("original host declaration is no longer loaded")
             return await port.invoke(declaration.host_tool_id, invocation)
 
-        providers.append(ExternalToolProvider(declaration.descriptor, invoke, current))
+        admission_factory = getattr(port, "provider_admission", None)
+        admit = admission_factory(declaration.host_tool_id) if callable(admission_factory) else None
+        providers.append(ExternalToolProvider(declaration.descriptor, invoke, current, admit))
     return ExternalToolExecutor(runtime, tuple(providers))

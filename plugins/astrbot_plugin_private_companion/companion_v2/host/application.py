@@ -20,7 +20,9 @@ from companion_v2.agenda.background import AgendaBackground, AgendaDispatchPolic
 from companion_v2.agenda.service import AgendaService
 from companion_v2.agenda.calendar import CalendarService
 from companion_v2.agenda.planning import CalendarPlanning
-from companion_v2.role_work.state.configuration import StateConfigurationOwner, configuration_fields as state_configuration_fields
+from companion_v2.role_work.state.configuration import (
+    StateConfigurationOwner, configuration_fields as state_configuration_fields, migrate_presence_to_role,
+)
 from companion_v2.role_work.state.service import RoleStateService
 from companion_v2.role_work.state.maintenance import StateMaintenance
 from companion_v2.capabilities.ownership import DEFAULT_MEMORY_OWNER
@@ -102,8 +104,12 @@ from companion_v2.screen.configuration import (ScreenConfigurationOwner, ScreenS
     configuration_fields as screen_configuration_fields)
 from companion_v2.screen.interpretation import ScreenInterpretationService
 from companion_v2.screen.peek import ScreenPeekService
+from companion_v2.conversation.relay_settings import (RelayConfigurationOwner, RelaySettings,
+    configuration_fields as relay_configuration_fields)
 from companion_v2.conversation.recall_settings import (RecallConfigurationOwner, RecallSettings,
     configuration_fields as recall_configuration_fields)
+from companion_v2.conversation.web_understanding import (WebUnderstandingConfigurationOwner,
+    WebUnderstandingSettings, configuration_fields as web_configuration_fields)
 from companion_v2.library.configuration import (LibraryConfigurationOwner, LibrarySettings,
     configuration_fields as library_configuration_fields)
 from companion_v2.library.provider import (CATALOG_CAPABILITY as LIBRARY_CATALOG_CAPABILITY,
@@ -160,6 +166,9 @@ from companion_v2.memory.configuration import extend_registry
 from companion_v2.memory.person.configuration import (AcquaintanceSettings,
     configuration_fields as person_configuration_fields,
     learning_configuration_fields as person_learning_configuration_fields)
+from companion_v2.role_work.awareness import RoleAwareness
+from companion_v2.conversation.awareness_context import ConversationAwarenessContext
+from companion_v2.host.role_attention import RoleAttention
 from companion_v2.proactive.configuration import ContactConfigurationOwner, GROUP as CONTACT_GROUP, with_contact_fields
 from companion_v2.proactive.service import ProactiveContacts
 from companion_v2.proactive.scheduling import ContactSchedule
@@ -186,6 +195,9 @@ class ShutdownReport:
 
 class CompanionApplication:
     WAL_CHECKPOINT_INTERVAL_SECONDS = 30.0
+    # Expired model reservations only become eligible after twice their task
+    # timeout, so a one-minute maintenance pass never competes with live work.
+    BUDGET_RECLAIM_INTERVAL_SECONDS = 60.0
 
     def __init__(self, runtime, *, registry, profiles, providers, budget, sender, external=None,
                  policy=ConversationPolicy(), limits=SupervisorLimits(), split=single_part,
@@ -194,7 +206,8 @@ class CompanionApplication:
                  weather_port=None, weather_alert_port=None, balance_port=None, news_port=None,
                  solar_term_port=None, budget_soft=None, capability_owners=(),
                  qzone_transport=None, default_provider_resolver=None,
-                 knowledge=None, memory_owner=DEFAULT_MEMORY_OWNER, memory_push=DEFAULT_MEMORY_PUSH):
+                 knowledge=None, memory_owner=DEFAULT_MEMORY_OWNER, memory_push=DEFAULT_MEMORY_PUSH, wake_port=None,
+                 search_port_factory=None):
         if type(owns_runtime) is not bool or not any(p.kind == REPLY_KIND and p.lane is Lane.FOREGROUND for p in profiles):
             raise ValueError("assembly requires a foreground reply profile and explicit runtime ownership")
         if external is not None and (external.runtime is not runtime or external.messages is not None):
@@ -204,6 +217,10 @@ class CompanionApplication:
             raise ValueError("external tools need capacity for both parent and child")
         self.runtime, self.owns_runtime = runtime, owns_runtime
         self.now = now or (lambda: datetime.now(timezone.utc))
+        # 关键词材料（如服务余额）只有登记项自己需要时才会去取；端口留着由它按需调用。
+        self.balance_port = balance_port
+        self.keyword_materials = None
+        self.role_attention = RoleAttention()
         self.external = external
         self.semantics = None
         # Optional Laya resolver is attached by the host after assembly.  It is
@@ -230,11 +247,13 @@ class CompanionApplication:
             *busy_gate_configuration_fields(), *group_participation_configuration_fields(),
             *knowledge_configuration_fields(), *budget_configuration_fields(),
             *screen_configuration_fields(), *recall_configuration_fields(),
+            *web_configuration_fields(),
             *library_configuration_fields(),
             *reference_configuration_fields(),
             *wardrobe_configuration_fields(),
             *qzone_configuration_fields(),
             *private_access_configuration_fields(),
+            *relay_configuration_fields(),
             *(field for owner in capability_owners for field in owner.fields),
             *content_authoring_configuration_fields(), *content_cover_configuration_fields()) if f.field_id not in registry.fields)
         if extra:
@@ -253,15 +272,22 @@ class CompanionApplication:
                     ReactionConfigurationOwner(runtime), BusyGateConfigurationOwner(runtime),
                     GroupParticipationConfigurationOwner(runtime), KnowledgeConfigurationOwner(runtime),
                     ScreenConfigurationOwner(runtime), RecallConfigurationOwner(runtime),
+                    WebUnderstandingConfigurationOwner(runtime),
+                    RelayConfigurationOwner(runtime),
                     LibraryConfigurationOwner(runtime),
                     reference_configuration_owner,
                     WardrobeConfigurationOwner(runtime),
                     QzoneConfigurationOwner(runtime),
                     *capability_owners))
+        try:
+            migrate_presence_to_role(runtime)
+        except Exception as error:
+            logger.warning("[CompanionV2] QQ presence scope migration failed error_type=%s", type(error).__name__)
         self.reply_settings = ReplySettings(self.configuration)
         self.perception_settings = PerceptionSettings(self.configuration)
         self.screen_settings = ScreenSettings(self.configuration)
         self.recall_settings = RecallSettings(self.configuration)
+        self.relay_settings = RelaySettings(self.configuration)
         self.library_settings = LibrarySettings(self.configuration)
         self.reference_settings = ReferenceSettings(reference_configuration_owner)
         self.wardrobe_settings = WardrobeSettings(self.configuration)
@@ -303,6 +329,7 @@ class CompanionApplication:
         self.screen_peek = ScreenPeekService(runtime, notify=self.notify)
         self.authoring = ContentAuthoringWorkflow(runtime)
         self.poke_reply_model = PokeReplyModel(runtime, now=self.now)
+        self.poke_context_tasks = set()
         registrations = (
             TaskRegistration(TaskDefinition(REPLY_KIND, "conversation", REPLY_ACTION, Lane.FOREGROUND,
                 timeout_seconds=600, max_attempts=1, concurrency=self.worker_limit),
@@ -456,7 +483,9 @@ class CompanionApplication:
                                                 relationships=self.relationship_memories,
                                                 role_state=self.role_state, weather_port=weather_port,
                                                 weather_alert_port=weather_alert_port, balance_port=balance_port,
-                                                news_port=news_port, screen_peek=self.screen_peek,
+                                                news_port=news_port, screen_peek=self.screen_peek, wake_port=wake_port,
+                                                health_settings=lambda context, at: self.perception_settings.capture(
+                                                    context, at)["settings"],
                                                 notify=self.notify)
         self.proactive.schedule = self.contact_schedule
         self.role_reader.attach(self.gateway, self.role_reading, require_running=self.require_running,
@@ -479,11 +508,17 @@ class CompanionApplication:
         self.tools = LocalRoleTools(self.messages, diagnostics=self.diagnostics, external=external, memory=self.memory,
                                    growth=self.role_growth_context.reader, timeline=self.role_timeline, calendar=self.calendar,
                                    relationships=self.relationship_memories, weather_port=weather_port,
-                                   role_state=self.role_state, authoring=self.authoring)
+                                   role_state=self.role_state, authoring=self.authoring,
+                                   web_search_factory=search_port_factory)
         self.messages.reply_settings = self.reply_settings
         self.messages.perception_settings = self.perception_settings
         self.acquaintance_settings = AcquaintanceSettings(self.configuration)
         self.messages.acquaintance.settings = self.acquaintance_settings
+        self.role_attention.settings = self.acquaintance_settings
+        self.cross_window = RoleAwareness(runtime, acquaintance=self.messages.acquaintance,
+                                          source_validator=self.messages.sources)
+        self.messages.cross_window = self.cross_window
+        self.messages.cross_window_context = ConversationAwarenessContext(self.cross_window)
         self.generator = LocalReplyGenerator(self.messages, self.gateway, split=split, segmentation=segmentation,
                                              voice_policy=voice_policy)
         self.flow = ConversationFlow(self.messages, self.delivery, policy=policy)
@@ -582,6 +617,12 @@ class CompanionApplication:
                     break
                 after_attempt_id = page.last_attempt_id
                 await asyncio.sleep(0)
+            # Original model reservations are fenced by attempt generation, so they
+            # are settled here rather than by the task recovery above. Anything a
+            # dead process left behind, or any call that ended without a usage
+            # receipt, is returned to its account once it clearly outlived its task.
+            recovered += self.gateway.ledger.recover(self.tasks)
+            self.gateway.ledger.reclaim_expired(self.tasks, limit=1000)
             while True:
                 page = self.background_waiting.recover(limit=32)
                 recovered += len(page)
@@ -683,6 +724,9 @@ class CompanionApplication:
     def platform_recall(self, notice):
         self.require_running()
         result = require(self.messages.recalls.accept(notice))
+        if self.presence is not None and result.get("cancelled", 0):
+            self.presence.stop_native_scope(
+                notice.platform, notice.account_id, notice.kind, notice.native_scope_id)
         self.notify()
         return result
 
@@ -814,9 +858,16 @@ class CompanionApplication:
     async def _execute(self, run):
         # The supervisor remembers only that a worker stopped; the turn's own
         # reply diagnosis needs the code the owner actually raised.
+        lease, attention_note = None, ""
         try:
             if run.task.spec.kind == REPLY_KIND:
-                result = await self.generator.generate(run)
+                attention = getattr(self, "role_attention", None)
+                if attention is not None:
+                    context = run.task.spec.context
+                    lease = await attention.acquire(context, run.task.spec.task_id,
+                                                    window=context.scope.kind.value)
+                    attention_note = attention.note(lease)
+                result = await self.generator.generate(run, attention_note=attention_note)
                 if self.semantics is not None:
                     self.semantics.schedule_memory(run.task.spec.context)
                 return result
@@ -824,6 +875,9 @@ class CompanionApplication:
         except TaskError as error:
             self.flow.note_failure(run.task.task_id, error.code)
             raise
+        finally:
+            if lease is not None:
+                self.role_attention.finish(lease)
         if result.result_ref:
             self._mark_reaction_sent(result.result_ref)
         return result
@@ -833,6 +887,7 @@ class CompanionApplication:
             loop = asyncio.get_running_loop()
             next_contact_delivery_check = 0.0
             next_wal_checkpoint = loop.time()
+            next_budget_reclaim = loop.time() + self.BUDGET_RECLAIM_INTERVAL_SECONDS
             while self.state == "running":
                 self._wake.clear()
                 require(self.tasks.check_generation())
@@ -902,7 +957,7 @@ class CompanionApplication:
                     deadline = min(deadline, journal_deadline) if deadline else journal_deadline
                 more_background = self.background.advance() or more_background
                 await asyncio.sleep(0)
-                self.contact_schedule.advance()
+                await self.contact_schedule.advance_async()
                 await asyncio.sleep(0)
                 if loop.time() >= next_wal_checkpoint:
                     checkpoint = getattr(self.runtime, "checkpoint_passive", None)
@@ -913,6 +968,14 @@ class CompanionApplication:
                         worker.add_done_callback(self._report_wal_checkpoint)
                         self._wal_checkpoint_worker = worker
                     next_wal_checkpoint = loop.time() + self.WAL_CHECKPOINT_INTERVAL_SECONDS
+                if loop.time() >= next_budget_reclaim:
+                    # Maintenance, not a request path: a superseded or shutting-down
+                    # controller simply leaves reclamation to the next startup.
+                    try:
+                        self.gateway.ledger.reclaim_expired(self.tasks)
+                    except TaskError as error:
+                        logger.debug("[CompanionV2] 模型过期预留回收跳过 code=%s", error.code)
+                    next_budget_reclaim = loop.time() + self.BUDGET_RECLAIM_INTERVAL_SECONDS
                 delivery_deadline = self.background.next_wake()
                 if delivery_deadline is not None:
                     deadline = min(deadline, delivery_deadline) if deadline else delivery_deadline
@@ -971,7 +1034,7 @@ class CompanionApplication:
                 + self.image_review_service.active_handles
                 + self.image_narration.active_handles
                 + self.video_narration.active_handles
-                + self.poke_reply_model.active_handles
+                + self.poke_reply_model.active_handles + tuple(self.poke_context_tasks)
                 + self.screen_interpretation.active_handles
                 + self.screen_peek.active_handles
                 + (self.authoring.runner.active_handles if self.authoring.runner else ())
@@ -1001,6 +1064,8 @@ class CompanionApplication:
                 if pending:
                     await asyncio.wait(pending, timeout=0.25)
             await self.runner.close()
+            if self.poke_context_tasks:
+                await asyncio.wait(tuple(self.poke_context_tasks), timeout=1.0)
             await self.poke_reply_model.close()
             await self.authoring.close()
             await self.background.close(grace_seconds=grace_seconds)

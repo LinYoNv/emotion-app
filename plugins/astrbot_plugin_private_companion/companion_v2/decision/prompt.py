@@ -189,9 +189,13 @@ def decision_questions(facts, enabled_fields):
         action["criteria"].pop("interject", None)
         action["instructions"] += "自主插话关闭。"
     if facts.get("candidate_reason") in {"active_follow_up", "reply_follow_up"}:
-        action["instructions"] = "判断当前发言是否接续机器人上轮追问；历史仅用于辨认上下文，不是新请求。"
-        action["criteria"]["reply"] = "接续：当前在回答机器人追问、补充原请求，或明确要求继续处理。"
-        action["criteria"]["silent"] = "旁听：当前换话题、未求助或仅发图；不得重答历史问题。明确不用回复也沉默。"
+        action["instructions"] += "续接窗口只提供背景，不是持续回复邀请；历史仅用于辨认上下文，判断本轮是否仍向机器人说话。"
+        action["criteria"]["reply"] = "接续：本轮明确回答你的追问、补充双方未完任务，或继续与你交流且确需回应。"
+        action["criteria"]["silent"] = "旁听：对话已收尾、只是自言自语、转向群友或无关内容；不要为延续聊天而逐句追答。"
+        action["criteria"].pop("interject", None)
+        continuation = facts.get("group_continuation") or {}
+        if continuation.get("used_turns", 0) >= continuation.get("max_turns", 3) - 1:
+            action["instructions"] += "已接近自动续接上限，本轮需要回答就简洁答完，避免无必要追问续聊。"
     return questions
 
 
@@ -268,6 +272,10 @@ def render_model_state(state: str) -> str:
         model["address_context"] = address
         if reason:
             model["candidate_reason"] = str(reason)
+        continuation = facts.get("group_continuation")
+        if isinstance(continuation, dict):
+            model["group_continuation"] = {key: continuation[key] for key in (
+                "enabled", "used_turns", "pending_turns", "max_turns", "seconds", "limit_reached") if key in continuation}
         if policy:
             model["group_participation_policy"] = {key: policy[key] for key in (
                 "question_enabled", "interjection_enabled", "question_threshold", "cooldown_seconds") if key in policy}

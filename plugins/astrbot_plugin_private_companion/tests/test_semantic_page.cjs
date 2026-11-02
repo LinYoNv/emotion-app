@@ -386,6 +386,89 @@ test('batch import reports new, duplicate, failed, and out-of-limit files withou
   assert.match(node.innerHTML, /新增 1 张，重复跳过 1 张，失败 1 张/);
 });
 
+test('one button recognizes every pending reaction card and exposes progress', async () => {
+  const {page, requests, root} = harness();
+  const node = root();
+  page.mount(node, {view: 'expression'});
+  const pending = ['one', 'two'].map((name, index) => ({
+    id: 'reaction-' + (index + 1), kind: 'reaction', revision: 1, enabled: true,
+    payload: {name, analysis: 'pending'},
+  }));
+  requests[0].resolve({...settingsCatalog(), catalog: {reaction: {pending: 2}}, items: pending});
+  await flush();
+  assert.match(node.innerHTML, /批量识别待补全 \(2\)/);
+
+  node.click('[data-semantic]', {semantic: 'analyze-pending'});
+  assert.equal(requests[1].values.action, 'analyze');
+  assert.equal(requests[1].values.id, 'reaction-1');
+  requests[1].resolve({item: {...pending[0], payload: {name: 'one', analysis: 'manual'}}});
+  await flush();
+  assert.equal(requests[2].values.action, 'analyze');
+  assert.equal(requests[2].values.id, 'reaction-2');
+  requests[2].resolve({item: {...pending[1], payload: {name: 'two', analysis: 'manual'}}});
+  await flush();
+
+  assert.equal(requests[3].method, 'GET');
+  requests[3].resolve({...settingsCatalog(), items: pending.map(item => ({
+    ...item, payload: {...item.payload, analysis: 'manual'},
+  }))});
+  await flush();
+  assert.match(node.innerHTML, /已识别 2 张/);
+  assert.match(node.innerHTML, /批量识别待补全<\/button>/);
+});
+
+test('batch analysis scans unloaded pages even when the visible page has no pending assets', async () => {
+  const {page, requests, root} = harness();
+  const node = root();
+  page.mount(node, {view: 'expression'});
+  const full = index => ({
+    id: 'reaction-' + String(index).padStart(3, '0'), kind: 'reaction', revision: 1,
+    enabled: true, payload: {name: 'asset ' + index, analysis: index >= 25 ? 'pending' : 'manual'},
+  });
+  const first = Array.from({length: 24}, (_, i) => full(i + 1));
+  const second = [full(25), full(26)];
+  requests[0].resolve({...settingsCatalog(), catalog: {reaction: {total: 26, pending: 2}},
+    items: first, next_after: 'reaction-024'});
+  await flush();
+  assert.match(node.innerHTML, /批量识别待补全 \(2\)/);
+  node.click('[data-semantic]', {semantic: 'analyze-pending'});
+  assert.equal(requests[1].method, 'GET');
+  assert.equal(requests[1].values.kind, 'reaction');
+  assert.equal(requests[1].values.after, 'reaction-024');
+  requests[1].resolve({...settingsCatalog(), items: second, next_after: null});
+  await flush();
+  assert.equal(requests[2].values.action, 'analyze');
+  assert.equal(requests[2].values.id, 'reaction-025');
+  requests[2].resolve({item: {...second[0], payload: {...second[0].payload, analysis: 'analyzed'}}});
+  await flush();
+  assert.equal(requests[3].values.id, 'reaction-026');
+  requests[3].resolve({item: {...second[1], payload: {...second[1].payload, analysis: 'analyzed'}}});
+  await flush();
+  assert.equal(requests[4].method, 'GET');
+  requests[4].resolve({...settingsCatalog(), catalog: {reaction: {total: 26, pending: 0}},
+    items: first, next_after: 'reaction-024'});
+  await flush();
+  assert.match(node.innerHTML, /已识别 2 张/);
+  assert.match(node.innerHTML, /批量识别待补全<\/button>/);
+  assert.equal(requests.filter(item => item.method === 'POST').length, 2);
+});
+
+test('batch analysis aborts on failed pagination before calling any vision model', async () => {
+  const {page, requests, root} = harness();
+  const node = root();
+  page.mount(node, {view: 'expression'});
+  requests[0].resolve({...settingsCatalog(), catalog: {reaction: {total: 30, pending: 5}},
+    items: [{id:'reaction-1',kind:'reaction',payload:{analysis:'pending'}}],
+    next_after:'reaction-1'});
+  await flush();
+  node.click('[data-semantic]', {semantic:'analyze-pending'});
+  assert.equal(requests[1].method,'GET');
+  requests[1].reject(new Error('temporary failure'));
+  await flush();
+  assert.match(node.innerHTML, /剩余素材读取失败/);
+  assert.equal(requests.filter(item => item.method === 'POST').length, 0);
+});
+
 test('automatic collection status is visible without exposing event or asset identifiers', async () => {
   const {page, requests, root} = harness();
   const node = root();

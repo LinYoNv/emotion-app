@@ -50,6 +50,7 @@ function harness() {
     structuredClone, setTimeout, clearTimeout, requestAnimationFrame: callback => callback(), matchMedia: () => ({matches: true}),
     localStorage: {getItem: () => null}});
   vm.runInContext(page("shell.js"), context);
+  vm.runInContext(page("page-guards.js"), context);
   // Run the navigation and render functions without starting the live page or SDK.
   const source = page("app.js");
   vm.runInContext(source.slice(0, source.indexOf("document.addEventListener('click'")), context);
@@ -69,6 +70,14 @@ function harness() {
       anchors.set(id, target);return target;
     }};
 }
+
+test("navigation is exposed to the setup guide and workspace modules", () => {
+  const h = harness();
+  assert.equal(typeof h.window.navigate, "function");
+  assert.equal(h.window.navigate("manage", "data", "migration"), true);
+  assert.equal(h.window.location.hash, "#manage/data/migration");
+  assert.equal(h.run("currentNavigationHref()"), "#manage/data/migration");
+});
 
 test("returning home clears configuration, diary and furniture selections", () => {
   const h = harness(), shell = h.window.CompanionShell;
@@ -106,6 +115,45 @@ test("unsaved weather changes hold navigation until the in-page confirmation res
   decisions[2](false);
   assert.equal(await backNavigation, false);
   assert.equal(h.window.location.hash, "#manage/models");
+});
+
+test("dirty navigation lists changed fields, saves once and continues to the requested route", async () => {
+  const h = harness();
+  let dirty = true, options, resolve, saves = 0;
+  h.window.CompanionWorkbench = {dirtyEditors:() => dirty ? [{title:'设备观察契机',fields:['每日观察上限','观察冷却间隔'],
+    save:async () => {saves++;dirty=false;return true;}}] : []};
+  h.window.CompanionConfirm = config => {options=config;return new Promise(done => {resolve=done;});};
+  const navigation = h.run("navigate('manage','models')");
+  assert.equal(h.renders.length, 0);
+  assert.equal(options.details[0].title, '设备观察契机');
+  assert.deepEqual(Array.from(options.details[0].fields), ['每日观察上限','观察冷却间隔']);
+  assert.equal(await options.onSave(), true);
+  assert.equal(saves, 1);
+  resolve(true);
+  assert.equal(await navigation, true);
+  assert.equal(h.window.location.hash, '#manage/models');
+  assert.equal(h.run("navigate('manage','perception')"), true);
+});
+
+test("cancel preserves drafts; discard clears them and rapid navigation shares one dialog", async () => {
+  const h = harness();
+  let dirty = true, calls = 0, options, resolve;
+  h.window.CompanionWorkbench = {dirtyEditors:() => dirty ? [{title:'设备观察契机',fields:['每日观察上限'],
+    discard:() => {dirty=false;return true;}}] : []};
+  h.window.CompanionConfirm = config => {calls++;options=config;return new Promise(done => {resolve=done;});};
+  const canceled = h.run("navigate('manage','models')");
+  resolve(false); assert.equal(await canceled, false);
+  assert.equal(dirty, true);
+  assert.equal(h.window.location.hash, '#life');
+  const first = h.run("navigate('manage','models')");
+  const second = h.run("navigate('manage','perception')");
+  assert.equal(calls, 2);
+  assert.equal(await options.onConfirm(), true);
+  resolve(true);
+  assert.equal(await first, false); assert.equal(await second, true);
+  assert.equal(h.window.location.hash, '#manage/perception');
+  h.run("navigate('manage','models')"); h.run("backHome()");
+  assert.equal(calls, 2, 'discarded drafts must not block later navigation');
 });
 
 test("task prompts stay inside maintenance while direct links select the internal view", () => {
@@ -171,7 +219,7 @@ test("data page exposes three deep-linkable subpages", () => {
   for (const [pane, title, workspace] of [
     ["storage", "存储位置与清理策略", "storageWorkspace"],
     ["backup", "备份与还原", "backupWorkspace"],
-    ["migration", "V1 数据迁移", "legacyMigrationWorkspace"],
+    ["migration", "旧版资料迁入", "legacyMigrationWorkspace"],
   ]) {
     h.run(`navigate('manage','data','${pane}')`);
     assert.equal(h.window.location.hash, `#manage/data/${pane}`);

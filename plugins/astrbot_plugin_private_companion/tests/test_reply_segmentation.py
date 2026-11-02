@@ -87,6 +87,23 @@ class ReplySegmentationTests(unittest.TestCase):
         self.assertEqual(replace(policy, threshold=3).parts("甲。乙。"), ("甲。乙。",))
         self.assertEqual(replace(policy, rule_mode="paragraphs").parts("甲。乙。\n\n丙。"), ("甲。乙。\n\n", "丙。"))
 
+    def test_rule_boundaries_are_balanced_within_the_segment_limit(self):
+        policy = replace(self.policy, llm_controlled=False, threshold=500,
+                         min_segment_chars=1, max_segments=5)
+        source = "甲。乙。丙。丁。戊。己。庚。辛。壬。癸。"
+        parts = policy.parts(source)
+        self.assertEqual(parts, ("甲。乙。", "丙。丁。", "戊。己。", "庚。辛。", "壬。癸。"))
+        self.assertEqual("".join(parts), source)
+
+    def test_excess_model_boundaries_do_not_leave_one_long_tail(self):
+        source = f"\n{MARKER}\n".join(("先接住。", "再回应对方。", "补充原因。", "接着说一点。",
+                                             "再补一层。", "收住这一段。", "回应后续问题。", "最后自然结束。"))
+        parts = replace(self.policy, max_segments=4).parts(source)
+        self.assertEqual(len(parts), 4)
+        self.assertEqual("".join(parts), source.replace(f"\n{MARKER}\n", "\n"))
+        lengths = tuple(sum(not char.isspace() for char in part) for part in parts)
+        self.assertLessEqual(max(lengths) - min(lengths), 20)
+
     def test_legacy_rules_switch_cannot_disable_rule_completion(self):
         legacy = replace(self.policy, rules_enabled=False, threshold=500,
                          min_segment_chars=1, max_segments=3)
@@ -138,6 +155,29 @@ class ReplySegmentationTests(unittest.TestCase):
         for block in ("```python\nprint('x。')\n```", "> 引用。\n> 后续。", "- 第一项\n- 第二项"):
             source = f"开头\n{MARKER}\n{block}\n{MARKER}\n结尾"
             self.assertEqual(self.policy.parts(source), ("开头\n", block + "\n", "结尾"))
+
+    def test_opening_quote_never_ends_a_part(self):
+        # 2026-10-25 现场：一条回复被切成「不过你之前那句“」+「生日结束也就
+        # 意味着什么”，话才说一半呢」，上一段以一个孤零零的开引号结尾。
+        # 原因是默认分段词里带着开引号，断点落在它之后。
+        policy = SegmentationPolicy(split_words=json.dumps(["。", "，", "“"], ensure_ascii=False),
+                                    min_segment_chars=2, max_segments=6)
+        source = "今天是周日下午，农历九月十六呀。 不过你之前那句“生日结束也就意味着什么”，话才说一半呢。"
+        parts = policy.parts(source)
+        self.assertEqual("".join(parts), source)
+        self.assertTrue(all(not part.rstrip().endswith("“") for part in parts), parts)
+        quoted = next(part for part in parts if "生日结束" in part)
+        self.assertIn("那句“", quoted, parts)
+
+    def test_default_split_words_do_not_split_inside_a_quote(self):
+        from companion_v2.conversation.segmentation import DEFAULT_SPLIT_WORDS
+        self.assertNotIn("“", DEFAULT_SPLIT_WORDS)
+        source = "不过你之前那句“生日结束也就意味着什么”，话才说一半呢。"
+        parts = self.policy.parts(source)
+        self.assertEqual("".join(parts), source)
+        quoted = next(part for part in parts if "生日结束" in part)
+        self.assertIn("那句“", quoted, parts)
+        self.assertIn("什么”", quoted, parts)
 
     def test_prompt_uses_v1_placeholder_and_policy_validates_types(self):
         policy = replace(self.policy, prompt="只在需要时用 {{ split_marker }}。")

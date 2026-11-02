@@ -107,7 +107,7 @@ class MemoryManagement:
             item["view_token"] = self.token(context, ref)
             items.append(item)
         return {"items": items[:limit], "next_cursor": items[limit - 1]["atom_id"] if len(items) > limit else None,
-            "operator_id": self.operator.subject.subject_id, "subject_id": context.actor.subject.subject_id,
+            "operator_id": self.writer.caller(context), "subject_id": context.actor.subject.subject_id,
             "supported_visibility": ["private"], "physical_erasure": "not_supported"}
 
     @outcome
@@ -125,9 +125,15 @@ class MemoryManagement:
                 AND json_remove(context_json, '$.actor.policy_revision') = json_remove(?, '$.actor.policy_revision')
                 GROUP BY state""", (owner, encode(context)))}
         scope = context.scope
+        # Two writers record an authorized conversation input for memory: the host
+        # event adapter publishes ``conversation.host_input`` and the native core
+        # observation path publishes ``conversation.native_input``. Counting only
+        # one owner reports zero for windows that the other writer serves, so the
+        # overview counts both and deduplicates by source id.
         sources = self.writer.runtime.read_one(
-            """SELECT COUNT(*) AS count FROM sources s
-                WHERE s.owner = 'conversation.host_input' AND s.state = 'active'
+            """SELECT COUNT(DISTINCT s.source_id) AS count FROM sources s
+                WHERE s.owner IN ('conversation.host_input', 'conversation.native_input')
+                AND s.state = 'active'
                 AND (s.expires_at IS NULL OR s.expires_at > ?)
                 AND s.installation_id = ? AND s.platform = ? AND s.scope_kind = ? AND s.native_scope_id = ?
                 AND s.bot_id IS ? AND s.account_id IS ? AND s.conversation_id IS ? AND s.session_id IS ?
@@ -148,10 +154,17 @@ class MemoryManagement:
         }
 
     def _clear_token(self, context, rows):
+        # 聊天内自证（operator 为空）与管理页（operator 为管理员）必须对同一份
+        # 预览算出同一个确认令牌；caller 在两种身份下都由 writer 统一解析。
         return digest([
-            owner_key(context), self.operator, self.writer.access.access.revision,
+            owner_key(context), self.writer.caller(context), self.writer.access.access.revision,
             [(row["atom_id"], row["revision"], row["namespace"], row["state"]) for row in rows],
         ])
+
+    @staticmethod
+    def confirmation_code(token):
+        """Short code a chat-side confirmation must echo for this exact preview."""
+        return digest(["memory-clear-confirm.v1", token])[:6].upper()
 
     @outcome
     def preview_clear(self, context):
@@ -163,7 +176,7 @@ class MemoryManagement:
             (owner,),
         )
         return {"owner_id": owner, "subject_id": context.actor.subject.subject_id,
-                "operator_id": self.operator.subject.subject_id,
+                "operator_id": self.writer.caller(context),
                 "counts": {"active": sum(row["state"] == "active" for row in rows),
                            "already_inactive": sum(row["state"] != "active" for row in rows)},
                 "revision_token": self._clear_token(context, rows),

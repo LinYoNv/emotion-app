@@ -9,6 +9,30 @@ from companion_v2.adapters.astrbot.files import DOCUMENT_SUFFIXES, TEXT_SUFFIXES
 from companion_v2.execution.models import TaskError
 
 
+_DOCUMENT_PARSERS = {".pdf": "fitz", ".docx": "docx", ".xlsx": "openpyxl", ".pptx": "pptx"}
+
+
+def parser_availability() -> dict[str, bool]:
+    """各文档格式的解析器是否可用。
+
+    只探测模块能否导入，不读文件；缺失时对应格式在发送附件后才会暴露，
+    所以启动时用 ``report_parser_availability`` 打一行日志。
+    """
+    import importlib.util
+    return {suffix: importlib.util.find_spec(module) is not None
+            for suffix, module in _DOCUMENT_PARSERS.items()}
+
+
+def report_parser_availability(logger) -> dict[str, bool]:
+    """启动时报告缺失的解析器，免得上传附件时才发现。"""
+    available = parser_availability()
+    missing = [suffix for suffix, ok in available.items() if not ok]
+    if missing:
+        logger.warning("[CompanionV2] 文档解析组件缺失 formats=%s；这些格式的附件会返回「解析组件未安装」",
+                       ",".join(sorted(missing)))
+    return available
+
+
 def _archive(content):
     try:
         with ZipFile(io.BytesIO(content)) as archive:

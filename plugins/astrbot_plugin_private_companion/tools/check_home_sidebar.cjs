@@ -7,7 +7,7 @@ const {pathToFileURL} = require("node:url");
 const {chromium} = require("playwright");
 
 function syntheticBridge(options={}) {
-  const HOST="astrbot_plugin_private_companion_v2", base="/"+HOST+"/host/targets/";
+  const HOST="astrbot_plugin_private_companion", base="/"+HOST+"/host/targets/";
   const iso = offset => new Date(Date.now()+offset*60000).toISOString();
   const qa=window.__sidebarQA={empty:false,denyState:false,deferSecond:false,hiddenKinds:[],
     calendarCoverage:null,stateEnabled:true,posts:0};
@@ -84,9 +84,21 @@ if(require.main===module)(async()=>{
     assert.match(await side.locator(".home-state-board").getAttribute("aria-label"),/能量 71 \/ 100/);
     checks.push("首页状态看板悬停可读细节，键盘聚焦可访问完整摘要");
     for(const [width,height] of [[960,900],[390,844],[320,740]]){
-      await page.setViewportSize({width,height});await layout();await capture("width-"+width);
+      await page.setViewportSize({width,height});await layout();
+      if(width<=390){
+        const shellWidth=(await page.locator(".shell-body").boundingBox()).width;
+        const box=await page.locator(".home-environment").boundingBox();
+        assert.ok(box.width>=shellWidth-40,"天气栏应铺满手机端内容宽度");
+        const summary=await page.locator(".home-environment-copy strong").evaluate(el=>{
+          const r=el.getBoundingClientRect(),style=getComputedStyle(el);
+          return {width:r.width,height:r.height,lineHeight:parseFloat(style.lineHeight),lineClamp:style.webkitLineClamp};
+        });
+        assert.ok(summary.width>summary.lineHeight*6,"天气摘要不能缩成逐字竖排");
+        assert.ok(summary.lineClamp==="2"&&summary.height<=summary.lineHeight*2.2,"天气摘要应限制为两行");
+      }
+      await capture("width-"+width);
     }
-    checks.push("状态摘要和时间线在 1440、960、390、320 像素下无溢出");
+    checks.push("状态摘要和时间线在 1440、960、390、320 像素下无溢出；手机天气栏铺满单列且摘要不竖排");
     await page.setViewportSize({width:1440,height:1000});
     await page.evaluate(()=>{__sidebarQA.deferSecond=true;});
     await page.locator("#product-target").selectOption("b");

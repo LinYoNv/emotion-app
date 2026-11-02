@@ -7,7 +7,8 @@ from companion_v2.execution.models import TaskError, digest, stamp
 from .group_observation import parse_moment
 from .group_timing import clean_group_text, repeat_burst, repeat_signature
 from .group_questions import question_signal
-from .reply_settings import group_wakeup_settings
+from .group_followup import FOLLOW_UP_REASONS, progress as followup_progress
+from .reply_settings import group_continuation_settings, group_wakeup_settings
 from .reset import batch_current, boundary
 
 
@@ -73,6 +74,16 @@ class GroupReplyAdmission:
         live = self._live_core_events.get(self._key(context), ())
         return any(other != event_id for other in live)
 
+    def _sample(self, context, reason, probability, event_id, at, text):
+        # Repeat observations of one event must keep the same decision. Include
+        # the authorized window/role so independent bots do not share a draw.
+        if probability <= 0:
+            return False
+        if probability >= 1:
+            return True
+        key = [context.key, reason, event_id or [stamp(at), text]]
+        return int(digest(key)[:16], 16) / (1 << 64) < probability
+
     def observe(self, context, *, text, speaker_id, received_at, event_id=None):
         reset = boundary(self.runtime, context.scope)
         if reset is not None and stamp(received_at) <= reset["reset_at"]:
@@ -91,7 +102,8 @@ class GroupReplyAdmission:
 
     def candidate(self, context, *, text, instruction, at, settings, participation,
                   mentioned=False, native_wakeup=False, mentions_others=False, reply_ids=(),
-                  mentions_all=False, quoted_bot=False, has_image=False, persona_name="", event_id=None):
+                  mentions_all=False, quoted_bot=False, has_image=False, persona_name="", event_id=None,
+                  continuation=None):
         self.messages.group_context.authorize(context, self.messages.tasks.now())
         wakeup = group_wakeup_settings(settings)
         if mentioned:
@@ -108,18 +120,22 @@ class GroupReplyAdmission:
             direct.append(wakeup["group_wakeup_bot_name"] or persona_name)
         if context.actor.principal.native_account_id in wakeup["group_wakeup_primary_member_ids"]:
             direct.extend(wakeup["group_wakeup_owner_direct_words"])
-        if (wakeup["group_wakeup_enabled"]
+        if (wakeup["group_wakeup_enabled"] and not mentions_others
                 and any(word and word.casefold() in compact.casefold() for word in direct)):
             return "direct_word"
+        continuation = continuation if continuation is not None else self.continuation_status(
+            context, instruction, at, settings=settings, event_id=event_id)
+        if continuation["limit_reached"]:
+            return ""
         if mentions_others:
             return "behavior" if self._behavior_candidate(context, compact, wakeup, participation) else ""
-        continuation = self._continuation(context, instruction, at, event_id=event_id)
-        if continuation:
-            return continuation
+        if continuation["candidate_reason"]:
+            return continuation["candidate_reason"]
         if not wakeup["group_wakeup_enabled"]:
             return ""
-        if (wakeup["group_wakeup_image_enabled"] and wakeup["group_wakeup_image_weight"] > 0
-                and has_image):
+        if (wakeup["group_wakeup_image_enabled"] and has_image
+                and self._sample(context, "image_interest", wakeup["group_wakeup_image_weight"],
+                                 event_id, at, compact)):
             return "image_interest"
         if not compact or not any(char.isalnum() for char in compact):
             return ""
@@ -149,8 +165,9 @@ class GroupReplyAdmission:
             return "question"
         if any(word.casefold() in compact.casefold() for word in wakeup["group_wakeup_context_words"]):
             return "context_word"
-        if (wakeup["group_wakeup_interest_probability"] > 0
-                and any(word.casefold() in compact.casefold() for word in wakeup["group_wakeup_interest_keywords"])):
+        if (any(word.casefold() in compact.casefold() for word in wakeup["group_wakeup_interest_keywords"])
+                and self._sample(context, "interest", wakeup["group_wakeup_interest_probability"],
+                                 event_id, at, compact)):
             return "interest"
         if participation["enable_group_interjection"]:
             from .group_interjection import openings
@@ -232,7 +249,7 @@ class GroupReplyAdmission:
             (self._core_key(context), json.dumps({"version": 1, "turns": turns[-MAX_OBSERVATIONS:]},
                                                ensure_ascii=False, sort_keys=True)))
 
-    def record_core_reply(self, context, event_id, *, instruction, reason, mentioned, at):
+    def record_core_reply(self, context, event_id, *, instruction, reason, mentioned, at, continuation=None):
         """Remember a core turn without opening a V2 batch or delivery task."""
         with self.runtime.transaction() as connection:
             turns = self._core_turns(context)
@@ -248,6 +265,9 @@ class GroupReplyAdmission:
                      "admitted_at": stamp(at), "state": "admitted", "send_state": "not_started",
                      "send_attempts": 0, "send_returns": 0, "unknown_sends": 0, "send_failed": 0,
                      "platform_ids": [], "reason": reason, "mentioned": bool(mentioned), "logged_stages": []}
+            if continuation is not None:
+                saved["followup_seconds"] = continuation["seconds"]
+                saved["followup_base_turns"] = continuation["used_turns"]
             turns.append(saved)
             self._save_core_turns(connection, context, turns)
             return saved
@@ -272,6 +292,13 @@ class GroupReplyAdmission:
                 if saved["send_state"] not in ("unknown", "denied"):
                     saved["send_state"] = "started"
             elif stage == "send_returned":
+                if saved["send_returns"] == 0:
+                    saved["first_returned_at"] = stamp(at)
+                    previous = followup_progress([turn for turn in self._current_core_turns(
+                        context, None, at, instruction_digest=saved["instruction_digest"]) if turn["event_id"] != event_id], at=at,
+                                                 seconds=saved.get("followup_seconds", FOLLOW_UP_SECONDS))
+                    saved["followup_turns"] = (max(previous["used_turns"], saved.get("followup_base_turns", 0)) + 1
+                                               if saved.get("reason") in FOLLOW_UP_REASONS else 0)
                 saved["send_returns"] += 1
                 saved["returned_at"] = stamp(at)
                 if saved["send_state"] not in ("unknown", "denied"):
@@ -302,11 +329,11 @@ class GroupReplyAdmission:
             self._save_core_turns(connection, context, turns)
             return True
 
-    def _current_core_turns(self, context, instruction, at):
+    def _current_core_turns(self, context, instruction, at, *, instruction_digest=None):
         reset = boundary(self.runtime, context.scope)
         return [turn for turn in self._core_turns(context)
                 if turn.get("scope_key") == context.scope.key
-                and turn.get("instruction_digest") == digest(instruction)
+                and turn.get("instruction_digest") == (instruction_digest or digest(instruction))
                 and (when := parse_moment(turn.get("admitted_at"))) is not None and when <= at
                 and (reset is None or stamp(when) > reset["reset_at"])]
 
@@ -353,7 +380,7 @@ class GroupReplyAdmission:
             return True
         return False
 
-    def _core_continuation(self, context, turn, at, *, event_id=None):
+    def _core_continuation(self, context, turn, at, *, event_id=None, seconds=FOLLOW_UP_SECONDS):
         returned = turn.get("state") == "completed" and turn.get("send_state") == "returned"
         if (turn.get("scope_key") != context.scope.key
                 or (not returned and turn.get("context_key") != context.key)
@@ -368,17 +395,17 @@ class GroupReplyAdmission:
                     and when < (parse_moment(item["received_at"]) or when) <= at
                     for item in self.observations.get(self._key(context), ())):
                 return ""
-            return "active_follow_up" if when is not None and 0 <= (at - when).total_seconds() <= FOLLOW_UP_SECONDS else ""
+            return "active_follow_up" if when is not None and 0 <= (at - when).total_seconds() <= seconds else ""
         if turn.get("state") in ("admitted", "inflight"):
             when = parse_moment(turn.get("inflight_at") or turn.get("admitted_at"))
             if when is not None and any(item["speaker_id"] != turn["speaker_id"]
                     and when < (parse_moment(item["received_at"]) or when) <= at
                     for item in self.observations.get(self._key(context), ())):
                 return ""
-            return "active_follow_up" if when is not None and 0 <= (at - when).total_seconds() <= FOLLOW_UP_SECONDS else ""
+            return "active_follow_up" if when is not None and 0 <= (at - when).total_seconds() <= seconds else ""
         when = parse_moment(turn.get("returned_at"))
         if (turn.get("state") != "completed" or turn.get("send_state") != "returned"
-                or when is None or not 0 <= (at - when).total_seconds() <= FOLLOW_UP_SECONDS):
+                or when is None or not 0 <= (at - when).total_seconds() <= seconds):
             return ""
         # The first reply after a bot send can come from any group member.
         # Keep that member's short burst together, but stop when another
@@ -399,7 +426,58 @@ class GroupReplyAdmission:
             return False
         return not (choice.get("source") == "laya" and choice.get("decision_action") == "wait")
 
-    def _continuation(self, context, instruction, at, *, event_id=None):
+    def continuation_status(self, context, instruction, at, *, settings, event_id=None):
+        policy = group_continuation_settings(settings)
+        seconds = policy["group_conversation_followup_seconds"]
+        maximum = policy["group_conversation_followup_max_turns"]
+        enabled = policy["group_conversation_followup_enabled"]
+        turns = self._current_core_turns(context, instruction, at)
+        legacy = self._legacy_followup_turns(context, instruction, at)
+        turns = [turn for turn in (*legacy, *turns) if turn.get("event_id") != event_id]
+        current = followup_progress(turns, at=at, seconds=seconds)
+        limited = enabled and current["used_turns"] + current["pending_turns"] >= maximum
+        reason = self._continuation(context, instruction, at, event_id=event_id, seconds=seconds) if enabled else ""
+        if (reason and current["anchor_at"] is not None and not current["active"]
+                and turns and turns[-1].get("reason") in FOLLOW_UP_REASONS):
+            reason = ""
+        return {**current, "enabled": enabled, "seconds": seconds, "max_turns": maximum,
+                "limit_reached": limited, "candidate_reason": "" if limited else reason}
+
+    def _legacy_followup_turns(self, context, instruction, at):
+        rows = self.runtime.read_all("""SELECT b.batch_id, b.created_at, a.value AS admission,
+            MAX(p.delivered_at) AS returned_at
+            FROM conversation_flows f JOIN conversation_batches b ON b.batch_id = f.batch_id
+            JOIN conversation_parts p ON p.batch_id = b.batch_id AND p.state = 'delivered'
+            JOIN conversation_sent_history h ON h.part_id = p.part_id AND h.batch_id = p.batch_id
+                AND h.receipt_ref = p.receipt_ref
+            JOIN conversation_delivery_receipts r ON r.part_id = p.part_id AND r.receipt_ref = p.receipt_ref
+            LEFT JOIN runtime_metadata a ON a.key = ? || b.batch_id
+            WHERE f.route_key = ? AND b.role_instruction = ? AND b.state NOT IN ('cancelled', 'invalidated')
+                AND json_extract(b.context_json, '$.role_binding.role.subject_id') = ?
+                AND json_extract(b.context_json, '$.role_binding.revision') = ?
+            GROUP BY b.batch_id ORDER BY f.sequence DESC LIMIT 128""",
+            (PREFIX, context.scope.key, instruction, context.role_binding.role.subject_id, context.role_binding.revision))
+        turns = []
+        for row in reversed(rows):
+            created = parse_moment(row["created_at"])
+            if (created is None or created > at
+                    or not batch_current(self.runtime, row["batch_id"], context.scope)):
+                continue
+            try:
+                saved = json.loads(row["admission"]) if row["admission"] else {}
+                reasons = saved.get("reasons", []) if isinstance(saved, dict) else []
+                if not isinstance(reasons, list):
+                    reasons = []
+            except (TypeError, ValueError):
+                reasons = []
+            reason = ("reply_follow_up" if reasons and all(item in FOLLOW_UP_REASONS for item in reasons)
+                      else "role_choice")
+            turns.append({"event_id": row["batch_id"], "admitted_at": created.isoformat(),
+                          "returned_at": row["returned_at"], "send_state": "returned", "send_returns": 1,
+                          "reason": reason})
+        return turns
+
+    def _continuation(self, context, instruction, at, *, event_id=None, seconds=FOLLOW_UP_SECONDS):
         core = self._current_core_turns(context, instruction, at)
         row = self.runtime.read_one("""SELECT b.*, f.state AS flow_state, f.deadline_at
             FROM conversation_flows f JOIN conversation_batches b ON b.batch_id = f.batch_id
@@ -409,7 +487,9 @@ class GroupReplyAdmission:
             for turn in reversed(core):
                 if row is not None and turn["admitted_at"] < row["created_at"]:
                     break
-                result = self._core_continuation(context, turn, at, event_id=event_id)
+                if turn.get("event_id") == event_id:
+                    continue
+                result = self._core_continuation(context, turn, at, event_id=event_id, seconds=seconds)
                 if result:
                     return result
                 if not self._is_silent_skip_turn(turn, speaker):
@@ -434,7 +514,7 @@ class GroupReplyAdmission:
             WHERE p.batch_id = ? AND p.state = 'delivered' AND h.origin_key = ?""",
             (row["batch_id"], context.key))
         when = parse_moment(receipt["delivered_at"]) if receipt is not None else None
-        if when is None or not 0 <= (at - when).total_seconds() <= FOLLOW_UP_SECONDS:
+        if when is None or not 0 <= (at - when).total_seconds() <= seconds:
             return ""
         if self._intervening_message(context, when, at, event_id):
             return ""

@@ -15,6 +15,7 @@ import base64
 import hashlib
 import hmac
 import inspect
+import io
 import json
 import re
 import time
@@ -229,20 +230,22 @@ def _effective_login_error(login: dict[str, Any]) -> str:
 
 
 def _build_qr_data_uri(content: str) -> str:
-    """在本地把登录 URL 编码为 SVG 二维码，不经过第三方服务。"""
+    """在本地把登录 URL 编码为 PNG 二维码，不经过第三方服务。
+
+    页面只接受 ``png/jpeg/webp`` 的 data URI；此前这里返回 SVG，尺寸虽小，
+    却被前端安全过滤直接丢掉，状态显示「等待扫码确认」但图是空的。
+    """
 
     if not content:
         return ""
     try:
         import qrcode
-        import qrcode.image.svg
 
-        image = qrcode.make(
-            content,
-            image_factory=qrcode.image.svg.SvgPathFillImage,
-        )
-        encoded = base64.b64encode(image.to_string()).decode("ascii")
-        return f"data:image/svg+xml;base64,{encoded}"
+        image = qrcode.make(content)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
     except Exception as exc:
         # 异常日志只记录类型，不带可能包含登录 URL 的上下文。
         logger.warning(

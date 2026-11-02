@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from astrbot.api.web import request
 
-from companion_v2.execution.models import TaskError, require
+from companion_v2.execution.models import TERMINAL, TaskError, require
 from companion_v2.foundation.outcome import Outcome
 from companion_v2.foundation.refs import ScopeKind
 from companion_v2.proactive.configuration import PURPOSES
@@ -21,20 +21,39 @@ from companion_v2.proactive.scheduling import DIAGNOSTIC_ENVIRONMENT_VARIANTS
 from companion_v2.sources.privacy import redact_text
 
 from .binding_store import PendingBinding, binding_path, read_binding, write_binding
-from .identity_derivation import derive_bot_id, derive_role_id
+from .bootstrap_provider import (resolve_bootstrap_provider, supported_text_provider,
+                                 text_provider_catalog, text_provider_predicate)
+from .identity_derivation import derive_bot_id, derive_role_id, normalize_persona_id
 from .management_identity import dashboard_operator
 from .persona_catalog import available_personas
-from .setup_state import SETUP_STEPS, SetupStateStore
+from .settings import HostControlError
+from .setup_state import SETUP_STEPS, SetupStateStore, SetupStepsIncomplete
 from .display_names import display_names
 
 
 PREFIX = "/astrbot_plugin_private_companion/setup"
+# Profile editors submit the complete edited field set in one request. The
+# per-field limits are larger than the small command-route body cap.
+PROFILE_BODY_LIMIT = 262144
 logger = logging.getLogger(__name__)
 
 PROACTIVE_TEST_SUGGESTIONS = {
+    "dashboard_identity_required": "当前请求没有可用于真实投递的 Dashboard 登录身份。请从已登录的管理界面重新打开；插件 API Key 不能代替 Dashboard 登录会话。",
+    "unbound_identity": "当前 Dashboard 身份还没有完成本体绑定。请从已登录的管理界面重新打开一次，让系统建立当前安装的身份绑定。",
+    "binding_revoked": "当前 Dashboard 身份与本体的绑定已撤销。请由仍有核心权限的管理员重新确认该身份，不要反复运行真实投递测试。",
+    "binding_expired": "当前 Dashboard 身份与本体的绑定已过期。请重新登录并由仍有核心权限的管理员确认当前身份。",
+    "binding_not_active": "当前 Dashboard 身份的本体绑定尚未生效。请稍后重新读取状态，确认绑定生效后再测。",
+    "binding_rebound": "当前 Dashboard 身份已被重新绑定到其他主体。请刷新管理界面，确认当前账号与本体身份对应后再测。",
+    "scope_installation_mismatch": "当前 Dashboard 身份属于其他 AstrBot 安装，不能管理这份插件数据。请从当前安装的管理界面重新打开。",
+    "scope_not_granted": "当前 Dashboard 身份没有这个配置范围的授权。请由仍有核心权限的管理员补发对应授权。",
+    "core_access_required": "当前 Dashboard 身份没有本体核心管理权限。请使用已获核心管理权限的账号，或由仍有权限的管理员恢复该授权。",
+    "authorization_denied": "当前 Dashboard 身份没有管理此配置的权限。请由仍有核心权限的管理员检查授权状态。",
+    "authorization_revoked": "当前 Dashboard 身份的核心管理授权已撤销。请由另一位仍有权限的管理员重新授权；反复运行测试不会恢复授权。",
+    "authorization_expired": "当前 Dashboard 身份的管理授权已过期。请由仍有核心权限的管理员重新授权。",
+    "authorization_not_active": "当前 Dashboard 身份的管理授权尚未生效。请稍后刷新状态，或由仍有核心权限的管理员重新授权。",
     "contact_permission_required": "在核心管理员私聊的主动联系设置中启用主动联系授权。",
     "model_task_unregistered": "为核心管理员角色配置并启用 proactive.compose 模型任务。",
-    "contact_attempt_budget": "这是旧版本的模型调用次数上限错误；当前版本已取消该独立上限，请更新插件并查看每日实际联系额度。",
+    "contact_attempt_budget": "主动模型调用次数上限错误；请更新插件，并查看每日实际联系额度。",
     "contact_delivery_budget": "到「主动联系 → 每日额度」查看实际联系上限；已确认发送计联系次数，待回执发送暂时预占，明确未发送后释放。模型跳过不计联系。",
     "contact_purpose_paused": "检查所选目的的暂停状态和恢复时间。",
     "contact_quiet_hours": "当前处于静默时段；结束后再运行测试。",
@@ -64,10 +83,25 @@ PROACTIVE_TEST_SUGGESTIONS = {
     "delivery_result_unknown": "投递结果未知；核对核心管理员私聊与平台消息记录。确认是否收到前不要重试本次测试。",
     "delivery_failed": "检查 OneBot 私聊连接、机器人在线状态和平台返回错误；确认没有收到后，再用新的验收尝试重测。",
     "setup_core_window_ambiguous": "检查已配置私聊目标的核心用户身份；主动测试只会发送到唯一且当前有效的核心管理员私聊窗口。",
+    "host_persona_binding_changed": "绑定已按当前窗口自动修复；若反复出现，请在「开始使用」重新确认管理员私聊窗口。",
 }
 
 PROACTIVE_TEST_FAILURE_LABELS = {
-    "contact_attempt_budget": ("attempt_budget", "旧版本的主动模型调用次数上限已触发"),
+    "dashboard_identity_required": ("authorization", "Dashboard 登录身份不可用"),
+    "unbound_identity": ("authorization", "Dashboard 身份尚未完成绑定"),
+    "binding_revoked": ("authorization", "Dashboard 身份绑定已撤销"),
+    "binding_expired": ("authorization", "Dashboard 身份绑定已过期"),
+    "binding_not_active": ("authorization", "Dashboard 身份绑定尚未生效"),
+    "binding_rebound": ("authorization", "Dashboard 身份已重新绑定"),
+    "scope_installation_mismatch": ("authorization", "Dashboard 身份不属于当前安装"),
+    "scope_not_granted": ("authorization", "当前 Dashboard 身份未获该配置范围授权"),
+    "core_access_required": ("authorization", "当前 Dashboard 身份没有核心管理权限"),
+    "authorization_denied": ("authorization", "当前 Dashboard 身份没有配置管理权限"),
+    "authorization_revoked": ("authorization", "当前 Dashboard 身份的管理授权已撤销"),
+    "authorization_expired": ("authorization", "当前 Dashboard 身份的管理授权已过期"),
+    "authorization_not_active": ("authorization", "当前 Dashboard 身份的管理授权尚未生效"),
+    "host_persona_binding_changed": ("binding", "管理员私聊绑定已变化"),
+    "contact_attempt_budget": ("attempt_budget", "主动模型调用次数上限已触发"),
     "contact_delivery_budget": ("delivery_budget", "本私聊今日实际联系额度已用完"),
     "contact_permission_required": ("authorization", "主动联系授权未通过"),
     "contact_purpose_paused": ("purpose", "所选联系目的当前已暂停"),
@@ -97,7 +131,7 @@ PROACTIVE_TEST_FAILURE_LABELS = {
 }
 
 PROACTIVE_TEST_STAGE_SUGGESTIONS = {
-    "authorization": "使用已登录的 Dashboard 管理员身份，并确认当前账号仍有插件管理权限。",
+    "authorization": "先看具体原因：登录身份缺失或使用 API Key，与本体核心权限不足、已撤销是不同问题；请勿重复启动真实投递测试。",
     "binding": "确认首次绑定，或确保共享配置中只有一个精确私聊目标对应当前核心管理员身份。",
     "runtime": "在宿主管理页检查 V2 运行实例、角色载入和路由注册状态。",
     "settings": "检查主动联系总开关、目的开关及角色/关系/窗口各层的有效配置。",
@@ -110,7 +144,7 @@ PROACTIVE_TEST_STAGE_SUGGESTIONS = {
     "mobile_location_fetch": "检查现实触及模块、手机端配对、位置读取授权和本次地点快照时效。",
     "image_attachment": "检查私聊表情边界、已授权图库素材、图片检索和 QQ 图片投递能力。",
     "model_route": "在模型路由中为 proactive.compose 选择可用文本 Provider。",
-    "attempt_budget": "此上限仅存在于旧版本；当前只按窗口每日实际联系额度限制发送。",
+    "attempt_budget": "该上限已不再单独限制；现在只按窗口每日实际联系额度限制发送。",
     "delivery_budget": "查看「主动联系」中的每日实际联系上限与待回执发送。",
     "model_generation": "检查 proactive.compose Provider、任务参数、服务可达性与模型用量。",
     "persona_review": "检查 proactive.judge 路由、角色设定和复核理由；不要跳过复核。",
@@ -127,10 +161,23 @@ PROACTIVE_TEST_STAGE_ORDER = (
 
 PROACTIVE_TEST_STAGE_BY_CODE = {
     "dashboard_identity_required": "authorization",
+    "unbound_identity": "authorization",
+    "binding_revoked": "authorization",
+    "binding_expired": "authorization",
+    "binding_not_active": "authorization",
+    "binding_rebound": "authorization",
+    "scope_installation_mismatch": "authorization",
+    "scope_not_granted": "authorization",
+    "core_access_required": "authorization",
+    "authorization_denied": "authorization",
+    "authorization_revoked": "authorization",
+    "authorization_expired": "authorization",
+    "authorization_not_active": "authorization",
     "setup_binding_confirmation_required": "binding",
     "setup_core_window_not_configured": "binding",
     "setup_core_window_ambiguous": "binding",
     "setup_private_window_required": "binding",
+    "host_persona_binding_changed": "binding",
     "staging_not_initialized": "runtime",
     "proactive_diagnostic_unavailable": "runtime",
     "contact_permission_required": "settings",
@@ -161,6 +208,7 @@ class SetupWebAPI:
     def routes(self):
         return [
             (PREFIX + "/status", self.status, ["GET"], "Read persistent Companion V2 setup progress"),
+            (PREFIX + "/upgrade", self.prepare_upgrade, ["POST"], "Confirm existing legacy account and persona mappings"),
             (PREFIX + "/targets", self.api_targets, ["GET"], "Read connected OneBot accounts and native personas"),
             (PREFIX + "/binding/confirm", self.confirm_binding, ["POST"], "Confirm the Companion V2 core administrator window"),
             (PREFIX + "/model", self.model, ["POST"], "Choose the initial Companion V2 text provider"),
@@ -173,6 +221,7 @@ class SetupWebAPI:
             (PREFIX + "/prepare", self.prepare, ["POST"], "Prepare the confirmed Companion V2 profile"),
             (PREFIX + "/complete", self.complete, ["POST"], "Record a completed Companion V2 setup section"),
             (PREFIX + "/proactive-test", self.proactive_test, ["POST"], "Run a one-time proactive contact through the V2 contact and delivery pipeline"),
+            (PREFIX + "/proactive-test/status", self.proactive_test_status, ["GET"], "Read the existing proactive test receipt without host discovery"),
             (PREFIX + "/proactive-diagnostic", self.proactive_diagnostic, ["POST"], "Run a confirmed purpose-specific proactive diagnostic to the core administrator"),
             (PREFIX + "/proactive-test/confirm", self.confirm_proactive_test, ["POST"], "Record administrator confirmation of the existing test message"),
         ]
@@ -187,9 +236,9 @@ class SetupWebAPI:
         return username
 
     @staticmethod
-    async def _body(expected: set[str], *, optional: set[str] | frozenset[str] = frozenset()) -> dict:
+    async def _body(expected: set[str], *, optional: set[str] | frozenset[str] = frozenset(), limit: int = 4096) -> dict:
         raw = await request.body()
-        if len(raw) > 4096:
+        if len(raw) > limit:
             raise ValueError("request is too large")
 
         def unique(pairs):
@@ -223,26 +272,28 @@ class SetupWebAPI:
         return getter()
 
     def _model_providers(self) -> list[dict]:
-        context = self.controller.context
-        providers = []
-        try:
-            inventory = list(context.get_all_providers() or [])
-        except Exception:
-            return providers
-        for provider in inventory:
-            try:
-                meta = provider.meta() if callable(getattr(provider, "meta", None)) else None
-                identifier = str(getattr(meta, "id", "") or getattr(provider, "id", "") or "").strip()
-                if not identifier:
-                    continue
-                name = str(getattr(meta, "name", "") or getattr(provider, "name", "") or identifier)
-                expected_type = getattr(getattr(self.controller, "native_types", None), "provider", None)
-                if expected_type is not None and type(provider) is expected_type:
-                    providers.append({"id": identifier, "name": name[:120]})
-            except (AttributeError, TypeError, ValueError):
-                continue
-        return sorted({item["id"]: item for item in providers}.values(),
-                      key=lambda item: (item["name"].lower(), item["id"]))
+        context = getattr(self.controller, "context", None)
+        expected_type = text_provider_predicate(getattr(self.controller, "native_types", None))
+        return text_provider_catalog(context, expected_type) if context is not None else []
+
+    def _configured_provider_id(self) -> str:
+        config = getattr(self.controller, "config", {})
+        section = config.get("model", {}) if isinstance(config, dict) else {}
+        return str(section.get("provider_id", "")) if isinstance(section, dict) else ""
+
+    def _model_selection(self):
+        context = getattr(self.controller, "context", None)
+        expected_type = text_provider_predicate(getattr(self.controller, "native_types", None))
+        return (resolve_bootstrap_provider(context, expected_type, self._configured_provider_id())
+                if context is not None else None)
+
+    def _model_catalog(self):
+        selection = self._model_selection()
+        providers = self._model_providers()
+        if selection is not None and selection.provider_id and not any(
+                item["id"] == selection.provider_id for item in providers):
+            providers.append({"id": selection.provider_id, "name": selection.name or selection.provider_id})
+        return providers
 
     def _configured_provider_id(self) -> str:
         config = getattr(self.controller, "config", {})
@@ -259,13 +310,17 @@ class SetupWebAPI:
                              or getattr(self.controller, "last_session", None)))
         completed = list(state["completed"])
         skipped = list(state["skipped"])
+        selection = self._model_selection()
+        selection_id = (selection.provider_id
+                        if selection is not None and selection.source in ("auto", "configured")
+                        else "")
         if not confirmed:
             step = "binding"
         elif state["ready"]:
             step = "complete"
         elif "model" not in completed and "model" not in skipped:
             step = "model"
-        elif not self._configured_provider_id():
+        elif not selection_id:
             step = "model"
         else:
             step = next((name for name in SETUP_STEPS if name not in completed and name not in skipped),
@@ -273,24 +328,54 @@ class SetupWebAPI:
         return {"step": step,
                 "binding": binding, "binding_confirmed": confirmed, "prepared": prepared,
                 "completed": completed, "skipped": skipped,
-                "model": {"provider_id": self._configured_provider_id(),
-                          "providers": self._model_providers()},
+                "model": {"provider_id": selection_id or self._configured_provider_id(),
+                          "provider_source": (selection.source if selection_id and selection is not None
+                                              else "unavailable"),
+                          "providers": self._model_catalog()},
                 "proactive_test": state["proactive_test"], "ready": state["ready"],
                 "settings_error": getattr(getattr(self.controller, "settings_error", None), "code", None),
                 "host": status}
 
-    async def status(self):
-        try:
-            username = self._admin()
+    async def _test_progress(self, username: str) -> dict:
+        saved = self.progress.read()
+        receipt = saved["proactive_test"]
+        if (receipt and receipt["state"] == "started"
+                and (self._test_task is None or self._test_task.done())):
             async with self._test_lock:
                 saved = self.progress.read()
                 receipt = saved["proactive_test"]
                 if (receipt and receipt["state"] == "started"
                         and (self._test_task is None or self._test_task.done())):
                     await self._restore_test_contact_permission(username, receipt["attempt_id"])
-                    self.progress.finish_proactive_test(outcome="unknown",
+                    saved = self.progress.finish_proactive_test(outcome="unknown",
                         finished_at=datetime.now(timezone.utc).isoformat(), error_code="setup_test_interrupted")
+        return saved
+
+    async def proactive_test_status(self):
+        try:
+            saved = await self._test_progress(self._admin())
+            return self._response(Outcome.success({"proactive_test": saved["proactive_test"],
+                                                   "ready": saved["ready"]}))
+        except TaskError as error:
+            return self._error(error.code, str(error))
+        except (ValueError, TypeError, KeyError, OSError, UnicodeError):
+            return self._error("setup_progress_unavailable", "the existing test receipt could not be read")
+
+    async def status(self):
+        try:
+            await self._test_progress(self._admin())
             document = self._status_document()
+            from .upgrade_setup import UpgradeSetup
+            try:
+                document["upgrade"], _ = await UpgradeSetup(self.controller).plan()
+            except (TaskError, ValueError, OSError, UnicodeError) as error:
+                # 升级计划读不出来不该把整页设置进度一起弄没：页面还能显示绑定、
+                # 模型和步骤，只把这一块标成不可用，并把原因留在日志里。
+                logger.warning("[CompanionV2] 升级计划读取失败 error_type=%s code=%s",
+                               type(error).__name__, getattr(error, "code", ""))
+                document["upgrade"] = {"present": False, "configured": False, "can_prepare": False,
+                                       "unavailable": True,
+                                       "reason": getattr(error, "code", None) or type(error).__name__}
             names = display_names(self.controller)
             if document["binding"].get("participant_id"):
                 document["binding"] = (await names.targets([document["binding"]]))[0]
@@ -298,8 +383,23 @@ class SetupWebAPI:
             return self._response(Outcome.success(document))
         except TaskError as error:
             return self._error(error.code, str(error))
-        except (ValueError, OSError, UnicodeError):
+        except (ValueError, OSError, UnicodeError) as error:
+            logger.warning("[CompanionV2] 设置进度读取失败 error_type=%s detail=%s",
+                           type(error).__name__, str(error)[:200])
             return self._error("setup_progress_unavailable", "the saved setup progress cannot be read")
+
+    async def prepare_upgrade(self):
+        try:
+            self._admin()
+            body = await self._body({"confirmed", "plan_token"})
+            if body["confirmed"] is not True or type(body["plan_token"]) is not str:
+                raise ValueError("review confirmation is required")
+            from .upgrade_setup import UpgradeSetup
+            return self._response(Outcome.success(await UpgradeSetup(self.controller).prepare(body["plan_token"])))
+        except (TaskError, HostControlError) as error:
+            return self._error(error.code, str(error))
+        except (ValueError, OSError, UnicodeError):
+            return self._error("upgrade_prepare_failed", "旧版连接准备未完成，请保留来源并重新读取状态。")
 
     async def api_targets(self):
         try:
@@ -307,17 +407,71 @@ class SetupWebAPI:
             context = self.controller.context
             accounts = self.controller.session_topology.accounts()
             persona_names = await available_personas(context)
+            from .multi_settings import MultiHostSettings
+            try:
+                # The runtime may already share one persona role across Bot
+                # accounts; use the same normalized mapping in the setup picker.
+                mapping_rows = [{"bot_id": item.bot_id, "persona_id": item.persona_id,
+                                 "role_id": item.role_id}
+                                for item in MultiHostSettings.parse(self.controller.config).personas]
+            except (HostControlError, ValueError):
+                mapping_rows = self.controller.config.get("multi_host", {}).get("personas", [])
             choices = []
             for account in accounts:
                 names = [*persona_names, "[%None]"]
                 for persona_id in names:
-                    mapping = next((item for item in self.controller.config.get("multi_host", {}).get("personas", [])
+                    mapping = next((item for item in mapping_rows
                                     if item.get("bot_id") == account["bot_id"] and item.get("persona_id") == persona_id), None)
-                    choices.append({"bot_id": account["bot_id"], "persona_id": persona_id,
+                    choices.append({"platform_id": account["platform_id"], "account_id": account["account_id"],
+                                    "bot_id": account["bot_id"], "persona_id": persona_id,
                                     "role_id": mapping["role_id"] if mapping else derive_role_id(account["account_id"], persona_id),
-                                    "label": persona_id})
-            directory = await self.controller.session_topology.inventory_report()
+                                    "label": persona_id, "mapped": mapping is not None})
+            # When the shared host is assembled, use its normalized settings so
+            # a persona that is shared by several Bot accounts reports the same
+            # canonical role id that the role editor and runtime use.
+            inventory_settings = getattr(self.controller, "settings", None)
+            if inventory_settings is not None and not hasattr(inventory_settings, "targets"):
+                # Single-target HostSettings has no shared account inventory.
+                inventory_settings = None
+            directory = await self.controller.session_topology.inventory_report(settings=inventory_settings)
             targets = directory["targets"]
+            # The setup page runs before the first runtime profile exists, so
+            # page/targets cannot supply migration routes yet. The setup catalog
+            # must still describe which native roles can receive an old install.
+            from .legacy_api import PREFIX as LEGACY_PREFIX
+            from .role_paths import role_legacy_paths
+            inventory_roles = {}
+            inventory = getattr(getattr(self.controller, "web_api", None), "target_inventory", None)
+            if callable(inventory):
+                try:
+                    inventory_roles = {
+                        (target.get("target_id"), role.get("role_id")): role
+                        for target in inventory() for role in target.get("roles", [])
+                        if target.get("target_id") and role.get("role_id")
+                    }
+                except Exception:
+                    inventory_roles = {}
+            for target in targets:
+                scope_kind = target.get("scope_kind")
+                for role in target.get("roles", []):
+                    target_id, role_id = target.get("target_id"), role.get("role_id")
+                    matched = inventory_roles.get((target_id, role_id))
+                    if matched:
+                        for key in ("role_name", "legacy_api", "legacy_group_data_api"):
+                            if not role.get(key) and matched.get(key):
+                                role[key] = matched[key]
+                        role["persona_ids"] = list(dict.fromkeys(
+                            [*(role.get("persona_ids") or []), *(matched.get("persona_ids") or [])]))
+                    if target_id and role_id:
+                        if getattr(self.controller, "_multi_host", False):
+                            paths = role_legacy_paths(target_id, role_id, scope_kind)
+                            if not role.get("legacy_api"):
+                                role["legacy_api"] = paths["legacy_api"]
+                            if not role.get("legacy_group_data_api"):
+                                role["legacy_group_data_api"] = paths["legacy_group_data_api"]
+                        elif scope_kind != "group" and not role.get("legacy_api"):
+                            # The single-target host mounts migration at the root.
+                            role["legacy_api"] = LEGACY_PREFIX
             names = display_names(self.controller)
             accounts = await names.targets(accounts)
             targets = await names.targets(targets)
@@ -367,13 +521,21 @@ class SetupWebAPI:
             provider_id = data["provider_id"]
             if type(provider_id) is not str or not provider_id.strip() or len(provider_id) > 512:
                 raise ValueError("invalid provider")
+        except TaskError as error:
+            return self._error(error.code, str(error))
+        except (ValueError, TypeError, KeyError, OSError, UnicodeError):
+            return self._error("setup_model_invalid", "choose a loaded AstrBot text provider and retry")
+
+        stage = "provider_validation"
+        try:
             status = self._status_document()
             if status["step"] != "model":
                 raise TaskError("setup_step_order_invalid", "confirm the core administrator window before choosing a model")
             available = {item["id"] for item in status["model"]["providers"]}
             provider = self.controller.context.get_provider_by_id(provider_id)
-            expected_type = getattr(getattr(self.controller, "native_types", None), "provider", None)
-            if provider_id not in available or expected_type is None or type(provider) is not expected_type:
+            expected_type = text_provider_predicate(getattr(self.controller, "native_types", None))
+            if (provider_id not in available or expected_type is None
+                    or not supported_text_provider(provider, expected_type)):
                 raise TaskError("host_provider_unavailable", "choose a loaded AstrBot text provider supported by V2")
             config = self.controller.config
             if not isinstance(config, dict):
@@ -394,22 +556,35 @@ class SetupWebAPI:
                 ]
             if model_settings.get("fallback_provider_id") == provider_id:
                 model_settings["fallback_provider_id"] = ""
+            stage = "config_persistence"
             save(candidate)
+            stage = "settings_refresh"
             refresh = getattr(self.controller, "refresh_settings", None)
             if callable(refresh):
                 refresh()
             settings_error = getattr(self.controller, "settings_error", None)
             if settings_error is not None:
                 raise TaskError(settings_error.code, str(settings_error))
+            stage = "profile_initialization"
             initialized = await self.controller.initialize_profile()
             if initialized.failure is not None:
-                raise TaskError(initialized.failure.code, initialized.failure.reason)
+                if initialized.failure.code != "host_must_stop":
+                    raise TaskError(initialized.failure.code, initialized.failure.reason)
+                # The setup guide can be reopened while the shared host is
+                # already running. The provider is saved and the current host
+                # keeps serving; it will use the new selection after reload.
+                return self._response(Outcome.success({"provider_id": provider_id,
+                    "prepared": True, "restart_required": True,
+                    "status": self._status_document()}))
             return self._response(Outcome.success({"provider_id": provider_id,
                 "prepared": True, "status": self._status_document()}))
         except TaskError as error:
             return self._error(error.code, str(error))
-        except (ValueError, TypeError, KeyError, OSError, UnicodeError):
-            return self._error("setup_model_invalid", "choose a loaded AstrBot text provider and retry")
+        except Exception as error:
+            logger.warning("[CompanionV2] Initial model setup failed stage=%s error_type=%s",
+                           stage, type(error).__name__)
+            return self._error("setup_model_apply_failed",
+                               "the selected provider was accepted, but setup could not save or initialize it")
 
     async def reconnect_host(self):
         try:
@@ -521,6 +696,49 @@ class SetupWebAPI:
             raise TaskError("setup_private_window_required", "the active test requires the confirmed private window")
         return session, context, instruction
 
+    def _canonical_role(self, role_id):
+        settings = getattr(self.controller, "settings", None)
+        canonical = getattr(settings, "canonical_role_id", None)
+        return canonical(role_id) if callable(canonical) else str(role_id or "")
+
+    @staticmethod
+    def _context_role(context):
+        role = getattr(getattr(context, "role_binding", None), "role", None)
+        return getattr(role, "subject_id", None)
+
+    def _role_matches_binding(self, binding_role, context):
+        """角色比对容错：任一侧缺信息就不校验，别名链视为同一角色。"""
+        actual = self._context_role(context)
+        if not binding_role or not actual:
+            return True
+        return self._canonical_role(binding_role) == self._canonical_role(actual)
+
+    def _repair_parked_binding(self, target, context):
+        """窗口目标没变时，按当前角色重写过期的人格映射，而不是中断流程。"""
+        actual = self._context_role(context)
+        root = getattr(self.controller, "binding_root", None)
+        if not actual or root is None:
+            return False
+        parked = read_binding(root)
+        if parked is None:
+            return False
+        settings = getattr(self.controller, "settings", None)
+        wanted = self._canonical_role(actual)
+        matches = [item for item in getattr(settings, "personas", ())
+                   if item.bot_id == target.bot_id and self._canonical_role(item.role_id) == wanted]
+        if len(matches) != 1:
+            return False
+        persona_id = matches[0].persona_id
+        if normalize_persona_id(persona_id) == normalize_persona_id(parked.persona_id):
+            return False
+        try:
+            write_binding(root, PendingBinding(parked.platform_id, parked.account_id,
+                parked.participant_id, persona_id, parked.confirmed))
+        except (OSError, ValueError):
+            return False
+        logger.info("[CompanionV2] 管理员私聊绑定已按当前窗口人格自动修复 target=%s", target.target_id)
+        return True
+
     async def _setup_context_with_target(self):
         binding = self._binding()
         if not binding.get("bound") or binding.get("pending"):
@@ -552,8 +770,10 @@ class SetupWebAPI:
                     or (target.platform_id, target.account_id, target.participant_id) != (
                         current.get("platform_id"), current.get("account_id"), current.get("participant_id"))):
                 raise TaskError("setup_binding_confirmation_required", "the administrator private window changed during setup")
-            if current.get("role_id") and context.role_binding.role.subject_id != current["role_id"]:
-                raise TaskError("host_persona_binding_changed", "the administrator role changed; confirm the window again")
+            if not self._role_matches_binding(current.get("role_id"), context):
+                # 窗口目标没变时，角色漂移只修绑定、不阻断测试。
+                if not self._repair_parked_binding(target, context):
+                    logger.warning("[CompanionV2] 管理员私聊窗口角色与绑定不一致，按当前窗口继续 code=host_persona_binding_changed")
             return session, context, instruction, target
         else:
             context = session.profile.target
@@ -590,8 +810,9 @@ class SetupWebAPI:
                 (fallback_target.platform_id, fallback_target.account_id, fallback_target.participant_id)):
             raise TaskError("setup_binding_confirmation_required",
                             "the core administrator binding changed during the diagnostic")
-        if binding.get("role_id") and context.role_binding.role.subject_id != binding["role_id"]:
-            raise TaskError("host_persona_binding_changed", "the administrator role changed during the diagnostic")
+        if not self._role_matches_binding(binding.get("role_id"), context):
+            if not self._repair_parked_binding(fallback_target, context):
+                logger.warning("[CompanionV2] 诊断期间管理员角色与绑定不一致，按当前窗口继续 code=host_persona_binding_changed")
         resolver = getattr(self.controller, "proactive_diagnostic_target", None)
         if not callable(resolver) or await resolver() != fallback_target:
             raise TaskError("setup_binding_confirmation_required",
@@ -604,8 +825,11 @@ class SetupWebAPI:
         if not getattr(self.controller, "_multi_host", False):
             return self.controller
         _session, context, _instruction, target = await self._setup_context_with_target()
+        role_id = self._context_role(context) or self._binding().get("role_id") or ""
+        if not role_id:
+            raise TaskError("setup_binding_confirmation_required", "confirm the core administrator private window first")
         from .multi_api import TargetControllerView
-        return TargetControllerView(self.controller, target.target_id, context.role_binding.role.subject_id)
+        return TargetControllerView(self.controller, target.target_id, role_id)
 
     @staticmethod
     def _operator(controller, username):
@@ -668,7 +892,8 @@ class SetupWebAPI:
     async def save_profile(self):
         try:
             username = self._admin()
-            data = await self._body({"target", "operation_key", "edit_token", "changes"})
+            data = await self._body({"target", "operation_key", "edit_token", "changes"},
+                                    limit=PROFILE_BODY_LIMIT)
             target, changes = data["target"], data["changes"]
             if (target not in ("role_profile", "relationship_profile")
                     or type(data["operation_key"]) is not str or not data["operation_key"].strip()
@@ -700,6 +925,7 @@ class SetupWebAPI:
                 state = self.progress.confirm_proactive_test(attempt_id=data["attempt_id"],
                     confirmed_by=username, confirmed_at=datetime.now(timezone.utc).isoformat())
                 return self._response(Outcome.success({"state": state["proactive_test"]["state"],
+                    "proactive_test": state["proactive_test"],
                     "ready": state["ready"], "replay_allowed": False}))
             except TaskError as error:
                 return self._error(error.code, str(error))
@@ -732,6 +958,13 @@ class SetupWebAPI:
                 attempt_id = uuid4().hex
                 try:
                     self.progress.begin_proactive_test(attempt_id=attempt_id, started_at=started)
+                except SetupStepsIncomplete as error:
+                    # "The guide is not finished" and "this attempt already ran and
+                    # cannot be replayed" have nothing in common. Collapsing both
+                    # into setup_test_non_replayable told the operator to hunt a
+                    # replay problem while proactive_test was still null, i.e. while
+                    # no attempt had ever existed.
+                    raise TaskError("setup_steps_incomplete", str(error)) from error
                 except ValueError as error:
                     raise TaskError("setup_test_non_replayable", str(error)) from error
                 self._test_task = asyncio.create_task(self._execute_proactive_test(username, attempt_id),
@@ -810,7 +1043,7 @@ class SetupWebAPI:
                             raise TaskError("proactive_diagnostic_unavailable",
                                             "the active host has no synthetic diagnostic event registry")
                         candidate = await synthetic_producer(context, purpose, at=now,
-                                                             test_id=attempt_id, variant=variant)
+                            test_id=attempt_id, variant=variant, role_instruction=instruction)
                     elif variant == "mobile_location":
                         native_extensions = getattr(self.controller, "native_extensions", None)
                         reality = (native_extensions.active_service("reality")
@@ -956,7 +1189,7 @@ class SetupWebAPI:
                     "started_at": started, "finished_at": datetime.now(timezone.utc).isoformat(),
                     "stages": stages, "replay_allowed": False}))
             except TaskError as error:
-                failure_stage = PROACTIVE_TEST_STAGE_BY_CODE.get(error.code, "authorization")
+                failure_stage = PROACTIVE_TEST_STAGE_BY_CODE.get(error.code, "execution")
                 return self._response(Outcome.success(self._diagnostic_failure(
                     data.get("purpose") if "data" in locals() and isinstance(data, dict) else None,
                     None, failure_stage, error.code, str(error))))
@@ -1123,15 +1356,34 @@ class SetupWebAPI:
             deadline = asyncio.get_running_loop().time() + 150
             last_progress = None
             while asyncio.get_running_loop().time() < deadline:
+                receipt = self.progress.read()["proactive_test"]
+                if not receipt or receipt["attempt_id"] != attempt_id or receipt["state"] != "started":
+                    return
                 observed = require(app.proactive.observe(context, task.task_id))
                 delivery = observed["delivery"]
-                stage_state("model_generation", "passed")
+                generation = observed.get("generation")
+                stage_state("model_generation", "passed" if generation == "succeeded" else "running")
                 judge = observed.get("judge")
                 stage_state("persona_review", "passed" if observed.get("judge_allowed") is True else
                             "not_required" if judge is None else
                             "running" if judge == "pending" else "pending")
-                if delivery in (None, "pending", "partial"):
+                if delivery in ("pending", "partial", "dispatched"):
                     stage_state("delivery", "running")
+                if delivery is None and generation in TERMINAL - {"succeeded"}:
+                    current_task = require(app.tasks.read(context, task.task_id))
+                    stage_state("model_generation", "failed")
+                    for item in stages:
+                        if item["stage"] == "model_generation" and current_task.reason:
+                            item["detail"] = redact_text(str(current_task.reason))[:256]
+                    stage_state("persona_review", "skipped")
+                    stage_state("delivery", "skipped")
+                    stage_state("receipt", "skipped")
+                    self._restore_test_contact_permission_with_context(username, attempt_id, app, context)
+                    self.progress.finish_proactive_test(
+                        outcome="unknown" if generation == "uncertain" else "failed",
+                        finished_at=datetime.now(timezone.utc).isoformat(),
+                        error_code="setup_contact_generation_failed", report=report())
+                    return
                 progress = (tuple((item["stage"], item["state"], item.get("detail", ""))
                                   for item in stages), delivery, observed.get("receipt_ref"))
                 if progress != last_progress:
@@ -1192,8 +1444,11 @@ class SetupWebAPI:
                     code = "setup_contact_permission_restore_failed"
                     outcome = "unknown"
             try:
+                for item in stages:
+                    if item["state"] == "running":
+                        item["state"] = "failed"
                 self.progress.finish_proactive_test(outcome=outcome,
-                    finished_at=datetime.now(timezone.utc).isoformat(), error_code=code)
+                    finished_at=datetime.now(timezone.utc).isoformat(), error_code=code, report=report())
             except ValueError:
                 pass
 
@@ -1225,9 +1480,8 @@ class SetupWebAPI:
         operator = dashboard_operator(self.controller.runtime, username, at=self.controller.now())
         manager = ContactManagement(app, context)
         current = require(manager.status(operator))
-        # The global switch may still be off while this test's old window
-        # row/grant is on. Always clear the temporary window permission when the
-        # test enabled it; its effective public value cannot prove cleanup.
+        # Restore the public switch independently from the administrator's
+        # temporary grant, so the test can be repeated without hidden reauthorization.
         if not enabled_before:
             data = {
                 "operation_key": "setup-test-restore-" + attempt_id,

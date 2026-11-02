@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import logging
 from uuid import uuid4
@@ -31,6 +31,7 @@ from .busy_gate import BUSY_DELAY_INSTRUCTION
 from .perception_settings import validate as validate_perception_settings, validate_snapshot as validate_perception_snapshot
 from .reply_settings import validate as validate_reply_settings
 from .models import InboundConversationEvent
+from . import debounce_log
 from .media.models import ImageConversationEvent, INSTRUCTION as IMAGE_INSTRUCTION
 from .media.codec import image_descriptor
 from .media.service import ConversationImages
@@ -60,6 +61,7 @@ from .style_context import ConversationExpressionStyleContext, EXPRESSION_STYLE_
 from .open_items_context import ConversationOpenItems, INSTRUCTION as OPEN_ITEMS_INSTRUCTION
 from .state_context import ConversationStateContext
 from .group_context import GroupConversationContext, INSTRUCTION as GROUP_CONTEXT_INSTRUCTION
+from .awareness_context import ConversationAwarenessContext, INSTRUCTION as AWARENESS_INSTRUCTION
 from .recalls import ConversationRecalls
 from companion_v2.role_work.state.service import INSTRUCTION as STATE_INSTRUCTION
 from companion_v2.expression.configuration import read_settings as read_expression_settings
@@ -123,7 +125,7 @@ class ConversationMessages:
     def __init__(self, tasks: TaskSupervisor, *, relationships=None, memory=None, life=None, open_items=None,
                  role_growth=None, role_state=None, knowledge=None, role_self_review=None,
                  expression_style=None, reference_materials=None, timezone_name="Asia/Shanghai", solar_term_port=None,
-                 calendar=None):
+                 calendar=None, cross_window=None):
         if relationships is not None and relationships.runtime is not tasks.runtime:
             raise ValueError("relationship context must use the conversation's original runtime")
         if life is not None and life.tasks is not tasks:
@@ -164,6 +166,9 @@ class ConversationMessages:
         self.group_memory = GroupMemory(self)
         from companion_v2.memory.person.service import PersonAcquaintance
         self.acquaintance = PersonAcquaintance(self.runtime, self.tasks)
+        self.cross_window = cross_window
+        self.cross_window_context = (ConversationAwarenessContext(cross_window)
+                                     if cross_window is not None else None)
         # One group graph is shared by the member card, imported clues and the
         # short interaction rhythm.  It is deliberately independent of the
         # private relationship-memory owner.
@@ -238,6 +243,37 @@ class ConversationMessages:
             raise TaskError("source_audience_mismatch", "material is not available to the original audience")
         return record
 
+    def _group_peer_count(self, context, at):
+        """Distinct other group speakers in a short window; no names leave this method."""
+        if context.scope.kind is not ScopeKind.GROUP:
+            return 0
+        try:
+            minutes = self.cross_window.peer_minutes(context) if self.cross_window is not None else 5
+        except Exception:
+            minutes = 5
+        try:
+            rows = self.runtime.read_all("""SELECT i.event_json FROM conversation_inputs i
+                JOIN conversation_batches b ON b.batch_id = i.batch_id
+                WHERE json_extract(b.context_json, '$.role_binding') = ?
+                  AND json_extract(b.context_json, '$.scope.kind') = 'group'
+                  AND json_extract(i.event_json, '$.received_at') >= ?
+                  AND json_extract(i.event_json, '$.received_at') <= ?
+                ORDER BY i.rowid DESC LIMIT 64""",
+                (encode(context.role_binding), stamp(at - timedelta(minutes=minutes)), stamp(at)))
+        except Exception:
+            return 0
+        current = context.actor.principal.native_account_id
+        accounts = set()
+        for row in rows:
+            try:
+                data = json.loads(row["event_json"])
+            except (TypeError, ValueError):
+                continue
+            account = (data.get("principal") or {}).get("native_account_id")
+            if account and account != current:
+                accounts.add(account)
+        return min(64, len(accounts))
+
     @outcome
     def accept(self, context: TaskContext, event: InboundConversationEvent, *, role_instruction: str,
                batch_id: str | None = None) -> str:
@@ -248,6 +284,9 @@ class ConversationMessages:
         observers = tuple(item for item in (self.acquaintance.intake_observer(context),
                                             None if self.habits is None else self.habits.intake_observer(context))
                           if item is not None)
+        cross_window_enabled = self.cross_window is not None and self.cross_window.enabled(context)
+        group_peers = self._group_peer_count(context, event.received_at) if cross_window_enabled else 0
+        quote_sender_ids = tuple(quote.sender_id for quote in getattr(event, "quotes", ()))
         with self.runtime.transaction() as connection:
             self.authorize(context)
             from .reset import boundary
@@ -322,6 +361,16 @@ class ConversationMessages:
                     # The graph is a management projection; a damaged optional
                     # record must never reject the authenticated group input.
                     logger.warning("V2 group relationship graph update failed: %s", type(error).__name__)
+            if cross_window_enabled:
+                try:
+                    self.cross_window.record_input(connection, context, event.received_at,
+                                                   record.payload, event.scoped_key, enabled=True,
+                                                   source=event.source, peer_count=group_peers,
+                                                   quote_sender_ids=quote_sender_ids)
+                except Exception as error:
+                    # Cross-window presence is optional background.  A damaged
+                    # ledger must never reject an authenticated input.
+                    logger.warning("V2 cross-window presence update failed: %s", type(error).__name__)
             connection.execute("UPDATE conversation_batches SET revision = revision + 1 WHERE batch_id = ?", (batch_id,))
             return batch_id
 
@@ -392,6 +441,16 @@ class ConversationMessages:
         card = self.acquaintance.card_contribution(context, at, snapshot=saved.get("person_card"))
         if card is not None:
             contributions.append(card)
+        cross_window_material = None
+        if (isinstance(saved, dict) and saved.get("cross_window") is not None
+                and self.cross_window_context is not None):
+            try:
+                cross_window_material = self.cross_window_context.contributions(
+                    saved["cross_window"], context, at)
+            except Exception as error:
+                logger.warning("V2 cross-window context unavailable: %s", type(error).__name__)
+            if cross_window_material is not None:
+                contributions.append(cross_window_material)
         if context.scope.kind is ScopeKind.GROUP:
             network = self.group_network.contribution(context, events, at=at, snapshot=saved.get("group_network"))
             if network is not None:
@@ -444,8 +503,7 @@ class ConversationMessages:
                     ConversationExpressionStyleContext.validate_snapshot(style_snapshot, context)
                     contributions.extend(
                         self.expression_style_context.contributions(style_snapshot, context, at,
-                            policy=read_expression_settings(self.runtime, context),
-                            batch_id=None if historical else row["batch_id"]))
+                            policy=read_expression_settings(self.runtime, context), candidate_pool=True))
                 except Exception as error:
                     logger.warning("V2 expression materials unavailable: %s", type(error).__name__)
         if isinstance(saved, dict) and saved.get("role_state") is not None:
@@ -528,7 +586,15 @@ class ConversationMessages:
                 ContributionState.READY, calendar_payload))
             if important_date_settings is not None:
                 date_context = project_important_dates(calendar_at, important_date_settings)
-                if date_context["entries"]:
+                try:
+                    from companion_v2.relationships import anniversaries
+                    date_context["auto_anniversaries"] = list(anniversaries.upcoming(
+                        self.runtime, context, calendar_at,
+                        timezone_name=date_context["timezone"],
+                        lookahead_days=important_date_settings["lookahead_days"]))
+                except Exception:
+                    date_context["auto_anniversaries"] = []
+                if date_context["entries"] or date_context["auto_anniversaries"]:
                     contributions.append(ContextContribution(
                         "important-dates:" + date_context["timezone"], "conversation.calendar",
                         "upcoming_important_dates", ContributionState.READY,
@@ -576,10 +642,8 @@ class ConversationMessages:
             if file_prompt:
                 file_instruction += "\n管理员补充文件描述偏好（只约束说明方式）：\n" + file_prompt
             request = replace(request, instruction=request.instruction + "\n" + file_instruction)
-        profile_snapshot = saved.get("role_profile") if isinstance(saved, dict) else None
-        profile_instruction = self.role_profile_context.instruction(profile_snapshot, context)
-        if profile_instruction:
-            request = replace(request, instruction=request.instruction + profile_instruction)
+        # The self page is the role reference for background tasks, not a second
+        # identity layer in conversation; conversation keeps the host persona.
         relationship_profile_snapshot = saved.get("relationship_profile") if isinstance(saved, dict) else None
         relationship_profile_instruction = self.relationship_profile_context.instruction(
             relationship_profile_snapshot, context)
@@ -603,7 +667,9 @@ class ConversationMessages:
         if audios:
             request = replace(request, audios=tuple(audios), instruction=request.instruction + "\n" + AUDIO_INSTRUCTION)
         if images:
-            request = replace(request, images=tuple(images), instruction=request.instruction + "\n" + IMAGE_INSTRUCTION)
+            request = replace(request, images=tuple(images),
+                user_input_image_sources=tuple(image.source for image in images),
+                instruction=request.instruction + "\n" + IMAGE_INSTRUCTION)
             if self.reply_images.enabled and context.scope.kind in (ScopeKind.PRIVATE, ScopeKind.GROUP):
                 request = replace(request, reply_images=True)
         if any(getattr(event, "quotes", ()) for event in events):
@@ -612,6 +678,8 @@ class ConversationMessages:
             request = replace(request, instruction=request.instruction + "\n" + FORWARD_INSTRUCTION)
         if forward_adaptation_enabled and any(getattr(q, "forwards", ()) for event in events for q in getattr(event, "quotes", ())):
             request = replace(request, instruction=request.instruction + "\n" + QUOTED_FORWARD_INSTRUCTION)
+        if cross_window_material is not None:
+            request = replace(request, instruction=request.instruction + "\n" + AWARENESS_INSTRUCTION)
         if any(item.state is ContributionState.READY for item in relationship_materials):
             request = replace(request, instruction=request.instruction + "\n" + RELATIONSHIP_INSTRUCTION)
         if any(item.state is ContributionState.READY for item in life_materials):
@@ -708,6 +776,19 @@ class ConversationMessages:
                 context, events, row["role_instruction"], self.tasks.now(), batch_id
             )
             contributions = tuple(contributions) + tuple(captured_knowledge)
+        current_text = ""
+        if context.scope.kind is ScopeKind.PRIVATE and self.cross_window_context is not None and inputs:
+            parts = []
+            for item in inputs:
+                try:
+                    data = json.loads(item["event_json"])
+                    record = self._read_source(source_from_document(data["source"]), context,
+                                               data["capability"], self.tasks.now())
+                except Exception:
+                    continue
+                if record.payload:
+                    parts.append(record.payload)
+            current_text = "\n".join(parts)
         if len(contributions) > 32:
             raise ValueError("context contributions must be bounded")
         material_refs = []
@@ -736,6 +817,13 @@ class ConversationMessages:
             task_id = "generate-" + batch_id
             saved = {"inputs": [item["event_key"] for item in inputs], "materials": material_refs}
             saved["person_card"] = self.acquaintance.capture(context, self.tasks.now())
+            if (self.cross_window_context is not None
+                    and context.scope.kind in (ScopeKind.PRIVATE, ScopeKind.GROUP)):
+                try:
+                    saved["cross_window"] = self.cross_window_context.capture(
+                        context, self.tasks.now(), current_text=current_text)
+                except Exception as error:
+                    logger.warning("V2 cross-window snapshot failed: %s", type(error).__name__)
             profile_snapshot = self.role_profile_context.capture(context, self.tasks.now())
             if profile_snapshot is not None:
                 saved["role_profile"] = profile_snapshot
@@ -792,7 +880,7 @@ class ConversationMessages:
             if private and self.background_history is not None:
                 saved["background_history"] = self.background_history.capture(context, self.tasks.now())
             flow_row = self.runtime.read_one(
-                "SELECT reason FROM conversation_flows WHERE batch_id = ?", (batch_id,))
+                "SELECT * FROM conversation_flows WHERE batch_id = ?", (batch_id,))
             if flow_row is not None and flow_row["reason"] == "busy_delay":
                 saved["busy_delay"] = True
             not_before = self.tasks.now()
@@ -802,6 +890,22 @@ class ConversationMessages:
             connection.execute("""UPDATE conversation_batches SET state = 'sealed', revision = revision + 1,
                 generation_task_id = ?, contributions_json = ? WHERE batch_id = ?""",
                 (task_id, encode(saved), batch_id))
+            if (context.scope.kind is ScopeKind.GROUP and flow_row is not None
+                    and flow_row["reason"] in ("debounce", "busy_delay") and inputs):
+                try:
+                    timing_values = json.loads(flow_row["policy_json"])
+                    max_wait = float(timing_values["maximum_wait_seconds"])
+                    started_at = datetime.fromisoformat(flow_row["merge_until"]) - timedelta(seconds=max_wait)
+                    debounce_log.settled(
+                        "group", target=context.scope.native_scope_id,
+                        inputs=len(inputs), followups=max(0, len(inputs) - 1),
+                        waited_ms=max(0.0, (not_before - started_at).total_seconds() * 1000),
+                        timing_text=debounce_log.timing(
+                            quiet_ms=float(timing_values["quiet_seconds"]) * 1000,
+                            max_wait_ms=max_wait * 1000),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    pass
             return require(self.tasks.submit(task))
 
     @outcome
@@ -903,14 +1007,41 @@ class ConversationMessages:
             return False
         actual = self._request(self.owned(context, batch_id), context, self.tasks.now(), include_tools=False)
         expected = tuple(m for m in actual.context.materials if self.optional_guidance(m))
-        if new != expected:
+        style_purposes = {"expression_style_context", "expression_style_rule"}
+        other = lambda items: tuple(m for m in items if m.purpose not in style_purposes)
+        if other(new) != other(expected):
             return False
-        # The style summary changes its injection count after a rule lapses.
-        # Other payloads may only disappear, never be replaced or newly injected.
-        old_payloads = iter(m for m in old if m.purpose != "expression_style_context")
-        for material in new:
-            if material.purpose != "expression_style_context" and not any(m == material for m in old_payloads):
+        previous_other = iter(other(old))
+        if any(not any(material == previous for previous in previous_other) for material in other(new)):
+            return False
+
+        def style_rules(items):
+            return tuple(m for m in items if m.purpose == "expression_style_rule")
+
+        def ordered_subset(items, candidates):
+            remaining = iter(candidates)
+            return all(any(item == candidate for candidate in remaining) for item in items)
+
+        selected = style_rules(new)
+        if not ordered_subset(selected, style_rules(old)) or not ordered_subset(selected, style_rules(expected)):
+            return False
+        summaries = tuple(m for m in new if m.purpose == "expression_style_context")
+        if not selected:
+            return not summaries
+        sources = tuple(m for m in expected if m.purpose == "expression_style_context")
+        if len(summaries) != 1 or len(sources) != 1:
+            return False
+        try:
+            current_info, source_info = json.loads(summaries[0].payload), json.loads(sources[0].payload)
+            for name in ("context_at", "rules_available", "learning_mode"):
+                if current_info.get(name) != source_info.get(name):
+                    return False
+            if (current_info.get("rules_injected") != len(selected)
+                    or current_info.get("selection_partial") != (
+                        len(selected) < current_info["rules_available"])):
                 return False
+        except (TypeError, ValueError, AttributeError, KeyError):
+            return False
         return True
 
     def _prepare_daily_outfit(self, run, at):

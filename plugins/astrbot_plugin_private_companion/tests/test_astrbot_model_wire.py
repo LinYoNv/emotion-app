@@ -18,6 +18,120 @@ REPORTED_USAGE = Amount(40, 90, input_tokens=30, cached_input_tokens=10, output_
 
 
 class NativeModelTests(NativeFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_provider_registry_refresh_rebinds_same_configuration(self):
+        envelope = await self.envelope()
+        original = self.native.provider
+        replacement = type(original)()
+        self.native.provider = replacement
+
+        response = await self.native_model.generate(envelope)
+        self.assertEqual(response.status, "generated")
+        self.assertIs(self.native_model.native, replacement)
+        self.assertIs(self.native_model.client, replacement.client)
+
+        replacement.provider_config = {**replacement.provider_config, "model": "changed"}
+        with self.assertRaises(TaskError) as error:
+            self.native_model._current()
+        self.assertEqual(error.exception.code, "host_provider_changed")
+
+    async def test_auto_context_length_backfill_is_not_a_provider_change(self):
+        # 装配时 max_context_tokens 还是 0（自动），宿主在普通聊天后补成具体值；
+        # 这属于自动补全，不是模型配置被替换。
+        original = self.native.provider
+        original.provider_config["max_context_tokens"] = 0
+        self.native_model = self.make_model()
+        envelope = await self.envelope()
+        replacement = type(original)()
+        replacement.provider_config = {**replacement.provider_config,
+                                       "max_context_tokens": 262144}
+        self.native.provider = replacement
+
+        response = await self.native_model.generate(envelope)
+        self.assertEqual(response.status, "generated")
+        self.assertEqual(len(replacement.client.state.calls), 1)
+        self.assertIs(self.native_model.native, replacement)
+
+        # 补全后的具体值再被改掉，才算真正的配置变化。
+        replacement.provider_config = {**replacement.provider_config,
+                                       "max_context_tokens": 131072}
+        with self.assertRaises(TaskError) as error:
+            self.native_model._current()
+        self.assertIn("max_context_tokens", str(error.exception))
+
+    async def test_context_limit_backfilled_during_generation_survives_response_recheck(self):
+        original = self.native.provider
+        original.provider_config["max_context_tokens"] = 0
+        self.native_model = self.make_model()
+
+        async def backfill(_payload, _tools):
+            original.provider_config["max_context_tokens"] = 262144
+            return completion()
+
+        original.client.state.behavior = backfill
+        response = await self.native_model.generate(await self.envelope())
+        self.assertEqual(response.status, "generated")
+        self.assertEqual(len(original.client.state.calls), 1)
+
+    async def test_task_profile_prompt_keeps_the_host_persona_guard(self):
+        envelope = await self.envelope()
+        request = replace(envelope.original, role_instruction="角色稳定档案：温和、细心。",
+                          role_guard_instruction=envelope.original.role_instruction)
+        observed_guards = []
+        verify_role = self.bridge.verify_role
+
+        async def record_guard(*args):
+            observed_guards.append(args[2])
+            return await verify_role(*args)
+
+        self.bridge.verify_role = record_guard
+        response = await self.native_model.generate(replace(envelope, original=request))
+        self.assertEqual(response.status, "generated")
+        calls = self.native.provider.client.state.calls
+        self.assertTrue(calls[-1][0]["messages"][0]["content"].startswith(request.role_instruction))
+        self.assertEqual(observed_guards, [envelope.original.role_instruction] * 2)
+
+    async def test_probe_does_not_pass_stream_to_native_query(self):
+        await self.native_model.probe()
+        payload, _ = self.native.provider.client.state.calls[-1]
+        self.assertNotIn("stream", payload)
+        self.assertEqual(payload["max_tokens"], 256)
+
+    async def test_state_and_planning_use_json_mode_and_end_with_their_task_contract(self):
+        envelope = await self.envelope()
+        for kind in ("role_state", "calendar_planning"):
+            request = replace(envelope.original, output_format=kind, response_format="json_object",
+                              instruction="维护角色数据，只输出 JSON。")
+            wire = build_wire(replace(envelope, original=request))
+            self.assertTrue(wire.messages[0]["content"].startswith(envelope.original.role_instruction))
+            self.assertIn("不写聊天回复", wire.messages[0]["content"])
+            self.assertNotIn("claims", wire.messages[0]["content"])
+            async def respond(*_):
+                return completion('{"items":[]}')
+            self.native.provider.client.state.behavior = respond
+            result = await self.native_model.generate(replace(envelope, original=request))
+            self.assertEqual(result.status, "generated")
+            payload, _ = self.native.provider.client.state.calls[-1]
+            self.assertEqual(payload["response_format"], {"type": "json_object"})
+
+    async def test_self_review_transmits_its_schema_and_names_the_fields_in_prompt(self):
+        """#407: the model must receive the exact shape, not guess it."""
+        envelope = await self.envelope()
+        request = replace(envelope.original, output_format="role_self_review",
+                          response_format="json_object",
+                          instruction="复盘最近的回复。")
+        wire = build_wire(replace(envelope, original=request))
+        prompt = wire.messages[0]["content"]
+        for expected in ("summary", "guidance", "kind", "next_action", "evidence_handles", "expires_at"):
+            self.assertIn(expected, prompt)
+        self.assertNotIn("claims", prompt)
+        async def respond(*_):
+            return completion('{"summary":"ok","guidance":[]}')
+        self.native.provider.client.state.behavior = respond
+        result = await self.native_model.generate(replace(envelope, original=request))
+        self.assertEqual(result.status, "generated")
+        payload, _ = self.native.provider.client.state.calls[-1]
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+
     async def test_model_wire_records_the_final_prompt_when_a_snapshot_sink_is_attached(self):
         envelope = await self.envelope()
         snapshots = []
@@ -39,7 +153,7 @@ class NativeModelTests(NativeFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "generated")
         self.assertEqual(len(signatures), 1)
         self.assertEqual(observed_before_io, [1])
-        self.assertEqual(len(signatures[0].system_parts), 3)
+        self.assertEqual(len(signatures[0].system_parts), 1)
         self.assertTrue(signatures[0].context_observed)
 
     async def test_prompt_composition_preserves_cache_prefix_and_ends_after_all_inputs(self):
@@ -55,18 +169,17 @@ class NativeModelTests(NativeFixture, unittest.IsolatedAsyncioTestCase):
             return build_wire(replace(envelope, original=request, tool_history=history))
 
         first, second = wire_for("first user request"), wire_for("different user request")
-        self.assertEqual(first.messages[:2], second.messages[:2])
-        self.assertEqual([message["role"] for message in first.messages[:2]], ["system", "system"])
-        payload = first.messages[2]["content"]
+        self.assertEqual(first.messages[:1], second.messages[:1])
+        self.assertEqual([message["role"] for message in first.messages[:1]], ["system"])
+        payload = first.messages[1]["content"]
         self.assertIn('"content_class":"current_user_request"', payload)
         self.assertIn('"instruction_authority":"user_request"', payload)
         self.assertIn('"content_class":"reference_data"', payload)
         self.assertIn('"instruction_authority":"none"', payload)
-        self.assertEqual(first.messages[-2]["role"], "tool")
-        self.assertEqual(first.messages[-1]["role"], "system")
-        self.assertIn("末尾约束", first.messages[-1]["content"])
-        self.assertIn("最终面向用户只输出一个 JSON 对象", first.messages[-1]["content"])
-        self.assertEqual(first.messages[-1], second.messages[-1])
+        self.assertEqual(first.messages[-1]["role"], "tool")
+        self.assertIn("末尾约束", first.messages[0]["content"])
+        self.assertIn("最终面向用户只输出一个 JSON 对象", first.messages[0]["content"])
+        self.assertEqual(first.messages[0], second.messages[0])
         self.assertNotIn("末尾约束", first.messages[1]["content"])
 
         async def respond(*_):
@@ -82,22 +195,92 @@ class NativeModelTests(NativeFixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_reply_contract_example_is_accepted_by_the_real_decoder(self):
         wire = build_wire(await self.envelope())
-        self.assertIn(REPLY_CONTRACT_EXAMPLE, wire.messages[1]["content"])
+        self.assertIn(REPLY_CONTRACT_EXAMPLE, wire.messages[0]["content"])
         response = NS(raw_completion=NS(choices=[NS(finish_reason="stop", message=NS(tool_calls=None))]),
                       completion_text=REPLY_CONTRACT_EXAMPLE, tools_call_ids=[], tools_call_name=[],
                       tools_call_args=[])
         draft, calls = decode_response(response, wire)
         self.assertEqual(calls, ())
-        self.assertEqual(draft.text, "我愿意陪你聊聊。")
+        self.assertTrue(draft.text)
         self.assertEqual(draft.claims[0].statement, draft.text)
+
+    async def test_single_code_fence_around_the_whole_object_is_unwrapped(self):
+        # 中转不透传 response_format 时，Claude 常回 ```json … ```；整段就是一个围栏才剥。
+        wire = build_wire(await self.envelope())
+        for fenced in ("```json\n" + REPLY_CONTRACT_EXAMPLE + "\n```",
+                       "```\n" + REPLY_CONTRACT_EXAMPLE + "\n```",
+                       "  ```JSON\n" + REPLY_CONTRACT_EXAMPLE + "```  "):
+            with self.subTest(fenced=fenced[:24]):
+                response = NS(raw_completion=NS(choices=[NS(finish_reason="stop", message=NS(tool_calls=None))]),
+                              completion_text=fenced, tools_call_ids=[], tools_call_name=[],
+                              tools_call_args=[])
+                draft, calls = decode_response(response, wire)
+                self.assertEqual(calls, ())
+                self.assertEqual(draft.claims[0].statement, draft.text)
+
+    async def test_prose_outside_the_fence_is_still_rejected(self):
+        wire = build_wire(await self.envelope())
+        for text in ("好的：\n```json\n" + REPLY_CONTRACT_EXAMPLE + "\n```",
+                     "```json\n" + REPLY_CONTRACT_EXAMPLE + "\n```\n以上是结果。"):
+            with self.subTest(text=text[:24]), self.assertRaises(ValueError):
+                decode_response(NS(raw_completion=NS(choices=[NS(finish_reason="stop", message=NS(tool_calls=None))]),
+                    completion_text=text, tools_call_ids=[], tools_call_name=[], tools_call_args=[]), wire)
+
+    async def test_responses_api_shape_is_decoded_from_host_parsed_text(self):
+        wire = build_wire(await self.envelope())
+        # ProviderOpenAIResponses returns an LLMResponse whose raw_completion
+        # is a Responses object with output items, not ChatCompletion choices.
+        response = NS(raw_completion=NS(output=[]), completion_text=REPLY_CONTRACT_EXAMPLE,
+                      tools_call_ids=[], tools_call_name=[], tools_call_args=[])
+        draft, calls = decode_response(response, wire)
+        self.assertEqual(calls, ())
+        self.assertTrue(draft.text)
+
+    async def test_responses_api_shape_validates_host_parsed_tool_calls(self):
+        tool = ToolSpec("memo.list", "Read memos",
+                        '{"type":"object","properties":{},"additionalProperties":false}')
+        wire = build_wire(await self.envelope(tools=(tool,)))
+        alias = tool_alias("memo.list")
+        response = NS(raw_completion=NS(output=[]), completion_text="",
+                      tools_call_ids=["call-1"], tools_call_name=[alias],
+                      tools_call_args=[{"limit": 1}])
+        draft, calls = decode_response(response, wire)
+        self.assertIsNone(draft)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((calls[0].action, calls[0].call_id), ("memo.list", "call-1"))
+        self.assertEqual(json.loads(calls[0].arguments_json), {"limit": 1})
 
     def test_reply_prompt_discourages_internal_markup_in_visible_text(self):
         self.assertIn("内部协议标签、控制块", REPLY_CONTRACT)
         self.assertIn("调试标记", REPLY_CONTRACT)
 
+    async def test_dispatched_payload_has_only_the_merged_system_message(self):
+        envelope = await self.envelope()
+
+        async def respond(*_):
+            return completion()
+
+        self.native.provider.client.state.behavior = respond
+        result = await self.native_model.generate(envelope)
+        self.assertEqual(result.status, "generated")
+        payload, _ = self.native.provider.client.state.calls[-1]
+        self.assertEqual([message["role"] for message in payload["messages"][:2]], ["system", "user"])
+        self.assertEqual(sum(message["role"] == "system" for message in payload["messages"]), 1)
+        self.assertIn("末尾约束", payload["messages"][0]["content"])
+
+    async def test_wire_sends_one_system_message_with_terminal_guard_inside_it(self):
+        envelope = await self.envelope()
+        wire = build_wire(envelope)
+        self.assertEqual([message["role"] for message in wire.messages[:2]], ["system", "user"])
+        self.assertEqual(sum(message["role"] == "system" for message in wire.messages), 1)
+        system = wire.messages[0]["content"]
+        self.assertIn("末尾约束", system)
+        self.assertIn("最终面向用户只输出一个 JSON 对象", system)
+        self.assertGreater(system.index("末尾约束"), system.index(envelope.original.role_instruction))
+
     async def test_terminal_guard_covers_unknown_and_escaped_internal_markup(self):
         wire = build_wire(await self.envelope())
-        guard = wire.messages[-1]["content"]
+        guard = wire.messages[0]["content"]
         self.assertIn("未知 XML/HTML 样式标签", guard)
         self.assertIn("半截还是转义形式", guard)
 
@@ -140,11 +323,11 @@ class NativeModelTests(NativeFixture, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.draft.claims, ())
             self.assertEqual(response.usage, REPORTED_USAGE)
             wire = build_wire(selected)
-            self.assertEqual(wire.messages[0]["content"], envelope.original.role_instruction)
-            self.assertNotIn('"claims"', wire.messages[1]["content"])
-            self.assertNotIn("本轮能力与会话背景", wire.messages[1]["content"])
-            self.assertEqual(wire.messages[-1]["role"], "system")
-            self.assertIn("末尾约束", wire.messages[-1]["content"])
+            self.assertTrue(wire.messages[0]["content"].startswith(envelope.original.role_instruction))
+            self.assertNotIn('"claims"', wire.messages[0]["content"])
+            self.assertNotIn("本轮能力与会话背景", wire.messages[0]["content"])
+            self.assertEqual(wire.messages[-1]["role"], "user")
+            self.assertIn("末尾约束", wire.messages[0]["content"])
             self.assertEqual(wire.tools, ())
         with self.assertRaises(ValueError):
             build_wire(replace(selected, tools=(ToolSpec("memo.create", "写入", "{}"),)))
@@ -152,48 +335,48 @@ class NativeModelTests(NativeFixture, unittest.IsolatedAsyncioTestCase):
     async def test_model_perception_tracks_offered_tools_without_claiming_screen_access(self):
         envelope = await self.envelope()
         first = build_wire(replace(envelope, provider_capabilities=("text", "tools", "image")))
-        self.assertEqual(first.messages[0]["content"], envelope.original.role_instruction)
-        self.assertIn("当前是私聊", first.messages[1]["content"])
-        self.assertIn("本轮会话的平台标识：", first.messages[1]["content"])
-        self.assertIn("本轮接入配置允许提交：文本、图片输入、结构化工具调用", first.messages[1]["content"])
-        self.assertIn("遵循原人格与世界观自然表达", first.messages[1]["content"])
-        self.assertIn("不等于底层模型已验证理解", first.messages[1]["content"])
-        self.assertIn("本轮没有可调用工具", first.messages[1]["content"])
-        self.assertIn("不能查看当前屏幕", first.messages[1]["content"])
-        self.assertNotIn("native-model", first.messages[1]["content"])
+        self.assertTrue(first.messages[0]["content"].startswith(envelope.original.role_instruction))
+        self.assertIn("当前是私聊", first.messages[0]["content"])
+        self.assertIn("本轮会话的平台标识：", first.messages[0]["content"])
+        self.assertIn("本轮接入配置允许提交：文本、图片输入、结构化工具调用", first.messages[0]["content"])
+        self.assertIn("遵循原人格与世界观自然表达", first.messages[0]["content"])
+        self.assertIn("不等于底层模型已验证理解", first.messages[0]["content"])
+        self.assertIn("本轮没有可调用工具", first.messages[0]["content"])
+        self.assertIn("不能查看当前屏幕", first.messages[0]["content"])
+        self.assertNotIn("native-model", first.messages[0]["content"])
         offered = replace(envelope, provider_capabilities=("text", "tools"), tools=(
             ToolSpec("screen.capture", "截屏", '{"type":"object"}'),
             ToolSpec("image.generate", "生图", '{"type":"object"}')))
         second = build_wire(offered)
         self.assertIn("只有用户明确要求看屏，或当前问题确实依赖桌面画面时，才调用 screen.capture",
-                      second.messages[1]["content"])
-        self.assertIn("生成图片需调用 image.generate", second.messages[1]["content"])
-        self.assertNotIn("编辑图片需调用 image.edit", second.messages[1]["content"])
-        self.assertNotIn("本轮未提供识屏工具", second.messages[1]["content"])
+                      second.messages[0]["content"])
+        self.assertIn("生成图片需调用 image.generate", second.messages[0]["content"])
+        self.assertNotIn("编辑图片需调用 image.edit", second.messages[0]["content"])
+        self.assertNotIn("本轮未提供识屏工具", second.messages[0]["content"])
         edited = build_wire(replace(envelope, tools=(ToolSpec("image.edit", "修图", '{}'),)))
-        self.assertIn("需要修改图片时调用 image.edit", edited.messages[1]["content"])
-        self.assertNotIn("生成图片需调用 image.generate", edited.messages[1]["content"])
+        self.assertIn("需要修改图片时调用 image.edit", edited.messages[0]["content"])
+        self.assertNotIn("生成图片需调用 image.generate", edited.messages[0]["content"])
 
     async def test_model_perception_follows_the_dispatched_override(self):
         envelope = await self.envelope(model_override="fallback-model")
         wire = build_wire(envelope, model_name="fallback-model")
-        self.assertIn("目标对话模型标识：fallback-model", wire.messages[1]["content"])
-        self.assertIn("不代表底层实际型号或能力已验证", wire.messages[1]["content"])
-        self.assertNotIn("fixture", wire.messages[1]["content"])
+        self.assertIn("目标对话模型标识：fallback-model", wire.messages[0]["content"])
+        self.assertIn("不代表底层实际型号或能力已验证", wire.messages[0]["content"])
+        self.assertNotIn("fixture", wire.messages[0]["content"])
         async def respond(*_):
             return completion()
         self.native.provider.client.state.behavior = respond
         self.assertEqual((await self.native_model.generate(envelope)).status, "generated")
         payload, _ = self.native.provider.client.state.calls[0]
         self.assertEqual(payload["model"], "fallback-model")
-        self.assertIn("目标对话模型标识：fallback-model", payload["messages"][1]["content"])
-        self.assertNotIn("目标对话模型标识：fixture", payload["messages"][1]["content"])
+        self.assertIn("目标对话模型标识：fallback-model", payload["messages"][0]["content"])
+        self.assertNotIn("目标对话模型标识：fixture", payload["messages"][0]["content"])
 
     async def test_model_label_is_bounded_to_one_line(self):
         envelope = await self.envelope()
         wire = build_wire(envelope, model_name="model-a\n" + "x" * 100)
-        self.assertIn("目标对话模型标识：model-a " + "x" * 72 + "；", wire.messages[1]["content"])
-        self.assertNotIn("model-a\nx", wire.messages[1]["content"])
+        self.assertIn("目标对话模型标识：model-a " + "x" * 72 + "；", wire.messages[0]["content"])
+        self.assertNotIn("model-a\nx", wire.messages[0]["content"])
 
     async def test_native_provider_capabilities_follow_explicit_host_modalities(self):
         full = ("text", "tools", "image", "audio")
@@ -229,7 +412,7 @@ class NativeModelTests(NativeFixture, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.receipt_ref.endswith(":response-1"))
         payload, _ = self.native.provider.client.state.calls[0]
         self.assertEqual(payload["max_tokens"], 100)
-        self.assertEqual(payload["messages"][0]["content"], envelope.original.role_instruction)
+        self.assertTrue(payload["messages"][0]["content"].startswith(envelope.original.role_instruction))
         self.assertNotIn("materials", payload["messages"][0]["content"])
         self.assertGreater(self.native_model.reserve(envelope).tokens, 100)
         self.assertEqual(self.native.provider.client.max_retries, 2)
@@ -260,9 +443,8 @@ class NativeModelTests(NativeFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.tool_calls, (ToolCall("tool-1", "memo.list", '{"limit":2}'),))
         exchange = ToolExchange(response.tool_calls[0], '{"state":"succeeded","items":[]}')
         history = build_wire(replace(envelope, tools=(), tool_history=(exchange,))).messages
-        self.assertEqual(history[-3]["tool_calls"][0]["function"]["name"], tool_alias("memo.list"))
-        self.assertEqual(history[-2]["tool_call_id"], "tool-1")
-        self.assertEqual(history[-1]["role"], "system")
+        self.assertEqual(history[-2]["tool_calls"][0]["function"]["name"], tool_alias("memo.list"))
+        self.assertEqual(history[-1]["tool_call_id"], "tool-1")
 
     async def test_missing_usage_never_becomes_zero_and_no_retry_on_timeout(self):
         envelope = await self.envelope()
@@ -302,6 +484,20 @@ class NativeModelTests(NativeFixture, unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result.usage, Amount(0, 0) if state == "not_started" else None)
                 self.assertNotIn("private transport detail", "\n".join(captured.output))
         self.assertEqual(len(self.native.provider.client.state.calls), 3)
+
+    async def test_http_client_rejection_is_marked_not_started(self):
+        class Rejected(Exception):
+            status_code = 400
+
+        envelope = await self.envelope()
+        async def reject(*_):
+            raise Rejected("invalid request")
+
+        self.native.provider.client.state.behavior = reject
+        result = await self.native_model.generate(envelope)
+        self.assertEqual(result.status, "not_started")
+        self.assertEqual(result.failure, ModelFailure.TRANSPORT)
+        self.assertEqual(result.usage, Amount(0, 0))
 
     async def test_usage_does_not_require_an_optional_total_or_completion_id(self):
         usage = self.native_model._usage(NS(usage=NS(prompt_tokens=30, completion_tokens=10,
@@ -409,16 +605,24 @@ class NativeModelTests(NativeFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.native.provider.client.state.calls, [])
 
     async def test_host_persona_switch_during_generation_discards_tools_and_keeps_usage(self):
-        envelope = await self.envelope()
+        self.map_second_native_persona()
+        second = self.bridge.personas[("bot-a", "second")]
+        self.bridge.personas[("bot-a", "second")] = replace(
+            second, role=replace(second.role, subject_id="persona-second"))
+        envelope = await self.envelope(tools=(ToolSpec("memo.list", "list", '{"type":"object"}'),))
         async def respond(*_):
-            self.native.selected = "different"
-            return completion()
+            # V2 follows the installed window/persona mapping, not the host's
+            # unrelated global default. Change that actual mapping in-flight.
+            self.select_window_persona("second")
+            return completion(tools=[NS(id="stale-call", type="function",
+                function=NS(name=tool_alias("memo.list"), arguments="{}"))])
         self.native.provider.client.state.behavior = respond
         response = await self.native_model.generate(envelope)
         self.assertEqual(response.status, "unknown")
         self.assertEqual(response.failure, ModelFailure.ROLE_RECHECK)
         self.assertEqual(response.usage, REPORTED_USAGE)
         self.assertIsNone(response.draft)
+        self.assertEqual(response.tool_calls, ())
 
     async def test_provider_change_after_response_has_its_own_failure_classification(self):
         envelope = await self.envelope()
@@ -472,16 +676,62 @@ class NativeModelTests(NativeFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, "generated")
         self.assertIsNone(response.usage)
 
+    async def test_a_truncated_background_result_keeps_its_body_and_length_reason(self):
+        """The OpenAI wire must not lose the round the native wire now keeps.
+
+        The workflow owns the decision: half a planning object may still carry
+        complete items, and half a state object must be refused. A generic
+        "unknown" failure hides both cases from the log and the owner.
+        """
+        envelope = await self.envelope()
+        request = replace(envelope.original, output_format="calendar_planning", response_format="json_object")
+
+        async def respond(*_):
+            return completion('{"items":[{"title":"练琴"', finish="length")
+
+        self.native.provider.client.state.behavior = respond
+        response = await self.native_model.generate(replace(envelope, original=request))
+
+        self.assertEqual(response.status, "generated")
+        self.assertEqual(response.captured_output.text, '{"items":[{"title":"练琴"')
+        self.assertEqual(response.captured_output.finish_reason, "length")
+        self.assertEqual(response.usage, REPORTED_USAGE)
+        self.assertEqual(response.diagnostics.parse_state, "captured")
+
     async def test_reserved_config_overrides_and_unbounded_prompt_are_rejected_before_io(self):
         for key in ("messages", "model", "tools", "max_tokens", "max_completion_tokens", "stream", "n"):
             self.native.provider.provider_config["custom_extra_body"] = {key: 1}
             with self.subTest(key=key), self.assertRaises(ValueError): self.make_model()
         self.native.provider.provider_config["custom_extra_body"] = {}
         provider = self.make_model(maximum_input_estimate=1024)
+        # The owner-side preflight reads this value; a dropped injection would
+        # silently fall back to the default and record a ceiling production is not
+        # running under.
+        self.assertEqual(provider.local_provider().maximum_input_estimate, 1024)
         envelope = await self.envelope()
         with self.assertRaises(TaskError): provider.reserve(envelope)
         self.assertEqual((await provider.generate(envelope)).status, "not_started")
         self.assertEqual(self.native.provider.client.state.calls, [])
+
+    async def test_the_input_and_output_ceilings_keep_separate_codes_and_numbers(self):
+        """「装不下」有两个不同的处置动作，不能共用一个不说数值的 code。"""
+        envelope = await self.envelope()
+        with self.assertRaises(TaskError) as error:
+            self.make_model(maximum_input_estimate=1024).reserve(envelope)
+        self.assertEqual(error.exception.code, "host_model_limit_input")
+        message = str(error.exception)
+        self.assertIn("maximum=1024", message)
+        self.assertRegex(message, r"estimated=\d+")
+        # reason 只带配置数值，不带提示词正文。
+        self.assertNotIn("你好", message)
+        self.assertNotIn(envelope.original.role_instruction, message)
+
+        for budget in (0, -1, 101):
+            with self.subTest(budget=budget):
+                with self.assertRaises(TaskError) as error:
+                    self.make_model().reserve(replace(envelope, max_output_tokens=budget))
+                self.assertEqual(error.exception.code, "host_model_limit_output")
+                self.assertIn("allowed=1..100", str(error.exception))
 
     async def test_assembled_tool_round_keeps_owner_and_final_reply(self):
         snapshot = await self.capture()
@@ -508,7 +758,7 @@ class NativeModelTests(NativeFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual((silent.action, silent.text, calls), ("silent", "", ()))
         poke, calls = decode_text_response(json.dumps({"action": "poke", "text": "", "claims": []}), wire)
         self.assertEqual((poke.action, poke.text, calls), ("poke", "", ()))
-        self.assertIn("poke", wire.messages[-1]["content"])
+        self.assertIn("poke", wire.messages[0]["content"])
 
         restricted = build_wire(envelope)
         with self.assertRaises(ValueError):

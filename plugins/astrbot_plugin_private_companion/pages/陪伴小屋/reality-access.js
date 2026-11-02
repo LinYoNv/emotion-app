@@ -12,6 +12,9 @@ window.CompanionRealityAccess = (() => {
     capability_not_installed:"当前会话尚未启用现实触及。",
     capability_not_active:"现实触及能力已暂停或移除，需要先恢复能力。",
     capability_role_disabled:"当前 Bot 的这个人格尚未启用现实触及。",
+    capability_role_not_enabled:"当前 Bot 的这个人格尚未启用现实触及。",
+    capability_role_revision_conflict:"角色启用状态已变化，请重新读取后再试。",
+    capability_not_admissible:"现实触及能力已暂停或移除，需要先恢复能力。",
     capability_consent_missing:"当前私聊尚未允许此项能力。",
     camera_consent_missing:"当前私聊尚未允许摄像头识别。",
     reality_tool_unavailable:"此项工具尚未进入当前对话。",
@@ -25,9 +28,9 @@ window.CompanionRealityAccess = (() => {
     bridge_timeout:"连接超时。可用同一个操作编号核对原请求。",
   };
   const labels = {
-    mobile:{path:"", capability:"reality.snapshot.read", icon:"map-pin", title:"手机摘要",
-      description:"读取位置、终端状态、活动和健康摘要。", allowed:"允许读取手机摘要", revoke:"撤回手机摘要授权",
-      saved:"已允许当前私聊读取手机摘要。", removed:"已撤回当前私聊的手机摘要授权。", ready:"手机摘要工具已进入当前对话。"},
+    mobile:{path:"", capability:"reality.snapshot.read", icon:"smartphone", title:"手机读取",
+      description:"一次授权覆盖当前定位与手机状态；不会主动采集。", allowed:"允许手机读取（定位与手机状态）", revoke:"撤回手机读取授权",
+      saved:"已允许当前私聊读取手机摘要。定位与手机状态现在一起可用。", removed:"已撤回当前私聊的手机读取授权。", ready:"手机读取工具已进入当前对话。"},
     camera:{path:"/camera", capability:"reality.camera.observe", icon:"camera", title:"摄像头单帧",
       description:"仅按用户本轮明确请求读取单帧并返回识别摘要。", allowed:"允许摄像头单帧观察", revoke:"撤回摄像头授权",
       saved:"已允许当前私聊按明确请求读取单帧。", removed:"已撤回当前私聊的摄像头授权。",
@@ -56,7 +59,7 @@ window.CompanionRealityAccess = (() => {
     ["米家设备", ["deviceList", "deviceStatus", "deviceControl", "deviceAction"]],
     ["设备操作确认", ["operationLookup", "operationCancel"]],
   ];
-  let node = null, scope = "", paths = {}, statuses = {}, pending = {}, busy = new Set();
+  let node = null, scope = "", paths = {}, statuses = {}, pending = {}, busy = new Set(), focusKind = "";
   let notices = {}, generation = 0;
   const pendingByScope = new Map();
   /* 授权读取结果按私聊角色范围暂存于本页内存。这样切换工作区后先能看到
@@ -73,14 +76,28 @@ window.CompanionRealityAccess = (() => {
   function panel(kind) {
     const meta = labels[kind], status = statuses[kind], command = pending[kind];
     const canManage = status?.can_manage !== false;
-    const stateLabel = !status ? "读取失败" : !canManage ? "只读" : status.invokable ? "可调用"
-      : status.consented ? "未接通" : "未授权";
-    const text = notices[kind] || (!canManage ? messages.core_access_required : status?.invokable ? meta.ready
+    const notInstalled = status?.installed === false;
+    const paused = Boolean(status) && !notInstalled && status.active === false;
+    const roleControlled = canManage && status?.auto_consent === true;
+    const roleDisabled = status?.role_enabled === false;
+    const unavailable = notInstalled ? "未装配" : paused ? "能力未就绪" : "";
+    const stateLabel = !status ? "读取失败" : !canManage ? "只读" : notInstalled ? "未装配"
+      : paused ? "未就绪" : roleControlled ? (roleDisabled ? "未启用" : "已启用")
+      : status.invokable ? "可调用" : status.consented ? "未接通" : "未授权";
+    const text = notices[kind] || (!canManage ? messages.core_access_required : notInstalled
+      ? messages.capability_not_installed
+      : paused ? messages[status.reason] || "此项能力尚未就绪，请先在设备与终端里恢复模块。"
+      : roleControlled && roleDisabled ? "已装配，但尚未为此角色启用；启用后本角色的会话即可使用。"
+      : status?.invokable ? meta.ready
       : status ? messages[status.reason] || "此项能力尚未进入当前对话。" : "正在读取此项授权…");
     const button = command
       ? canManage ? `<button class="button small" type="button" data-reality-access-action="${kind}-retry" ${busy.has(kind) ? "disabled" : ""}>${busy.has(kind) ? "正在核对…" : "核对原请求"}</button>` : ""
       : status && paths[kind] && canManage
-        ? `<button class="button small ${status.consented ? "secondary" : "primary"}" type="button" data-reality-access-action="${kind}-${status.consented ? "disable" : "enable"}" ${busy.has(kind) ? "disabled" : ""}>${busy.has(kind) ? "正在保存…" : status.consented ? meta.revoke : meta.allowed}</button>`
+        ? unavailable
+          ? `<button class="button small" type="button" disabled>${unavailable}</button>`
+          : roleControlled
+            ? `<button class="button small ${roleDisabled ? "primary" : "secondary"}" type="button" data-reality-access-action="${kind}-${roleDisabled ? "role-enable" : "role-disable"}" ${busy.has(kind) ? "disabled" : ""}>${busy.has(kind) ? "正在保存…" : roleDisabled ? "启用此角色" : "停用此角色"}</button>`
+            : `<button class="button small ${status.consented ? "secondary" : "primary"}" type="button" data-reality-access-action="${kind}-${status.consented ? "disable" : "enable"}" ${busy.has(kind) ? "disabled" : ""}>${busy.has(kind) ? "正在保存…" : status.consented ? meta.revoke : meta.allowed}</button>`
         : "";
     return `<article class="reality-consent-panel ${status?.invokable ? "is-ready" : ""}">
       <header><span class="reality-consent-mark"><i data-lucide="${meta.icon}"></i></span><div><h4>${meta.title}</h4><small>${meta.description}</small></div>
@@ -90,9 +107,19 @@ window.CompanionRealityAccess = (() => {
   }
   function render() {
     if (!node?.isConnected) return;
-    const sections = groups.map(([title, kinds]) => `<section class="reality-consent-group" aria-label="${title}">
-      <h4>${title}</h4><div class="reality-consent-grid">${kinds.map(panel).join("")}</div></section>`).join("");
-    node.innerHTML = `<div class="reality-consent-head"><div><strong>当前会话能力授权</strong><small>${esc(identityLine())}</small></div>
+    if (focusKind && labels[focusKind]) {
+      node.innerHTML = `<div class="reality-consent-head"><div><strong>${esc(labels[focusKind].title)}</strong><small>${esc(identityLine())}</small></div>
+        <button class="button small" type="button" data-reality-access-action="refresh" ${busy.size ? "disabled" : ""}>重新读取</button></div>
+        <section class="reality-consent-group"><div class="reality-consent-grid is-single">${panel(focusKind)}</div></section>`;
+      window.lucide?.createIcons({attrs:{"aria-hidden":"true"}});
+      return;
+    }
+    const primary = groups[0];
+    const advanced = groups.slice(1).map(([title, kinds]) => `<details class="reality-consent-advanced">
+      <summary>${title}</summary><div class="reality-consent-grid">${kinds.map(panel).join("")}</div></details>`).join("");
+    const sections = `<section class="reality-consent-group" aria-label="${primary[0]}">
+      <h4>${primary[0]}</h4><div class="reality-consent-grid">${primary[1].map(panel).join("")}</div></section>${advanced}`;
+    node.innerHTML = `<div class="reality-consent-head"><div><strong>当前私聊的现实触及授权</strong><small>${esc(identityLine())} · 手机读取一次授权覆盖定位与手机状态，摄像头单独授权</small></div>
       <button class="button small" type="button" data-reality-access-action="refresh" ${busy.size ? "disabled" : ""}>重新读取</button></div>${sections}`;
     window.lucide?.createIcons({attrs:{"aria-hidden":"true"}});
   }
@@ -151,6 +178,34 @@ window.CompanionRealityAccess = (() => {
       }
     } finally { if (current(ticket)) { busy.delete(kind); render(); } }
   }
+  async function saveRole(kind, enabled) {
+    const status = statuses[kind];
+    if (!current(generation) || busy.has(kind) || !paths[kind] || !status) return;
+    const ticket = generation;
+    const command = {operation_key:`reality-role-${kind}-${nonce()}`,
+      expected_revision:Number.isInteger(status.role_revision) ? status.role_revision : 0, enabled};
+    busy.add(kind); notices[kind] = ""; render();
+    try {
+      const result = await product.request("POST", paths[kind] + "/role-selection", command);
+      if (!current(ticket)) return;
+      const next = result?.status;
+      if (!next || typeof next.role_enabled !== "boolean" || !Number.isInteger(next.role_revision)
+          || typeof next.invokable !== "boolean") throw {code:"invalid_response"};
+      const reason = next.role_enabled
+        ? (next.invokable ? "" : (status.reason === "capability_role_disabled" ? "" : status.reason))
+        : "capability_role_disabled";
+      statuses[kind] = {...status, role_enabled: next.role_enabled, role_revision: next.role_revision,
+        auto_consent: next.auto_consent === true, installed: next.installed !== false,
+        active: next.active !== false, can_manage: next.can_manage !== false,
+        invokable: next.invokable, reason,
+        edit_token: typeof next.edit_token === "string" ? next.edit_token : status.edit_token};
+      statusByScope.set(statusKey(kind), statuses[kind]);
+      notices[kind] = enabled ? "已为此角色启用现实触及。"
+        : "已为此角色停用现实触及；本角色的会话不再提供这些工具。";
+    } catch (error) {
+      if (current(ticket)) notices[kind] = errorText(error);
+    } finally { if (current(ticket)) { busy.delete(kind); render(); } }
+  }
   function click(event) {
     const action = event.target.closest("[data-reality-access-action]")?.dataset.realityAccessAction;
     if (!action) return;
@@ -159,10 +214,13 @@ window.CompanionRealityAccess = (() => {
       void Promise.all(Object.keys(labels).map(kind => loadOne(kind, ticket)));
       return;
     }
-    const divider = action.lastIndexOf("-");
-    const kind = action.slice(0, divider), intent = action.slice(divider + 1);
+    const match = /^(.*?)-(retry|role-enable|role-disable|enable|disable)$/.exec(action);
+    if (!match) return;
+    const kind = match[1], intent = match[2];
     if (!labels[kind]) return;
     if (intent === "retry") void save(kind, pending[kind]?.enabled);
+    else if (intent === "role-enable") void saveRole(kind, true);
+    else if (intent === "role-disable") void saveRole(kind, false);
     else void save(kind, intent === "enable");
   }
   function unmount() {
@@ -186,5 +244,5 @@ window.CompanionRealityAccess = (() => {
     const ticket = generation;
     void Promise.all(Object.keys(labels).map(kind => loadOne(kind, ticket)));
   }
-  return {mount, unmount};
+  return {mount, unmount, focus(kind){ focusKind = typeof kind === "string" ? kind : ""; render(); }};
 })();

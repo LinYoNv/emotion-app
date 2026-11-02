@@ -69,8 +69,12 @@
       hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
   };
   const nameOf = (person) => person.display_name || `未命名成员 ${person.native_account_id ?? ""}`.trim();
-  const personFilter = (person) => person?.private_chat || person?.private_target ? "stable"
-    : person?.group_member ? "temporary" : person ? "stable" : null;
+  const isPrivateUser = person => Boolean(person?.private_chat || person?.private_contact
+    || person?.private_target && (person?.admin_nickname || ["core", "important"].includes(person?.identity_tier)));
+  const knownPerson = person => Boolean(hasInteraction(person) || person?.private_contact
+    || person?.admin_nickname || ["core", "important"].includes(person?.identity_tier));
+  const personFilter = person => isPrivateUser(person) ? "stable"
+    : person?.group_member ? "temporary" : person ? "discovered" : null;
   const accountLabel = (item) => item.account_name || (/^\d+$/.test(String(item.account_id || ""))
     ? `QQ ${item.account_id}` : "当前 Bot 账号");
   const groupsOf = (person) => person.groups && typeof person.groups === "object" ? person.groups : {};
@@ -87,7 +91,8 @@
   const personaDisplayLabel = (person) => personaIdsOf(person).map(value => value || "默认人格").join("、")
     || person?.role_name || "当前人格";
   const routeSnapshot = (person) => Object.fromEntries(["platform", "bot_id", "account_id", "role_id", "persona_ids",
-    "revision", "settings_available", "private_target", "private_chat", "admin_nickname", "identity_tier",
+    "revision", "settings_available", "private_target", "private_chat", "private_contact",
+    "legacy_private_contact", "legacy_maintained", "admin_nickname", "identity_tier",
     "display_name", "native_account_id", "role_name", "private", "groups", "total"]
     .filter(key => person?.[key] !== undefined).map(key => [key, Array.isArray(person[key]) ? [...person[key]] : person[key]]));
   const displayPersonKey = (person) => JSON.stringify([person.subject_id, personaGroupKey(person)]);
@@ -124,6 +129,9 @@
       target.display_route_count = target.display_routes.length;
       target.persona_ids = [...new Set([...(target.persona_ids || []), ...personaIdsOf(source)])];
       target.private_chat ||= Boolean(source.private_chat);
+      target.private_contact ||= Boolean(source.private_contact);
+      target.legacy_private_contact ||= Boolean(source.legacy_private_contact);
+      target.legacy_maintained ||= Boolean(source.legacy_maintained);
       target.private_target ||= Boolean(source.private_target);
       target.group_member ||= Boolean(source.group_member);
       target.settings_available = target.display_route_count > 0;
@@ -172,6 +180,11 @@
   const groupName = (group) => group.display_name || group.group_name || `群 ${groupKey(group)}`;
   const groupLabel = (group) => group.display_name || group.group_name
     ? `${groupName(group)}（${groupKey(group)}）` : groupName(group);
+  const groupRoleLabel = (group) => {
+    const values = String(group?.role_name || "").split(/[、,，]/).map(value =>
+      value.replace(/\s*[-_·－]\s*(?:私聊|群聊)\s*$/u, "").trim()).filter(Boolean);
+    return [...new Set(values)].join("、") || (group?.role_id ? "人格分线" : "角色待映射");
+  };
   const groupListStatus = (group) => group.configured ? "已自动接入"
     : group.discovered ? groupTargetRouteReady(group) ? "AstrBot 已发现，待角色映射" : "AstrBot 已发现，账号待确认"
       : "历史往来";
@@ -207,15 +220,16 @@
       || Object.values(groupsOf(person)).some((item) => number(item?.msg_count) > 0));
   }
   function isIdleOrdinaryUser(person) {
-    return String(person?.identity_tier || "standard") === "standard" && !hasInteraction(person);
+    return !knownPerson(person);
   }
   function peopleForCurrentFilter({includeHidden = false} = {}) {
     if (!data) return [];
     return data.persons.filter((person) => {
       if (!matchesSearch(person)) return false;
-      if (filter === "stable" && personFilter(person) !== "stable") return false;
-      if (filter === "temporary" && personFilter(person) !== "temporary") return false;
-      if (!includeHidden && hideIdleUsers && isIdleOrdinaryUser(person)) return false;
+      if (filter === "stable" && !isPrivateUser(person)) return false;
+      if (filter === "temporary" && !person.group_member) return false;
+      if (filter === "discovered" && knownPerson(person)) return false;
+      if (filter !== "discovered" && !includeHidden && hideIdleUsers && isIdleOrdinaryUser(person)) return false;
       return true;
     });
   }
@@ -280,7 +294,7 @@
     return data.persons.filter((person) => {
       if (!matchesSearch(person)) return false;
       if (hideIdleUsers && isIdleOrdinaryUser(person)) return false;
-      if (graphScope === "private") return person.private_chat;
+      if (graphScope === "private") return isPrivateUser(person);
       if (graphScope === "group") return person.group_member;
       return true;
     });
@@ -352,8 +366,13 @@
       const groupNetworks = networks.get(groupBaseKey(group)) || [];
       const people = peopleByBase.get(groupBaseKey(group)) || [];
       if (groupNetworks.length) {
+        /* A current route wins over stale historical routes for the same physical group.
+           Otherwise an old role key from a previous profile produces a second card for a
+           group that is already configured, and its reply/archive buttons cannot resolve. */
+        const activeNetworks = groupNetworks.filter(network => network.configured === true);
+        const visibleNetworks = activeNetworks.length ? activeNetworks : groupNetworks;
         const byPersona = new Map();
-        for (const network of groupNetworks) {
+        for (const network of visibleNetworks) {
           const key = personaIdsOf(network).length ? JSON.stringify(["persona", personaIdsOf(network)])
             : JSON.stringify(["role", network.role_id || ""]);
           const entries = byPersona.get(key) || [];
@@ -364,6 +383,8 @@
           const network = mergeGroupNetworks(entries);
           expanded.push({...group, role_id: network.role_id, role_ids: network.role_ids,
             persona_ids: network.persona_ids, role_name: network.role_name, network,
+            configured: network.configured === true,
+            discovered: Boolean(network.discovered || group.discovered),
             member_count: number(network.member_count), people});
         }
       } else {
@@ -487,7 +508,7 @@
     const badges = node("span", undefined, "card-badges");
     if (person.private_chat) badges.append(badge("私聊", "private"));
      if (person.group_member) badges.append(badge(`群聊 ${groupIdsOf(person).length}`, "group"));
-     if (!person.private_chat && !person.group_member) badges.append(badge("暂无往来"));
+     if (!person.private_chat && !person.group_member) badges.append(badge(person.private_contact ? "已维护" : "未有往来"));
      badges.append(badge(TIER_LABELS[person.identity_tier] || "普通用户", person.identity_tier === "core" ? "companion" : ""));
      if (person.identity_tier === "core") badges.append(badge("管理员", "administrator"));
      title.append(badges);
@@ -513,12 +534,12 @@
     const visibilitySummary = $("people-visibility-summary");
     if (visibilitySummary) {
       const hidden = data ? peopleForCurrentFilter({includeHidden: true}).length - people.length : 0;
-      visibilitySummary.textContent = hideIdleUsers
+      visibilitySummary.textContent = filter === "discovered" ? "仅在 AstrBot 中发现的会话，可在此单独配置" : hideIdleUsers
         ? hidden ? `已隐藏 ${hidden} 位无交往普通用户` : "默认隐藏无交往普通用户"
         : "已显示全部用户";
     }
     const toggle = $("hide-idle-users");
-    if (toggle) toggle.checked = hideIdleUsers;
+    if (toggle) { toggle.checked = hideIdleUsers; toggle.disabled = filter === "discovered"; }
     if (!people.length) {
       const empty = node("div", undefined, "empty-state");
       const hidden = data ? peopleForCurrentFilter({includeHidden: true}).length : 0;
@@ -904,7 +925,7 @@
       const nameLine = node("span", undefined, "group-name-line");
       nameLine.append(node("strong", groupName(group)), badge(groupStatusLabel(group), group.configured ? "group" : group.discovered ? "pending" : "history"));
       info.append(nameLine,
-        node("small", `群号 ${id} · ${groupListStatus(group)}${group.account_name || group.account_id ? ` · ${accountLabel(group)}` : ""}${group.role_id ? ` · ${group.role_name || "人格分线"}` : ""}`));
+        node("small", `群号 ${id} · ${groupListStatus(group)}${group.account_name || group.account_id ? ` · ${accountLabel(group)}` : ""}${group.role_id ? ` · ${groupRoleLabel(group)}` : ""}`));
       const stats = node("span", undefined, "group-stats");
       const rosterCount = group.network?.member_count ?? group.member_count;
       const unconfiguredSession = group.discovered && !group.configured;
@@ -942,11 +963,11 @@
     const head = node("header", undefined, "group-detail-head group-detail-hero");
     const title = node("div");
     title.append(node("span", "GROUP SPACE", "eyebrow"), node("h3", groupName(group)), node("small", `群号 ${id}`),
-      node("small", `${groupDetailStatus(group)}${group.role_id ? ` · ${group.role_name || "人格分线"}` : ""}`, "detail-subtitle"));
+      node("small", `${groupDetailStatus(group)}${group.role_id ? ` · ${groupRoleLabel(group)}` : ""}`, "detail-subtitle"));
     const routeFacts = node("div", undefined, "group-route-facts");
     routeFacts.append(node("span", group.platform_id || group.platform || "平台待确认"),
       node("span", group.account_name || group.account_id || "账号待确认"),
-      node("span", group.role_name || (group.role_id ? "人格分线" : "角色待映射")));
+      node("span", groupRoleLabel(group)));
     const stateBadge = badge(groupStatusLabel(group), group.configured ? "group" : group.discovered ? "pending" : "history");
     const statusStack = node("div", undefined, "group-detail-status-stack");
     statusStack.append(stateBadge, routeFacts);
@@ -1226,7 +1247,7 @@
     const counts = data?.counts;
     $("count-total").textContent = counts ? String(number(counts.total)) : "—";
     const stableCount = data?.persons.filter(person => personFilter(person) === "stable").length;
-    const temporaryCount = data?.persons.filter(person => personFilter(person) === "temporary").length;
+    const temporaryCount = data?.persons.filter(person => person.group_member).length;
     $("count-private").textContent = counts ? String(number(counts.private_chat)) : "—";
     $("count-group").textContent = counts ? String(number(counts.group_member)) : "—";
     $("count-both").textContent = counts ? String(number(counts.both)) : "—";
@@ -1235,6 +1256,7 @@
     $("operator").textContent = data?.operator_name ?? "—";
     $("chip-stable").textContent = String(stableCount || 0);
     $("chip-temporary").textContent = String(temporaryCount || 0);
+    $("chip-discovered").textContent = String(data?.persons.filter(person => !knownPerson(person)).length || 0);
     $("nav-people-count").textContent = `${number(counts?.total)} 位`;
     $("nav-groups-count").textContent = `${allGroups().length} 个`;
   }
@@ -1323,6 +1345,11 @@
     if (documentTitle) documentTitle.textContent = `${pageMeta.name} · 陪伴`;
     const refresh = $("refresh");
     if (refresh) refresh.title = pageMeta.refresh;
+    /* 新用户默认权限是「用户」目录自己的规则，入口跟着标题走；其他两个视图
+       是关系总览和群聊，放这个按钮只会让人误以为它管的是当前视图。 */
+    const access = $("open-private-access");
+    if (access) access.hidden = next !== "people";
+    if (next === "people") void loadStrangers();
     const currentNotice = $("notice");
     currentNotice.hidden = !currentNotice.textContent || Boolean(noticeView && noticeView !== next);
     document.querySelectorAll(".tab").forEach((item) => {
@@ -1368,11 +1395,11 @@
   }
   function applyDirectory(result, {background = false} = {}) {
     const persons = mergeDirectoryPeople(Array.isArray(result.persons) ? result.persons : []);
-    const privateCount = persons.filter(item => item.private_chat).length;
+    const privateCount = persons.filter(isPrivateUser).length;
     const groupCount = persons.filter(item => item.group_member).length;
-    const bothCount = persons.filter(item => item.private_chat && item.group_member).length;
+    const bothCount = persons.filter(item => isPrivateUser(item) && item.group_member).length;
     data = { ...result, persons, groups: Array.isArray(result.groups) ? result.groups : [],
-      counts: {...(result.counts || {}), total: persons.length, private_chat: privateCount,
+      counts: {...(result.counts || {}), total: persons.filter(knownPerson).length, private_chat: privateCount,
         group_member: groupCount, both: bothCount, private_only: privateCount - bothCount,
         group_only: groupCount - bothCount} };
     const previous = selected ? displayPersonKey(selected) : null;
@@ -1384,6 +1411,42 @@
     if (background && previous && (!selected || displayPersonKey(selected) !== previous)) renderDetail();
   }
 
+  function strangerRow(item) {
+    const row = document.createElement("li");
+    row.className = "stranger-row";
+    const who = document.createElement("strong");
+    who.textContent = `账号 ${item.peer || "未知"} · 收到方 ${item.login || "未知"}`;
+    const outcomes = {
+      stranger_notice_sent: "已回婉拒",
+      stranger_notice_disabled: "未回（婉拒已关闭）",
+      stranger_notice_cooldown: "未回（冷却中）",
+      stranger_notice_daily_cap: "未回（超每日上限）",
+      stranger_notice_delivery_unavailable: "未回（通道不可用）",
+      stranger_notice_send_failed: "未回（发送失败）",
+    };
+    const meta = document.createElement("small");
+    const seen = item.last_seen_at ? new Date(item.last_seen_at).toLocaleString() : "未知";
+    meta.textContent = `${outcomes[item.last_outcome] || "未回"} · 共 ${Number(item.attempts) || 0} 次 · 最近 ${seen}`;
+    row.append(who, meta);
+    return row;
+  }
+  /* 被拒私聊不在目录里（没有身份/路由），但管理员需要看到“谁在敲门”。
+     只读、有界，账号与时间而已，不在页面里提供授予入口。 */
+  async function loadStrangers() {
+    const section = $("stranger-contacts");
+    if (!section || !bridge) return;
+    try {
+      const payload = unwrap(await bridge.apiGet("acquaintance/strangers", {}));
+      const items = Array.isArray(payload?.items) ? payload.items : [];
+      const list = $("stranger-list");
+      if (list) list.replaceChildren(...items.map(strangerRow));
+      const count = $("stranger-count");
+      if (count) count.textContent = `${items.length} 人`;
+      section.hidden = !items.length;
+    } catch {
+      section.hidden = true;
+    }
+  }
   async function supplementDirectory(sequence, edits) {
     try {
       const result = unwrap(await bridge.apiGet(endpoint, {}));
@@ -1422,6 +1485,7 @@
       const result = unwrap(await bridge.apiGet(endpoint, {read_mode: "stored"}));
       if (sequence !== requestSequence) return;
       applyDirectory(result);
+      void loadStrangers();
       setSyncState("ready", result.directory_refresh_pending ? "本地关系已读取，正在更新补充资料" : "V2 数据已同步");
       if (!preserveNotice) notice("");
       if (result.directory_refresh_pending) void supplementDirectory(sequence, memberChangeSequence);
@@ -1511,7 +1575,15 @@
     activateGraphNode(target);
   });
   $("refresh").addEventListener("click", () => { notice(""); load(); });
+  /* 这里只做转发：设置弹窗由外壳（陪伴小屋）统一渲染，工作区里再画一份会
+     出现两套配置控件争同一个 sparse owner。 */
+  $("open-private-access")?.addEventListener("click", () => {
+    parent.postMessage({channel: "companion-workspace", kind: "open-settings", target: "private-access"}, "*");
+  });
   document.addEventListener("companion-mappings-change", () => { if (bridge) void load(); });
+  document.addEventListener("companion-navigate-failed", (event) => {
+    notice(event.detail?.message || "目标入口暂时不可用，请重新读取群聊目录后再试。", true);
+  });
   (async function start() {
     window.lucide?.createIcons();
     readDirectoryPreferences();

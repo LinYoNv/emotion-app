@@ -107,17 +107,13 @@ window.CompanionShell = (() => {
     shell.dataset.away = String(Boolean(state.section));
   }
 
-  /* 左栏导航。四组都有标题：此前第一组没有分组名，「关系网」到「治理与维护」
+  /* 左栏导航。三组都有标题：此前第一组没有分组名，「关系网」到「治理与维护」
      六项悬在左栏顶部，而下面两组却有「能力配置」「设置」——同一列里一半有
      标题一半没有，看起来像漏渲染。
-     「生活」这一组是二级视图（状态页、日记），此前只能从首页右栏或底部进入：
-     状态页有 85 个字段、13 个功能图块，是最大的配置面之一，离开后却只能回首页
-     再点一次；日记同理。视图用 kind="view"，点击走 data-shell-view。 */
+     「状态与日程」「日记与生活」不再单列成组：它们本来就能从首页右栏和家具
+     进入，单开一组把左栏撑到要滚动。手机连接放进「专题配置」末尾，因为它是
+     一次性的配对与网关设置，不属于能力页里的日常操作。 */
   const RAIL_GROUPS = [
-    ["生活", [
-      ["state", "activity", "状态与日程", "view"],
-      ["diary", "book-open", "日记与生活", "view"],
-    ]],
     ["专题配置", [
       ["identity", "network", "关系网"],
       ["contact", "heart-handshake", "主动与联系"],
@@ -125,6 +121,7 @@ window.CompanionShell = (() => {
       ["learning", "graduation-cap", "学习与反思"],
       ["models", "sliders-horizontal", "模型与连接"],
       ["maintenance", "settings-2", "治理与维护"],
+      ["mobile", "smartphone", "手机连接"],
     ]],
     ["能力配置", [
       ["perception", "scan-eye", "感知"],

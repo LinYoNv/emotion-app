@@ -8,7 +8,7 @@ async function run({browser, outputDir, bridgePath, replyOnly=false, identityOnl
   const root=path.resolve(__dirname,'../pages/陪伴小屋');
   await fs.mkdir(outputDir,{recursive:true});
   const sdk=await fs.readFile(bridgePath,'utf8');
-  const HOST='astrbot_plugin_private_companion_v2';
+  const HOST='astrbot_plugin_private_companion';
   const qa={calls:[],posts:[],mode:'direct',catalogMode:'multi',initialized:true,deny:false,late:null,growthState:'proposed',semanticRevision:1,semanticReactions:true};
   const internalIdentity={installation_id:'synthetic-installation-internal',operator_id:'dashboard:qa-internal'};
   const replyDefaults={enabled:false,llm_controlled:true,rules_enabled:false,rule_mode:'sentences',threshold:120,min_segment_chars:12,max_segments:4,prompt:'',streaming:false,part_gap_ms:0,image_position:'after_text',

@@ -9,6 +9,7 @@ from uuid import uuid4
 from astrbot.api.message_components import Plain
 from astrbot.core.message.message_event_result import MessageChain
 
+from companion_v2.conversation.text_processing import strip_internal_expression_protocol
 from companion_v2.execution.models import TaskError, digest, encode, require
 from companion_v2.foundation.refs import OperationRef, SourceRef, VersionRef
 from companion_v2.sources.models import SourceRecord
@@ -21,7 +22,11 @@ class RealityHostDelivery:
         self.contexts = contexts
 
     async def send(self, umo, text, *, user_id, operation_key):
-        if not text.strip() or not isinstance(operation_key, str) or not operation_key:
+        if isinstance(text, str):
+            # This path calls the host context directly rather than event.send,
+            # so the core presentation boundary may not have seen its text.
+            text = strip_internal_expression_protocol(text)
+        if not isinstance(text, str) or not text.strip() or not isinstance(operation_key, str) or not operation_key:
             raise TaskError("reality_delivery_invalid", "Reality delivery needs its original operation key and text")
         original = self.contexts.target(user_id, umo=umo)
         await self.contexts.verified_persona(original, user_id, umo=umo)

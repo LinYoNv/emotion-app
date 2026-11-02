@@ -2,6 +2,7 @@
 
 import re
 import asyncio
+from collections.abc import Mapping
 
 from astrbot.api import logger
 from astrbot.core.message.components import Plain, Record
@@ -13,6 +14,7 @@ from companion_v2.conversation.voice_reply import (
     speech_candidates,
     speech_chunks,
     strip_voice_markup,
+    voice_wrapper_pairing,
 )
 from .core_reply import CORE_REPLY_CONTEXT_EXTRA
 from companion_v2.conversation.voice_markup import slice_speech, visible_speech
@@ -36,10 +38,15 @@ def observe_core_voice_response(event, response):
     if core.get("_voice_observed_response") is response:
         return
     core["_voice_observed_response"] = response
-    policy = core["prepared"].get("voice_reply_policy")
+    prepared = core.get("prepared")
+    policy = prepared.get("voice_reply_policy") if isinstance(prepared, Mapping) else None
     text = getattr(response, "completion_text", "") or ""
     visible, spans = separate_spoken(text, policy)
-    if spans:
+    repaired = core.pop("_voice_repaired_response", None)
+    if repaired is not None and repaired["response"] is response:
+        core["_voice_authored"] = repaired["plan"]
+        spans = repaired["plan"]["spans"]
+    elif spans:
         core["_voice_authored"] = {"visible": visible, "spans": spans, "cursor": 0, "used": set()}
     else:
         core.pop("_voice_authored", None)
@@ -48,7 +55,7 @@ def observe_core_voice_response(event, response):
             "reason": "authored" if spans else "plain_generation" if policy.generation_mode == "plain"
             and policy.trigger_mode != "adaptive" else "no_authored_speech"}
         logger.info("[CompanionV2][media] stage=response event_ref=%s media=voice mode=%s spans=%s reason=%s",
-                    core["prepared"].get("event_ref", "unknown"), policy.trigger_mode, len(spans),
+                    prepared.get("event_ref", "unknown"), policy.trigger_mode, len(spans),
                     core["_voice_response_diagnostics"]["reason"])
     if visible != text:
         response.completion_text = visible
@@ -60,14 +67,29 @@ def observe_core_voice_response(event, response):
 def capture_core_voice_message(event, message):
     """Consume native tool speech before text cleanup or segmentation."""
     core = event.get_extra(CORE_REPLY_CONTEXT_EXTRA)
-    policy = core.get("prepared", {}).get("voice_reply_policy") if isinstance(core, dict) else None
+    prepared = core.get("prepared") if isinstance(core, dict) else None
+    policy = prepared.get("voice_reply_policy") if isinstance(prepared, Mapping) else None
     if not isinstance(policy, VoiceReplyPolicy):
         return message
     visible, spans, cleaned = _clean_plain_runs(message, policy)
     if spans:
         core["_voice_authored"] = {"visible": visible, "spans": spans, "cursor": 0, "used": set()}
         return cleaned
-    return message
+    source = _plain_text(message)
+    if visible == source:
+        return message
+    # 未配对/未闭合的语音包装已经被 separate_spoken 去掉；这里如果退回原始消息，
+    # 字面量 <pc_tts> 就会随正文发给用户，因为下游协议清洗刻意排除了 tts 家族。
+    # plain 生成模式下成对标签也走这条分支，所以 state 只描述"清理了包装"，
+    # 由 pairing 区分成对/未成对，避免把成对标签误记成 unpaired。
+    paired, stray = voice_wrapper_pairing(source)
+    pairing = "unpaired" if stray else ("paired" if paired else "other")
+    logger.info("[CompanionV2][media] stage=voice_cleanup event_ref=%s media=voice "
+                "state=voice_wrapper_cleanup pairing=%s paired_wrappers=%d stray_tags=%d "
+                "removed_chars=%d visible_chars=%d",
+                prepared.get("event_ref", "unknown"), pairing, paired, stray,
+                len(source) - len(visible), len(visible))
+    return cleaned
 
 
 def _captured_speech(core, visible):
@@ -196,33 +218,58 @@ async def prepare_core_reply_voice_message(
                                        any(isinstance(component, Record) for component in chain)):
         note["state"] = "native_voice_exists"
         return message
+    segment_index = max(0, int(segment_index))
+    segment_count = max(1, int(segment_count))
+    # Whole-reply voice speaks the joined text of the turn, so a segment with no
+    # text of its own (a trailing image, say) still has to reach the bucket
+    # below: bailing out here dropped the speech collected so far and the turn
+    # ended silently.
+    whole = policy.segment_mode == "whole" and isinstance(core, dict)
     source = _plain_text(message)
-    if not source.strip():
+    if not source.strip() and not whole:
         note["state"] = "no_text"
         return message
 
     visible, spans, cleaned_message = _clean_plain_runs(message, policy)
-    if not visible.strip():
+    if not visible.strip() and not whole:
         note["state"] = "no_visible_text"
         return cleaned_message
-
-    segment_index = max(0, int(segment_index))
-    segment_count = max(1, int(segment_count))
     captured_speech = _captured_speech(core, getattr(message, "_companion_v2_voice_source", visible)) if not spans else ""
-    selected = (policy.segment_mode == "each" or
-                policy.segment_mode == "first" and segment_index == 0 or
-                policy.segment_mode == "last" and segment_index == segment_count - 1)
-    if not selected:
-        note["state"] = "segment_skipped"
-        return cleaned_message
-
     candidates = speech_candidates(visible, (visible,), spans, policy)
-    speech = captured_speech or (candidates[0].strip() if candidates else "")
-    if not speech:
-        note["state"] = "no_authored_speech"
-        logger.info("[CompanionV2][media] stage=delivery event_ref=%s media=voice state=%s segment=%s/%s",
-                    prepared.get("event_ref", "unknown"), note["state"], segment_index + 1, segment_count)
-        return cleaned_message
+    segment_speech = captured_speech or (candidates[0].strip() if candidates else "")
+    if whole:
+        # Whole-reply voice waits until every text segment has been prepared,
+        # then synthesizes the joined speech once.  Per-segment TTS cuts the
+        # sentence context and produces noticeably flatter prosody.
+        bucket = core.setdefault("_voice_whole_segments", {"visible": [], "speech": []})
+        if visible.strip():
+            bucket["visible"].append(visible)
+        if segment_speech:
+            bucket["speech"].append(segment_speech)
+        if segment_index < segment_count - 1:
+            note["state"] = "segment_deferred"
+            return cleaned_message
+        visible = "\n".join(bucket["visible"]).strip()
+        speech = "\n".join(bucket["speech"]).strip()
+        core.pop("_voice_whole_segments", None)
+        if not speech:
+            note["state"] = "no_authored_speech"
+            logger.info("[CompanionV2][media] stage=delivery event_ref=%s media=voice state=%s segment=%s/%s",
+                        prepared.get("event_ref", "unknown"), note["state"], segment_index + 1, segment_count)
+            return cleaned_message
+    else:
+        selected = (policy.segment_mode in {"whole", "each"} or
+                    policy.segment_mode == "first" and segment_index == 0 or
+                    policy.segment_mode == "last" and segment_index == segment_count - 1)
+        if not selected:
+            note["state"] = "segment_skipped"
+            return cleaned_message
+        speech = segment_speech
+        if not speech:
+            note["state"] = "no_authored_speech"
+            logger.info("[CompanionV2][media] stage=delivery event_ref=%s media=voice state=%s segment=%s/%s",
+                        prepared.get("event_ref", "unknown"), note["state"], segment_index + 1, segment_count)
+            return cleaned_message
     chunks = speech_chunks(speech, policy.max_speech_chars)
     note["chars"], note["chunks"] = len(speech), len(chunks)
 
@@ -230,8 +277,10 @@ async def prepare_core_reply_voice_message(
     event_id = prepared.get("event_id") or prepared.get("turn_id") or "core-reply"
     claim = None
     claim_route = getattr(delivery, "claim_core_route", None)
-    if callable(claim_route) and policy.cooldown_seconds:
-        claim = claim_route(context, event_id, policy.cooldown_seconds)
+    kind = getattr(getattr(getattr(context, "scope", None), "kind", None), "value", None)
+    cooldown = policy.cooldown(kind) if kind is not None else policy.cooldown_seconds
+    if callable(claim_route) and cooldown:
+        claim = claim_route(context, event_id, cooldown)
         if claim is None:
             note["state"] = "cooldown"
             return cleaned_message
@@ -240,8 +289,15 @@ async def prepare_core_reply_voice_message(
         records = []
         for chunk in chunks:
             await authorize()
-            audio = await renderer(context, chunk, provider_id=policy.provider_for_language(),
-                                   timeout_seconds=policy.timeout_seconds)
+            render_options = {"provider_id": policy.provider_for_language(kind),
+                              "timeout_seconds": policy.timeout_seconds}
+            model_override = getattr(policy, "_model_override", "")
+            voice_override = getattr(policy, "_voice_override", "")
+            if model_override:
+                render_options["model_override"] = model_override
+            if voice_override:
+                render_options["voice_override"] = voice_override
+            audio = await renderer(context, chunk, **render_options)
             audio_data = audio.get("data") if isinstance(audio, dict) and audio.get("type") == "record" else None
             file_value = audio_data.get("file") if isinstance(audio_data, dict) else None
             if not isinstance(file_value, str) or not file_value.startswith("base64://"):
@@ -269,7 +325,9 @@ async def prepare_core_reply_voice_message(
         core["_voice_reply_pending_claim"] = (delivery, claim)
     same_text = re.sub(r"\s+", "", visible) == re.sub(r"\s+", "", visible_speech(speech))
     return _message_with_voice(cleaned_message, visible, records, policy,
-                               hide_text=policy.delivery_mode == "voice_only" and same_text)
+                               hide_text=(policy.delivery_mode == "voice_only"
+                                          and not (policy.segment_mode == "whole" and segment_count > 1)
+                                          and same_text))
 
 
 def prepare_core_reply_voice(event):

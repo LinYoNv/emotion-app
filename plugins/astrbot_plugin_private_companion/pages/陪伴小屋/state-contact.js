@@ -147,11 +147,12 @@ window.CompanionStateContact = (() => {
     candidate_queued:["候选已进入后台执行","若没有发出，请查看任务执行和投递回执诊断。"],
     contact_model_unregistered:["主动联系模型任务尚未登记","检查模型路由配置并重启插件。"],
     background_capacity_exhausted:["后台执行槽位暂时占满","等待现有后台任务结束后会继续评估。"],
-    contact_attempt_budget:["旧版本的模型调用次数上限已触发","当前版本已取消该独立上限，请查看窗口每日实际联系额度。"],
+    contact_attempt_budget:["模型调用次数上限已触发","请查看窗口每日实际联系额度。"],
     delivery_history_unavailable:["当前私聊历史无法完成核验","检查 AstrBot 会话历史是否可读取后再重新评估。"],
-    contact_conversation_changed:["原私聊已变化，旧候选被安全取消","等待当前私聊完成后重新评估。"],
+    contact_conversation_changed:["私聊已变化，待发送计划已取消","等待当前私聊完成后重新评估。"],
     scheduler_heartbeat_missing:["尚未收到主动调度心跳","确认插件已启动且主动联系模型已登记。"],
     scheduler_heartbeat_stale:["主动调度心跳已中断","检查插件调度器是否异常或已停止。"],
+    official_alert_none_current:["本轮没有生效中的官方预警","预警轮询正常；有新的官方预警时会再联系，无需处理。"],
   };
   const scheduleStages={permission:"权限",settings:"设置",conversation:"会话",sources:"来源",rhythm:"节律",
     validation:"校验",candidate:"候选",delivery_admission:"发送准入",busy_gate:"忙碌门槛",task_queue:"任务队列",scheduler:"调度器"};

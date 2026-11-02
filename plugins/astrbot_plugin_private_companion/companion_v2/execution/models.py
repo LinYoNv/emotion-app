@@ -93,6 +93,22 @@ class TaskContext:
                        "binding": [self.actor.binding_id, self.actor.binding_revision],
                        "role": asdict(self.role_binding), "audience": asdict(self.audience)})
 
+    def same_window(self, other: object) -> bool:
+        """Whether ``other`` denotes this exact conversation window.
+
+        A window is the principal, its subject, the identity binding, the role
+        binding and the audience — exactly ``key``. ``actor.policy_revision``
+        is excluded on purpose: the identity directory advances it for every
+        unrelated bind, grant or revoke in the installation, so two snapshots
+        of one unchanged window routinely carry different revisions. Comparing
+        whole records for equality (``==``) keeps that revision and must not be
+        used to decide whether a role is still bound.
+
+        A changed participant, conversation scope, role or audience produces a
+        different ``key`` and therefore a different window.
+        """
+        return isinstance(other, TaskContext) and self.key == other.key
+
     @classmethod
     def restore(cls, value: dict) -> TaskContext:
         def subject(data):
@@ -251,7 +267,20 @@ class WorkerStopRecovery:
 
 @dataclass(frozen=True)
 class ClaimResult:
+    """One exact-task claim attempt: a new attempt, or why the queue refused one.
+
+    ``refused`` names a *transient* condition that left the row untouched and
+    still queued, so the caller can retry or keep the reservation. A terminal
+    transition is never reported here: the row's own state and reason are
+    authoritative then.
+    """
+
     claim: TaskClaim | None
+    refused: str | None = None
+
+    def __post_init__(self):
+        if self.claim is not None and self.refused is not None:
+            raise ValueError("an admitted claim cannot also be refused")
 
 
 @dataclass(frozen=True)

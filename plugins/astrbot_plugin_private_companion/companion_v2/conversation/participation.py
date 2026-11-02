@@ -26,12 +26,14 @@ from companion_v2.model_gateway.models import ToolSpec
 from .group_interjection import (INTERJECTION, REPEAT_FOLLOW, REPEAT_INTERRUPT, GroupSpeechLedger,
                                  InterjectionPolicy, addresses_role, best_burst, day_key, interjection_state,
                                  openings, repeat_state)
-from .group_observation import GroupPresenceStore, history_items, observe
+from .group_observation import GroupPresenceStore, parse_moment, history_items, observe
 from .group_admission import GroupReplyAdmission, REASONS
 from .group_timing import ADDRESS_MARKER, RepeatPolicy, clean_group_text
 from .participation_prompts import (group_hints, interjection_instruction, observation_instruction,
                                     repeat_instruction)
-from .reply_settings import group_safety_settings, group_wakeup_settings, validate as validate_reply_settings
+from .reply_settings import (group_air_settings, group_safety_settings,
+                             group_wakeup_settings, validate as validate_reply_settings)
+from . import group_high_intensity
 
 
 ACTION = "group.participation.choose"
@@ -247,7 +249,8 @@ class GroupParticipation:
             if any(reason in ("active_follow_up", "reply_follow_up") for reason in admission["reasons"]):
                 instruction += ("这是机器人上一轮互动后的非点名接话候选，发言者可能是另一位群成员；结合上一轮群聊上下文，"
                                 "若仍在回答你的追问、补充刚才未说完的信息或顺着刚才与你的话头继续交流，可自然接住（mode=reply）；"
-                                "若对话已收尾或对方已转向他人，则选择 skip。")
+                                "若对话已收尾或对方已转向他人，则选择 skip。时间接近和话题相关都不等于仍在向你说话，"
+                                "不要为了保持对话而逐句跟答，也不必反复回应礼貌收尾。")
         saved = json.loads(batch["contributions_json"])
         captured = saved.get("reply_settings") if isinstance(saved, dict) else None
         if captured is not None:
@@ -269,6 +272,29 @@ class GroupParticipation:
             self._frozen_turns[batch["batch_id"]] = frozen
         return replace(request, instruction=instruction + frozen["hints"])
 
+    def high_intensity_state(self, context, instruction, *, at, settings):
+        """Read the opt-in hard closeout from confirmed role turns.
+
+        The window/threshold/cooldown live in the air-guard group so V2 does not
+        grow a second set of near-identical settings.  No merge queue is kept
+        here: the ordinary group turn path still owns message batching.
+        """
+        air = group_air_settings(settings)
+        if not air["group_high_intensity_enabled"]:
+            return {"active": False, "recent_wakeups": 0, "threshold": 0,
+                    "window_seconds": 0, "cooldown_seconds": 0, "until": "",
+                    "remaining_seconds": 0}
+        _, turns = self.admission.native_participation_history(
+            context, instruction, at=at)
+        rounds = [when for turn in turns
+                  if (when := parse_moment(turn.get("returned_at"))) is not None]
+        return group_high_intensity.state(
+            rounds, at,
+            window_seconds=air["group_air_guard_window_seconds"],
+            threshold=max(2, air["group_air_guard_max_bot_replies"]),
+            cooldown_seconds=air["group_air_guard_cooldown_seconds"],
+        )
+
     def _build_turn(self, context, request, settings):
         """Derive every participation reference for one group turn, without writing.
 
@@ -286,14 +312,15 @@ class GroupParticipation:
             + ",".join("?" for _ in parts) + ")", parts)} if parts else {}
         if set(batches) != set(parts):
             raise TaskError("group_participation_history", "confirmed reply history lost its original batch")
-        hints = group_hints(request, context, settings, recent, batches)
+        texts = [clean_group_text(material.payload) for material in request.context.materials
+                 if material.purpose == "current_source" or material.purpose.startswith("merged_input:")]
+        current = " ".join(texts)
+        hints = group_hints(request, context, settings, recent, batches, current_text=current)
         values = group_participation_settings(self.runtime, context)
         interjection = self._interjection_policy(values, settings)
         repeat_policy = self._repeat_policy(values)
         owner = owner_key(context)
         speaker = context.actor.principal.native_account_id
-        texts = [clean_group_text(material.payload) for material in request.context.materials
-                 if material.purpose == "current_source" or material.purpose.startswith("merged_input:")]
         visible = (*history_items(recent),
                    *({"kind": "member", "speaker_id": speaker, "received_at": at.isoformat(), "text": text}
                      for text in texts))
@@ -304,7 +331,6 @@ class GroupParticipation:
         resolved = self.speech.resolve(self.speech.load(owner), at=at, day=day_key(at, self.messages.timezone_name),
                                        policy=interjection, items=visible, origin_key=context.key,
                                        timezone_name=self.messages.timezone_name)
-        current = " ".join(texts)
         mood = (observation["facts"].get("mood") or {}).get("top_mood", "")
         facts = interjection_state(interjection, resolved["record"], at=at,
                                    initiative=bool(current) and not addresses_role(current, self._address_words(settings)),

@@ -173,19 +173,25 @@ class RealitySettingsMethods:
         action = _single_line(payload.get('action'), 40).lower()
         mihome_page_snapshot: dict[str, Any] | None = None
         try:
-            if action.startswith('mihome_'):
+            if action == 'mobile_pairing_token':
+                rotate = payload.get('rotate', False)
+                if type(rotate) is not bool:
+                    raise ValueError('令牌轮换参数无效')
+                result = await self._mobile_pairing_token_command(rotate=rotate)
+            elif action.startswith('mihome_'):
                 mihome_api = self._mihome_api()
                 handler = getattr(mihome_api, 'page_action', None) if mihome_api is not None else None
                 if not callable(handler):
                     raise TaskError('native_mihome_unavailable', self.mihome_unavailable_reason())
                 mihome_payload = dict(payload)
                 mihome_payload['action'] = action.removeprefix('mihome_')
-                result = await handler(mihome_payload)
-                if not isinstance(result, dict) or result.get('ok') is not True:
-                    raise ValueError(str(result.get('message') or '米家操作未完成') if isinstance(result, dict) else '米家操作未完成')
-                mihome_page_snapshot = result.get('data') if isinstance(result.get('data'), dict) else {}
-                if isinstance(result.get('result'), dict):
-                    mihome_page_snapshot['mihome_action_result'] = result['result']
+                page_result = await handler(mihome_payload)
+                if not isinstance(page_result, dict) or page_result.get('ok') is not True:
+                    raise ValueError(str(page_result.get('message') or '米家操作未完成') if isinstance(page_result, dict) else '米家操作未完成')
+                mihome_page_snapshot = page_result.get('data') if isinstance(page_result.get('data'), dict) else {}
+                action_result = page_result.get('result') if isinstance(page_result.get('result'), dict) else {}
+                mihome_page_snapshot['mihome_action_result'] = action_result
+                result = action_result
             elif action in {'scan_camera', 'scan_cameras'}:
                 result = self._reality_touch_scan_camera_devices()
             elif action == 'scan_audio':
@@ -313,7 +319,7 @@ class RealitySettingsMethods:
 
     def _reality_touch_configuration_snapshot(self) -> dict[str, Any]:
         """Return editable settings without exposing the mobile pairing secret."""
-        return {'enabled': bool(self.enable_experimental_bluetooth_wakeup), 'vision_provider_id': _single_line(self.plugin_vision_provider_id, 160), 'timezone': _single_line(self.environment_perception_timezone, 80) or 'Asia/Shanghai', 'authorized_user_ids': sorted(self.authorized_user_ids), 'audio_default_playback_volume': _safe_int(self.tts_local_playback_volume, 35, 0, 100), 'home': {'enabled': bool(self.home_enabled), 'provider': _single_line(self.home_provider, 48) or 'home_assistant', 'base_url': _single_line(self.home_base_url, 240), 'access_token_configured': bool(self._cfg_str('home.access_token', '')), 'default_area': _single_line(self.home_default_area, 80), 'request_timeout_seconds': int(self.home_request_timeout_seconds), 'available': bool(self.home_enabled and self.home_base_url and self._cfg_str('home.access_token', ''))}, 'health': {'enabled': bool(self.health_enabled), 'ttl_seconds': int(self.health_ttl_seconds), 'available': bool(self.health_enabled and self._mobile_enabled())}, 'mobile': {'gateway_version': PLUGIN_VERSION, 'api_version': MOBILE_API_VERSION, 'enabled': self._mobile_enabled(), 'host': self._mobile_host(), 'port': self._mobile_port(), 'public_base_url': _single_line(self._cfg_str('mobile.public_base_url', ''), 300).rstrip('/'), 'allowed_user_id': self._mobile_allowed_user_id(), 'session_ttl_hours': self._cfg_int('mobile.session_ttl_hours', 168, 1, 720), 'location_ttl_seconds': self._mobile_location_ttl(), 'amap_reverse_geocode_enabled': self._mobile_amap_enabled(), 'amap_api_key_configured': bool(self._mobile_amap_api_key()), 'amap_cache_ttl_seconds': self._mobile_amap_cache_ttl(), 'amap_request_timeout_seconds': self._mobile_amap_timeout_seconds(), 'telemetry_enabled': self._mobile_telemetry_enabled(), 'telemetry_ttl_seconds': self._mobile_telemetry_ttl(), 'activity_enabled': self._mobile_activity_enabled(), 'activity_ttl_seconds': self._mobile_activity_ttl(), 'proxy_rooms': self._cfg_bool('mobile.proxy_rooms', True), 'screen_upload_enabled': self._mobile_screen_upload_enabled(), 'pairing_token_configured': bool(self._mobile_pairing_token()), 'running': self._mobile_server_runner is not None, 'bound_port': _safe_int(self._mobile_server_bound_port, 0, 0, 65535), 'active_sessions': len(self._mobile_sessions)}}
+        return {'enabled': bool(self.enable_experimental_bluetooth_wakeup), 'vision_provider_id': _single_line(self.plugin_vision_provider_id, 160), 'timezone': _single_line(self.environment_perception_timezone, 80) or 'Asia/Shanghai', 'authorized_user_ids': sorted(self.authorized_user_ids), 'audio_default_playback_volume': _safe_int(self.tts_local_playback_volume, 35, 0, 100), 'home': {'enabled': bool(self.home_enabled), 'provider': _single_line(self.home_provider, 48) or 'home_assistant', 'base_url': _single_line(self.home_base_url, 240), 'access_token_configured': bool(self._cfg_str('home.access_token', '')), 'default_area': _single_line(self.home_default_area, 80), 'request_timeout_seconds': int(self.home_request_timeout_seconds), 'available': bool(self.home_enabled and self.home_base_url and self._cfg_str('home.access_token', ''))}, 'health': {'enabled': bool(self.health_enabled), 'ttl_seconds': int(self.health_ttl_seconds), 'available': bool(self.health_enabled and self._mobile_enabled())}, 'mobile': {'gateway_version': PLUGIN_VERSION, 'api_version': MOBILE_API_VERSION, 'enabled': self._mobile_enabled(), 'host': self._mobile_host(), 'port': self._mobile_port(), 'public_base_url': _single_line(self._cfg_str('mobile.public_base_url', ''), 300).rstrip('/'), 'allowed_user_id': self._mobile_allowed_user_id(), 'core_user_id': self._mobile_core_user_id(), 'session_ttl_hours': self._cfg_int('mobile.session_ttl_hours', 168, 1, 720), 'location_ttl_seconds': self._mobile_location_ttl(), 'amap_reverse_geocode_enabled': self._mobile_amap_enabled(), 'amap_api_key_configured': bool(self._mobile_amap_api_key()), 'amap_cache_ttl_seconds': self._mobile_amap_cache_ttl(), 'amap_request_timeout_seconds': self._mobile_amap_timeout_seconds(), 'telemetry_enabled': self._mobile_telemetry_enabled(), 'telemetry_ttl_seconds': self._mobile_telemetry_ttl(), 'activity_enabled': self._mobile_activity_enabled(), 'activity_ttl_seconds': self._mobile_activity_ttl(), 'proxy_rooms': self._cfg_bool('mobile.proxy_rooms', True), 'screen_upload_enabled': self._mobile_screen_upload_enabled(), 'pairing_token_configured': bool(self._mobile_pairing_token()), 'running': self._mobile_server_runner is not None, 'bound_port': _safe_int(self._mobile_server_bound_port, 0, 0, 65535), 'active_sessions': len(self._mobile_sessions)}}
 
     async def _reality_touch_save_global_config(self, payload: dict[str, Any]) -> dict[str, Any]:
         enabled = self._coerce_config_bool(payload.get('enabled'), False)
@@ -377,6 +383,7 @@ class RealitySettingsMethods:
                                         state_fields=None) -> dict[str, Any]:
         """Save only the portable V1 Reality settings approved by the converter."""
         from companion_v2.legacy.reality_migration import (
+            REALITY_INTEGER_BOUNDS,
             REALITY_SETTING_DEFAULTS,
             reality_settings_state_token,
         )
@@ -391,61 +398,40 @@ class RealitySettingsMethods:
         if reality_settings_state_token(self.config, fields) != expected_state_token:
             return {'saved': False, 'reason': 'reality_config_changed'}
 
-        numeric_bounds = {
-            'camera.min_interval_seconds': (10, 3600),
-            'camera.capture_timeout_seconds': (2, 20),
-            'camera.analysis_timeout_seconds': (5, 90),
-            'audio.default_playback_volume': (0, 100),
-        }
         for field, value in changes.items():
             if field == 'camera.enabled' and type(value) is not bool:
                 return {'saved': False, 'reason': 'reality_camera_setting_invalid'}
-            if field in numeric_bounds:
-                minimum, maximum = numeric_bounds[field]
+            if field in REALITY_INTEGER_BOUNDS:
+                minimum, maximum = REALITY_INTEGER_BOUNDS[field]
                 if type(value) is not int or not minimum <= value <= maximum:
                     return {'saved': False, 'reason': 'reality_numeric_setting_invalid'}
             if field == 'timezone' and (not isinstance(value, str) or not value.strip() or len(value) > 80):
                 return {'saved': False, 'reason': 'reality_timezone_invalid'}
+            if field == 'vision_provider_id' and (type(value) is not str or not value.strip() or len(value) > 160):
+                return {'saved': False, 'reason': 'reality_vision_provider_invalid'}
 
-        previous_values: dict[str, Any] = {}
-        for field in changes:
-            current: Any = self.config
-            for part in field.split('.'):
-                current = current.get(part) if isinstance(current, dict) else None
-            previous_values[field] = current
+        from copy import deepcopy
+        previous = deepcopy(dict(self.config))
 
         try:
             for field, value in changes.items():
-                parts = field.split('.')
-                group = self.config
-                for part in parts[:-1]:
-                    nested = group.get(part)
-                    if not isinstance(nested, dict):
-                        nested = {}
-                        group[part] = nested
-                    group = nested
-                group[parts[-1]] = value
+                group, separator, key = field.partition('.')
+                if separator:
+                    self._set_group_config_field(group, key, value)
+                else:
+                    self.config[field] = value
             saver = getattr(self.config, 'save_config', None)
             if not callable(saver):
                 raise RuntimeError('reality_config_save_unavailable')
             if saver() is False:
                 raise RuntimeError('reality_config_save_failed')
         except Exception:
-            for field, value in previous_values.items():
-                parts = field.split('.')
-                group = self.config
-                for part in parts[:-1]:
-                    nested = group.get(part)
-                    if not isinstance(nested, dict):
-                        break
-                    group = nested
-                else:
-                    if value is None:
-                        group.pop(parts[-1], None)
-                    else:
-                        group[parts[-1]] = value
+            self.config.clear()
+            self.config.update(previous)
             raise
 
         self._sync_runtime_config()
         self.environment_perception_timezone = self._cfg_str('timezone', 'Asia/Shanghai') or 'Asia/Shanghai'
+        if 'vision_provider_id' in changes:
+            self.plugin_vision_provider_id = self._cfg_str('vision_provider_id', '')
         return {'saved': True, 'fields': sorted(changes)}

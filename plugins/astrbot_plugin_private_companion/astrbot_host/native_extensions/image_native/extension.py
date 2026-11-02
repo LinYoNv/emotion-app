@@ -71,7 +71,7 @@ class ImageExtensionAPI:
         endpoint = next((item for item in source["endpoints"] if item["id"] == endpoint_id), None)
         if endpoint is None or not endpoint["enabled"]:
             raise NativeImageError("native_endpoint_unconfigured")
-        backend = OnlineImageBackend(endpoint)
+        backend = OnlineImageBackend(endpoint, source.get("network", {}))
         owner = NativeImageOwner(self.data_dir / "endpoint_tests", backend,
                                  identity_key="v2-image-output-endpoint-tests-v1")
         started = monotonic()
@@ -82,7 +82,10 @@ class ImageExtensionAPI:
                 envelope={"endpoint_id": endpoint_id}), before_dispatch=before_dispatch)
             return {"status": result["state"], "operation_id": result["id"],
                     "elapsed_ms": round((monotonic() - started) * 1000),
-                    "error": result.get("error", "")}
+                    "error": result.get("error", ""),
+                    # Redacted, bounded per-endpoint evidence for the dashboard.
+                    # The model-facing receipt contract is untouched.
+                    "diagnostics": list(result.get("receipt", {}).get("diagnostics", ()) or ())}
         finally:
             await owner.close()
 

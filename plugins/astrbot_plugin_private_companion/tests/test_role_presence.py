@@ -5,11 +5,13 @@ from dataclasses import replace
 from datetime import timedelta
 import json
 import unittest
+from unittest.mock import patch
 
 from companion_v2.adapters.astrbot.presence import OneBotPresencePort
 from companion_v2.conversation.flow import ConversationPolicy
 from companion_v2.delivery.presence import PresenceCoordinator
 from companion_v2.execution.models import TaskError, encode, stamp
+from companion_v2.foundation.refs import AudienceRef
 from companion_v2.agenda.models import Schedule
 from tests.native_adapter_support import NativeFixture, FakeReverseApi
 from tests.test_management_access import NOW
@@ -50,6 +52,82 @@ class FakePresence:
 
 
 class PresenceTests(StateFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_real_reply_restores_online_without_reapplying_old_away_after_finish(self):
+        port = FakePresence()
+        host, app, context, manager = self.setup_state(presence_port=port)
+        self.configure(manager, enabled=True, online_status_enabled=True)
+        app.role_state.write(context, data=state_data(online_mode="away", sleep="待休息"),
+                             expected_revision=0, operation_key="old-away")
+        await self.start(host)
+        app.presence.bind(context)
+        await self.until(lambda: bool(port.modes))
+        self.advance(app, 1)
+        app.presence.begin_native_reply(context, "actual-reply")
+        await app.presence._sync_status()
+        app.presence.finish_native_reply(context, "actual-reply")
+        await app.presence._sync_status()
+        self.assertEqual([mode for _, mode in port.modes], ["online"])
+        self.assertEqual(app.role_state.read(context)["values"]["sleep"], "待休息")
+        self.advance(app, 1)
+        app.role_state.write(context, data=state_data(online_mode="away", sleep="已入睡"),
+                             expected_revision=1, operation_key="new-absence")
+        await app.presence._sync_status()
+        self.assertEqual([mode for _, mode in port.modes], ["online"])
+
+    async def test_returned_native_reply_restores_online_after_coordinator_restart_once(self):
+        from companion_v2.conversation.native_turns import NativeConversationTurns
+        port = FakePresence()
+        host, app, context, manager = self.setup_state(presence_port=port)
+        self.configure(manager, enabled=True, online_status_enabled=True)
+        # Away/busy are normalized to online immediately. Use an actual
+        # remaining absence to exercise recovery after durable reply intake.
+        app.role_state.write(context, data=state_data(online_mode="invisible"),
+                             expected_revision=0, operation_key="old-invisible")
+        await self.start(host)
+        app.presence.bind(context)
+        await self.until(lambda: bool(port.modes))
+        self.advance(app, 1)
+        turns = NativeConversationTurns(app.runtime)
+        turns.mark({"context": context, "turn_id": "durable-reply", "instruction": "聊天"},
+                   "completed", at=self.clock.now())
+        turns.sent("durable-reply", self.clock.now())
+        self.advance(app, 1)
+        turns.mark({"context": context, "turn_id": "interrupted-reply", "instruction": "聊天"},
+                   "failed", at=self.clock.now())
+        await app.presence.close()
+        next_port = FakePresence()
+        next_port.status_result = {"state": "unknown"}
+        coordinator = PresenceCoordinator(app, next_port)
+        self.addAsyncCleanup(coordinator.close)
+        coordinator.bind(context)
+        await coordinator._sync_status()
+        await coordinator._sync_status()
+        self.assertEqual([mode for _, mode in next_port.modes], ["online"])
+        retry_port = FakePresence()
+        restarted = PresenceCoordinator(app, retry_port)
+        self.addAsyncCleanup(restarted.close)
+        restarted.bind(context)
+        await restarted._sync_status()
+        self.assertEqual(retry_port.modes, [])
+
+    async def test_reply_recovery_respects_online_opt_in_and_operator_calibration(self):
+        port = FakePresence()
+        host, app, context, manager = self.setup_state(presence_port=port)
+        self.configure(manager, enabled=True, presence_enabled=True)
+        app.role_state.write(context, data=state_data(online_mode="away", presence="休息中"),
+                             expected_revision=0, operation_key="old-away")
+        await self.start(host)
+        self.advance(app, 1)
+        app.presence.begin_native_reply(context, "actual-reply")
+        await app.presence._sync_status()
+        self.assertEqual(port.modes, [])
+        self.configure(manager, online_status_enabled=True)
+        await app.presence._sync_status()
+        app.role_state.write(context, data=state_data(online_mode="invisible"),
+            expected_revision=1, operation_key="manual-invisible", operator=self.core, reason="human_edit")
+        await app.presence._sync_status()
+        self.assertEqual([mode for _, mode in port.modes], ["online", "invisible"])
+
     async def test_one_typing_worker_survives_input_merge_model_wait_and_part_gap(self):
         port = FakePresence()
         host, app, context, manager = self.setup_state(presence_port=port,
@@ -164,6 +242,23 @@ class PresenceTests(StateFixture, unittest.IsolatedAsyncioTestCase):
         row = self.runtime.read_one("SELECT state FROM platform_presence_operations", ())
         self.assertEqual(row["state"], "unknown")
 
+
+    async def test_same_role_windows_share_one_presence_owner(self):
+        port = FakePresence()
+        _, app, context, _ = self.setup_state(presence_port=port)
+        other_scope = replace(context.scope, native_scope_id="other-native",
+                              conversation_id="other-conversation", session_id="other-session")
+        other = replace(context,
+            role_binding=replace(context.role_binding, scope=other_scope),
+            audience=AudienceRef(other_scope, (context.actor.subject,)))
+        coordinator = app.presence
+        coordinator.bind(context)
+        coordinator.bind(other)
+        with patch.object(coordinator, "_status_available", return_value=True):
+            owners = coordinator._candidates()[coordinator.account(context)]
+        self.assertEqual(len(owners), 1)
+        self.assertEqual(owners[0].key, other.key)
+
     async def test_changed_plan_during_native_preflight_does_not_send_old_wording(self):
         port, app, context, _, data = await self.current_plan()
         self.event_command(app, context, action="revise", revision=1, data=data | {"presence": "散步中"})
@@ -201,10 +296,10 @@ class PresenceTests(StateFixture, unittest.IsolatedAsyncioTestCase):
                                      expected_revision=revision - 1, operation_key="mode-" + mode)
             await app.presence._sync_status()
             await app.presence._sync_status()
-        self.assertEqual([mode for _, mode in port.modes], ["online", "away", "busy", "invisible"])
+        self.assertEqual([mode for _, mode in port.modes], ["online", "invisible"])
         app.role_state.write(context, data=state_data(), expected_revision=4, operation_key="no-mode")
         await app.presence._sync_status()
-        self.assertEqual(len(port.modes), 4)
+        self.assertEqual(len(port.modes), 2)
 
     async def test_schedule_wording_precedes_online_mode_then_mode_resumes(self):
         port = FakePresence()
@@ -221,7 +316,7 @@ class PresenceTests(StateFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(port.modes, [])
         self.event_command(app, context, action="cancel", revision=1)
         await app.presence._sync_status()
-        self.assertEqual([mode for _, mode in port.modes], ["busy"])
+        self.assertEqual([mode for _, mode in port.modes], ["online"])
 
     async def test_unknown_online_ack_persists_without_resend_after_restart(self):
         port = FakePresence()
@@ -240,7 +335,21 @@ class PresenceTests(StateFixture, unittest.IsolatedAsyncioTestCase):
         await coordinator._sync_status()
         self.assertEqual(next_port.modes, [])
         receipt = coordinator.results_for(context)[coordinator.account(context)]
-        self.assertEqual((receipt["state"], receipt["desired"]["mode"]), ("unknown", "away"))
+        self.assertEqual((receipt["state"], receipt["desired"]["mode"]), ("unknown", "online"))
+
+    async def test_role_simulation_never_dispatches_away_or_busy(self):
+        port = FakePresence()
+        host, app, context, manager = self.setup_state(presence_port=port)
+        self.configure(manager, enabled=True, online_status_enabled=True)
+        await self.start(host)
+        app.presence.bind(context)
+        for revision, mode in enumerate(("away", "busy"), 1):
+            app.role_state.write(context, data=state_data(online_mode=mode),
+                                 expected_revision=revision - 1, operation_key="blocked-" + mode)
+            await app.presence._sync_status()
+        self.assertEqual([mode for _, mode in port.modes], ["online"])
+        self.assertNotIn("away", [mode for _, mode in port.modes])
+        self.assertNotIn("busy", [mode for _, mode in port.modes])
 
 
 class NativePresenceTests(NativeFixture, unittest.IsolatedAsyncioTestCase):
@@ -265,13 +374,13 @@ class NativePresenceTests(NativeFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await port.online_status(self.native_context, "sleeping"))["state"], "not_started")
         self.assertEqual(len(calls), 6)
 
-    async def test_revocation_during_preflight_and_wrong_account_never_dispatch(self):
+    async def test_revoked_grant_and_wrong_account_never_dispatch(self):
         port = await self.setup_port()
-        async def revoke(_):
-            for grant in self.identity.snapshot().grants:
-                if grant.capability == "platform.typing":
-                    self.identity.revoke_grant(grant.grant_id, revoked_at=NOW, expected_revision=self.identity.revision)
-        self.native.before_resolve = revoke
+        # Persona resolution uses the startup snapshot. Permission revocation
+        # remains live and must not depend on resolving the persona again.
+        for grant in self.identity.snapshot().grants:
+            if grant.capability == "platform.typing":
+                self.identity.revoke_grant(grant.grant_id, revoked_at=NOW, expected_revision=self.identity.revision)
         self.assertEqual((await port.typing(self.native_context))["state"], "not_started")
         altered = replace(self.native_context, actor=replace(self.native_context.actor,
             principal=replace(self.native_context.actor.principal, account_id="101")))

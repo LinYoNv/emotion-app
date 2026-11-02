@@ -117,7 +117,99 @@ class RealityActivityMethods:
         return api if getattr(self, 'mihome_web_api', None) is not None else None
 
     async def _try_legacy_migration(self) -> bool:
-        return False
+        """Import the V1 runtime records the config migration never touched.
+
+        V1 把音响输出、摄像头设备目录和按用户的摄像头授权写在运行库
+        （``plugin_data/astrbot_plugin_reality_companion/reality_companion.json``），
+        配置迁移只搬可移植偏好，这些记录一直留在旧目录里。这里只补新版还没有的项，
+        已有值一律保留。
+        """
+        path = self._legacy_reality_state_path()
+        if path is None:
+            await self._finish_legacy_migration('legacy_reality_state_missing')
+            return True
+        try:
+            payload = json.loads(await asyncio.to_thread(path.read_text, encoding='utf-8'))
+        except FileNotFoundError:
+            await self._finish_legacy_migration('legacy_reality_state_missing')
+            return True
+        except (OSError, ValueError) as exc:
+            logger.warning('[RealityCompanion] 读取旧版运行记录失败: %s', _single_line(exc, 160))
+            return False
+        from companion_v2.legacy.reality_migration import merge_legacy_runtime_state
+        merged, report = merge_legacy_runtime_state(self.data, payload)
+        if isinstance(merged, dict) and merged is not self.data:
+            self.data.clear()
+            self.data.update(merged)
+        copied = [item for item in report if item.get('kind') == 'copied']
+        kept = [item for item in report if item.get('kind') == 'kept_current']
+        index_report = await self._migrate_legacy_camera_index()
+        if index_report is not None:
+            (copied if index_report.get('kind') == 'copied' else kept).append(index_report)
+        await self._finish_legacy_migration(
+            'legacy_reality_state_migrated' if copied else 'legacy_reality_state_kept')
+        if copied or kept:
+            logger.info('[RealityCompanion] 旧版现实触及运行记录已核对 copied=%d kept=%d',
+                        len(copied), len(kept))
+        return True
+
+    async def _migrate_legacy_camera_index(self):
+        """Carry the old camera choice only when the old catalog proves the device.
+
+        V1 的 ``camera.index`` 只有在设备目录里真实存在时才继续可用；新版目录刚由
+        运行记录补进来，所以这里能做一次有据可依的核对，而不是照抄一个可能已经指向
+        别的设备的编号。新版已经有非默认选择时一律保留。
+        """
+        config_path = self._legacy_reality_config_path()
+        catalog = (self.data.get('reality_touch') or {}).get('camera_device_catalog')
+        devices = catalog.get('devices') if isinstance(catalog, dict) else None
+        known = {item.get('index') for item in devices or [] if isinstance(item, dict)}
+        camera = self.config.get('camera') if isinstance(self.config, dict) else None
+        if not isinstance(camera, dict):
+            return None
+        if camera.get('index') not in (None, 0, '0'):
+            return {'field': 'reality.camera.index', 'kind': 'kept_current',
+                    'explain': '新版已经选过摄像头，保留当前值。'}
+        if config_path is None:
+            return None
+        try:
+            legacy_config = json.loads(await asyncio.to_thread(config_path.read_text, encoding='utf-8'))
+        except (OSError, ValueError):
+            return None
+        legacy_camera = legacy_config.get('camera') if isinstance(legacy_config, dict) else None
+        index = legacy_camera.get('index') if isinstance(legacy_camera, dict) else None
+        if type(index) is not int or index <= 0 or (known and index not in known):
+            return None
+        camera['index'] = index
+        saver = getattr(self.config, 'save_config', None)
+        try:
+            if callable(saver):
+                saver()
+        except Exception as exc:
+            logger.warning('[RealityCompanion] 保存迁移的摄像头编号失败: %s', _single_line(exc, 160))
+            return None
+        return {'field': 'reality.camera.index', 'kind': 'copied',
+                'explain': '旧版摄像头在设备目录中存在，继续沿用这个编号。'}
+
+    def _legacy_reality_config_path(self):
+        base = Path(self.data_dir)
+        for parent in base.parents:
+            if parent.name.casefold() == 'plugin_data':
+                return parent.parent / 'config' / 'astrbot_plugin_reality_companion_config.json'
+        return None
+
+    async def _finish_legacy_migration(self, outcome: str) -> None:
+        self.data['legacy_migration_completed'] = True
+        self.data['legacy_migration_at'] = _now_ts()
+        self.data['legacy_migration_outcome'] = outcome
+        await asyncio.to_thread(self._save_data_sync)
+
+    def _legacy_reality_state_path(self):
+        base = Path(self.data_dir)
+        for parent in base.parents:
+            if parent.name.casefold() == 'plugin_data':
+                return parent / 'astrbot_plugin_reality_companion' / 'reality_companion.json'
+        return None
 
     def _relationship_owner_user_ids(self) -> set[str]:
         owners = set(self.authorized_user_ids)
@@ -197,20 +289,29 @@ class RealityActivityMethods:
         managed = self.v2_host_api() is not None
         return {'available': True, 'enabled': bool(self.enable_experimental_bluetooth_wakeup), 'camera_enabled': bool(self.enable_reality_touch_camera), 'home_enabled': bool(self.home_enabled), 'home_available': bool(self.home_enabled and self.home_base_url and self._cfg_str('home.access_token', '')), 'health_enabled': bool(self.health_enabled), 'owner': 'companion_v2', 'execution_path': 'v2_native', 'managed_by_v2': managed, 'users': len(self.data.get('users', {})) if isinstance(self.data.get('users'), dict) else 0, 'audio': self._reality_touch_audio_snapshot(), 'camera': self._reality_touch_camera_page_snapshot(), 'mobile': {'enabled': self._mobile_enabled(), 'running': self._mobile_server_runner is not None, 'host': self._mobile_host(), 'port': self._mobile_server_bound_port or self._mobile_port(), 'pairing_configured': bool(self._mobile_pairing_token()), 'session_ttl_hours': self._mobile_session_ttl() // 3600, 'location_ttl_seconds': self._mobile_location_ttl(), 'amap_reverse_geocode_enabled': self._mobile_amap_enabled(), 'amap_api_key_configured': bool(self._mobile_amap_api_key()), 'amap_cache_ttl_seconds': self._mobile_amap_cache_ttl(), 'amap_request_timeout_seconds': self._mobile_amap_timeout_seconds(), 'telemetry_enabled': self._mobile_telemetry_enabled(), 'telemetry_ttl_seconds': self._mobile_telemetry_ttl(), 'activity_enabled': self._mobile_activity_enabled(), 'activity_ttl_seconds': self._mobile_activity_ttl(), 'active_sessions': len(self._mobile_sessions), 'screen_upload_enabled': self._mobile_screen_upload_enabled()}}
 
-    async def _mobile_pairing_token_command(self, *, rotate: bool) -> str:
+    async def _mobile_pairing_token_command(self, *, rotate: bool) -> dict[str, Any]:
         token = self._mobile_pairing_token()
         generated = rotate or not token
+        if generated and self._mobile_server_runner is not None:
+            await self._stop_mobile_server()
         if generated:
             token = secrets.token_urlsafe(32)
             self._set_group_config_field('mobile', 'pairing_token', token)
-            saver = getattr(self.config, 'save_config', None)
-            if callable(saver):
-                saver()
-            await self._stop_mobile_server()
+        self._set_group_config_field('mobile', 'enabled', True)
+        saver = getattr(self.config, 'save_config', None)
+        if callable(saver) and saver() is False:
+            raise RuntimeError('保存手机网关配置失败')
+        if self._mobile_server_runner is None:
             await self._start_mobile_server()
-        state = '已重置' if rotate else '已生成' if generated else '当前'
-        gateway = f'{self._mobile_host()}:{self._mobile_server_bound_port or self._mobile_port()}' if self._mobile_enabled() else '移动端网关尚未启用'
-        return f'Android 配对令牌（{state}）：\n{token}\n网关：{gateway}\n该令牌可用于建立新的移动端会话，请勿转发、截图或发送到群聊。'
+        return {
+            'pairing_token': token if generated else '',
+            'generated': generated,
+            'enabled': self._mobile_enabled(),
+            'running': self._mobile_server_runner is not None,
+            'host': self._mobile_host(),
+            'port': self._mobile_server_bound_port or self._mobile_port(),
+            'public_base_url': _single_line(self._cfg_str('mobile.public_base_url', ''), 300).rstrip('/'),
+        }
 
     async def _home_request(self, request_text: str) -> dict[str, Any]:
         """Send a small, explicit Home Assistant service request.

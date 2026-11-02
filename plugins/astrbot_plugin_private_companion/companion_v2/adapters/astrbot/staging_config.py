@@ -26,7 +26,7 @@ from companion_v2.identity_policy.object_access import DEFAULT_ACTIONS
 from companion_v2.model_gateway.budget import BudgetSoftPolicy
 from companion_v2.model_gateway.models import Amount, BudgetPolicy, ModelTaskProfile
 
-from .native import HostAccount, HostPersona, account_number
+from .native import HostAccount, HostPersona, route_id
 from .provider import UsageTariff
 
 
@@ -242,7 +242,7 @@ class StagingConfiguration:
                 or self.persona.bot_id != scope.bot_id or self.persona.role.installation_id != scope.installation_id):
             raise StagingConfigurationError("configuration requires one complete private target and matching subjects")
         HostAccount(scope.platform, scope.account_id, scope.bot_id)
-        account_number(scope.native_scope_id)
+        route_id(scope.native_scope_id)
         for name in ("host_id", "ecosystem_id", "authority_ref", "provider_id"):
             _opaque(getattr(self, name), field=name)
         _hash(self.persona.instruction_hash, "persona.instruction_hash")
@@ -302,10 +302,9 @@ class StagingConfiguration:
         return {"delivery_mode": "onebot_private"}
 
     def _forward_intake_document(self) -> dict:
-        # Same late-field rule as segmentation: an operator who never narrowed the
-        # intake ceilings keeps the original hash. The ceilings themselves are always
-        # inside the structural constants because ForwardIntakePolicy validates that
-        # on construction, so a stored value can only ever be a tightening.
+        # Same late-field rule as segmentation: an operator who kept the defaults
+        # preserves the original hash; explicit bounds or nested parsing decisions
+        # enter the profile fingerprint so the active bridge applies them.
         values = asdict(self.forward_intake)
         defaults = asdict(ForwardIntakePolicy())
         serialized = {name: value for name, value in values.items() if value != defaults[name]}

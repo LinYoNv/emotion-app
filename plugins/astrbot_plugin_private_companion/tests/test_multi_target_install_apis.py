@@ -96,7 +96,7 @@ class MultiTargetInstallApiTests(multi_support.MultiFixture, unittest.IsolatedAs
 
         self.controller.save_plugin_config = lambda candidate: (
             self.controller.config.clear(), self.controller.config.update(candidate))
-        async def apply_bindings(candidate):
+        async def apply_bindings(candidate, **_options):
             self.controller.config.clear()
             self.controller.config.update(candidate)
             return {"saved": True, "started": True}
@@ -183,17 +183,20 @@ class MultiTargetInstallApiTests(multi_support.MultiFixture, unittest.IsolatedAs
 
         calls = []
         applied = {"applied": True, "reason": "test-restore"}
+        state = {"state": "applied", "blocking": False, "startup_allowed": True,
+                 "code": None, "detail": None, "journals": [], "pending": None,
+                 "recovered_journals": []}
 
         def recorder(root, *, installation_id, backup_directory):
             # 记录当时运行实例还没有打开——那正是唯一能安全换文件的时刻。
             calls.append((root, installation_id, backup_directory, self.controller.runtime))
-            return dict(applied)
+            return dict(applied), dict(state)
 
-        with patch.object(multi_controller, "apply_staged_restore", recorder):
+        with patch.object(multi_controller, "guard_restore_startup", recorder):
             initialized = await self.controller.initialize_profile()
         self.assertTrue(initialized.is_success, initialized.failure)
 
-        self.assertEqual(len(calls), 1, "开库路径必须调用一次 apply_staged_restore")
+        self.assertEqual(len(calls), 1, "开库路径必须调用一次启动闸")
         root, installation_id, backup_directory, runtime_at_call = calls[0]
         self.assertEqual(Path(root), self.controller.profile_root / "runtime")
         self.assertEqual(installation_id, self.controller.settings.installation_id)
@@ -201,6 +204,47 @@ class MultiTargetInstallApiTests(multi_support.MultiFixture, unittest.IsolatedAs
         self.assertIsNone(runtime_at_call, "必须在开库之前应用，否则会留下孤儿连接")
         # 结果要留在运行实例上，「还原到底生效了没有」才有地方读。
         self.assertEqual(self.controller.last_restore, applied)
+        self.assertEqual(self.controller.restore_state, state)
+        self.assertFalse(self.controller.restore_blocked)
+
+    async def test_rollback_incomplete_blocks_initialize_profile_and_preserves_the_scene(self):
+        """A startup gate refusal must leave the journal and request untouched.
+
+        ``StorageRuntime.open`` creates a missing database. When the previous
+        restore could not be rolled back, opening would fork the installation and
+        hide the only copy of the old bytes; the controller has to fail instead.
+        """
+        runtime_root = self.controller.profile_root / "runtime"
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        database = runtime_root / "companion-v2.sqlite3"
+        database.mkdir()  # the journaled original cannot be moved back onto a directory
+        journal = runtime_root / ".restore-aaaaaaaa-12345678"
+        (journal / "rollback").mkdir(parents=True)
+        (journal / "rollback" / "companion-v2.sqlite3").write_bytes(b"original-bytes")
+        (journal / "journal.json").write_text(json.dumps({
+            "format": "companion-v2.restore-journal.v1", "phase": "prepared",
+            "snapshot_id": "a" * 32, "content_hash": "b" * 64,
+            "artifacts": [{"path": "companion-v2.sqlite3", "kind": "sqlite"}],
+            "roots": ["companion-v2.sqlite3"]}))
+        pending = runtime_root / "restore-pending.json"
+        pending.write_text(json.dumps({
+            "format": "companion-v2.restore-request.v1", "snapshot_id": "a" * 32,
+            "content_hash": "b" * 64}))
+
+        initialized = await self.controller.initialize_profile()
+
+        self.assertIsNotNone(initialized.failure, initialized)
+        self.assertEqual(initialized.failure.code, "backup_restore_rollback_incomplete")
+        self.assertIsNone(self.controller.runtime, "the controller opened a store anyway")
+        self.assertTrue(self.controller.restore_blocked)
+        self.assertEqual(self.controller.restore_state["state"], "blocked")
+        self.assertTrue(self.controller.restore_state["blocking"])
+        self.assertEqual(self.controller.last_failure["code"], "backup_restore_rollback_incomplete")
+        self.assertTrue(pending.is_file(), "the staged request was cleared")
+        self.assertTrue((journal / "journal.json").is_file(), "the journal was cleared")
+        self.assertEqual((journal / "rollback" / "companion-v2.sqlite3").read_bytes(),
+                         b"original-bytes")
+        self.assertFalse(database.is_file(), "an empty database was created next to the journal")
 
     async def test_legacy_routes_are_mounted_once_per_role(self):
         self.controller.register_routes()
@@ -230,6 +274,60 @@ class MultiTargetInstallApiTests(multi_support.MultiFixture, unittest.IsolatedAs
             for role in target["roles"]:
                 self.assertTrue(role["legacy_api"].endswith("/legacy"), role)
 
+    async def test_group_model_routes_support_role_defaults_and_isolated_group_windows(self):
+        config = multi_support.multi_config(group_targets=[
+            {"target_id": "group-one", "platform_id": "qq-main", "account_id": "100",
+             "bot_id": "bot-a", "group_id": "300"},
+            {"target_id": "group-two", "platform_id": "qq-main", "account_id": "100",
+             "bot_id": "bot-a", "group_id": "301"},
+        ])
+        self.controller = self.make_controller(config=config)
+        await self.controller.initialize_profile()
+        self.controller.register_routes()
+        from astrbot_host import group_model_api
+
+        caller = RouteCaller(self.native, group_model_api)
+        inventory = self.controller.web_api.target_inventory()
+        groups = {target["target_id"]: target for target in inventory if target["scope_kind"] == "group"}
+        self.assertEqual(set(groups), {"group-one", "group-two"})
+        first_route = groups["group-one"]["roles"][0]["model_api"]
+        second_route = groups["group-two"]["roles"][0]["model_api"]
+        paths = {path for path, _, _, _ in self.native.registered_web_apis}
+        self.assertIn(first_route, paths)
+        self.assertIn(first_route + "/configure", paths)
+        self.assertIn(second_route, paths)
+
+        role_status = await caller.call(first_route, query={"layer": "role"})
+        window_status = await caller.call(first_route, query={"layer": "window"})
+        self.assertEqual(role_status["status"], "ok", role_status)
+        self.assertEqual(window_status["status"], "ok", window_status)
+        self.assertEqual(role_status["data"]["scope_kind"], "group")
+        self.assertEqual(role_status["data"]["configuration_layer"], "role")
+        self.assertEqual(window_status["data"]["configuration_layer"], "window")
+        proactive = next(item for item in window_status["data"]["tasks"]
+                         if item["kind"] == "proactive.compose")
+        relationship_prompts = [item for item in proactive["prompt_sections"]
+                                if item.get("configuration_layer") == "role"]
+        self.assertTrue(relationship_prompts)
+        self.assertTrue(all(not item["editable"] for item in relationship_prompts))
+
+        task = next(item for item in window_status["data"]["tasks"] if item["kind"] == "memory.reflect")
+        saved = await caller.call(first_route + "/configure", payload={
+            "kind": "memory.reflect", "operation_key": "group-one-window-prompt",
+            "edit_token": task["edit_token"], "changes": {"prompt": "只用于群一窗口"},
+            "reset": [], "layer": "window",
+        })
+        self.assertEqual(saved["status"], "ok", saved)
+
+        first_window = await caller.call(first_route, query={"layer": "window"})
+        second_window = await caller.call(second_route, query={"layer": "window"})
+        first_task = next(item for item in first_window["data"]["tasks"] if item["kind"] == "memory.reflect")
+        second_task = next(item for item in second_window["data"]["tasks"] if item["kind"] == "memory.reflect")
+        role_task = next(item for item in role_status["data"]["tasks"] if item["kind"] == "memory.reflect")
+        self.assertEqual(first_task["fields"]["prompt"]["value"], "只用于群一窗口")
+        self.assertNotEqual(second_task["fields"]["prompt"]["value"], "只用于群一窗口")
+        self.assertNotEqual(role_task["fields"]["prompt"]["value"], "只用于群一窗口")
+
 
 class MultiTargetLegacyApplyTests(multi_support.MultiFixture, unittest.IsolatedAsyncioTestCase):
     """多目标下的迁移：先选目标与角色，再对着那个角色的路径执行。"""
@@ -242,6 +340,85 @@ class MultiTargetLegacyApplyTests(multi_support.MultiFixture, unittest.IsolatedA
         config = multi_support.multi_config()
         config["legacy"] = {"v1_root": str(self.v1)}
         self.controller = self.make_controller(config=config)
+
+    async def test_official_supplement_adds_group_persona_to_existing_role_without_changing_data(self):
+        await self._supplement_existing_role(auto=False)
+
+    async def test_auto_inheritance_adds_shared_persona_without_locking_or_losing_its_receipt(self):
+        await self._supplement_existing_role(auto=True)
+
+    async def _supplement_existing_role(self, *, auto):
+        import astrbot_host.legacy_api as legacy_api
+        from copy import deepcopy
+
+        section = self.controller.config["multi_host"]
+        section["targets"] = section["targets"][:1]
+        section["personas"] = [{"bot_id": "bot-a", "persona_id": "original", "role_id": "role-a"}]
+        self.window_personas["qq-main:GroupMessage:300"] = "second"
+        self.native.persona_manager.personas_v3 = list(self.native.persona_records.values())
+        self.native.platforms = {"qq-main": self.native.platform}
+        clients = self.native.platform.client._wsr_api_clients
+        self.native.platform.client._wsr_api_clients = {"100": clients["100"]}
+        self.controller.refresh_settings()
+        config_path = self.root / "config" / "astrbot_plugin_private_companion_config.json"
+        config_path.parent.mkdir()
+        self.controller.default_data_root = self.root / "plugin_data" / "companion-7"
+        config_path.write_text(json.dumps({
+            "basic_config": {"bot_scope_mode": "allowlist", "bot_scope_ids": ["100"],
+                "target_user_ids": ["200"], "plugin_specific_persona_id": "original",
+                "enable_multi_persona_mode": False},
+            "group_observation_config": {"enable_group_companion": True,
+                "group_access_mode": "whitelist", "group_whitelist_ids": ["300"]},
+        }), encoding="utf-8")
+        source_bytes = config_path.read_bytes()
+        (await self.controller.initialize_profile()).unwrap()
+        self.controller.save_plugin_config = lambda candidate: self.controller.config.update(candidate)
+        self.controller.register_routes()
+        caller = RouteCaller(self.native, legacy_api)
+        runtime = self.controller.runtime
+        route = self.controller.web_api.target_inventory()[0]["roles"][0]["legacy_api"]
+        api = caller.routes[route].__self__
+        from companion_v2.legacy.migration import ConfigIntent
+        request = Request({"type": "http", "method": "POST", "path": route,
+                           "headers": [], "query_string": b""})
+        with bind_request_context(PluginRequest(request, username="admin")):
+            seed = ConfigIntent("role.profile", "role.profile", {"name": "已迁移角色"}, "test")
+            target = api._scope_target(api.controller.session, seed)
+            snapshot = api.controller.session.application.configuration._snapshot(
+                api._operator(), target, seed.group_id, support.NOW)
+            api._apply_intent(seed, api.controller.session, snapshot)
+        with runtime.transaction() as connection:
+            connection.execute("INSERT INTO runtime_metadata(key, value) VALUES (?, ?)",
+                               ("persona-migration-existing-profile", "保留原角色资料"))
+        before_configuration = [dict(row) for row in runtime.read_all("SELECT * FROM configuration_values", ())]
+        original_target = deepcopy(section["targets"][0])
+        planned = await caller.call(route + "/plan", query={"configuration_scope": "plugin"})
+        self.assertEqual(planned["status"], "ok", planned)
+        plan = planned["data"]
+        self.assertTrue(any(item["target_kind"] == "plugin_config" for item in plan["intents"]), plan)
+        plugin = next(item for item in plan["intents"] if item["target_kind"] == "plugin_config")
+        pairs = plugin["values"]["multi_host.personas"]
+        self.assertEqual({row["persona_id"]: row["role_id"] for row in pairs},
+                         {"original": "role-a", "second": "role-a"})
+        import asyncio
+        applied = await asyncio.wait_for(caller.call(route + ("/auto" if auto else "/apply"), payload={} if auto else {
+            "plan_token": plan["plan_token"], "configuration_scope": "plugin"}), timeout=20)
+        self.assertEqual(applied["status"], "ok", applied)
+        self.assertEqual(applied["data"]["errors"], [], applied)
+        if auto:
+            self.assertEqual(applied["data"]["state"], "imported", applied)
+            self.assertTrue(applied["data"]["configuration_imported"], applied)
+            self.assertTrue(applied["data"]["data_import_required"], applied)
+        runtime = self.controller.runtime
+        self.assertEqual(self.controller.config["multi_host"]["targets"][0], original_target)
+        self.assertEqual(self.controller.config["multi_host"]["personas"], pairs)
+        self.assertEqual(self.controller.config["multi_host"]["group_targets"][0]["group_id"], "300")
+        for row in before_configuration:
+            self.assertEqual(dict(runtime.read_one("SELECT * FROM configuration_values "
+                "WHERE target_key = ? AND field_id = ?", (row["target_key"], row["field_id"]))), row)
+        self.assertEqual(runtime.read_one("SELECT value FROM runtime_metadata WHERE key = ?",
+            ("persona-migration-existing-profile",))["value"], "保留原角色资料")
+        self.assertEqual(config_path.read_bytes(), source_bytes)
 
     async def test_migration_writes_the_selected_roles_settings(self):
         import astrbot_host.legacy_api as legacy_api
@@ -336,6 +513,87 @@ class SingleTargetLegacyApplyTests(unittest.IsolatedAsyncioTestCase):
                            "迁移必须真的写进去（原先目标推导失败，一条都写不进去）")
         self.assertEqual(applied["data"]["errors"], [])
         self.assertTrue(applied["data"]["completion_recorded"])
+
+    def _split_migration(self):
+        from companion_v2.foundation.outcome import Outcome
+        from companion_v2.legacy.migration import ConfigIntent, MigrationPlan, SourceFinding
+
+        plan = MigrationPlan(str(self.v1), findings=(
+            SourceFinding("private.host_configuration", "private", "converted", "ready", ()),
+            SourceFinding("reality.configuration", "reality", "converted", "absent", ()),
+            SourceFinding("image.configuration", "image", "converted", "absent", ()),
+            *(SourceFinding(name + ".configuration", name, "converted", "absent", ())
+              for name in ("game", "together", "live")),
+        ), intents=(ConfigIntent("role.state", "role.state",
+            {"enabled": True, "maintenance_minutes": 45, "presence_enabled": True},
+            "private.host_configuration"),))
+        return NS(plan=lambda: Outcome.success(plan), configuration_context_fingerprint="split-test",
+                  v1_root=self.v1, _configuration=lambda: {})
+
+    async def test_split_plan_keeps_existing_role_values_and_matches_the_remaining_fields_token(self):
+        from astrbot_host.legacy_api import LegacyMigrationWebAPI
+        from companion_v2.legacy.migration import ConfigIntent
+
+        (await self.controller.initialize_profile()).unwrap()
+        session = self.controller.session
+        api = LegacyMigrationWebAPI(self.controller)
+        raw = Request({"type": "http", "method": "POST", "path": "/",
+                       "headers": [], "query_string": b""})
+        with bind_request_context(PluginRequest(raw, username="admin")):
+            seed = ConfigIntent("role.state", "role.state", {"enabled": False}, "test")
+            service = session.application.configuration
+            target = api._scope_target(session, seed)
+            baseline = service._snapshot(api._operator(), target, seed.group_id, support.NOW)
+            api._apply_intent(seed, session, baseline)
+            migration = self._split_migration()
+            plan = api._plan(migration, self.v1, session).unwrap()
+            state_intents = [item for item in plan["intents"] if item["group_id"] == "role.state"]
+            self.assertEqual([item["fields"] for item in state_intents],
+                             [["maintenance_minutes", "presence_enabled"]])
+            result = (await api._apply(migration, self.v1, session, plan["plan_token"])).unwrap()
+            self.assertEqual(result["errors"], [])
+            self.assertNotIn("role.state.enabled", result["written"])
+            snapshot = service._snapshot(api._operator(), target, seed.group_id, support.NOW)
+            self.assertFalse(snapshot.fields["role.state.enabled"].value)
+            self.assertEqual(snapshot.fields["role.state.maintenance_minutes"].value, 45)
+
+    async def test_split_plan_rejects_changes_after_preparation_before_any_write(self):
+        from astrbot_host.legacy_api import LegacyMigrationWebAPI
+        from companion_v2.configuration.models import ConfigLayer
+        from companion_v2.configuration.owners import SparseConfigurationOwner
+        from companion_v2.legacy.migration import ConfigIntent
+
+        (await self.controller.initialize_profile()).unwrap()
+        session = self.controller.session
+        api = LegacyMigrationWebAPI(self.controller)
+        migration = self._split_migration()
+        raw = Request({"type": "http", "method": "POST", "path": "/",
+                       "headers": [], "query_string": b""})
+        with bind_request_context(PluginRequest(raw, username="admin")):
+            plan = api._plan(migration, self.v1, session).unwrap()
+            original = api._prepare_intents
+            service = session.application.configuration
+            def changed_after_preparation(*args):
+                prepared = original(*args)
+                intent = ConfigIntent("role.state", "role.state", {"maintenance_minutes": 50}, "test")
+                target = api._scope_target(session, intent)
+                self.assertIs(target.layer, ConfigLayer.ROLE)
+                definitions = service.registry.group(intent.group_id)
+                owner = service._owners[definitions[0].owner_id]
+                current = owner.read(target, definitions)
+                SparseConfigurationOwner.write(owner, target, owner.role_fields(definitions),
+                    changes={"role.state.maintenance_minutes": 50}, reset=(),
+                    expected_revision=current.revision, observed_at=support.NOW)
+                return prepared
+            with patch.object(api, "_prepare_intents", side_effect=changed_after_preparation):
+                result = await api._apply(migration, self.v1, session, plan["plan_token"])
+            self.assertFalse(result.is_success)
+            self.assertEqual(result.failure.code, "legacy_plan_stale")
+            window = api._scope_target(session, ConfigIntent("role.state", "role.state",
+                {"presence_enabled": True}, "test"))
+            snapshot = service._snapshot(api._operator(), window, "role.state", support.NOW)
+            self.assertFalse(snapshot.fields["role.state.presence_enabled"].value)
+            self.assertEqual(snapshot.fields["role.state.maintenance_minutes"].value, 50)
 
     async def test_upgrade_guide_route_lifecycle_imports_then_confirms_after_restart(self):
         import astrbot_host.legacy_api as legacy_api
@@ -532,7 +790,7 @@ class HostConfigDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.data_root.mkdir(parents=True)
         # V1 数据根留空：证明来源的就绪只靠宿主配置文件，不靠任何转储。
         self.v1 = base / "plugin_data" / "astrbot_plugin_private_companion"
-        self.v1.mkdir()
+        self.v1.mkdir(parents=True)
         config_dir = base / "config"
         config_dir.mkdir()
         self.host_config_path = config_dir / "astrbot_plugin_private_companion_config.json"
@@ -585,7 +843,8 @@ class HostConfigDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(plan["change_count"], 0, "试算要产出可写入的天气设置")
         presentation = next(item for item in plan["intents"]
                             if item["group_id"] == "conversation.presentation")
-        self.assertEqual(presentation["values"]["style_prompt"], "V1 的回复表达配置")
+        self.assertEqual(presentation["values"]["style_prompt"],
+                         {"configured": True, "characters": len("V1 的回复表达配置")})
         self.assertEqual(presentation["confidence"]["style_prompt"], "high")
 
         applied = await caller.call(LEGACY_PREFIX + "/apply",
@@ -601,6 +860,7 @@ class HostConfigDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             "back_probability": 0.4,
             "replies": ["V1 戳一戳回复"],
         })
+
 
     async def test_auto_inheritance_rejects_unreadable_host_config_without_writing(self):
         import astrbot_host.legacy_api as legacy_api
@@ -766,6 +1026,12 @@ class HostConfigDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("poke", self.controller.config)
 
     async def test_account_targets_and_persona_are_previewed_and_applied_without_mode_switch(self):
+        from dataclasses import replace
+        from unittest.mock import AsyncMock
+
+        self.controller.native_types = replace(self.controller.native_types,
+            persona_snapshot_lookup=AsyncMock(return_value="original"),
+            persona_selection_lookup=lambda _context, _umo, selected: selected)
         self._write_host_config(
             basic_config={
                 "bot_scope_mode": "all",

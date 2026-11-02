@@ -20,6 +20,11 @@ function harness() {
     function isEnabled() { return status.enabled === true; }
     function isAccepting() { return status.accepting === true; }
     function stateLabel(value) { return value; }
+    /* stateLabel 与 renderStatus 都会问「角色映射是否已保存」；与页面里同一份判定，
+       少了它渲染阶段就会在 uninitialized 状态下抛 ReferenceError。 */
+    function hasSavedRoleMappings() {
+      return (status?.targets || []).some(target => Array.isArray(target?.roles) && target.roles.length > 0);
+    }
     function paintStatusValue(id, value) { $(id).textContent = value; }
     function notice(message, kind) { notices.push({message, kind}); }
     ${section("  function codeOf(", "  async function api(")}
@@ -92,6 +97,12 @@ test("unrecognized lifecycle codes remain visible without exposing exception tex
 test("known role preparation failures show a specific recovery action", () => {
   const h = harness();
   assert.match(h.page.publicError({code: "host_mappings_required"}), /至少一个 Bot 账号与人格/);
-  assert.match(h.page.publicError({code: "host_provider_required"}), /选择可用的模型连接/);
+  assert.match(h.page.publicError({code: "host_provider_required"}), /保存共享启动模型/);
   assert.match(h.page.publicError({code: "host_store_in_use"}), /实例与数据目录/);
+});
+
+test("account workspace exposes shared model bootstrap", () => {
+  const html = fs.readFileSync(path.join(__dirname, "..", "pages", "\u5bbf\u4e3b\u7ba1\u7406", "workspace.html"), "utf8");
+  assert.match(html, /shared-model-provider/);
+  assert.match(source, /model-provider/);
 });

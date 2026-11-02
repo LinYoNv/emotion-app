@@ -19,13 +19,28 @@ from .contract import CONFIGURABLE_DECISION_FIELDS
 DEFAULT_DECISION_FIELDS = {name: True for name in CONFIGURABLE_DECISION_FIELDS}
 
 
+# The model each backend pins when the operator leaves `remote_model` empty.
+# Local and SystemOne use Laya's own checkpoints; a Jev gateway serves `jev-latest`.
+MODE_MODELS = {"local": "multilingual", "remote": "multilingual", "jev": "jev-latest",
+               # Cloudflare's own decision model draws on the daily Workers AI
+               # neuron allowance; third-party models such as typesafe/jev are
+               # billed separately and need an override here.
+               "workers_ai": "@cf/cloudflare/clef"}
+
+
 DEFAULTS = {
     "enabled": False,
     "mode": "local",
     "local_model_path": "",
     "endpoint": "",
     "api_key": "",
+    # Named apart from the historical `model` key, which older settings files
+    # carried without any effect; adopting it would silently retarget a server.
+    "remote_model": "",
     "timeout_seconds": 20,
+    # 0 disables the host-side gate. Values are percentages because the model
+    # page exposes a familiar 0-100 control; Laya reports a 0-1 probability.
+    "followup_confidence_threshold": 0,
     "decision_fields": DEFAULT_DECISION_FIELDS,
 }
 ALLOWED_CHANGES = frozenset(DEFAULTS)
@@ -88,22 +103,36 @@ def cached_multilingual_model() -> Path | None:
     return None
 
 
-def _install_command() -> str:
+def _pip_command(arguments) -> str:
     executable = str(Path(sys.executable).resolve())
     if os.name == "nt":
         quote = lambda value: "'" + value.replace("'", "''") + "'"
-        return f"& {quote(executable)} -m pip install 'laya==0.4.0'"
-    return f"{shlex.quote(executable)} -m pip install 'laya==0.4.0'"
+        parts = [str(item) if str(item) in {"install", "--no-deps"} else quote(str(item))
+                 for item in arguments]
+        return f"& {quote(executable)} -m pip " + " ".join(parts)
+    return shlex.quote(executable) + " -m pip " + " ".join(shlex.quote(str(item)) for item in arguments)
+
+
+def _install_command() -> str:
+    # Installing the package normally lets pip replace an existing CUDA torch
+    # wheel with the CPU wheel from PyPI. Keep the package install dependency
+    # free and install only its non-torch runtime dependencies afterwards.
+    return (_pip_command(["install", "--no-deps", "laya==0.4.0"]) + "; "
+            + _pip_command(["install", "transformers>=4.48.0", "safetensors>=0.4.0",
+                            "huggingface_hub>=0.20.0", "numpy>=1.20.0"]))
 
 
 def _remote_commands() -> tuple[str, str]:
     executable = str(Path(sys.executable).resolve())
+    install = (_pip_command(["install", "--no-deps", "laya==0.4.0"]) + "; "
+               + _pip_command(["install", "transformers>=4.48.0", "safetensors>=0.4.0",
+                               "huggingface_hub>=0.20.0", "numpy>=1.20.0",
+                               "fastapi>=0.110.0", "uvicorn>=0.27.0",
+                               "python-multipart>=0.0.9"]))
     if os.name == "nt":
         quote = lambda value: "'" + value.replace("'", "''") + "'"
-        install = f"& {quote(executable)} -m pip install 'laya[serve]==0.4.0'"
         start = f"$env:LAYA_DEFAULT_MODEL='multilingual'; & {quote(executable)} -m laya.serve"
     else:
-        install = f"{shlex.quote(executable)} -m pip install 'laya[serve]==0.4.0'"
         start = f"LAYA_DEFAULT_MODEL=multilingual {shlex.quote(executable)} -m laya.serve"
     return install, start
 
@@ -165,13 +194,17 @@ class LayaSettingsStore:
     def _validate(values: dict) -> None:
         if type(values["enabled"]) is not bool:
             raise LayaSettingsError("laya_config_invalid", "enabled 必须是布尔值")
-        if values["mode"] not in {"local", "remote"}:
-            raise LayaSettingsError("laya_config_invalid", "mode 必须是 local 或 remote")
-        for key in ("endpoint", "api_key", "local_model_path"):
+        if values["mode"] not in MODE_MODELS:
+            raise LayaSettingsError("laya_config_invalid",
+                                   "mode 必须是 local、remote、jev 或 workers_ai")
+        for key in ("endpoint", "api_key", "local_model_path", "remote_model"):
             if type(values[key]) is not str or len(values[key]) > 4096:
                 raise LayaSettingsError("laya_config_invalid", f"{key} 配置无效")
         if type(values["timeout_seconds"]) is not int or isinstance(values["timeout_seconds"], bool) or not 1 <= values["timeout_seconds"] <= 120:
             raise LayaSettingsError("laya_config_invalid", "timeout_seconds 超出范围")
+        threshold = values["followup_confidence_threshold"]
+        if type(threshold) is not int or not 0 <= threshold <= 100:
+            raise LayaSettingsError("laya_config_invalid", "followup_confidence_threshold 超出范围")
         fields = values["decision_fields"]
         if type(fields) is not dict or set(fields) != set(DEFAULT_DECISION_FIELDS) or any(
                 type(value) is not bool for value in fields.values()):
@@ -189,9 +222,11 @@ class LayaSettingsStore:
             "mode": values["mode"],
             "local_model_path": values["local_model_path"],
             "endpoint": values["endpoint"],
-            "default_model": "multilingual",
+            "remote_model": values["remote_model"],
+            "default_model": values["remote_model"] or MODE_MODELS[values["mode"]],
             "api_key_set": bool(values["api_key"]),
             "timeout_seconds": values["timeout_seconds"],
+            "followup_confidence_threshold": values["followup_confidence_threshold"],
             "decision_fields": dict(values["decision_fields"]),
             "package_installed": installed,
             "package_version": version,

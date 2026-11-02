@@ -23,6 +23,12 @@
 .self-page .wb-journal [data-wb-row="avatar_data_url"]{display:none!important}
 .journal-id{display:grid;gap:calc(var(--sp-1) * 1.5);min-width:0}
 .journal-name-row{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap;min-width:0}
+.journal-avatar-action{display:flex;align-items:center;gap:var(--sp-2);min-width:0}
+.profile-avatar-upload{display:inline-flex;align-items:center;min-height:26px;padding:0 var(--sp-2);border:1px solid var(--t-line);
+  border-radius:var(--r-pill);background:var(--t-surface-raised);color:var(--t-accent-ink);font-size:var(--fs-micro);
+  font-weight:600;cursor:pointer;box-shadow:var(--t-shadow)}
+.profile-avatar-upload:hover{background:var(--t-accent-quiet)}
+.profile-avatar-upload:focus-visible{outline:2px solid var(--t-accent);outline-offset:2px}
 .journal-name-row h2{margin:0;color:var(--t-text-strong);font-size:var(--fs-title);font-weight:650;line-height:1.25;overflow-wrap:anywhere}
 .live{display:inline-flex;align-items:center;gap:calc(var(--sp-1) * 1.5);max-width:100%;padding:1px calc(var(--sp-3) * .75);border-radius:var(--r-pill);
   background:var(--t-surface-soft);color:var(--t-text-faint);font-size:var(--fs-micro)}
@@ -267,6 +273,7 @@
 .role-profile-draft-compose textarea{min-height:76px;padding:var(--sp-2) var(--sp-3)}
 .role-profile-draft-compose select{min-height:40px;padding:0 var(--sp-3);resize:none}
 .role-profile-draft-persona{display:grid;gap:var(--sp-1)}
+.role-profile-draft-source-picks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-2)}
 .role-profile-draft-field textarea{min-height:72px;padding:var(--sp-2)}
 .role-profile-draft-field select{min-height:42px;padding:0 var(--sp-3)}
 .role-profile-draft-compose textarea:focus,.role-profile-draft-compose select:focus,.role-profile-draft-field textarea:focus,.role-profile-draft-field select:focus{outline:none;border-color:var(--t-accent);box-shadow:0 0 0 3px var(--t-accent-quiet)}
@@ -450,3 +457,7 @@ body.reduce-motion .role-profile-draft-dialog[open],body.reduce-motion .role-pro
 :root:is([data-motion="low"],[data-motion="off"]) .role-profile-draft-dialog *::after,
 body.reduce-motion .role-profile-draft-dialog *,body.reduce-motion .role-profile-draft-dialog *::before,
 body.reduce-motion .role-profile-draft-dialog *::after{transition:none}
+
+@media(max-width:720px){
+  .role-profile-draft-source-picks{grid-template-columns:1fr}
+}

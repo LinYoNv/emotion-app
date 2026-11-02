@@ -171,9 +171,12 @@ class PersonAuthorizationManagement:
         tier = row["tier"] if row else AuthorizationTier.STANDARD.value
         for item in items:
             core_intervention = tier == AuthorizationTier.CORE.value and item["capability"] in INTERVENTION_CAPABILITIES
-            item["effective_state"] = ("active" if core_intervention or tier != AuthorizationTier.STANDARD.value
-                and item["capability"] in REVOCABLE_CAPABILITIES else item["state"])
-            item["identity_override"] = core_intervention or tier != AuthorizationTier.STANDARD.value and item["capability"] in REVOCABLE_CAPABILITIES
+            explicit = any(grant.capability == item["capability"]
+                           and grant.grant_id.startswith(PERSON_PERMISSION_GRANT_PREFIX) for grant in grants)
+            override = core_intervention or (tier != AuthorizationTier.STANDARD.value
+                and item["capability"] in REVOCABLE_CAPABILITIES and not explicit)
+            item["effective_state"] = "active" if override else item["state"]
+            item["identity_override"] = override
         return {"subject_id": subject.subject_id, "items": items,
                 "identity_tier": tier, "identity_revision": self.policy.revision,
                 # 管理员权限不是一条可单独签发的成员 grant，而是 CORE 身份的明确投影。
@@ -183,7 +186,8 @@ class PersonAuthorizationManagement:
                                   "state": ("active" if tier == AuthorizationTier.CORE.value else "off"),
                                   "label": ("核心管理员" if tier == AuthorizationTier.CORE.value else "未开启")},
                 "policy_revision": self.identity.revision,
-                "companion": tier != AuthorizationTier.STANDARD.value or all(name in active for name in COMPANION_CAPABILITIES),
+                "companion": all(any(item["capability"] == name and item["effective_state"] == "active"
+                                     for item in items) for name in COMPANION_CAPABILITIES),
                 "counts": {state: sum(1 for item in items if item["state"] == state)
                            for state in ("active", "off", "revoked", "expired", "pending")}}
 

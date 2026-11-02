@@ -135,6 +135,8 @@ h1 { margin: 0; font-size: clamp(25px, 4vw, 34px); line-height: 1.22; letter-spa
 .notice[data-kind="error"] { border-color: color-mix(in srgb, var(--danger) 35%, var(--line)); background: var(--danger-soft); color: var(--danger); }
 .status-panel, .actions-panel { position:relative; overflow:hidden; border:1px solid var(--line); border-radius:16px; background:var(--surface); box-shadow:var(--shadow); }
 .panel-heading { align-items: center; }
+.status-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.status-actions [hidden] { display: none; }
 .panel-heading h2 { margin: 0; font-size: 19px; line-height: 1.35; }
 .panel-heading .eyebrow { margin-bottom: 5px; }
 .status-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 18px 0 15px; }
@@ -190,6 +192,7 @@ dialog::backdrop { background: rgba(25, 27, 45, .48); }
   .shell { width: min(100% - 28px, 520px); padding: 30px 0 44px; }
   .topbar { gap: 10px; }
   .topbar, .panel-heading { flex-wrap: wrap; }
+  .status-actions { width: 100%; }
   .connection { margin-top: 0; }
   .status-panel, .actions-panel { padding: 18px 15px 15px; }
   .action-grid { grid-template-columns: 1fr; gap: 9px; }
@@ -218,7 +221,7 @@ dialog::backdrop { background: rgba(25, 27, 45, .48); }
 .topology-empty[hidden], .topology-canvas[hidden] { display: none; }
 .topology-empty strong { color: var(--ink); font-size: 13px; }
 .topology-canvas { position: relative; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: center; gap: clamp(14px, 3vw, 38px); min-height: 160px; margin-top: 17px; }
-.topology-links { position: absolute; z-index: 2; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.topology-links { position: absolute; z-index: 2; inset: 0; width: 100%; height: 100%; overflow: hidden; pointer-events: none; }
 .topology-column { position: relative; z-index: 1; min-width: 0; animation: topology-column-in .36s var(--ease-out) both; }
 .topology-column:nth-of-type(2) { animation-delay: .04s; }
 .topology-column:nth-of-type(3) { animation-delay: .08s; }
@@ -243,6 +246,7 @@ dialog::backdrop { background: rgba(25, 27, 45, .48); }
 .topology-node.is-active { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 8px 18px rgba(79, 83, 168, .14); }
 .topology-node:active:not(:disabled) { transform: translateY(0) scale(.985); }
 .topology-node.is-muted { border-color: var(--line); background: var(--surface-muted); color: var(--muted); filter: saturate(.45); }
+.topology-node[data-topology-kind="account"]::before, .topology-node[data-topology-kind="session"]::before { position: absolute; top: 10px; bottom: 10px; left: -1px; width: 3px; border-radius: 0 3px 3px 0; background: var(--account-color, var(--accent)); content: ""; opacity: .9; }
 .topology-node-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
 .topology-node-title { min-width: 0; overflow: hidden; font-size: 12px; font-weight: 750; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
 .topology-node-badge { flex: 0 0 auto; padding: 2px 5px; border-radius: 999px; background: var(--green-soft); color: var(--green); font-size: 9px; line-height: 1.25; }
@@ -250,9 +254,9 @@ dialog::backdrop { background: rgba(25, 27, 45, .48); }
 .topology-node-badge.pinned { background: var(--accent-soft); color: var(--accent); }
 .topology-node-meta { display: block; margin-top: 5px; overflow: hidden; color: var(--muted); font-size: 10px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
 .topology-node-detail { display: block; margin-top: 3px; overflow: hidden; color: var(--ink-soft); font-size: 10px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
-.topology-line { fill: none; stroke: color-mix(in srgb, var(--accent) 32%, var(--line-strong)); stroke-width: 1.4; stroke-linecap: round; stroke-dasharray: 1; stroke-dashoffset: 0; opacity: .58; transition: opacity .24s var(--ease-out), stroke .24s var(--ease-out), stroke-width .24s var(--ease-out); animation: topology-draw .62s var(--ease-out) var(--line-delay, 0ms) both; }
+.topology-line { fill: none; stroke: color-mix(in srgb, var(--topology-account-color, var(--accent)) 42%, var(--line-strong)); stroke-width: 1.4; stroke-linecap: round; stroke-dasharray: 1; stroke-dashoffset: 0; opacity: .58; transition: opacity .24s var(--ease-out), stroke .24s var(--ease-out), stroke-width .24s var(--ease-out); animation: topology-draw .62s var(--ease-out) var(--line-delay, 0ms) both; }
 .topology-line.is-muted { opacity: .12; }
-.topology-line.is-active { stroke: var(--accent); stroke-width: 2.4; opacity: .95; filter: drop-shadow(0 0 3px color-mix(in srgb, var(--accent) 30%, transparent)); }
+.topology-line.is-active { stroke: var(--topology-account-color, var(--accent)); stroke-width: 2.4; opacity: .95; filter: drop-shadow(0 0 3px color-mix(in srgb, var(--topology-account-color, var(--accent)) 30%, transparent)); }
 .topology-pagination { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 9px; }
 .topology-pagination[hidden] { display: none; }
 .topology-pagination .button { min-height: 30px; padding: 5px 9px; font-size: 11px; }
@@ -432,3 +436,34 @@ dialog::backdrop { background: rgba(25, 27, 45, .48); }
 .status-grid dd.is-updated { animation: value-pop .46s var(--ease-out) both; }
 dialog[open] { animation: rise .3s var(--ease-out) both; }
 dialog::backdrop { animation: fade .3s both; }
+
+/* Keep long role keys and session names inside the three-column topology. */
+.topology-node { box-sizing: border-box; min-width: 0; }
+.topology-node-head { min-width: 0; flex-wrap: wrap; gap: 5px 8px; }
+.topology-node-title { flex: 1 1 100%; overflow: visible; overflow-wrap: anywhere; text-overflow: clip; white-space: normal; }
+.topology-node-meta, .topology-node-detail { min-width: 0; overflow: visible; overflow-wrap: anywhere; text-overflow: clip; white-space: normal; }
+.role-binding-identity { display: grid; flex: 1 1 180px; min-width: 0; gap: 4px; }
+.role-binding-identity strong { color: var(--ink); font-size: 13px; }
+.role-binding-identity input { box-sizing: border-box; width: 100%; }
+.role-binding-identity small { color: var(--muted); font-size: 10px; }
+
+
+/* 首次启动的共享模型选择：账号与会话负责启动，模型与连接页负责启动后的任务路由。 */
+.shared-model-panel { display: grid; gap: 12px; }
+.shared-model-panel .panel-heading { margin-bottom: 0; }
+.shared-model-intro { margin: 4px 0 0; color: var(--muted); font-size: 13px; line-height: 1.7; }
+.shared-model-controls { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 10px; }
+.shared-model-select { display: flex; flex: 1 1 280px; min-width: 0; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; }
+.shared-model-select select { width: 100%; min-height: 38px; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); font: inherit; }
+.shared-model-select select:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 2px; }
+.shared-model-note { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.75; }
+.shared-model-note[data-kind="error"] { color: var(--danger, #b13b3b); }
+.session-window-link { display: grid; gap: 8px; margin-top: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-muted); }
+.session-window-link h4 { margin: 0; font-size: 13px; }
+.session-window-link-help { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.65; }
+.session-window-link-controls { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
+.session-window-link-controls label { display: grid; gap: 4px; min-width: 0; color: var(--muted); font-size: 11px; }
+.session-window-link-controls select { width: 100%; min-width: 0; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); font: inherit; }
+.session-window-link-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.session-window-link-state { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+@media (max-width: 720px) { .session-window-link-controls { grid-template-columns: 1fr; } }

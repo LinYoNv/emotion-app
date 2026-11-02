@@ -604,9 +604,9 @@ test("启动幕随机预载一张单次动图并遵从减少动态效果", () =>
   }
   assert.match(INDEX, /Math\.floor\(Math\.random\(\)\s*\*\s*choices\.length\)/,
     "启动幕没有在两张动图之间随机选择");
-  assert.match(INDEX, /<template[^>]+data-room-boot-gif="assets\/room-loading-tea-coffee\.gif[^>]*>[\s\S]*?<img[^>]+src="assets\/room-loading-tea-coffee\.gif/, 
+  assert.match(INDEX, /<template[^>]+data-room-boot-gif="assets\/room-loading-tea-coffee\.gif[^>]*>[\s\S]*?<img[^>]+src="assets\/room-loading-tea-coffee\.gif/,
     "茶咖啡杯没有以宿主可重写的静态 src 放进 inert template");
-  assert.match(INDEX, /<template[^>]+data-room-boot-gif="assets\/room-loading-mug\.gif[^>]*>[\s\S]*?<img[^>]+src="assets\/room-loading-mug\.gif/, 
+  assert.match(INDEX, /<template[^>]+data-room-boot-gif="assets\/room-loading-mug\.gif[^>]*>[\s\S]*?<img[^>]+src="assets\/room-loading-mug\.gif/,
     "马克杯没有以宿主可重写的静态 src 放进 inert template");
   assert.match(INDEX, /preload\.rel\s*=\s*"preload"[\s\S]*?preload\.as\s*=\s*"image"[\s\S]*?preload\.href\s*=\s*candidate\.src[\s\S]*?fetchpriority[\s\S]*?document\.head\.appendChild\(preload\)/,
     "启动图没有用宿主已重写的最终地址低优先级预载");

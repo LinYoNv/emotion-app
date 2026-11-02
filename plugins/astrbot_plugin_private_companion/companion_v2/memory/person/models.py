@@ -29,7 +29,18 @@ def empty_document():
     return {"version": VERSION, "route": None, "native_account_id": None,
             "platform_nickname": None, "nickname_updated_at": None,
             "admin_nickname": None, "admin_nickname_updated_at": None,
+            "display_name_events": [],
             "group_cards": {}, "contexts": {}, "private_attempts": {"count": 0, "last_at": None}}
+
+
+def legacy_nickname(document):
+    """The name the role historically used for this person, if V1 recorded one.
+
+    It is an address hint, not an identity proof: the account stays the key and
+    the value is only shown after the same card owner was authenticated.
+    """
+    contact = document.get("legacy_private_contact") or {}
+    return clean_name(contact.get("nickname"))
 
 
 def bind_route(document, context):
@@ -73,7 +84,8 @@ def count_input(document, scope, received_at, day):
 
 def aggregate(document):
     entries = tuple(document["contexts"].values())
-    return {"msg_count": sum(entry["msg_count"] for entry in entries),
+    legacy = document.get("legacy_private_contact") or {}
+    return {"msg_count": sum(entry["msg_count"] for entry in entries) + legacy.get("message_count", 0),
             "active_days": sum(entry["active_days"] for entry in entries),
             "first_seen": min((entry["first_seen"] for entry in entries), default=None),
             "last_seen": max((entry["last_seen"] for entry in entries), default=None)}
@@ -89,6 +101,35 @@ def display_name(document, scope):
     if document["platform_nickname"]:
         return document["platform_nickname"], "platform"
     return None, None
+
+
+def known_names(document, scope, *, limit=8):
+    """Return bounded display aliases already observed for this account.
+
+    The current group card leads; other group cards are only historical
+    display clues. Group identifiers and membership details are never
+    included, and the caller still decides whether sharing a name is useful.
+    """
+    names = []
+    current = document["group_cards"].get(scope.native_scope_id) if scope.kind is ScopeKind.GROUP else None
+    ordered = sorted(document["group_cards"].items(),
+                     key=lambda item: (item[0] == (scope.native_scope_id if scope.kind is ScopeKind.GROUP else None),
+                                       item[1].get("updated_at") or "", item[0]), reverse=True)
+    for _, entry in ordered:
+        value = clean_name(entry.get("card"))
+        if value and value not in names:
+            names.append(value)
+    for value in (document.get("platform_nickname"), document.get("admin_nickname"),
+                  legacy_nickname(document)):
+        value = clean_name(value)
+        if value and value not in names:
+            names.append(value)
+    if current is not None:
+        value = clean_name(current.get("card"))
+        if value and value in names:
+            names.remove(value)
+            names.insert(0, value)
+    return tuple(names[:max(1, int(limit))])
 
 
 def directory_display_name(document):

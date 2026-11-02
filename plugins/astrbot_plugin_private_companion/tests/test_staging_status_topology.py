@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace as NS
 import unittest
+from unittest.mock import patch
 
 from tests.test_astrbot_staging_host import WebContext, host_config
 from tests.native_adapter_support import FakeEvent, FakeProvider, FakeReverseApi
@@ -60,6 +61,16 @@ class StagingStatusTopologyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.files(), before)
         self.assertNotIn(self.config["model"]["task_prompt"], json.dumps(status, ensure_ascii=False))
         self.assert_no_external_io()
+
+    async def test_status_route_exposes_document_parser_availability(self):
+        self.controller.register_routes()
+        handler = next(handler for route, handler, _, _ in self.native.registered_web_apis
+                       if route.endswith("/staging/status"))
+        expected = {".pdf": True, ".docx": False, ".xlsx": True, ".pptx": False}
+        with patch("astrbot_host.controller.parser_availability", return_value=expected):
+            response = await handler()
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["parser_availability"], expected)
 
     async def test_unbound_and_pending_targets_stay_empty_until_dashboard_confirmation(self):
         self.config["target"] = {}

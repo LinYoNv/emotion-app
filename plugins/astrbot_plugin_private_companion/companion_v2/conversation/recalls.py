@@ -46,6 +46,20 @@ class MessageRecall:
 
     @property
     def key(self):
+        """The marker belongs to the message and route, never the operator.
+
+        A group administrator may recall another member's message. OneBot then
+        puts the moderator in ``user_id``; keying the marker by that id would
+        make the original author's withdrawal invisible. V1 keyed its recalled
+        id cache by message and scope for the same reason.
+        """
+        return "recall-" + digest([self.installation_id, self.platform, self.bot_id,
+                                    self.account_id, self.kind.value, self.native_scope_id,
+                                    self.message_id])
+
+    @property
+    def legacy_key(self):
+        """Read markers written before the operator id was removed from the key."""
         return "recall-" + digest(self)
 
     def matches(self, scope):
@@ -62,9 +76,12 @@ class ConversationRecalls:
     def recalled(self, scope, message_id, sender_id):
         if not scope.is_resolved:
             return False
-        key = MessageRecall.from_scope(scope, message_id, sender_id).key
-        return self.runtime.read_one("SELECT 1 FROM inbox WHERE consumer = ? AND event_id = ?",
-                                     (CONSUMER, key)) is not None
+        marker = MessageRecall.from_scope(scope, message_id, sender_id)
+        for key in (marker.key, marker.legacy_key):
+            if self.runtime.read_one("SELECT 1 FROM inbox WHERE consumer = ? AND event_id = ?",
+                                     (CONSUMER, key)) is not None:
+                return True
+        return False
 
     def check(self, scope, message_id, sender_id):
         if self.recalled(scope, message_id, sender_id):
@@ -185,6 +202,21 @@ class ConversationRecalls:
             revision = revision + 1 WHERE batch_id = ? AND state NOT IN ('cancelled', 'invalidated')""", (batch_id,))
         connection.execute("UPDATE conversation_parts SET state = 'cancelled' WHERE batch_id = ? AND state = 'pending'", (batch_id,))
 
+    def _cancel_reply(self, batch_id):
+        service = getattr(self.messages, "reply_settings", None)
+        if service is None:
+            return True
+        row = self.runtime.read_one("SELECT context_json FROM conversation_batches WHERE batch_id = ?", (batch_id,))
+        if row is None:
+            return True
+        try:
+            from companion_v2.execution.models import TaskContext
+            context = TaskContext.restore(json.loads(row["context_json"]))
+            settings = service.capture(context, self.messages.tasks.now())["settings"]
+            return bool(settings.get("recall_silence_enabled", True))
+        except Exception:
+            return True
+
     def _inputs(self, notice):
         # Page routing metadata only. Native IDs survive /new and persona changes;
         # reconstructing a key with the currently selected role would miss them.
@@ -220,55 +252,57 @@ class ConversationRecalls:
             require(self.messages.tasks.check_generation())
             receipt = require(self.inbox.accept(consumer=CONSUMER, event_id=notice.key,
                 payload_hash=digest(notice), observed_at=self.messages.tasks.now()))
-            withdrawn, quoted, replies = 0, 0, 0
+            withdrawn, quoted, replies, cancelled = 0, 0, 0, 0
             for row in self._inputs(notice):
                 data = json.loads(row["event_json"])
                 scope = ScopeRef.restore(data["scope"])
                 if not notice.matches(scope):
                     raise TaskError("recall_route_mismatch", "stored native route changed")
                 parent = source_from_document(data["source"])
-                direct = (data["event_id"] == notice.message_id
-                          and data["principal"]["native_account_id"] == notice.sender_id)
+                cancel = self._cancel_reply(row["batch_id"])
+                direct = data["event_id"] == notice.message_id
                 if direct and not row["withdrawn"]:
                     self._revoke(parent)
                     connection.execute("UPDATE conversation_inputs SET withdrawn = 1 WHERE event_key = ?", (row["event_key"],))
-                    self._invalidate(connection, row["batch_id"])
+                    if cancel:
+                        self._invalidate(connection, row["batch_id"])
+                        cancelled += 1
                     withdrawn += 1
                 for quote in data.get("quotes", ()):
-                    if quote["message_id"] == notice.message_id and quote["sender_id"] == notice.sender_id:
+                    if quote["message_id"] == notice.message_id:
                         changed = self._revoke(quote_reference(parent, quote["position"]))
                         quoted += changed
-                        if changed:
+                        if changed and cancel:
                             self._invalidate(connection, row["batch_id"])
+                            cancelled += 1
             from .native_observations import observations_available
             if observations_available(self.runtime):
                 for row in self.runtime.read_all("""SELECT source_json, context_json
                     FROM conversation_native_observations WHERE kind = 'input' AND event_id = ?
-                    AND json_extract(context_json, '$.actor.principal.native_account_id') = ?
                     AND json_extract(context_json, '$.audience.scope.installation_id') = ?
                     AND json_extract(context_json, '$.audience.scope.platform') = ?
                     AND json_extract(context_json, '$.audience.scope.bot_id') = ?
                     AND json_extract(context_json, '$.audience.scope.account_id') = ?
                     AND json_extract(context_json, '$.audience.scope.kind') = ?
                     AND json_extract(context_json, '$.audience.scope.native_scope_id') = ?""",
-                    (notice.message_id, notice.sender_id, notice.installation_id, notice.platform,
+                    (notice.message_id, notice.installation_id, notice.platform,
                      notice.bot_id, notice.account_id, notice.kind.value, notice.native_scope_id)):
                     from companion_v2.execution.models import TaskContext
                     original = TaskContext.restore(json.loads(row["context_json"]))
                     if not notice.matches(original.scope):
                         raise TaskError("recall_route_mismatch", "stored native observation route changed")
                     withdrawn += self._revoke(source_from_document(json.loads(row["source_json"])))
-            if notice.sender_id == notice.account_id:
-                platform_ref = "onebot-message:" + digest([notice.platform, notice.account_id])[:24] + ":" + notice.message_id
-                for row in self.runtime.read_all("""SELECT p.*, b.context_json FROM conversation_parts p
-                    JOIN conversation_batches b ON b.batch_id = p.batch_id WHERE p.platform_ref = ?""", (platform_ref,)):
-                    from companion_v2.execution.models import TaskContext
-                    original = TaskContext.restore(json.loads(row["context_json"]))
-                    if notice.matches(original.scope):
-                        if row["delivered_at"] and self.messages.confirmed_reply_sources is not None:
-                            self._revoke(self.messages.confirmed_reply_sources.reference(row))
-                        replies += 1
+            platform_ref = "onebot-message:" + digest([notice.platform, notice.account_id])[:24] + ":" + notice.message_id
+            for row in self.runtime.read_all("""SELECT p.*, b.context_json FROM conversation_parts p
+                JOIN conversation_batches b ON b.batch_id = p.batch_id WHERE p.platform_ref = ?""", (platform_ref,)):
+                from companion_v2.execution.models import TaskContext
+                original = TaskContext.restore(json.loads(row["context_json"]))
+                if notice.matches(original.scope):
+                    if row["delivered_at"] and self.messages.confirmed_reply_sources is not None:
+                        self._revoke(self.messages.confirmed_reply_sources.reference(row))
+                    replies += 1
             # A missing original is still a committed withdrawal. Late inputs,
             # quotes and delivery acknowledgements must consult this same marker.
             return {"replayed": receipt.replayed, "withdrawn_inputs": withdrawn,
-                    "revoked_quotes": quoted, "recalled_replies": replies}
+                    "revoked_quotes": quoted, "recalled_replies": replies,
+                    "cancelled": cancelled}

@@ -4,13 +4,13 @@ window.CompanionDecisionPage = (() => {
     ["overview", "layout-dashboard", "总览"],
     ["response", "bell", "回应判断"],
     ["tempo", "clock-3", "参与节奏"],
-    ["safety", "shield", "安全边界"],
+    ["safety", "shield", "沉默与安全"],
     ["group", "users-round", "群聊参与"],
   ];
   const replyViewSections = {
     response: ["wakeup_direct", "wakeup_interest", "wakeup_members"],
     tempo: ["wakeup_cold_group", "wakeup_fatigue"],
-    safety: ["group_air_guard", "group_content_safety"],
+    safety: ["silence_policy", "group_air_guard", "private_closing", "group_content_safety"],
   };
   let root = null;
   let activeView = "overview";
@@ -91,7 +91,7 @@ window.CompanionDecisionPage = (() => {
             <span class="decision-step-number">2</span><span class="decision-step-copy"><b>参与节奏</b><small>冷群重启、等待、疲劳与冷却</small><em>冷群重启 ${flag(s, "group_wakeup_cold_group_enabled")} · 疲劳上限 ${shown(s.group_wakeup_fatigue_limit)} 点</em></span>${icon("arrow-right")}
           </button>
           <button type="button" class="decision-chain-step" data-decision-open="safety">
-            <span class="decision-step-number">3</span><span class="decision-step-copy"><b>安全边界</b><small>空气护栏、内容护栏与玩笑尺度</small><em>${activeGuards === null ? "—" : `${activeGuards} 项`} 内容护栏 · 接话护栏 ${flag(s, "group_air_guard_enabled")}</em></span>${icon("arrow-right")}
+            <span class="decision-step-number">3</span><span class="decision-step-copy"><b>沉默与安全</b><small>撤回、收尾、空气护栏与内容边界</small><em>撤回沉默 ${flag(s, "recall_silence_enabled")} · 收尾 ${flag(s, "private_closing_guard_enabled")} · 空气护栏 ${flag(s, "group_air_guard_enabled")}</em></span>${icon("arrow-right")}
           </button>
           <button type="button" class="decision-chain-step" data-decision-open="group">
             <span class="decision-step-number">4</span><span class="decision-step-copy"><b>群聊参与</b><small>氛围与话题线供当前回复参考，插话或跟读另行判定</small><em>氛围参考 ${atmosphereCount === null ? "—" : `${atmosphereCount} / 4`} · 话题线 ${groupReady ? flag(g, "enable_group_topic_threads") : "—"} · 跟读 ${flag(g, "enable_group_repeat_follow")}</em></span>
@@ -142,9 +142,9 @@ window.CompanionDecisionPage = (() => {
     if (view === "response") {
       return `<div class="decision-stats decision-stats-four">
         ${stat("专属直呼词", listCount(s, "group_wakeup_direct_words"), "同一角色的群聊共用")}
-        ${stat("兴趣参与概率", shown(s.group_wakeup_interest_probability), "命中兴趣话题后的参与概率")}
+        ${stat("兴趣候选概率", shown(s.group_wakeup_interest_probability), "候选通过筛选后仍可旁听")}
         ${stat("提问识别阈值", shown(s.group_wakeup_question_threshold), "0–100 · 越低越敏感")}
-        ${stat("图片相关性", flag(s, "group_wakeup_image_enabled"), `权重 ${shown(s.group_wakeup_image_weight)}`)}
+        ${stat("图片候选概率", flag(s, "group_wakeup_image_enabled"), `${shown(s.group_wakeup_image_weight)} 抽取概率`)}
       </div>`;
     }
     if (view === "tempo") {
@@ -158,7 +158,9 @@ window.CompanionDecisionPage = (() => {
     if (view === "safety") {
       const guards = replyReady ? ["enable_group_injection_guard", "enable_group_privacy_guard", "enable_group_reality_promise_guard"]
         .filter(key => on(s, key)).length : null;
-      return `<div class="decision-stats decision-stats-three">
+      return `<div class="decision-stats decision-stats-four">
+        ${stat("沉默策略", `${flag(s, "recall_silence_enabled")} · ${flag(s, "private_closing_guard_enabled")}`,
+          "撤回沉默 · 私聊收尾沉默")}
         ${stat("内容护栏", guards === null ? "— / 3" : `${guards} / 3 开`,
           guards === null ? "读取配置后显示" : "注入 · 隐私 · 现实承诺", guards === 3 ? "ok" : "")}
         ${stat("空气护栏窗口", shown(s.group_air_guard_window_seconds, " 秒"), "窗口内统计角色自己的发言")}
@@ -193,7 +195,7 @@ window.CompanionDecisionPage = (() => {
         overview: "四段独立 · 只回应不发起",
         response: `总闸 · ${replyReady ? on(s, "group_wakeup_enabled") ? "默认开" : "已关闭" : "读取中"}`,
         tempo: `冷群重启 · ${flag(s, "group_wakeup_cold_group_enabled")}`,
-        safety: `内容护栏 · ${replyReady ? ["enable_group_injection_guard", "enable_group_privacy_guard", "enable_group_reality_promise_guard"].filter(key => on(s, key)).length + " / 3" : "读取中"}`,
+        safety: `沉默 · ${flag(s, "recall_silence_enabled")} · 护栏 ${replyReady ? ["enable_group_injection_guard", "enable_group_privacy_guard", "enable_group_reality_promise_guard"].filter(key => on(s, key)).length + " / 3" : "读取中"}`,
         group: `复读跟读 · ${flag(g, "enable_group_repeat_follow")}`,
       };
       current.textContent = states[activeView] || states.overview;

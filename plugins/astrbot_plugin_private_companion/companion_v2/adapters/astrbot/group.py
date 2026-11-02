@@ -18,7 +18,9 @@ from companion_v2.conversation.forwards.models import CapturedForward, fits_forw
 from companion_v2.conversation.quotes.models import CapturedQuote, event_images, event_audios, event_videos, message_number
 from companion_v2.conversation.quotes.forward_models import CapturedQuoteMedia, CapturedForwardQuote, CapturedForwardQuoteMedia
 from .native import (NativeAudioLocator, NativeConversationInput, NativePrivateBridge, NativeVideoLocator,
-                     MEDIA_PREPARE_TIMEOUT, account_number, native_id)
+                     MEDIA_PREPARE_TIMEOUT, account_number, event_account_id, event_group_id,
+                     event_peer_id, native_client_connected, native_id, native_user_subject_id,
+                     route_id, supported_platform_name)
 from .quotes import NativeQuoteLocator, image_locator
 from .forwards import NativeForwardLocator, resource_id
 from .group_quotes import mention_text
@@ -33,35 +35,48 @@ class GroupEventRoute:
     group_id: str
     session_id: str
     event_id: str
+    _platform_name: str = ""
 
     @property
     def route_key(self):
         return self.platform_id, self.account_id, self.group_id
 
+    @property
+    def platform_name(self):
+        return self._platform_name
+
 
 def group_event_route(event):
-    """Cross-check normalized fields against the original authenticated OneBot event."""
+    """Cross-check normalized fields against one supported authenticated event."""
     message, meta, session = event.message_obj, event.platform_meta, event.session
     if (getattr(message.type, "value", None) != "GroupMessage"
             or getattr(session.message_type, "value", None) != "GroupMessage"):
         raise TaskError("host_scene_unsupported", "group capture requires a native group event")
-    sender, login, group = (account_number(message.sender.user_id), account_number(message.self_id),
-                            account_number(message.group_id))
+    if not supported_platform_name(meta.name):
+        raise TaskError("host_route_mismatch", "the native group platform is unsupported")
+    sender, login, group = event_peer_id(event), event_account_id(event), event_group_id(event)
     event_id = native_id(message.message_id)
-    raw = getattr(message, "raw_message", None)
-    if (not isinstance(raw, Mapping) or raw.get("post_type") != "message" or raw.get("message_type") != "group"
-            or raw.get("anonymous") is not None or raw.get("sub_type") == "anonymous"
-            or not isinstance(raw.get("sender"), Mapping)
-            or tuple(account_number(raw.get(key)) for key in ("self_id", "user_id", "group_id")) != (login, sender, group)
-            or account_number(raw["sender"].get("user_id")) != sender or native_id(raw.get("message_id")) != event_id
-            or sender == login):
-        raise TaskError("host_group_identity_mismatch", "group sender and route must match the original OneBot message")
-    if (meta.name != "aiocqhttp" or session.platform_id != meta.id or session.platform_name != meta.id
-            or session.session_id not in (group, sender + "_" + group)
+    if meta.name == "aiocqhttp":
+        raw = getattr(message, "raw_message", None)
+        if (not isinstance(raw, Mapping) or raw.get("post_type") != "message" or raw.get("message_type") != "group"
+                or raw.get("anonymous") is not None or raw.get("sub_type") == "anonymous"
+                or not isinstance(raw.get("sender"), Mapping)
+                or tuple(account_number(raw.get(key)) for key in ("self_id", "user_id", "group_id")) != (login, sender, group)
+                or account_number(raw["sender"].get("user_id")) != sender or native_id(raw.get("message_id")) != event_id
+                or sender == login):
+            raise TaskError("host_group_identity_mismatch", "group sender and route must match the original OneBot message")
+        valid_sessions = (group, sender + "_" + group)
+    else:
+        # QQ Official group openids are not OneBot envelopes.  AstrBot's
+        # adapter already verified the websocket payload before creating the
+        # native event; the fields below are its normalized projection.
+        valid_sessions = (group,)
+    if (session.platform_id != meta.id or session.platform_name != meta.id
+            or session.session_id not in valid_sessions
             or message.session_id != group
             or event.unified_msg_origin != f"{meta.id}:GroupMessage:{session.session_id}"):
         raise TaskError("host_route_mismatch", "group fields do not identify one native conversation")
-    return GroupEventRoute(meta.id, login, sender, group, session.session_id, event_id)
+    return GroupEventRoute(meta.id, login, sender, group, session.session_id, event_id, meta.name)
 
 
 class NativeGroupBridge(NativePrivateBridge):
@@ -74,6 +89,18 @@ class NativeGroupBridge(NativePrivateBridge):
     @staticmethod
     def _umo(platform_id, session_id):
         return f"{platform_id}:GroupMessage:{session_id}"
+
+    @staticmethod
+    def _connection(client, account_id):
+        clients = getattr(client, "_wsr_api_clients", None)
+        if isinstance(clients, Mapping) and account_id in clients:
+            return clients[account_id]
+        return client
+
+    def _connection_current(self, account, client, connection):
+        return (client is self.platforms[account.platform_id][1]
+                and self.account_connected(account, client)
+                and self._connection(client, account.self_id) is connection)
 
     @staticmethod
     def _text_only_parts(event, route, *, require_text=False):
@@ -113,8 +140,11 @@ class NativeGroupBridge(NativePrivateBridge):
         # readable turn when the optional attachment lookup is unavailable.
         # Synthetic/preprocessed component lists without their raw envelope
         # remain strict, as they cannot prove which native media was sent.
-        media_only_allowed = bool(raw_kinds) and raw_kinds.issubset(
-            {"image", "record", "video", "file", "reply", "forward"})
+        media_only_allowed = (
+            bool(raw_kinds) and raw_kinds.issubset(
+                {"image", "record", "video", "file", "reply", "forward"})) or (
+            segments is None and any(kind in {"Image", "Record", "Video", "File", "Reply", "Forward"}
+                                     for kind in native_kinds))
         text, has_text = [], False
         for part in parts:
             if isinstance(part, Mapping):
@@ -127,7 +157,8 @@ class NativeGroupBridge(NativePrivateBridge):
                     has_text |= bool(value.strip())
                 elif kind == "at":
                     try:
-                        value = mention_text(data.get("qq"), route.account_id)
+                        value = mention_text(data.get("qq"), route.account_id,
+                                             bot_ids=(event.message_obj.self_id, "qq_official"))
                         text.append(value)
                         has_text |= value == "[提及机器人]"
                     except (TaskError, ValueError, TypeError):
@@ -154,7 +185,8 @@ class NativeGroupBridge(NativePrivateBridge):
                 has_text |= bool(value.strip())
             elif kind == "At":
                 try:
-                    value = mention_text(part.qq, route.account_id)
+                    value = mention_text(part.qq, route.account_id,
+                                         bot_ids=(event.message_obj.self_id, "qq_official"))
                     text.append(value)
                     has_text |= value == "[提及机器人]"
                 except (TaskError, ValueError, TypeError):
@@ -176,7 +208,7 @@ class NativeGroupBridge(NativePrivateBridge):
     async def capture_text_only(self, event):
         """Capture a group turn when optional native media is unavailable."""
         try:
-            if type(event) is not self.event_type:
+            if not isinstance(event, self.event_type):
                 raise TaskError("host_event_unsupported", "group capture requires the verified native event class")
             route = group_event_route(event)
             target = self.target_for_route(*route.route_key)
@@ -184,7 +216,9 @@ class NativeGroupBridge(NativePrivateBridge):
             if target is None or account is None or target.bot_id != account.bot_id:
                 raise TaskError("host_target_unavailable", "group and account require an explicit target mapping")
             parts = self.component_reader(event) if self.component_reader is not None else tuple(event.message_obj.message)
-            self._validate_quote_components(event.message_obj.raw_message.get("message"), parts)
+            raw = getattr(event.message_obj, "raw_message", None)
+            original_parts = raw.get("message") if isinstance(raw, Mapping) else None
+            self._validate_quote_components(original_parts, parts)
             text = self._text_only_parts(event, route)
             at, event_client = datetime.fromtimestamp(event.created_at, timezone.utc), event.bot
             principal = AuthenticatedHostPrincipal(self.installation_id, self.host_id, route.platform_id,
@@ -192,9 +226,10 @@ class NativeGroupBridge(NativePrivateBridge):
             cid, role, instruction = await self._role(account, route.session_id)
             scope = ScopeRef(self.installation_id, route.platform_id, ScopeKind.GROUP, route.group_id,
                              account.bot_id, route.account_id, cid, route.session_id)
-            if event_client is not self.client(scope) or not event_client._wsr_api_clients.get(route.account_id):
+            if event_client is not self.client(scope) or not self.account_connected(account, event_client):
                 raise TaskError("host_client_mismatch", "group event did not originate from the connected account client")
-            speaker = SubjectRef(self.installation_id, SubjectKind.HUMAN, "onebot-user:" + route.sender_id)
+            speaker = SubjectRef(self.installation_id, SubjectKind.HUMAN,
+                native_user_subject_id(route.platform_name, route.sender_id))
             return Outcome.success(NativeConversationInput(route.event_id, principal,
                 ConversationRoute(scope, group_id=route.group_id), group_audience(scope, speaker), text, at, role,
                 instruction))
@@ -213,9 +248,13 @@ class NativeGroupBridge(NativePrivateBridge):
                        for part in original_parts)):
             raise TaskError("host_group_media_unsupported", "original group components need their own source adapter")
         try:
-            raw_quotes = tuple((position, message_number(part["data"].get("id")))
-                               for position, part in enumerate(original_parts) if part.get("type") == "reply")
-            native_quotes = tuple((position, message_number(part.id)) for position, part in enumerate(parts)
+            # AstrBot may normalize or drop At components before plugin handlers,
+            # so component positions are not stable across preprocessing.  The
+            # quoted message identifiers and their order are the security-
+            # relevant invariant for the text-only group capture.
+            raw_quotes = tuple(message_number(part["data"].get("id"))
+                               for part in original_parts if part.get("type") == "reply")
+            native_quotes = tuple(message_number(part.id) for part in parts
                                   if getattr(getattr(part, "type", None), "value", getattr(part, "type", None)) == "Reply")
         except (TaskError, ValueError, TypeError, AttributeError):
             raise TaskError("host_quote_invalid", "group quote identifiers are not valid") from None
@@ -241,20 +280,27 @@ class NativeGroupBridge(NativePrivateBridge):
         self.target_for_scope(scope)
         return super().client(scope)
 
+    def _session_matches_group(self, account, session_id, group_id):
+        if self.platform_name(account) == "aiocqhttp":
+            parts = session_id.split("_")
+            return (len(parts) in (1, 2)
+                    and all(account_number(part) == part for part in parts)
+                    and parts[-1] == group_id)
+        return session_id == group_id
+
     def _verified_persona_umo(self, scope, binding, account):
-        parts = scope.session_id.split("_")
-        if (len(parts) not in (1, 2) or any(account_number(part) != part for part in parts)
-                or parts[-1] != scope.native_scope_id or binding.scope != scope):
+        if (not self._session_matches_group(account, scope.session_id, scope.native_scope_id)
+                or binding.scope != scope):
             raise TaskError("host_route_changed", "original group session is inconsistent")
         return self._umo(account.platform_id, scope.session_id)
 
     async def verify_role(self, scope, binding, instruction=None):
         self.client(scope)
-        parts = scope.session_id.split("_")
-        if (len(parts) not in (1, 2) or any(account_number(part) != part for part in parts)
-                or parts[-1] != scope.native_scope_id or binding.scope != scope):
+        account = self.accounts[(scope.platform, scope.account_id)]
+        if (not self._session_matches_group(account, scope.session_id, scope.native_scope_id)
+                or binding.scope != scope):
             raise TaskError("host_route_changed", "original group session is inconsistent")
-        cid, role, prompt = await self._role(self.accounts[(scope.platform, scope.account_id)], scope.session_id)
+        cid, role, prompt = await self._role(account, scope.session_id)
         self.client(scope)
         if cid != scope.conversation_id or role != binding.role or (instruction is not None and prompt != instruction):
             raise TaskError("host_persona_changed", "group conversation/persona differs from the original turn")
@@ -276,14 +322,16 @@ class NativeGroupBridge(NativePrivateBridge):
         intake = self.forward_intake
         fallback_input = None
         try:
-            if type(event) is not self.event_type:
+            if not isinstance(event, self.event_type):
                 raise TaskError("host_event_unsupported", "group capture requires the verified native event class")
             route = group_event_route(event)
             target = self.target_for_route(*route.route_key)
             account = self.accounts.get((route.platform_id, route.account_id))
             if target is None or account is None or target.bot_id != account.bot_id:
                 raise TaskError("host_target_unavailable", "group and account require an explicit target mapping")
-            original_parts = event.message_obj.raw_message.get("message")
+            raw_message = getattr(event.message_obj, "raw_message", None)
+            original_parts = raw_message.get("message") if isinstance(raw_message, Mapping) else None
+            onebot = route._platform_name == "aiocqhttp"
             if original_parts is not None and (not isinstance(original_parts, list)
                     or not 1 <= len(original_parts) <= 128
                     or any(not isinstance(p, Mapping) or not isinstance(p.get("data"), Mapping)
@@ -303,15 +351,18 @@ class NativeGroupBridge(NativePrivateBridge):
                 if kind == "Plain" and isinstance(part.text, str):
                     text_parts.append(part.text)
                 elif kind == "At":
-                    text_parts.append(mention_text(part.qq, route.account_id))
+                    text_parts.append(mention_text(part.qq, route.account_id,
+                                                   bot_ids=(event.message_obj.self_id, "qq_official")))
                 elif kind == "Image" and self.image_type is not None and type(part) is self.image_type:
                     image_locators.append(image_locator(position, part.file, part.url))
                     text_parts.append("\n[图片 " + str(len(image_locators)) + "]\n")
                 elif kind == "Reply" and self.reply_type is not None and type(part) is self.reply_type:
-                    quote_locators.append(NativeQuoteLocator(position, message_number(part.id)))
+                    if onebot:
+                        quote_locators.append(NativeQuoteLocator(position, message_number(part.id)))
                     text_parts.append("\n[引用消息]\n")
                 elif kind == "Forward" and self.forward_type is not None and type(part) is self.forward_type:
-                    forward_locators.append(NativeForwardLocator(position, resource_id(part.id)))
+                    if onebot:
+                        forward_locators.append(NativeForwardLocator(position, resource_id(part.id)))
                     text_parts.append("\n[合并转发 " + str(len(forward_locators)) + "]\n")
                 elif kind == "Record" and self.audio_type is not None and type(part) is self.audio_type:
                     value = part.file if type(part.file) is str and part.file.startswith("base64://") else part.url or part.file
@@ -354,7 +405,7 @@ class NativeGroupBridge(NativePrivateBridge):
                         originals.append((position, value))
                     if tuple(originals) != tuple((item.position, item.locator) for item in locators):
                         raise TaskError("host_group_media_unsupported", "group media differs from its original component")
-            elif audio_locators or video_locators:
+            elif onebot and (audio_locators or video_locators):
                 raise TaskError("host_group_media_unsupported", "group media requires original OneBot components")
             if (len(image_locators) > MAX_INPUT_IMAGES or len(quote_locators) > 1
                     or len(forward_locators) > intake.max_forwards or len(audio_locators) > MAX_INPUT_AUDIOS
@@ -376,11 +427,12 @@ class NativeGroupBridge(NativePrivateBridge):
             cid, role, instruction = await self._role(account, route.session_id)
             scope = ScopeRef(self.installation_id, route.platform_id, ScopeKind.GROUP, route.group_id,
                              account.bot_id, route.account_id, cid, route.session_id)
-            if event_client is not self.client(scope) or not event_client._wsr_api_clients.get(route.account_id):
+            if event_client is not self.client(scope) or not self.account_connected(account, event_client):
                 raise TaskError("host_client_mismatch", "group event did not originate from the connected account client")
-            connection = event_client._wsr_api_clients[route.account_id]
+            connection = self._connection(event_client, route.account_id)
+            subject_id = native_user_subject_id(route._platform_name, route.sender_id)
             if fallback_text is not None:
-                speaker = SubjectRef(self.installation_id, SubjectKind.HUMAN, "onebot-user:" + route.sender_id)
+                speaker = SubjectRef(self.installation_id, SubjectKind.HUMAN, subject_id)
                 fallback_input = NativeConversationInput(route.event_id, principal,
                     ConversationRoute(scope, group_id=route.group_id), group_audience(scope, speaker),
                     fallback_text, at, role, instruction)
@@ -468,9 +520,9 @@ class NativeGroupBridge(NativePrivateBridge):
                 if await self._role(account, route.session_id) != (cid, role, instruction):
                     raise TaskError("host_persona_changed", "group role changed while preparing attachments")
                 if (event_client is not self.client(scope)
-                        or event_client._wsr_api_clients.get(route.account_id) is not connection):
+                        or not self._connection_current(account, event_client, connection)):
                     raise TaskError("host_client_mismatch", "original group account connection changed")
-            speaker = SubjectRef(self.installation_id, SubjectKind.HUMAN, "onebot-user:" + route.sender_id)
+            speaker = SubjectRef(self.installation_id, SubjectKind.HUMAN, subject_id)
             return Outcome.success(NativeConversationInput(route.event_id, principal,
                 ConversationRoute(scope, group_id=route.group_id), group_audience(scope, speaker), text, at, role, instruction,
                 images, quotes, forwards, audios, videos))
@@ -480,7 +532,7 @@ class NativeGroupBridge(NativePrivateBridge):
                     if await self._role(account, route.session_id) != (cid, role, instruction):
                         raise TaskError("host_persona_changed", "group role changed while preparing attachments")
                     if (event_client is not self.client(scope)
-                            or event_client._wsr_api_clients.get(route.account_id) is not connection):
+                            or not self._connection_current(account, event_client, connection)):
                         raise TaskError("host_client_mismatch", "original group account connection changed")
                     return Outcome.success(fallback_input)
                 except TaskError as changed:

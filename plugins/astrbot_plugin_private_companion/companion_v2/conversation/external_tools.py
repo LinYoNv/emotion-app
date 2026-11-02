@@ -11,11 +11,14 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 import inspect
 import json
+import logging
 import re
+from threading import Lock
 from types import MappingProxyType
 from typing import Awaitable, Callable
 
 from companion_v2.capabilities.models import CapabilityPackageDescriptor
+from companion_v2.capabilities.privacy import PRIVACY_ACTIONS, is_core
 from companion_v2.capabilities.repositories import CapabilityRepository
 from companion_v2.execution.models import (
     Lane, ProviderBinding, SideEffect, TaskClaim, TaskContext, TaskDefinition, TaskError,
@@ -46,6 +49,17 @@ _ADOPTION_WITHDRAWN = frozenset({
 })
 _TYPES = {"string": (str,), "integer": (int,), "number": (int, float),
           "boolean": (bool,), "null": (type(None),), "object": (dict,), "array": (list,)}
+logger = logging.getLogger(__name__)
+
+
+def _same_declaration(declared, descriptor):
+    """A tool keeps its identity when only the host's current binding moved."""
+    if descriptor == declared:
+        return True
+    binding = declared.binding
+    return ((descriptor.binding.provider, descriptor.binding.capability)
+            == (binding.provider, binding.capability)
+            and replace(descriptor, binding=binding) == declared)
 
 
 def _check_schema(schema, *, depth=0):
@@ -158,6 +172,7 @@ class ExternalToolResponse:
     receipt_ref: str | None = None
     images: tuple[CapturedImage, ...] = field(default=(), repr=False)
     dependencies: tuple[SourceRef, ...] = field(default=(), repr=False)
+    error_code: str | None = None
 
     def __post_init__(self):
         for name in ("invocation_id", "origin_key", "arguments_hash"):
@@ -166,6 +181,9 @@ class ExternalToolResponse:
             raise ValueError("external response requires its original binding and explicit outcome")
         TaskResult("uncertain" if self.state == "unknown" else self.state, self.effect,
                    receipt_ref=self.receipt_ref, operation_id=self.operation_id)
+        if (self.error_code is not None and (type(self.error_code) is not str
+                or re.fullmatch(r"[a-z][a-z0-9_]{0,95}", self.error_code) is None)):
+            raise ValueError("external error code must be a bounded stable identifier")
         if self.state == "succeeded":
             if not isinstance(self.source, SourceRecord):
                 raise ValueError("successful extension result requires a governed original")
@@ -188,10 +206,12 @@ class ExternalToolProvider:
     descriptor: ExtensionToolDescriptor
     invoke: Callable[[ExternalToolInvocation], Awaitable[ExternalToolResponse]]
     current_binding: Callable[[], ProviderBinding | None]
+    admit: Callable[[TaskContext, datetime], object] | None = None
 
     def __post_init__(self):
         if (not isinstance(self.descriptor, ExtensionToolDescriptor) or not inspect.iscoroutinefunction(self.invoke)
-                or not callable(self.current_binding) or inspect.iscoroutinefunction(self.current_binding)):
+                or not callable(self.current_binding) or inspect.iscoroutinefunction(self.current_binding)
+                or self.admit is not None and (not callable(self.admit) or inspect.iscoroutinefunction(self.admit))):
             raise ValueError("provider requires a cooperative async call and bounded synchronous binding attestation")
 
 
@@ -223,6 +243,11 @@ class ExternalToolExecutor:
         self.capabilities = CapabilityRepository(runtime)
         self.messages = self.tasks = self.runner = None
         self.registrations = tuple(TaskRegistration(p.descriptor.definition(), self.validate_child) for p in providers)
+        # A host registry refresh moves every provider binding at once.  Keep the
+        # last observed binding per action so a persistent drift is reported once
+        # instead of turning every catalog round into a warning.
+        self._rebindings = {}
+        self._binding_lock = Lock()
 
     def attach(self, messages):
         if self.messages is not None or messages.runtime is not self.runtime:
@@ -239,23 +264,64 @@ class ExternalToolExecutor:
         """Public admission check for trusted callers outside the model tool loop."""
         return self._admit(descriptor, context, at)
 
+    def resolve(self, descriptor):
+        """The declaration a dispatch would use after any host rebinding."""
+        return self._provider(descriptor)[1]
+
     def _provider(self, descriptor):
+        """Resolve the trusted owner and the binding that is current right now.
+
+        A host registry refresh changes the package version or credential
+        generation recorded in ``ProviderBinding`` while the same provider still
+        serves the same capability.  Treating that as a permanent ownership
+        change hid every external tool after one reload, so rebind instead.  A
+        different provider ID or capability is never adopted.
+        """
         provider = self.providers.get(descriptor.tool.action)
-        if provider is None or provider.descriptor != descriptor:
+        if provider is None or not _same_declaration(provider.descriptor, descriptor):
             raise TaskError("tool_owner_unavailable", "original extension declaration is unavailable")
         try:
             current = provider.current_binding()
         except Exception as error:
             raise TaskError("external_provider_unavailable", "host cannot attest the original provider") from error
-        if current != descriptor.binding:
-            raise TaskError("external_provider_changed", "host provider binding differs from the original")
-        return provider
+        if current is None:
+            # Unloaded, disabled or unsupported: the host is not offering the
+            # declaration at all, so no binding can be adopted.
+            raise TaskError("external_provider_changed", "host provider is no longer loaded")
+        if current == descriptor.binding:
+            return provider, descriptor
+        if (current.provider, current.capability) != (
+                descriptor.binding.provider, descriptor.binding.capability):
+            raise TaskError("external_provider_changed", "host provider now serves another provider or capability")
+        self._note_rebinding(descriptor.tool.action, descriptor.binding, current)
+        return provider, replace(descriptor, binding=current)
+
+    def _note_rebinding(self, action, previous, current):
+        with self._binding_lock:
+            if self._rebindings.get(action) == current:
+                return
+            self._rebindings[action] = current
+            logger.warning(
+                "[CompanionV2] 外部工具绑定已变化，重映射到当前 Provider action=%s provider=%s capability=%s "
+                "version=%s->%s generation=%s->%s",
+                action, current.provider, current.capability,
+                previous.version, current.version, previous.generation, current.generation)
 
     def _admit(self, descriptor, context, at):
-        if context.scope.kind is ScopeKind.GROUP and descriptor.tool.action not in GROUP_IMAGE_ACTIONS:
+        action = descriptor.tool.action
+        privacy = action in PRIVACY_ACTIONS
+        core = is_core(self.runtime, context.actor.subject) if privacy else False
+        # 隐私能力不再按会话范围拦截：群聊和私聊使用同一份授权判定。
+        if (context.scope.kind is ScopeKind.GROUP and action not in GROUP_IMAGE_ACTIONS
+                and not privacy):
             raise TaskError("tool_not_available", "this external action is not exposed to a group conversation")
-        require(self.tasks.authorize_context(context, action="extension.tool.invoke", observed_at=at))
-        self._provider(descriptor)
+        provider, current = self._provider(descriptor)
+        if provider.admit is not None:
+            require(self.tasks.authorize_context(context, action="conversation.reply", observed_at=at))
+            return require(provider.admit(context, at))
+        # 核心管理员默认可用：不再要求该会话的 extension.tool.invoke 授权。
+        if not core:
+            require(self.tasks.authorize_context(context, action="extension.tool.invoke", observed_at=at))
         package = descriptor.package
         installed = require(self.capabilities.installation(extension_id=package.extension_id))
         if (installed.package_id, installed.package_version, installed.artifact_hash) != (
@@ -267,8 +333,10 @@ class ExternalToolExecutor:
             raise TaskError("external_package_changed", "tool differs from the trusted package catalog")
         require(self.capabilities.require_role_enabled(extension_id=package.extension_id,
                 role=context.role_binding.role, bot_id=context.scope.bot_id))
+        if core:
+            return package
         return require(self.capabilities.authorize(extension_id=package.extension_id,
-                       capability_id=descriptor.binding.capability, subject=context.actor.subject, scope=context.scope))
+                       capability_id=current.binding.capability, subject=context.actor.subject, scope=context.scope))
 
     def catalog_for(self, context):
         return self.catalog_with_diagnostics(context)[0]
@@ -303,10 +371,26 @@ class ExternalToolExecutor:
 
     def _descriptor(self, row):
         provider = self.providers.get(row["action"])
-        if provider is None or (encode(provider.descriptor), encode(provider.descriptor.binding)) != (
-                row["descriptor_json"], row["provider_json"]):
+        if provider is None:
             raise TaskError("tool_owner_unavailable", "original extension owner or declaration changed")
-        return provider.descriptor
+        if (encode(provider.descriptor), encode(provider.descriptor.binding)) == (
+                row["descriptor_json"], row["provider_json"]):
+            return provider.descriptor
+        try:
+            binding = ProviderBinding(**json.loads(row["provider_json"]))
+        except (TypeError, ValueError) as error:
+            raise TaskError("tool_owner_unavailable", "original extension owner or declaration changed") from error
+        # The ledger keeps the declaration as it was dispatched.  Every field
+        # except the binding must still equal the trusted provider's identity;
+        # _provider() later rebinds a stale version/generation to the host's
+        # current attestation.  Cross-provider or cross-capability rows stay
+        # rejected here.
+        descriptor = replace(provider.descriptor, binding=binding)
+        if (encode(descriptor) != row["descriptor_json"]
+                or (binding.provider, binding.capability) != (
+                    provider.descriptor.binding.provider, provider.descriptor.binding.capability)):
+            raise TaskError("tool_owner_unavailable", "original extension owner or declaration changed")
+        return descriptor
 
     @outcome
     def validate_child(self, spec, at):
@@ -397,12 +481,10 @@ class ExternalToolExecutor:
                                                self.tasks.now(), run.task.spec.deadline_at)))
         try:
             result = require(await self.runner.run(run.task.spec.context, child_id)).task
-            if result.state in ("created", "retry_scheduled"):
-                # No slot: retire this exact child now so a queue sweep cannot dispatch it later.
-                require(self.tasks.cancel(run.task.spec.context, child_id, expected_revision=result.revision))
-                self._not_dispatched(identifier, "external_capacity_unavailable")
-            elif self._row(identifier)["state"] == "queued":
-                self._not_dispatched(identifier, "external_not_started")
+            if self._row(identifier)["state"] == "queued":
+                # The exact child never started, so a queue sweep must not dispatch it later.
+                self._not_dispatched(identifier, "external_capacity_unavailable" if result.state == "cancelled"
+                                     else "external_not_started")
             return self.snapshot(self._row(identifier), run.task.spec.context, self.tasks.now())[0]
         except BaseException:
             self._unknown(identifier)
@@ -466,11 +548,10 @@ class ExternalToolExecutor:
                 identifier, self.tasks.now(), run.task.spec.deadline_at)))
         try:
             result = require(await self.runner.run(run.task.spec.context, child_id)).task
-            if result.state in ("created", "retry_scheduled"):
-                require(self.tasks.cancel(run.task.spec.context, child_id, expected_revision=result.revision))
-                self._not_dispatched(identifier, "external_capacity_unavailable")
-            elif self._row(identifier)["state"] == "queued":
-                self._not_dispatched(identifier, "external_not_started")
+            if self._row(identifier)["state"] == "queued":
+                # The exact child never started, so a queue sweep must not dispatch it later.
+                self._not_dispatched(identifier, "external_capacity_unavailable" if result.state == "cancelled"
+                                     else "external_not_started")
             return self.snapshot(self._row(identifier), run.task.spec.context, self.tasks.now())
         except BaseException:
             self._unknown(identifier)
@@ -509,7 +590,12 @@ class ExternalToolExecutor:
             invocation = ExternalToolInvocation(row["invocation_id"], row["parent_task_id"], row["tool_call_id"],
                 run.task.spec.context, descriptor, row["arguments_json"], run.task.spec.deadline_at, before_dispatch)
         try:
-            response = await self._provider(descriptor).invoke(invocation)
+            provider, dispatch_descriptor = self._provider(descriptor)
+            if dispatch_descriptor.binding != descriptor.binding:
+                # The original ledger row stays immutable; only this dispatch
+                # adopts the host's current binding.
+                invocation = replace(invocation, descriptor=dispatch_descriptor)
+            response = await provider.invoke(invocation)
             self._record_response(invocation, response)
         except asyncio.CancelledError:
             self._unknown(invocation.invocation_id)
@@ -601,7 +687,8 @@ class ExternalToolExecutor:
                 encode(source.reference) if source else None, digest(source) if source else None,
                 (SCREEN_REJECTED_ADOPTION if invocation.descriptor.tool.action == SCREEN_ACTION
                  else REJECTED_ADOPTION) + adoption_error if adoption_error is not None else
-                None if response.state == "succeeded" else "external_not_started" if response.state == "failed" else "external_result_unknown",
+                None if response.state == "succeeded" else response.error_code or
+                ("external_not_started" if response.state == "failed" else "external_result_unknown"),
                 stamp(self.tasks.now()), invocation.invocation_id))
 
     def material_bytes(self, batch_id):

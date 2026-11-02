@@ -148,7 +148,7 @@ test("每个挂载容器都有对应的模块被加载", () => {
     /* 容器 id 出现在 app.js 的挂载调用里才算有人填。 */
     /* setupGuideHost 由一个包装函数挂，不是直接调模块，所以单独看它。 */
     if (id === "setupGuideHost") return !app.includes("mountSetupGuide()");
-    const owners = {backupWorkspace: "CompanionBackupPage", 
+    const owners = {backupWorkspace: "CompanionBackupPage",
       memorySettingsHost: "CompanionMemorySettingsSection", memoryWorkspace: "CompanionMemoryPage",
       modelWorkspace: "CompanionModelsPage", semanticWorkspace: "CompanionSemanticPage",
       replyWorkspace: "CompanionReplyPage", roleStateWorkspace: "CompanionStatePage",
@@ -176,19 +176,19 @@ test("渲染出的每个工作区容器都在面板挂载清单里", () => {
   const app = fs.readFileSync(path.join(PAGE, "app.js"), "utf8");
   const panel = app.match(/function mountPanelWorkspaces\(\)\{([\s\S]*?)\n\}/);
   assert.ok(panel, "app.js 里找不到 mountPanelWorkspaces()");
+  /* 配置分区由 renderConfigEditors() 统一挂载，它和 mountPanelWorkspaces() 是同一环
+     的两半：面板先调 renderConfigEditors()，后者再逐个探测容器。只扫前者会把所有
+     <section id="…ConfigWorkspace"> 误判成孤儿——groupInterjectionConfigWorkspace
+     就是这样被报成「面板会是一块空白」的，而它其实挂得好好的。 */
+  const editors = app.match(/function renderConfigEditors\(\)\{([\s\S]*?)\n\}/);
+  const mounted = panel[1] + (editors ? editors[1] : "");
 
   /* 只取字面量 id：拼出来的（模板变量）对不上也不该对，那属于另一类接线。 */
   const rendered = new Set([...app.matchAll(/<section id="([a-zA-Z]+Workspace)"/g)]
     .map(match => match[1]));
   assert.ok(rendered.size > 0, "app.js 里没有任何 <section id=\"…Workspace\">，这条对账失去意义");
 
-  const missing = [...rendered].filter(id => {
-    if (panel[1].includes("#" + id)) return false;
-    if (id !== "relationshipProfileConfigWorkspace" || !panel[1].includes("renderConfigEditors()"))
-      return true;
-    return !/if\(\$\('#relationshipProfileConfigWorkspace'\)\)\{\s*mountSelfRelationshipEditor\(\$\('#relationshipProfileConfigWorkspace'\)\)/
-      .test(app);
-  });
+  const missing = [...rendered].filter(id => !mounted.includes("#" + id));
   assert.deepStrictEqual(missing, [],
     `这些工作区容器由渲染函数产出却不在面板挂载清单里，面板会是一块空白：${missing.join(", ")}`);
 });

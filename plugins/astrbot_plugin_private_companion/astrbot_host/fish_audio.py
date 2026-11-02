@@ -20,13 +20,13 @@ DRAMA_DIRECTION = (
 )
 
 
-async def provider_direction(context, policy, umo):
+async def provider_direction(context, policy, umo, channel=""):
     """Describe only the selected live voice; never include endpoint or secrets."""
     if policy is None or context is None or not (
             policy.generation_mode == "model_tag" or policy.trigger_mode == "adaptive"):
         return ""
     try:
-        provider_id = policy.provider_for_language()
+        provider_id = policy.provider_for_language(channel)
         if provider_id:
             provider = context.get_provider_by_id(provider_id)
             if provider is None or provider not in context.get_all_tts_providers():

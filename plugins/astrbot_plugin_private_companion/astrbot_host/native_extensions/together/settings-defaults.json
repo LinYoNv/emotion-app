@@ -1,6 +1,6 @@
 {
   "server": {
-    "enabled": false,
+    "enabled": true,
     "host": "127.0.0.1",
     "port": 6321,
     "public_base_url": "",

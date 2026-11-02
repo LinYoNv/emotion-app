@@ -105,6 +105,14 @@ class OutboundPlanContractTests(unittest.TestCase):
         self.assertEqual(dropped.kinds, ("text", "face"))
         self.assertEqual(dropped.components[-1].value, 7)
 
+    def test_component_plan_strips_paired_control_tags_and_keeps_sentinels(self):
+        plan = build_component_plan(
+            '正文<pc_reaction_expression>{"emotion":"无奈"}</pc_reaction_expression>')
+        self.assertEqual(plan.components[0].value, "正文")
+        leaked = build_component_plan(
+            '好开心<pc_reaction_expression>{"x":1}[[PCTTS:abc123]]')
+        self.assertEqual(leaked.components[0].value, "好开心[[PCTTS:abc123]]")
+
     def test_outbound_plan_rejects_unusable_identifiers(self):
         for quote in ("0", "01", "event-1", 12, "x" * 21):
             with self.subTest(quote=quote):
@@ -155,7 +163,11 @@ class OneBotOutboundPlanEncodingTests(NativeFixture, unittest.IsolatedAsyncioTes
         api = self.native.platform.client._api._wsr_api
         self.assertEqual((await self.native_sender.send(selected)).status, "delivered")
         self.assertEqual(rendered, [("你好", "", 12)])
-        self.assertEqual([component["type"] for component in api.calls[-1][1]["message"]], ["text", "record"])
+        sent = [component["type"] for call in api.calls
+                for component in call[1].get("message", ())]
+        # A voice plan may be emitted as one combined message or as a text
+        # message followed by a record, depending on the native adapter.
+        self.assertEqual([kind for kind in sent if kind in {"text", "record"}], ["text", "record"])
 
     async def test_sealed_poke_precedes_the_message_as_its_own_action(self):
         envelope = await self.envelope()

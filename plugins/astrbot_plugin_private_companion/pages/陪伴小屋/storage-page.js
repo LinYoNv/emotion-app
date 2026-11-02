@@ -137,8 +137,17 @@ window.CompanionStoragePage = (() => {
     } catch (error) {
       if (!live(ticket)) return;
       state.error = true;
-      state.message = error.code === "storage_config_save_failed" ? "存储设置未能保存。"
-        : "操作未完成，请核对存储目录与清理设置后重试。";
+      const candidate = error.code || error.message;
+      const code = typeof candidate === "string" && /^[a-z][a-z0-9_]{2,80}$/.test(candidate) ? candidate : "";
+      const messages = {
+        storage_config_save_failed: "存储设置未能保存，请检查配置文件是否可写。",
+        storage_request_invalid: "存储目录或清理设置不合法，请核对绝对路径与保留范围。",
+        storage_operation_failed: "插件进程无法访问或迁移存储文件。请检查目录及磁盘连接；网络磁盘可填写对应的共享路径。",
+        dashboard_identity_required: "请从已登录的 AstrBot 管理页面保存存储设置。",
+        core_access_required: "当前管理身份没有修改存储设置的权限。",
+      };
+      state.message = messages[code] || "操作未完成，请核对存储目录与清理设置后重试。";
+      if (code) state.message += `（${code}）`;
     }
     state.busy = false;
     render();

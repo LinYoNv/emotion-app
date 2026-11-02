@@ -30,6 +30,7 @@ def recent(runtime, scope, role, *, limit):
             "reason": state, "turn_type": "astrbot.core.reply", "current_inputs": 1, "parts": [],
             "calls": [{"position": item["position"], "state": item["state"],
                 "actual_tokens": (item.get("usage") or {}).get("tokens"), "latency_ms": item.get("latency_ms"),
+                "provider": item.get("provider"),
                 "failure_code": item.get("failure_code"), "response_diagnostics": None} for item in requests],
             "response_type": "native_reply" if returned else "no_reply",
             "injected_materials": record.get("materials", []), "group_history_items": None,

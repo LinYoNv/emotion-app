@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 from astrbot.api.web import request
 from companion_v2.execution.models import TaskError, digest, require
@@ -28,6 +29,7 @@ from companion_v2.knowledge.catalog import KnowledgeCatalog
 from companion_v2.knowledge.configuration import read_settings as read_knowledge_settings
 from companion_v2.knowledge.retrieval import KnowledgeCandidate, KnowledgeRetriever, query_for_context
 from companion_v2.persona_craft import PersonaSnapshot, PersonaWorkshop
+from companion_v2.legacy.data_migration import persona_profile_settings
 from companion_v2.role_profile.configuration import (FIELD_LIMITS as ROLE_PROFILE_FIELD_LIMITS,
     GROUP as ROLE_PROFILE_GROUP, RoleProfileConfigurationOwner,
     configuration_fields as role_profile_configuration_fields,
@@ -46,8 +48,22 @@ from companion_v2.relationships.profile_drafts import (build_relationship_profil
     parse_relationship_profile_draft)
 
 from .management_identity import dashboard_operator
-from .legacy_config import read_v1_host_configuration
+from .legacy_config import find_v1_data_root, read_v1_host_configuration, v1_setting
 from .persona_catalog import persona_choices
+
+logger = logging.getLogger(__name__)
+DRAFT_TEXT_TIMEOUT_SECONDS = 180
+
+
+def _session_provider_id(session):
+    """Read the selected provider from either the single-host or multi-host session."""
+    common = getattr(getattr(session, "settings", None), "common", None)
+    configured = getattr(common, "provider_id", None)
+    if isinstance(configured, str) and configured.strip():
+        return configured.strip()
+    profile = getattr(session, "profile", None)
+    configured = getattr(profile, "provider_id", None)
+    return configured.strip() if isinstance(configured, str) and configured.strip() else ""
 
 
 PREFIX = "/astrbot_plugin_private_companion/persona"
@@ -245,29 +261,83 @@ class PersonaWorkshopWebAPI:
                                role_id=session.profile.target.role_binding.role.subject_id, now=controller.now)
 
     @staticmethod
-    def _text_provider(controller, authorized_session=None):
+    def _provider_for_id(controller, provider_id):
+        provider_id = provider_id.strip() if isinstance(provider_id, str) else ""
+        if not provider_id:
+            return None
+        from .bootstrap_provider import supported_text_provider, text_provider_predicate
+        expected_type = text_provider_predicate(getattr(controller, "native_types", None))
+        for provider in list(controller.context.get_all_providers() or []):
+            if expected_type is not None and not supported_text_provider(provider, expected_type):
+                continue
+            meta = provider.meta() if callable(getattr(provider, "meta", None)) else None
+            identifier = str(getattr(meta, "id", "") or getattr(provider, "id", "") or "").strip()
+            if identifier == provider_id and callable(getattr(provider, "text_chat", None)):
+                return provider
+        raise TaskError("role_profile_model_unavailable", "the selected provider is not loaded")
+
+    @staticmethod
+    def _session_provider_id(session):
+        """The model provider this host session is actually bound to.
+
+        The two host topologies keep it in different places.  A multi-account host
+        shares one provider across every Bot account and holds it on
+        ``settings.common.provider_id``; the single-target staging session pins it on
+        its ``profile``.  ``MultiHostSession`` has no ``profile`` attribute at all, so
+        reading only the profile raised ``AttributeError`` for every multi-account
+        request.  An unusable value returns ``""`` so the caller can say why instead of
+        comparing against a missing attribute.
+
+        Delegates to the module-level helper so there is a single implementation:
+        the host-facing function also strips the configured id (upstream 0c8c5e2),
+        and a second copy inside the class would silently drift from it.
+        """
+        return _session_provider_id(session)
+
+    @classmethod
+    def _text_provider(cls, controller, authorized_session=None, provider_id="",
+                       message="the selected model cannot create persona drafts"):
+        if provider_id:
+            provider = cls._provider_for_id(controller, provider_id)
+            owner = getattr(controller, "controller", controller)
+            model_session = owner.session or owner.last_session
+            return provider, (authorized_session or model_session).application
         owner = getattr(controller, "controller", controller)
         model_session = owner.session or owner.last_session
         model = getattr(model_session, "model", None)
         provider = getattr(model, "native", None)
         provider_id = getattr(model, "provider_id", "")
-        if (model is None or provider is None or provider_id != model_session.profile.provider_id
+        selected = cls._session_provider_id(model_session)
+        if not selected:
+            # Nothing usable on either topology: name the reason, so the page shows a
+            # diagnosable failure instead of a generic "draft failed" from the broad
+            # handler below.
+            raise TaskError("role_profile_model_unavailable",
+                            "this host session has no model provider selected")
+        if (model is None or provider is None or provider_id != selected
                 or not callable(getattr(provider, "text_chat", None))):
-            raise TaskError("role_profile_model_unavailable", "the selected model cannot create persona drafts")
+            raise TaskError("role_profile_model_unavailable", message)
         model._current()
         return provider, (authorized_session or model_session).application
 
-    async def _confirm_generation(self, *, persona_id, snapshot, context_key, application, provider):
+    async def _confirm_generation(self, *, persona_id, snapshot, context_key, application,
+                                  provider, provider_id=""):
         async with self.controller._control_lock:
             controller = self.controller
             session, _ = self._authorized(controller)
             owner = getattr(controller, "controller", controller)
             current_session = owner.session or owner.last_session
             current_model = getattr(current_session, "model", None)
-            if (session.profile.target.key != context_key or session.application is not application
-                    or current_model is None or current_model.native is not provider):
+            if provider_id:
+                current_provider = self._provider_for_id(controller, provider_id)
+                if current_provider is not provider:
+                    raise TaskError("role_profile_source_changed", "the selected model changed while drafting")
+            elif (current_model is None or current_model.native is not provider):
                 raise TaskError("role_profile_source_changed", "the selected role or model changed while drafting")
-            current_model._current()
+            if session.profile.target.key != context_key or session.application is not application:
+                raise TaskError("role_profile_source_changed", "the selected role or model changed while drafting")
+            if not provider_id:
+                current_model._current()
             latest = await self._read_persona(controller, session, persona_id=persona_id)
             if latest != snapshot:
                 raise TaskError("role_profile_source_changed", "the selected persona changed while drafting")
@@ -290,6 +360,17 @@ class PersonaWorkshopWebAPI:
                 if persona_id is not None and persona_id not in {item["value"] for item in choices}:
                     raise TaskError("host_persona_unavailable", "the selected AstrBot persona is unavailable")
                 state["personas"] = choices
+                owner = getattr(controller, "controller", controller)
+                model_session = owner.session or owner.last_session
+                default_provider_id = str(getattr(getattr(model_session, "model", None),
+                                                  "provider_id", "") or "")
+                try:
+                    from .model_api import text_provider_catalog
+                    providers = text_provider_catalog(controller)
+                except Exception:
+                    providers = []
+                state["providers"] = providers
+                state["default_provider_id"] = default_provider_id
                 return outcome_response(Outcome.success(state))
         except TaskError as error:
             return outcome_response(Outcome.failed(error.code, str(error)))
@@ -349,10 +430,13 @@ class PersonaWorkshopWebAPI:
             if len(raw) > 16384:
                 raise ValueError("supplement too large")
             data = self._document(raw)
-            if (set(data) not in ({"supplement"}, {"target", "supplement"},
-                                  {"persona_id", "supplement"}, {"persona_id", "target", "supplement"})
-                    or type(data["supplement"]) is not str):
+            if (set(data) - {"supplement", "target", "persona_id", "provider_id"}
+                    or "supplement" not in data or type(data["supplement"]) is not str):
                 raise ValueError("provide a supplement and an optional draft target")
+            requested_provider_id = data.get("provider_id", "")
+            if requested_provider_id is not None and (
+                    type(requested_provider_id) is not str or len(requested_provider_id) > 256):
+                raise ValueError("invalid provider selection")
             draft_target = data.get("target", "role_profile")
             if draft_target not in {"role_profile", "relationship_profile"}:
                 raise ValueError("unknown draft target")
@@ -376,13 +460,11 @@ class PersonaWorkshopWebAPI:
                 application = session.application
                 owner = getattr(controller, "controller", controller)
                 model_session = owner.session or owner.last_session
-                model = getattr(model_session, "model", None)
-                provider = getattr(model, "native", None)
-                provider_id = getattr(model, "provider_id", "")
-                if (model is None or provider is None or provider_id != model_session.profile.provider_id
-                        or not callable(getattr(provider, "text_chat", None))):
-                    raise TaskError("role_profile_model_unavailable", "the selected model cannot create a profile draft")
-                model._current()
+                provider, _ = self._text_provider(
+                    controller, session, provider_id=requested_provider_id,
+                    message="the selected model cannot create a profile draft")
+                provider_id = requested_provider_id or str(
+                    getattr(getattr(model_session, "model", None), "provider_id", "") or "")
                 try:
                     if draft_target == "role_profile":
                         existing_profile = current_role_profile(controller.runtime, session)
@@ -409,12 +491,11 @@ class PersonaWorkshopWebAPI:
                                     "the current role or relationship profile sources could not be read") from error
 
             try:
-                response = await asyncio.wait_for(provider.text_chat(prompt=prompt, max_tokens=6800), timeout=90)
+                response = await asyncio.wait_for(provider.text_chat(prompt=prompt, max_tokens=6800), timeout=DRAFT_TEXT_TIMEOUT_SECONDS)
             except asyncio.TimeoutError as error:
                 raise TaskError("role_profile_draft_timeout", "the profile draft request timed out") from error
             raw_text = getattr(response, "completion_text", response)
-            parsed = (parse_role_profile_draft(
-                raw_text, world_adaptation_mode=existing_profile.get("world_adaptation_mode", "auto"))
+            parsed = (parse_role_profile_draft(raw_text)
                 if draft_target == "role_profile" else parse_relationship_profile_draft(raw_text))
 
             async with self.controller._control_lock:
@@ -427,10 +508,15 @@ class PersonaWorkshopWebAPI:
                 current_owner = getattr(controller, "controller", controller)
                 current_session = current_owner.session or current_owner.last_session
                 current_model = getattr(current_session, "model", None)
-                if (current.application is not application or current_role != role_id
-                        or current_model is None or current_model.native is not provider):
+                if current.application is not application or current_role != role_id:
                     raise TaskError("role_profile_source_changed", "the current role or model changed while drafting")
-                current_model._current()
+                if requested_provider_id:
+                    if self._provider_for_id(controller, requested_provider_id) is not provider:
+                        raise TaskError("role_profile_source_changed", "the selected model changed while drafting")
+                else:
+                    if current_model is None or current_model.native is not provider:
+                        raise TaskError("role_profile_source_changed", "the current role or model changed while drafting")
+                    current_model._current()
                 latest = await self._read_persona(controller, current, persona_id=persona_id)
                 if latest != snapshot:
                     raise TaskError("role_profile_source_changed", "the source persona changed while drafting")
@@ -461,12 +547,14 @@ class PersonaWorkshopWebAPI:
                 "limits": limits,
                 "target": draft_target,
                 "total_limit": total_limit,
+                "provider_id": provider_id,
             }))
         except TaskError as error:
             return outcome_response(Outcome.failed(error.code, str(error)))
         except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
             return outcome_response(Outcome.failed("role_profile_draft_invalid", "the profile draft response was invalid"))
         except Exception:
+            logger.warning("[CompanionV2] 角色档案草稿生成失败", exc_info=True)
             return outcome_response(Outcome.failed("role_profile_draft_failed", "the profile could not be drafted; check the selected model and try again"))
 
     @staticmethod
@@ -492,33 +580,70 @@ class PersonaWorkshopWebAPI:
             raise ValueError("invalid role-profile migration plan")
         return persona_id, plan_token, edit_token, dict(changes)
 
+    def _v1_configuration_root(self):
+        """Read V1 settings from the canonical AstrBot root even after V2 relocation."""
+        return getattr(self.controller, "default_data_root", None) or self.controller.data_root
+
     def _profile_migration_source(self, persona_id, persona):
         try:
-            legacy_config, _, config_fingerprint = read_v1_host_configuration(self.controller.data_root)
+            legacy_config, _, config_fingerprint = read_v1_host_configuration(
+                self._v1_configuration_root())
         except (OSError, ValueError, UnicodeError):
             raise TaskError("role_profile_migration_source_invalid",
                             "the V1 plugin settings could not be read safely")
 
         if legacy_config is not None:
-            role_prompt = legacy_config.get("schedule_persona_prompt", "")
-            image_hint = legacy_config.get("private_image_self_recognition_hint", "")
-            if role_prompt or image_hint:
-                if legacy_config.get("enable_multi_persona_mode"):
-                    raise TaskError("role_profile_migration_source_ambiguous",
-                                    "select the V1 persona-specific role profile before importing")
-                source_persona_id = legacy_config.get("plugin_specific_persona_id")
+            role_prompt = v1_setting(legacy_config, "life_schedule_config.schedule_persona_prompt", "")
+            image_hint = v1_setting(legacy_config, "message_debounce_config.private_image_self_recognition_hint", "")
+            # 旧版把世界蓝图单独存一份；只读角色那一段会让世界设定整块丢失。
+            worldview_text = v1_setting(legacy_config, "life_schedule_config.schedule_worldview_prompt", "")
+            multi_enabled = bool(v1_setting(legacy_config, "basic_config.enable_multi_persona_mode", False))
+            primary_persona = v1_setting(legacy_config, "basic_config.plugin_specific_persona_id", "")
+            multi_ids = v1_setting(legacy_config, "basic_config.multi_persona_ids", [])
+            if not isinstance(multi_ids, (list, tuple, set)):
+                multi_ids = ()
+            allowed_personas = {str(item).strip() for item in multi_ids if str(item).strip()}
+            if type(primary_persona) is str and primary_persona.strip():
+                allowed_personas.add(primary_persona.strip())
+            if multi_enabled:
+                # 多人物模式下，每个已启用人物都可以作为来源；角色档案按
+                # 该人格的 persona_settings 读取，没有独立档案时继承主配置。
+                if persona_id not in allowed_personas:
+                    raise TaskError("role_profile_migration_source_persona_mismatch",
+                                    "the V1 role profile belongs to another persona")
+            else:
+                source_persona_id = primary_persona
                 if type(source_persona_id) is not str or not source_persona_id.strip():
                     raise TaskError("role_profile_migration_source_unbound",
                                     "the V1 role profile is not bound to a persona")
                 if source_persona_id != persona_id:
                     raise TaskError("role_profile_migration_source_persona_mismatch",
                                     "the V1 role profile belongs to another persona")
+            source_persona_id = persona_id
+            v1_root, _ = find_v1_data_root(self._v1_configuration_root())
+            payload, issue, source_path = persona_profile_settings(v1_root, legacy_config, persona_id)
+            if issue in ("persona_profile_ambiguous", "persona_profile_unreadable"):
+                raise TaskError("role_profile_migration_source_invalid",
+                                "the selected V1 persona profile could not be read safely")
+            settings = payload.get("persona_settings") if isinstance(payload, dict) else None
+            if isinstance(settings, dict):
+                profile_role = settings.get("schedule_persona_prompt")
+                profile_world = settings.get("schedule_worldview_prompt")
+                if isinstance(profile_role, str) and profile_role.strip():
+                    role_prompt = profile_role.strip()
+                if isinstance(profile_world, str) and profile_world.strip():
+                    worldview_text = profile_world.strip()
+            if role_prompt or image_hint or worldview_text:
                 try:
                     mapped = map_v1_world_knowledge_role_profile(
-                        role_prompt, image_hint,
+                        role_prompt, image_hint, worldview_text=worldview_text,
                         configuration_fingerprint=digest({
                             "file": config_fingerprint,
                             "persona_id": source_persona_id,
+                            "profile": source_path,
+                            "role_prompt": role_prompt,
+                            "worldview": worldview_text,
+                            "image_hint": image_hint,
                         }),
                     )
                 except RoleProfileMigrationError as error:
@@ -706,23 +831,15 @@ class PersonaWorkshopWebAPI:
                     raise TaskError("host_persona_invalid", "the selected AstrBot persona has no usable prompt")
                 if len(working_source) > 30000:
                     raise TaskError("persona_standardization_source_too_large", "the selected persona is too large")
-                owner = getattr(controller, "controller", controller)
-                model_session = owner.session or owner.last_session
-                model = getattr(model_session, "model", None)
-                provider = getattr(model, "native", None)
-                provider_id = getattr(model, "provider_id", "")
-                if (model is None or provider is None or provider_id != model_session.profile.provider_id
-                        or not callable(getattr(provider, "text_chat", None))):
-                    raise TaskError("role_profile_model_unavailable", "the selected model cannot create a persona draft")
-                model._current()
+                provider, application = self._text_provider(
+                    controller, session, message="the selected model cannot create a persona draft")
                 prompt = build_persona_standardization_prompt(working_source, answers, strength=strength,
                                                               reference_material=reference_material)
                 context_key = session.profile.target.key
-                application = session.application
                 selected_model = provider
 
             try:
-                response = await asyncio.wait_for(provider.text_chat(prompt=prompt, max_tokens=6800), timeout=90)
+                response = await asyncio.wait_for(provider.text_chat(prompt=prompt, max_tokens=6800), timeout=DRAFT_TEXT_TIMEOUT_SECONDS)
             except asyncio.TimeoutError as error:
                 raise TaskError("role_profile_draft_timeout", "the persona draft request timed out") from error
             raw_text = getattr(response, "completion_text", response)
@@ -779,7 +896,7 @@ class PersonaWorkshopWebAPI:
                 context_key = session.profile.target.key
                 prompt = build_persona_tryouts_prompt(data["draft_text"], variation=variation)
             try:
-                response = await asyncio.wait_for(provider.text_chat(prompt=prompt, max_tokens=3600), timeout=90)
+                response = await asyncio.wait_for(provider.text_chat(prompt=prompt, max_tokens=3600), timeout=DRAFT_TEXT_TIMEOUT_SECONDS)
             except asyncio.TimeoutError as error:
                 raise TaskError("role_profile_draft_timeout", "scenario replies timed out") from error
             generated = parse_persona_tryouts(getattr(response, "completion_text", response))
@@ -839,7 +956,7 @@ class PersonaWorkshopWebAPI:
                     reference_material=reference, speech_preference=speech,
                     constraint_preference=constraints)
             try:
-                response = await asyncio.wait_for(provider.text_chat(prompt=prompt, max_tokens=2600), timeout=90)
+                response = await asyncio.wait_for(provider.text_chat(prompt=prompt, max_tokens=2600), timeout=DRAFT_TEXT_TIMEOUT_SECONDS)
             except asyncio.TimeoutError as error:
                 raise TaskError("role_profile_draft_timeout", "style rules timed out") from error
             result = parse_persona_style_rules(getattr(response, "completion_text", response))

@@ -71,6 +71,43 @@ class ProactiveContactTests(ContactFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage["deliveries"]["session"]["delivered"], 1)
         self.assertEqual(usage["model"]["session"]["calls"], 2)
 
+    async def test_selected_relationship_candidate_is_the_only_saved_and_prompted_origin(self):
+        app = await self.enabled()
+        self.settings(app, {"chat.enabled": True, "care.enabled": True}).unwrap()
+        opportunity = self.opportunity("mixed-chat-relationship-candidates")
+        role_instruction = "這是原角色人格，保持自然。"
+        intents = (
+            self.intent(opportunity, purpose="chat", identifier="chat-candidate",
+                        summary="角色有一个独立的日常念头。"),
+            self.intent(opportunity, purpose="care", identifier="care-candidate",
+                        summary="这是一次关系表达机会。"),
+        )
+        origin = {
+            "batch_id": "original-batch",
+            "event_key": "original-event",
+            "event_hash": "original-hash",
+            "role_hash": digest(role_instruction),
+            "relationship_event": {"mode": "slot", "purposes": ["care"]},
+        }
+
+        with patch.object(app.proactive.schedule, "validate_origin", return_value=None):
+            task = (await app.proactive.contact(self.contact_context(), opportunity, intents,
+                role_instruction=role_instruction, selection_seed="mixed-candidate-seed",
+                automatic_origin=origin)).unwrap().task
+
+        row = app.runtime.read_one("SELECT record_json FROM proactive_contacts WHERE task_id = ?",
+                                   (task.task_id,))
+        record = json.loads(row["record_json"])
+        selected_purpose = record["purpose"]
+        relationship_instruction = "这是主动表达方向，不代表用户说过特定关键词或当前有同等意愿。"
+        if selected_purpose == "chat":
+            self.assertNotIn("relationship_event", record["automatic_origin"])
+            self.assertNotIn(relationship_instruction, self.called[-1].original.instruction)
+        else:
+            self.assertEqual(selected_purpose, "care")
+            self.assertEqual(record["automatic_origin"]["relationship_event"]["purposes"], ["care"])
+            self.assertIn(relationship_instruction, self.called[-1].original.instruction)
+
     async def test_proactive_contact_uses_saved_segmentation_and_delivers_ordered_parts(self):
         app = await self.enabled()
         self.presentation_settings(app, {"enabled": True, "llm_controlled": True,
@@ -847,6 +884,7 @@ class ProactiveContactTests(ContactFixture, unittest.IsolatedAsyncioTestCase):
         with patch.object(app.role_state, "read", return_value={
             "state": "active",
             "values": {"energy": 25, "sleep": "昨晚熬夜有点困", "mood": "微倦但平静"},
+            "sleep_execution": {"state": "awake", "awake_minutes": 10},
         }):
             self.presentation_settings(app, {"enabled": True, "llm_controlled": True,
                 "rules_enabled": False, "part_gap_mode": "log", "part_gap_min_ms": 1500,
@@ -862,3 +900,16 @@ class ProactiveContactTests(ContactFixture, unittest.IsolatedAsyncioTestCase):
         seg = json.loads(row["record_json"])["segmentation_settings"]
         self.assertEqual(seg.get("role_energy"), 25)
         self.assertTrue(seg.get("role_sleepy"))
+
+    async def test_awake_sleep_prose_does_not_force_sleepy_contact_pacing(self):
+        app = await self.enabled()
+        with patch.object(app.role_state, "read", return_value={
+            "state": "active", "values": {"energy": 85, "sleep": "睡得很好，不困了",
+                "conditions": [{"kind": "other", "text": "打算睡前再看一章"}]},
+            "sleep_execution": {"state": "awake", "awake_minutes": 120},
+        }):
+            task = (await self.contact(app, self.opportunity("awake-prose"))).unwrap().task
+        row = app.runtime.read_one("SELECT record_json FROM proactive_contacts WHERE task_id = ?", (task.task_id,))
+        self.assertFalse(json.loads(row["record_json"])["segmentation_settings"].get("role_sleepy", False))
+        intent = next(item for item in self.called[-1].original.context.materials if item.purpose == "contact_intent")
+        self.assertEqual(json.loads(intent.payload)["role_state"]["sleep"], "睡得很好，不困了")

@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, patch
 
 from astrbot_host.mobile_together import MobileTogetherBridge
 from companion_v2.execution.models import TaskError
+from companion_v2.foundation.outcome import Outcome
+from companion_v2.foundation.refs import ScopeKind, ScopeRef
 from companion_v2.sources.models import GovernanceState
 from companion_v2.storage.runtime import StorageRuntime
 
@@ -98,7 +100,7 @@ class MobileTogetherBridgeTests(unittest.IsolatedAsyncioTestCase):
                 }),
             "together": SimpleNamespace(companion_v2_status=lambda: {
                 "schema": "companion.provider-status.v1",
-                "plugin_id": "astrbot_plugin_private_companion_v2.together",
+                "plugin_id": "astrbot_plugin_private_companion.together",
                 "enabled": True,
                 "runtime_ready": False,
             }),
@@ -131,7 +133,7 @@ class MobileTogetherBridgeTests(unittest.IsolatedAsyncioTestCase):
     def test_disabled_room_service_is_distinct_from_missing_create_consent(self):
         self.apis['together'].companion_v2_status = lambda: {
             'schema': 'companion.provider-status.v1',
-            'plugin_id': 'astrbot_plugin_private_companion_v2.together',
+            'plugin_id': 'astrbot_plugin_private_companion.together',
             'enabled': False, 'runtime_ready': False}
         disabled = self.bridge.status('valid-session-token-123456')
         self.assertFalse(disabled['enabled'])
@@ -139,7 +141,7 @@ class MobileTogetherBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(disabled['reason'], 'mobile_together_disabled')
         self.apis['together'].companion_v2_status = lambda: {
             'schema': 'companion.provider-status.v1',
-            'plugin_id': 'astrbot_plugin_private_companion_v2.together',
+            'plugin_id': 'astrbot_plugin_private_companion.together',
             'enabled': True, 'runtime_ready': True}
         self.allowed.remove('together.room.create')
         denied = self.bridge.status('valid-session-token-123456')
@@ -309,6 +311,48 @@ class MobileTogetherBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.controller.authority = object()
         with self.assertRaisesRegex(TaskError, "more than one"):
             self.bridge._target_context("12345")
+
+    def test_explicit_primary_target_wins_over_wildcard_test_account(self):
+        self.controller._multi_host = True
+        exact = SimpleNamespace(target_id="exact-primary", participant_id="12345")
+        template = SimpleNamespace(target_id="wildcard-template", participant_id="*")
+        generated = SimpleNamespace(target_id="private-generated", participant_id="12345")
+        self.controller.settings = SimpleNamespace(
+            targets=(template, exact),
+            accounts=(SimpleNamespace(platform_id="qq", self_id="account-a"),
+                      SimpleNamespace(platform_id="test", self_id="test-account")),
+            private_target=lambda platform, account, participant: (
+                exact if account == "account-a" else generated)
+                if participant == "12345" else None)
+        scope = ScopeRef("mobile-test", "qq", ScopeKind.PRIVATE, "12345",
+                         "bot-a", "account-a", "conversation-a", "12345")
+        context = SimpleNamespace(
+            scope=scope,
+            actor=SimpleNamespace(principal=SimpleNamespace(native_account_id="12345")),
+            key="context-exact",
+        )
+        selected_targets = []
+
+        class Authority:
+            def read(inner, key):
+                return scope.document()
+
+            def context(inner, target_id, role_id):
+                selected_targets.append(target_id)
+                return context
+
+            class Personas:
+                def resolve(inner, scope, *, observed_at):
+                    return Outcome.success(SimpleNamespace(
+                        binding=SimpleNamespace(role=SimpleNamespace(subject_id="role-a"))))
+
+            personas = Personas()
+
+        self.controller.authority = Authority()
+        resolved = self.bridge._target_context("12345")
+        self.assertIsNotNone(resolved)
+        self.assertIs(resolved[2], context)
+        self.assertEqual(selected_targets, ["exact-primary"])
 
 
 if __name__ == "__main__":

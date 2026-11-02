@@ -14,6 +14,7 @@ from astrbot.core.message.components import Video
 from astrbot_host.media_components import private_components
 from astrbot_host.video.loader import load_native_video
 from companion_v2.execution.models import TaskError, stamp
+from companion_v2.foundation.refs import ScopeRef, SubjectKind, SubjectRef
 from companion_v2.memory.models import AtomRef, owner_key
 from companion_v2.adapters.astrbot.staging import NativeAdapterTypes
 from tests.multi_host_support import MultiFixture, multi_config
@@ -21,7 +22,7 @@ from tests.native_adapter_support import completion
 from tests.staging_bootstrap_support import database_contents, wait_for_batch
 from tests.memory_stream_support import StreamFixture
 from tests.video_support import video_bytes
-from astrbot_host.multi_settings import MultiHostSettings
+from astrbot_host.multi_settings import MultiHostSettings, find_persona_mapping
 from astrbot_host.shared_host_migration import migrate_single_target_config
 from astrbot_host.multi_authority import MultiAuthority
 from astrbot_host.settings import INSTALLATION_PREFIX
@@ -41,6 +42,24 @@ class _Query(dict):
 
 
 class MultiSettingsTests(unittest.TestCase):
+    def test_model_output_limit_uses_the_same_ceiling_as_runtime(self):
+        config = multi_config()
+        config["model"]["max_output_tokens"] = 65_536
+        self.assertEqual(MultiHostSettings.parse(config).common.max_output_tokens, 65_536)
+        config["model"]["max_output_tokens"] = 65_537
+        with self.assertRaises(ValueError):
+            MultiHostSettings.parse(config)
+
+    def test_follow_window_mapping_applies_only_when_it_is_the_bot_single_mapping(self):
+        from astrbot_host.multi_settings import PersonaMapping
+
+        default = PersonaMapping("bot-a", "[%None]", "role-default")
+        explicit = PersonaMapping("bot-a", "second", "role-second")
+
+        self.assertEqual(find_persona_mapping((default,), "bot-a", "custom"),
+                         PersonaMapping("bot-a", "custom", "role-default"))
+        self.assertEqual(find_persona_mapping((default, explicit), "bot-a", "custom"), None)
+        self.assertEqual(find_persona_mapping((default, explicit), "bot-a", "second"), explicit)
     def test_legacy_mode_is_migrated_and_ambiguous_routes_are_rejected(self):
         config = multi_config()
         config["staging"]["enabled"] = True
@@ -67,8 +86,84 @@ class MultiSettingsTests(unittest.TestCase):
         reordered["multi_host"]["personas"].reverse()
         self.assertEqual(MultiHostSettings.parse(original), MultiHostSettings.parse(reordered))
 
+    def test_same_persona_uses_one_shared_role_across_bot_accounts(self):
+        config = multi_config()
+        config["multi_host"]["personas"] = [
+            {"bot_id": "bot-a", "persona_id": "星缘-私聊", "role_id": "星缘"},
+            {"bot_id": "bot-b", "persona_id": "星缘-私聊", "role_id": "role-bot-b-generated"},
+        ]
+        parsed = MultiHostSettings.parse(config)
+        self.assertEqual({mapping.role_id for mapping in parsed.personas}, {"星缘"})
+
+    def test_differently_named_roles_for_the_same_persona_stay_separate(self):
+        config = multi_config()
+        config["multi_host"]["personas"] = [
+            {"bot_id": "bot-a", "persona_id": "星缘-私聊", "role_id": "星缘"},
+            {"bot_id": "bot-b", "persona_id": "星缘-私聊", "role_id": "小星"},
+        ]
+        parsed = MultiHostSettings.parse(config)
+        self.assertEqual({mapping.role_id for mapping in parsed.personas}, {"星缘", "小星"})
+
+    def test_shared_persona_merge_keeps_legacy_role_aliases_for_runtime_reads(self):
+        config = multi_config()
+        config["multi_host"]["personas"] = [
+            {"bot_id": "bot-a", "persona_id": "星缘-私聊", "role_id": "role-bot-a-generated"},
+            {"bot_id": "bot-b", "persona_id": "星缘-私聊", "role_id": "role-bot-b-generated"},
+        ]
+        parsed = MultiHostSettings.parse(config)
+        canonical = {mapping.role_id for mapping in parsed.personas}
+        self.assertEqual(len(canonical), 1)
+        canonical_role = next(iter(canonical))
+        for old_role in ("role-bot-a-generated", "role-bot-b-generated"):
+            self.assertEqual(parsed.canonical_role_id(old_role), canonical_role)
+
+    def test_existing_manifest_accepts_one_shared_role_after_upgrade(self):
+        from astrbot_host.multi_authority import MultiAuthority
+
+        pinned = {"personas": [
+            {"bot_id": "bot-a", "persona_id": "星缘-私聊", "role_id": "星缘"},
+            {"bot_id": "bot-b", "persona_id": "星缘-私聊", "role_id": "role-bot-b-generated"},
+        ]}
+        current = {"personas": [
+            {"bot_id": "bot-a", "persona_id": "星缘-私聊", "role_id": "星缘"},
+            {"bot_id": "bot-b", "persona_id": "星缘-私聊", "role_id": "星缘"},
+        ]}
+        self.assertEqual(MultiAuthority._binding_differences(pinned, current), ())
+
+    def test_window_links_reference_existing_private_windows_and_one_mode(self):
+        config = multi_config()
+        config["multi_host"]["window_links"] = [
+            {"primary_target_id": "first", "alias_target_ids": ["second"], "mode": "role"},
+        ]
+        parsed = MultiHostSettings.parse(config)
+        self.assertEqual(parsed.window_links[0].alias_target_ids, ("second",))
+        self.assertEqual(parsed.window_links[0].mode, "role")
+        self.assertEqual(parsed.window_link_for_target("second").primary_target_id, "first")
+        bad = deepcopy(config)
+        bad["multi_host"]["window_links"][0]["alias_target_ids"] = ["first"]
+        with self.assertRaises(ValueError):
+            MultiHostSettings.parse(bad)
+
 
 class NativePersonaSelectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_group_window_ignores_the_private_conversation_default(self):
+        from astrbot_host.session_topology import SessionTopology
+
+        lookup = AsyncMock(return_value="group-persona")
+        context = NS(get_config=lambda **_kwargs: {
+            "agent_runner": {"runner_type": "local",
+                             "config": {"persona": {"persona_id": "group-persona"}}}})
+        topology = object.__new__(SessionTopology)
+        topology.controller = NS(context=context, _multi_host=True,
+                                 native_types=NS(persona_selection_lookup=lookup))
+
+        selected = await topology._selected_native_persona(
+            "qq-main:GroupMessage:201", "private-persona")
+
+        self.assertEqual(selected, "group-persona")
+        lookup.assert_awaited_once_with(topology.controller.context,
+                                        "qq-main:GroupMessage:201", None)
+
     async def test_empty_resolver_result_uses_the_configured_window_default(self):
         configuration = {
             "agent_runner": {"runner_type": "local", "config": {"persona": {"persona_id": "private-persona"}}},
@@ -113,6 +208,224 @@ class LegacyStagingReceiptTests(unittest.TestCase):
 
 
 class MultiHostTests(MultiFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_saved_large_output_limit_prepares_and_reloads(self):
+        prepared = await self.controller.initialize_profile()
+        self.assertTrue(prepared.is_success, prepared.failure)
+        await self.controller.terminate()
+
+        config = multi_config()
+        config["model"]["max_output_tokens"] = 50_000
+        self.controller = self.make_controller(config)
+        loaded = await self.controller.load_existing()
+        self.assertTrue(loaded.is_success, loaded.failure)
+        self.assertTrue(loaded.unwrap()["loaded"])
+        self.assertEqual(self.controller.session.application.router.profiles["conversation.reply"].max_output_tokens,
+                         50_000)
+
+    async def test_legacy_default_mapping_routes_the_window_selected_persona(self):
+        config = multi_config()
+        config["multi_host"]["personas"] = [
+            {"bot_id": "bot-a", "persona_id": "[%None]", "role_id": "role-a"},
+            {"bot_id": "bot-b", "persona_id": "original", "role_id": "role-b"},
+            {"bot_id": "bot-b", "persona_id": "second", "role_id": "role-b-second"},
+        ]
+        self.controller = self.make_controller(config)
+        await self.start_host()
+        self.window_personas["qq-main:FriendMessage:200"] = "second"
+
+        mapping = await self.controller.persona_mapping_for_event(self.event())
+        account = self.controller.session.bridge.accounts[("qq-main", "100")]
+        _, _, _, projection, instruction = await self.controller.session.bridge._selected_role_snapshot(
+            account, "qq-main:FriendMessage:200")
+
+        self.assertEqual((mapping.persona_id, mapping.role_id), ("second", "role-a"))
+        self.assertEqual((projection.persona_id, projection.role.subject_id), ("second", "role-a"))
+        self.assertEqual(instruction, self.native.persona_records["second"]["prompt"])
+
+    async def test_initialize_profile_rebuilds_and_resumes_a_running_host(self):
+        await self.start_host()
+        previous = self.controller.session
+
+        result = await self.controller.initialize_profile()
+
+        self.assertTrue(result.is_success, result.failure)
+        self.assertEqual(previous.application.state, "stopped")
+        self.assertIsNot(self.controller.session, previous)
+        self.assertEqual(self.controller.session.application.state, "running")
+        self.assertTrue(self.controller._accepting)
+
+    async def test_primary_window_link_moves_alias_capture_to_the_primary_window(self):
+        config = multi_config()
+        config["multi_host"]["window_links"] = [
+            {"primary_target_id": "first", "alias_target_ids": ["second"], "mode": "primary"},
+        ]
+        self.controller = self.make_controller(config)
+        await self.start_host()
+        captured = (await self.controller.session.bridge.capture(self.event("second"))).unwrap()
+        self.assertEqual(captured.principal.account_id, "100")
+        self.assertEqual(captured.route.scope.account_id, "100")
+        self.assertEqual(captured.route.scope.native_scope_id, "200")
+        accepted = await self.controller.receive_claimed(self.event("second"))
+        self.assertTrue(accepted.is_success, accepted.failure)
+
+    async def test_role_window_link_keeps_alias_scope_but_shares_primary_role(self):
+        config = multi_config()
+        config["multi_host"]["personas"] = [
+            {"bot_id": "bot-a", "persona_id": "original", "role_id": "星缘"},
+            {"bot_id": "bot-a", "persona_id": "second", "role_id": "小星"},
+            {"bot_id": "bot-b", "persona_id": "original", "role_id": "小星"},
+            {"bot_id": "bot-b", "persona_id": "second", "role_id": "小星"},
+        ]
+        config["multi_host"]["window_links"] = [
+            {"primary_target_id": "first", "alias_target_ids": ["second"], "mode": "role"},
+        ]
+        self.controller = self.make_controller(config)
+        await self.start_host()
+        captured = (await self.controller.session.bridge.capture(self.event("second"))).unwrap()
+        self.assertEqual(captured.route.scope.account_id, "101")
+        self.assertEqual(captured.role.subject_id, "星缘")
+        accepted = await self.controller.receive_claimed(self.event("second"))
+        self.assertTrue(accepted.is_success, accepted.failure)
+
+    async def test_window_link_api_saves_primary_mode(self):
+        from astrbot_host.account_session_api import AccountSessionWebAPI
+        from types import SimpleNamespace as NS
+
+        api = AccountSessionWebAPI(self.controller)
+        body = json.dumps({"primary_target_id": "first", "alias_target_ids": ["second"],
+                           "mode": "primary"}).encode("utf-8")
+        fake_request = NS(username="admin", query={}, body=AsyncMock(return_value=body))
+        with patch("astrbot_host.account_session_api.request", fake_request), \
+                patch.object(self.controller, "apply_bindings", AsyncMock(return_value={"started": False})) as apply:
+            response = await api.link_window()
+        self.assertEqual(response["status"], "ok")
+        candidate = apply.await_args.args[0]
+        self.assertEqual(candidate["multi_host"]["window_links"][0]["alias_target_ids"], ["second"])
+
+    async def test_reviewed_bindings_detect_conflict_before_stopping_the_running_host(self):
+        await self.start_host()
+        expected = deepcopy(self.controller.config)
+        candidate = deepcopy(expected)
+        save = self.controller.save_plugin_config = AsyncMock()
+        original_probe = self.controller._probe
+        session = self.controller.session
+
+        async def changed_during_probe(*args, **kwargs):
+            result = await original_probe(*args, **kwargs)
+            self.controller.config["concurrent_edit"] = True
+            return result
+
+        with patch.object(self.controller, "_probe", side_effect=changed_during_probe), \
+                patch.object(session, "close", wraps=session.close) as close:
+            with self.assertRaises(TaskError) as caught:
+                await self.controller.apply_bindings(candidate, expected_config=expected)
+            close.assert_not_called()
+        self.assertEqual(caught.exception.code, "legacy_plan_stale")
+        save.assert_not_called()
+        self.assertIs(self.controller.session, session)
+        self.assertTrue(self.controller._accepting)
+        self.assertEqual(session.application.state, "running")
+
+    async def test_reviewed_bindings_resume_saved_routes_if_conflict_arrives_during_close(self):
+        await self.start_host()
+        expected = deepcopy(self.controller.config)
+        candidate = deepcopy(expected)
+        save = self.controller.save_plugin_config = AsyncMock()
+        session = self.controller.session
+        original_close = session.close
+
+        async def changed_during_close(*args, **kwargs):
+            result = await original_close(*args, **kwargs)
+            self.controller.config["concurrent_edit"] = True
+            return result
+
+        with patch.object(session, "close", side_effect=changed_during_close):
+            with self.assertRaises(TaskError) as caught:
+                await asyncio.wait_for(
+                    self.controller.apply_bindings(candidate, expected_config=expected), timeout=20)
+        self.assertEqual(caught.exception.code, "legacy_plan_stale")
+        save.assert_not_called()
+        self.assertTrue(self.controller.config["concurrent_edit"])
+        self.assertTrue(self.controller._accepting)
+        self.assertEqual(self.controller.session.application.state, "running")
+        self.assertIsNot(self.controller.session, session)
+
+    async def test_reviewed_bindings_reject_configuration_changed_while_waiting_for_lifecycle(self):
+        expected = deepcopy(self.controller.config)
+        candidate = deepcopy(expected)
+        save = self.controller.save_plugin_config = AsyncMock()
+        async with self.controller._lifecycle_lock:
+            applying = asyncio.create_task(self.controller.apply_bindings(candidate, expected_config=expected))
+            await asyncio.sleep(0)
+            self.controller.config["multi_host"]["installation_id"] = "changed-installation"
+        with self.assertRaises(TaskError) as caught:
+            await asyncio.wait_for(applying, timeout=2)
+        self.assertEqual(caught.exception.code, "legacy_plan_stale")
+        save.assert_not_called()
+
+    async def test_reviewed_bindings_prepare_the_first_valid_configuration(self):
+        candidate = multi_config()
+        unconfigured = deepcopy(candidate)
+        unconfigured["multi_host"] = {"enabled": False, "targets": [], "personas": []}
+        self.controller = self.make_controller(unconfigured)
+        self.assertEqual(self.controller.settings_error.code, "host_mappings_required")
+
+        def save(document):
+            self.controller.config.clear()
+            self.controller.config.update(deepcopy(document))
+
+        self.controller.save_plugin_config = save
+        result = await self.controller.apply_bindings(candidate)
+
+        self.assertTrue(result["saved"], result)
+        self.assertTrue(result["started"], result)
+        self.assertIsNone(self.controller.settings_error)
+        self.assertTrue(self.controller.status()["accepting"])
+
+    async def test_reviewed_persona_mapping_uses_astrbot_current_provider_when_blank(self):
+        candidate = multi_config()
+        candidate["model"]["provider_id"] = ""
+        unconfigured = deepcopy(candidate)
+        unconfigured["multi_host"] = {"enabled": False, "targets": [], "personas": []}
+        self.controller = self.make_controller(unconfigured)
+        self.assertEqual(self.controller.settings_error.code, "host_mappings_required")
+
+        def save(document):
+            self.controller.config.clear()
+            self.controller.config.update(deepcopy(document))
+
+        self.controller.save_plugin_config = save
+        result = await self.controller.apply_bindings(candidate)
+
+        self.assertTrue(result["saved"], result)
+        self.assertTrue(result["started"], result)
+        self.assertEqual(self.controller.settings.common.provider_id, "native-model")
+        self.assertEqual(self.controller.config["model"]["provider_id"], "")
+        self.assertEqual(self.controller.config["multi_host"]["personas"], candidate["multi_host"]["personas"])
+        self.assertIsNotNone(self.controller.runtime)
+        self.assertTrue(self.controller.status()["accepting"])
+        self.assertIsNone(self.controller.settings_error)
+
+    async def test_reviewed_persona_mapping_saves_when_selected_model_is_unavailable(self):
+        candidate = multi_config()
+        candidate["model"]["provider_id"] = "temporarily-missing"
+        unconfigured = deepcopy(candidate)
+        unconfigured["multi_host"] = {"enabled": False, "targets": [], "personas": []}
+        self.controller = self.make_controller(unconfigured)
+
+        def save(document):
+            self.controller.config.clear()
+            self.controller.config.update(deepcopy(document))
+
+        self.controller.save_plugin_config = save
+        result = await self.controller.apply_bindings(candidate)
+
+        self.assertTrue(result["saved"], result)
+        self.assertFalse(result["started"], result)
+        self.assertEqual(result["startup_error"], "host_provider_unavailable")
+        self.assertEqual(self.controller.config["multi_host"]["personas"], candidate["multi_host"]["personas"])
+        self.assertIsNone(self.controller.runtime)
+
     async def test_profile_initialization_does_not_load_the_global_identity_grant_snapshot(self):
         with patch("companion_v2.identity_policy.repository.PersistentIdentityDirectory.snapshot",
                    side_effect=AssertionError("profile provisioning should read only the current subject")):
@@ -361,7 +674,7 @@ class MultiHostTests(MultiFixture, unittest.IsolatedAsyncioTestCase):
         config = multi_config()
         config["staging"]["profile_id"] = legacy_profile
         controller = self.make_controller(config)
-        self.assertEqual(controller.profile_root, legacy_root)
+        self.assertTrue(controller.profile_root.samefile(legacy_root))
         self.assertTrue(controller._adopting_legacy_profile)
         self.assertEqual(controller.settings.installation_id, INSTALLATION_PREFIX + legacy_profile)
 
@@ -370,7 +683,7 @@ class MultiHostTests(MultiFixture, unittest.IsolatedAsyncioTestCase):
             data_root=shared_root / "runtime", installation_id=controller.settings.installation_id)
         shared_runtime.close()
         preferred = self.make_controller(config)
-        self.assertEqual(preferred.profile_root, shared_root)
+        self.assertTrue(preferred.profile_root.samefile(shared_root))
         self.assertFalse(preferred._adopting_legacy_profile)
 
     async def test_dashboard_routes_bind_each_target_memory_api_and_unregister_cleanly(self):
@@ -383,15 +696,15 @@ class MultiHostTests(MultiFixture, unittest.IsolatedAsyncioTestCase):
         }
         materials_route = NATIVE_PERCEPTION_PREFIX + "/materials"
         self.assertTrue({
-            "/astrbot_plugin_private_companion_v2/host-options",
-            "/astrbot_plugin_private_companion_v2/host-options/voice",
-            "/astrbot_plugin_private_companion_v2/host-options/poke",
-            "/astrbot_plugin_private_companion_v2/host-options/forward_intake",
-            "/astrbot_plugin_private_companion_v2/host-options/balance",
-            "/astrbot_plugin_private_companion_v2/storage",
+            "/astrbot_plugin_private_companion/host-options",
+            "/astrbot_plugin_private_companion/host-options/voice",
+            "/astrbot_plugin_private_companion/host-options/poke",
+            "/astrbot_plugin_private_companion/host-options/forward_intake",
+            "/astrbot_plugin_private_companion/host-options/balance",
+            "/astrbot_plugin_private_companion/storage",
         }.issubset(registered))
         storage_methods = {tuple(methods) for route, _, methods, _ in self.native.registered_web_apis
-                           if route == "/astrbot_plugin_private_companion_v2/storage"}
+                           if route == "/astrbot_plugin_private_companion/storage"}
         self.assertEqual(storage_methods, {("GET",), ("POST",)})
         self.assertTrue(expected.issubset(registered))
         self.assertIn(materials_route, registered)
@@ -409,8 +722,12 @@ class MultiHostTests(MultiFixture, unittest.IsolatedAsyncioTestCase):
                             for handler in memory_handlers))
 
         request = NS(username="dashboard-admin", query=_Query())
-        with patch("astrbot_host.multi_api.request", request), patch("astrbot_host.memory_api.request", request):
-            self.assertEqual((await registered[MULTI_HOST_PREFIX + "/status"]())["status"], "ok")
+        expected_parsers = {".pdf": True, ".docx": False, ".xlsx": True, ".pptx": False}
+        with patch("astrbot_host.multi_api.request", request), patch("astrbot_host.memory_api.request", request), \
+                patch("astrbot_host.multi_controller.parser_availability", return_value=expected_parsers):
+            status_response = await registered[MULTI_HOST_PREFIX + "/status"]()
+            self.assertEqual(status_response["status"], "ok")
+            self.assertEqual(status_response["data"]["parser_availability"], expected_parsers)
             self.assertEqual((await registered[MULTI_HOST_PREFIX + "/probe"]())["status"], "ok")
             self.assertEqual((await registered[MULTI_HOST_PREFIX + "/initialize"]())["status"], "ok")
             self.assertEqual((await registered[MULTI_HOST_PREFIX + "/start"]())["status"], "ok")
@@ -860,6 +1177,60 @@ class MultiHostTests(MultiFixture, unittest.IsolatedAsyncioTestCase):
         result = await self.controller.initialize_profile()
         self.assertEqual(result.failure.code, "authorization_revoked",
                          "必需能力被收回是真故障，不能跟着一起放行")
+
+    async def test_role_level_api_source_skips_wildcard_templates(self):
+        config = multi_config()
+        config["multi_host"]["targets"] = [
+            {"target_id": "wild", "platform_id": "qq-main", "account_id": "100",
+             "bot_id": "bot-a", "participant_id": "*"},
+            {"target_id": "exact", "platform_id": "qq-second", "account_id": "101",
+             "bot_id": "bot-b", "participant_id": "200"},
+        ]
+        config["multi_host"]["personas"] = [
+            {"bot_id": "bot-a", "persona_id": "original", "role_id": "role-shared"},
+            {"bot_id": "bot-b", "persona_id": "original", "role_id": "role-shared"},
+        ]
+        controller = self.make_controller(config)
+        self.assertEqual(controller.role_source_target_id("role-shared", "wild"), "exact")
+        self.assertEqual(controller.role_source_target_id("role-shared", "exact"), "exact")
+
+    async def test_context_follows_legacy_role_id_after_shared_persona_merge(self):
+        config = multi_config()
+        config["multi_host"]["personas"] = [
+            {"bot_id": "bot-a", "persona_id": "original", "role_id": "role-bot-a-generated"},
+            {"bot_id": "bot-b", "persona_id": "original", "role_id": "role-bot-b-generated"},
+        ]
+        controller = self.make_controller(config)
+        initialized = await controller.initialize_profile()
+        self.assertTrue(initialized.is_success, initialized.failure)
+        canonical_roles = {item.role_id for item in controller.settings.personas}
+        self.assertEqual(len(canonical_roles), 1)
+        canonical_role = next(iter(canonical_roles))
+        alias = next(role for role in controller.settings.role_aliases if role != canonical_role)
+        self.assertEqual(controller.settings.canonical_role_id(alias), canonical_role)
+
+        target = controller.settings.target("first")
+        stored = controller.authority.read(controller.authority.context_key(target, canonical_role))
+        self.assertIsNotNone(stored)
+        scope = ScopeRef.restore(stored)
+        selected = controller.authority.personas.resolve(
+            scope, observed_at=self.clock.now()).unwrap().selected
+        old_role = SubjectRef(controller.settings.installation_id, SubjectKind.BOT, alias)
+        controller.authority.personas.set_binding(
+            replace(selected, role=old_role, revision=selected.revision + 1),
+            expected_revision=selected.revision, observed_at=self.clock.now())
+        with controller.runtime.transaction() as connection:
+            connection.execute("DELETE FROM runtime_metadata WHERE key = ?",
+                               (controller.authority.context_key(target, canonical_role),))
+        controller.authority.write(controller.authority.context_key(target, alias), scope.document())
+
+        context = controller.authority.context(target.target_id, canonical_role)
+        self.assertEqual(context.role_binding.role.subject_id, canonical_role)
+        self.assertEqual(context.scope.key, scope.key)
+        resolved = controller.authority.identities.resolve_role(
+            context.scope, observed_at=self.clock.now())
+        self.assertTrue(resolved.is_success, resolved.failure)
+        self.assertEqual(resolved.unwrap(), context.role_binding)
 
 
 class MultiHostVideoTests(MultiFixture, unittest.IsolatedAsyncioTestCase):
