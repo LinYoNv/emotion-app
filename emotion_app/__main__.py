@@ -75,7 +75,14 @@ async def _serve() -> int:
     auth = AuthManager(
         access_token=config.auth.access_token,
         ttl_hours=config.auth.session_ttl_hours,
+        # 🔴 登录会话要落盘（2026-11-02）：否则**每次重启服务所有人都被踢下线**
+        #    （浏览器还带着 cookie，而服务端已经不认识它 ⇒ 401 ⇒ 弹回登录框）。
+        #    情绪原话：「说 24 小时但是我切出去干别的半小时就要重新刷新界面，
+        #    填 token」—— cookie 的 Max-Age 一直是好的（生产实测 7 天），
+        #    真凶是会话只活在内存字典里。
+        store=store,
     )
+    await auth.load()
 
     # 领域服务
     settings = SettingsService(store, config)

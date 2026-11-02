@@ -149,6 +149,39 @@ def main() -> int:
         if json.loads(leaked or "{}").get("body"):
             fails.append("令牌出现在 DOM 里")
 
+        # ---- 5b) 服务端会话没了 → 必须自动弹回登录框 ----
+        #  🔴 情绪 2026-11-02 报障的后半截：会话原来只在内存里，
+        #     重启就全丢，而页面**毫无反应**（`recheckLogin` 进去后就不探了），
+        #     用户要等下一次操作报错才发现。这条守"确定过期时要主动弹框"。
+        #
+        #  ⚠️ 判据不能用"重启服务"来造前置（那会把判据绑到外部进程上）。
+        #     这里直接调 logout 让服务端作废这个会话 —— 效果等价，
+        #     而且不依赖我们控制不了的部署动作。
+        # ⚠️ `cdp.eval` 拿不到 Promise 的解析值（同步返回），所以要
+        #    用 awaitPromise。写错的话打印出来是 `HTTP {}`，看着像成功，
+        #    其实**根本没确认作废是否发生** —— 那种判据是假判据。
+        forced = cdp.eval(
+            "fetch('/api/v1/auth/logout',{method:'POST'}).then(r=>String(r.status))",
+            await_promise=True,
+        )
+        print(f"5b) 已让服务端作废本会话: HTTP {forced}")
+        if str(forced).strip() != "200":
+            fails.append(f"作废会话没成功（HTTP {forced}），第 5b 项前置不满足")
+        # 触发一次 recheckLogin（它挂在 focus / visibilitychange 上）
+        cdp.eval("window.dispatchEvent(new Event('focus'))")
+        time.sleep(2.5)
+        gate3 = cdp.eval(VISIBLE)
+        print(f"5b) 会话作废后是否自动弹回登录框: {gate3}")
+        if not gate3:
+            fails.append(
+                "服务端会话已作废，页面却没有弹回登录框 —— "
+                "用户会看着一个数据全 401 的空面板"
+            )
+
+        # 重新登录，供第 6 项使用
+        cdp.eval(SUBMIT.format(t=json.dumps(token)))
+        time.sleep(2.5)
+
         # ---- 6) 登录态"迟到生效"时必须自动解锁 ----
         #  🔴 这是**真 bug**（实测抓到，与第 4 项同类）：
         #     浮层是 fail-closed 设计（HTML 里默认可见），

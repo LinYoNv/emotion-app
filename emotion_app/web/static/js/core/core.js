@@ -649,11 +649,34 @@ export function asArray(obj, field) {
       只能靠 CDP/curl 手动 POST /api/v1/auth/login 绕过。
       用户打开浏览器只会看到空列表 + 401，不知道该怎么办。
    令牌**不落任何浏览器存储**：登录后由服务端下发 HttpOnly cookie。 */
-export async function isLoggedIn() {
+
+/** 三种结果，**不能混成一个布尔**（情绪 2026-11-02 报障）。
+ *
+ *  - `"in"`       拿到 2xx，确实已登录
+ *  - `"out"`      **服务端明确说 401/403** —— 只有这才该弹登录框
+ *  - `"unknown"`  网络错误 / 超时 / 5xx —— 什么都不能断定，**不要弹框**
+ *
+ *  🔴 原来的写法是 `catch { return false; }`，把"请求失败"当成了"未登录"。
+ *     手机切后台再回来、隧道抖一下、服务正在重启 —— 全都会走到 catch，
+ *     于是用户明明登录着却被弹去重填令牌。
+ *     **"读不到"不等于"不存在"** —— 本项目通则里写过很多次，这次轮到登录态。
+ */
+export async function loginState() {
   try {
     const r = await fetch("/api/v1/status");
-    return r.ok;
-  } catch { return false; }
+    if (r.ok) return "in";
+    if (r.status === 401 || r.status === 403) return "out";
+    return "unknown";            // 5xx 等：服务有问题，不是没登录
+  } catch {
+    return "unknown";            // 断网、超时、AbortError 都到这里
+  }
+}
+
+/** 兼容旧调用。⚠️ 只有"明确未登录"才返回 false。
+ *  `unknown` 也返回 true —— 宁可带着可能过期的 cookie 去试，
+ *  也不要因为一次网络抖动把人踢到登录框。真过期了下一个 API 会 401。 */
+export async function isLoggedIn() {
+  return (await loginState()) !== "out";
 }
 
 export function showLogin(msg) {
@@ -707,12 +730,32 @@ export function boot() {
  *  浮层是 fail-closed 设计（默认可见，JS 挂了也不露裸面板），
  *  所以**每条"已登录"路径都必须显式关掉它**。
  *
- *  ⚠️ 只在浮层**可见时**才探，成功后走一次完整 `boot()`；已进入则直接返回。
  *  ⚠️ 监听器必须在**模块作用域**注册（实测踩到）：我一开始把它写在 `boot()` 里，
  *     而"没登录"时根本不会调 `boot()` → **监听器从来没装上**，修复形同虚设。
  *     这正是"写完模块+单测全绿却没接线"的老坑（本项目已固化 `test_assembly.py` 防它）。
+ *
+ *  🔴 **两个方向都要管**（情绪 2026-11-02 报障后补，原来只管一个方向）：
+ *
+ *  | 当前状态 | 探测结果 | 该做什么 |
+ *  |---|---|---|
+ *  | 浮层可见（未进） | in      | `boot()` 放行 |
+ *  | 浮层可见（未进） | out     | 什么都不做（已经在登录框） |
+ *  | **已进入**       | **out** | **弹回登录框**（会话真过期了） |
+ *  | **已进入**       | in/unknown | 什么都不做 |
+ *
+ *  原来第一行就是 `if (浮层已隐藏) return;` —— 登录进去之后**再也不探**，
+ *  于是 cookie 失效时页面毫无反应，用户要等到下一次操作报错才发现。
+ *  加上"已进入也要在 out 时弹框"这一支。
  */
 export async function recheckLogin() {
-  if ($("login").classList.contains("hidden")) return;   // 已经进去了
-  if (await isLoggedIn()) boot();
+  const showing = !$("login").classList.contains("hidden");
+  const state = await loginState();
+  if (showing) {
+    // 还没进来：只有确认已登录才放行（unknown 时保持原样，别乱弹）
+    if (state === "in") boot();
+    return;
+  }
+  // 已经进来：只有服务端**明确说**未登录才踢回去。unknown 一律不动 ——
+  // 网络抖一下就弹登录框正是这次要修的那个毛病。
+  if (state === "out") showLogin("登录已过期，请重新输入令牌。");
 }

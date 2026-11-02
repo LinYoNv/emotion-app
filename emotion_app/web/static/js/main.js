@@ -23,7 +23,7 @@
  *     本来就支持子目录，后端零改动）。
  */
 import { refreshUnread, send } from "./views/chat.js";
-import { $, NAV_LOADERS, api, applyRoute, boot, go, isLoggedIn, recheckLogin, showLogin, state, syncSidebarAria, toast, toggleSidebar } from "./core/core.js";
+import { $, NAV_LOADERS, api, applyRoute, boot, go, isLoggedIn, loginState, recheckLogin, showLogin, state, syncSidebarAria, toast, toggleSidebar } from "./core/core.js";
 import { renderPromptStats, selectPersona } from "./views/persona.js";
 import { openPluginConfig, renderNavPluginPages } from "./views/plugins.js";
 import { loadProviderSources, selectProviderSource } from "./views/providers.js";
@@ -58,7 +58,13 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("focus", recheckLogin);
 
-/* 先探一次：已登录（cookie 还在）就直接进，否则弹登录框 */
-isLoggedIn().then((ok) => {
-  if (ok) { boot(); } else { showLogin(); }
+/* 先探一次：已登录（cookie 还在）就直接进，否则弹登录框。
+ *
+ * 🔴 用 `loginState()` 而不是 `isLoggedIn()`（2026-11-02）：
+ *    只有服务端**明确 401** 才该弹登录框。启动时网络还没就绪、
+ *    或者服务正在重启，`fetch` 会直接抛 —— 那种情况下弹框等于骗用户去
+ *    重填一个其实还有效的令牌。`unknown` 一律按"先放行"处理：
+ *    数据接口真过期了会各自 401，`recheckLogin()` 那边会把人送回登录框。 */
+loginState().then((state) => {
+  if (state === "out") { showLogin(); } else { boot(); }
 });

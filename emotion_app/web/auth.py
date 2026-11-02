@@ -62,6 +62,16 @@ class AuthManager:
     #: 失败计数滑动窗口（秒）
     failure_window_seconds: float = 300.0
 
+    #: 会话落盘后端（可选）。给了就持久化，没给就纯内存。
+    #:
+    #: 🔴 **为什么需要它**（情绪 2026-11-02 报障「cookie 说 24 小时，切出去
+    #:    半小时就要重填令牌」）：会话原本只存在这个字典里，**服务一重启就
+    #:    全部作废**，而浏览器里的 cookie 还在 ⇒ 带着一个服务端不认识的
+    #:    cookie 过来 ⇒ 401 ⇒ 弹回登录框。cookie 的 `Max-Age` 是好的
+    #:    （生产实测 `Max-Age=604800`，7 天），**问题从来不在 cookie**。
+    #:    开发期频繁重启时，表现就是"随手改个东西就得重新登录"。
+    store: Any = field(default=None, repr=False)
+
     _sessions: dict[str, Session] = field(default_factory=dict, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     #: client_key → 失败时间戳列表
@@ -150,8 +160,74 @@ class AuthManager:
             )
             self._sessions[session.token] = session
             self._purge_expired(now)
+            await self._persist()
             log.info("登录成功", extra={"data": {"ttl_hours": self.ttl_hours}})
             return session
+
+    # ---- 落盘（可选）----
+
+    #: 会话落在 store 的这个 section 里。
+    #: 与 `sessions`（用户的聊天会话）**完全不是一个概念**，别合并 ——
+    #: 那个是业务数据，这个是登录凭据。
+    SECTION = "auth_sessions"
+
+    @staticmethod
+    def _encode(sessions: dict[str, Session]) -> dict[str, dict[str, float]]:
+        """只存令牌本身与两个时间戳。
+
+        ⚠️ 这里存的是**会话令牌**（随机 32 字节，本就不含用户信息），
+        不是访问令牌；访问令牌仍然只以摘要形式留在内存里。
+        """
+        return {token: {"created_at": s.created_at, "expires_at": s.expires_at}
+                for token, s in sessions.items()}
+
+    async def load(self) -> int:
+        """从 store 载入未过期会话。返回载入条数。
+
+        ⚠️ **失败必须不让服务起不来**：登录态丢了顶多重新登录一次，
+        而 store 读失败如果抛出去，整个服务就是起不来 —— 代价不对等。
+        所以这里只记日志、按空会话继续。
+        """
+        if self.store is None:
+            return 0
+        try:
+            raw = await self.store.load_sections([self.SECTION])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("会话载入失败，按空会话继续", extra={"data": {"error": type(exc).__name__}})
+            return 0
+        items = (raw or {}).get(self.SECTION) or {}
+        if not isinstance(items, dict):
+            log.warning("会话 section 形状不对，已忽略")
+            return 0
+        now = time.time()
+        loaded = 0
+        for token, value in items.items():
+            if not isinstance(token, str) or not isinstance(value, dict):
+                continue
+            try:
+                created = float(value["created_at"])
+                expires = float(value["expires_at"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if expires <= now:      # 落盘后已经过期的，直接不要
+                continue
+            self._sessions[token] = Session(token=token, created_at=created, expires_at=expires)
+            loaded += 1
+        if loaded:
+            log.info("已载入登录会话", extra={"data": {"loaded": loaded}})
+        return loaded
+
+    async def _persist(self) -> None:
+        """把当前会话整体写回 store。没配 store 时是空操作。"""
+        if self.store is None:
+            return
+        try:
+            self._purge_expired()
+            await self.store.save_sections({self.SECTION: self._encode(self._sessions)})
+        except Exception as exc:  # noqa: BLE001
+            # 写盘失败不该让登录本身失败：本次会话在内存里照样有效，
+            # 只是重启后需要重新登录。降级而非报错。
+            log.warning("会话落盘失败", extra={"data": {"error": type(exc).__name__}})
 
     # ---- 校验 ----
 
@@ -167,10 +243,13 @@ class AuthManager:
             return False
         return True
 
-    def logout(self, session_token: str | None) -> bool:
+    async def logout(self, session_token: str | None) -> bool:
         if not session_token:
             return False
-        return self._sessions.pop(session_token, None) is not None
+        removed = self._sessions.pop(session_token, None) is not None
+        if removed:
+            await self._persist()
+        return removed
 
     # ---- 运维 ----
 

@@ -243,7 +243,7 @@ def create_app(
 
     @app.post("/api/v1/auth/logout")
     async def logout():  # type: ignore[no-untyped-def]
-        auth.logout(_session_token())
+        await auth.logout(_session_token())
         resp = jsonify({"ok": True})
         resp.delete_cookie(SESSION_COOKIE)
         return resp, 200

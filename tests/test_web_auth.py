@@ -57,7 +57,8 @@ async def test_session_expires():
 async def test_logout_invalidates():
     auth = AuthManager(access_token=TOKEN)
     session = await auth.login(TOKEN)
-    assert auth.logout(session.token) is True
+    # logout 是 async：它要把落盘的会话一并删掉（见 WebAuthSessionPersistenceTests）
+    assert await auth.logout(session.token) is True
     assert auth.verify_session(session.token) is False
 
 
@@ -296,3 +297,112 @@ def test_is_public_detects_non_loopback():
         cfg = C()
         cfg.server.host = host
         assert cfg.server.is_public() is expected, host
+
+
+# ---------------------------------------------------------------------------
+# 登录会话落盘（2026-11-02）
+#
+# 🔴 情绪报障：「cookie 说 24 小时，但是切出去半小时就要重新刷新界面填 token」。
+#    生产实测 cookie 的 Max-Age 是 604800（7 天），**cookie 从来不是问题**；
+#    真因是 `AuthManager._sessions` 只在进程内存里，**服务一重启全部作废**，
+#    而浏览器还带着那个 cookie ⇒ 401 ⇒ 弹回登录框。
+#
+#    所以这组判据守的是「重启后还能进」，不是「cookie 有多长」。
+#    ⚠️ 只断言"cookie 的 Max-Age 正确"是抓不住这个 bug 的 —— 它一直是对的。
+# ---------------------------------------------------------------------------
+
+
+class WebAuthSessionPersistenceTests:
+    """用真实的 SqliteStore 验证跨实例（= 跨重启）的会话存活。"""
+
+
+async def _store(tmp_path):
+    from emotion_app.infra.config import StorageConfig
+
+    store = SqliteStore(tmp_path / "persist.db")
+    await store.open()
+    return store
+
+
+async def test_session_survives_a_restart(tmp_path):
+    """🔴 核心判据：换一个 AuthManager 实例（模拟重启）后，旧 cookie 仍然有效。"""
+    store = await _store(tmp_path)
+    try:
+        first = AuthManager(access_token=TOKEN, store=store)
+        await first.load()
+        session = await first.login(TOKEN)
+        assert session is not None
+        token = session.token
+
+        # ---- 重启：新实例，从同一份 store 载入 ----
+        second = AuthManager(access_token=TOKEN, store=store)
+        loaded = await second.load()
+        assert loaded == 1, f"重启后应该载回 1 条会话，实际 {loaded}"
+        assert second.verify_session(token) is True, (
+            "重启后旧 cookie 必须仍然有效，否则用户每次重启都要重填令牌"
+        )
+    finally:
+        await store.close()
+
+
+async def test_expired_sessions_are_not_loaded_from_disk(tmp_path):
+    """落盘时还没过期、但下次启动时已过期的，不能复活。"""
+    store = await _store(tmp_path)
+    try:
+        auth = AuthManager(access_token=TOKEN, ttl_hours=1, store=store)
+        session = await auth.login(TOKEN)
+        assert session is not None
+
+        # 手改落盘里的过期时间，模拟"睡了一整天再启动"
+        raw = await store.load_sections([AuthManager.SECTION])
+        entries = raw[AuthManager.SECTION]
+        entries[session.token]["expires_at"] = 0.0
+        await store.save_sections({AuthManager.SECTION: entries})
+
+        again = AuthManager(access_token=TOKEN, store=store)
+        assert await again.load() == 0
+        assert again.verify_session(session.token) is False
+    finally:
+        await store.close()
+
+
+async def test_logout_removes_the_persisted_session(tmp_path):
+    """登出必须同时删内存与落盘 —— 否则重启后"已登出"的会话又活了。"""
+    store = await _store(tmp_path)
+    try:
+        auth = AuthManager(access_token=TOKEN, store=store)
+        session = await auth.login(TOKEN)
+        token = session.token
+        assert await auth.logout(token) is True
+
+        again = AuthManager(access_token=TOKEN, store=store)
+        assert await again.load() == 0
+        assert again.verify_session(token) is False
+    finally:
+        await store.close()
+
+
+async def test_without_a_store_nothing_breaks():
+    """没配 store 时仍是纯内存（向后兼容），且 load() 是空操作。"""
+    auth = AuthManager(access_token=TOKEN)
+    assert await auth.load() == 0
+    session = await auth.login(TOKEN)
+    assert session is not None
+    assert auth.verify_session(session.token) is True
+
+
+async def test_a_broken_store_does_not_stop_the_service(tmp_path):
+    """store 读失败不能让服务起不来 —— 登录态丢了顶多重登一次。"""
+
+    class Broken:
+        async def load_sections(self, keys):
+            raise OSError("disk on fire")
+
+        async def save_sections(self, sections):
+            raise OSError("disk on fire")
+
+    auth = AuthManager(access_token=TOKEN, store=Broken())
+    assert await auth.load() == 0                 # 不抛
+    session = await auth.login(TOKEN)
+    assert session is not None                     # 登录本身照常成功
+    assert auth.verify_session(session.token) is True
