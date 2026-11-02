@@ -250,10 +250,8 @@ def test_main_companion_plugin_specifics(report):
         r for r in report.loaded
         if r.dir_name == "astrbot_plugin_private_companion"
     )
-    # 🔴 **2026-10-19：6.6.2 → 7.0.0、handler ≥100 → ≥10**
-    #    （7.0.0 实测 16 个 handler；架构从"每功能一个"改成"每事件类型一个总管"，
-    #     详见 `test_loader_real_plugin.py::test_handler_count` 的说明）
-    assert rec.version == "7.0.0"
+    # 🔴 2026-11-01：7.0.0 → 7.0.13
+    assert rec.version == "7.0.13"
     assert rec.handler_count >= 10
     assert rec.star_cls is not None
 

@@ -1,14 +1,15 @@
 # 情绪app
 
-> 自用的「虚拟聊天伙伴」**后端**。**形态参照爱语，机制参照陪伴插件**。
-> 后端跑在自己的电脑/服务器上，**手机是前端**（当前形态：爱语 App 改配置直连，见 `docs/APP_PLAN.md`）。
+> 自用的「虚拟聊天伙伴」**后端**。**机制参照陪伴插件**。
+> 后端跑在自己的电脑/服务器上，**手机是前端**（接入计划见 `docs/APP_PLAN.md`）。
 
 | | |
 |---|---|
 | 技术栈 | Python 3.12 + **Quart/Hypercorn** + SQLite + **零构建原生 HTML/JS 面板** |
-| 端口 | 本地 **6191**（外部 NAT `31818 → 6191`） |
-| 判据 | **1142 passed, 1 deselected** |
-| 接口 | **67 条路由** → 详见 **`docs/API.md`** |
+| 端口 | 本地 **6191**（现绑公网 `0.0.0.0:6191` + 令牌鉴权） |
+| 判据 | **1858 passed, 1 deselected, 0 skipped** |
+| 接口 | **65 条路由** → 详见 **`docs/API.md`** |
+| 生成环境 | 生产跑在 jp-vps `root@64.81.114.30:/root/apps/情绪app` |
 | 下一步 | 手机 App 接入 → **`docs/APP_PLAN.md`** |
 
 ---
@@ -19,10 +20,8 @@
 **以为自己在 AstrBot 上跑**。
 
 > 🎯 **路线已定，不再重新论证**：
-> 「**类似 AstrBot 的底子做后端 + 爱语 UI 做前端 App**」。
+> 「**类似 AstrBot 的底子做后端**」+ 手机端自己写 UI。
 > **不搬也不剥，造宿主管兼容** —— **不改插件源码**（插件升级了也不用改我们）。
->
-> 权威定位：`../爱语/docs/PLATFORM_POSITIONING.md`
 
 **四条已打通的链路**：
 
@@ -44,14 +43,16 @@
 | 人设 CRUD + 片段 + 导入导出 + 参考图 | ✅ |
 | 会话 + 三种上下文模式 + 多轮记忆 + 总结自动化 | ✅ |
 | **面板**（零构建原生 HTML/JS） | ✅ |
-| **AstrBot 插件宿主**（装/跑/挂） | ✅ 已加载 **9** 个插件 · 挂载 **268** 个 API |
+| **AstrBot 插件宿主**（装/跑/挂） | ✅ 已加载 **6** 个插件 · 挂载 **329** 个 API · 拓展页 **4** 个 |
 | **插件面板 + 详情页 + 拓展页** | ✅ |
+| **插件热重载 / 删除（带二次选择）/ README 查看** | ✅ 不需要重启服务 |
 | **主动消息**（插件发、我们投递） | ✅ 已开（克制档 3 条/天） |
 | **未读徽标** | ✅（只有插件主动消息 +1） |
-| **每会话唯一 umo** | ✅ `sess-<12位十六进制>` |
+| **每会话唯一 umo** | ✅ 真实 QQ 走 `onebot-napcat1:FriendMessage:<uin>` |
+| **原生会话的人设** | ✅ 面板改人设 → 同步给插件（单一数据源） |
 | 生图（含参考图） | ✅ |
 | 手机 App 接入 | 📋 **计划已定**（`docs/APP_PLAN.md`），未开始 |
-| 真实语音（TTS/ASR） | ⏳ 只有配置层 |
+| 真实语音（TTS/ASR） | ⏳ 只有配置层（`tts` 能力如实降级） |
 
 ---
 
@@ -128,11 +129,11 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:6191/v1/models
 
 ```bash
 EMOTION_IMAGE_DISPATCH=function_call   # 默认：原生 function calling（实测可用）
-EMOTION_IMAGE_DISPATCH=text_tag        # 退路：文本标签（照爱语，但更宽容）
+EMOTION_IMAGE_DISPATCH=text_tag        # 退路：文本标签（更宽容，但有已知缺陷）
 ```
-⭐ **为什么默认 function calling**：实测爱语的 `<generate_image:描述>` 标签
-**容易被截断**（正则要求独占整行 + 流式半截失效 + **失败静默**）。
-详见 `../爱语/docs/IMAGE_TOOL_DISPATCH.md`。
+⭐ **为什么默认 function calling**：文本标签方案要模型在正文里输出
+`<generate_image:描述>` 这样的标记，实测**容易被截断**
+（正则要求独占整行 + 流式半截失效 + **失败静默**）。
 
 ---
 
@@ -165,7 +166,7 @@ EMOTION_IMAGE_DISPATCH=text_tag        # 退路：文本标签（照爱语，但
 
 ## 接口
 
-> **完整接口文档（67 条路由 + 字段级说明 + 客户端注意事项）→ `docs/API.md`**
+> **完整接口文档（65 条路由 + 字段级说明 + 客户端注意事项）→ `docs/API.md`**
 
 最常用的四个：
 
@@ -188,9 +189,10 @@ EMOTION_IMAGE_DISPATCH=text_tag        # 退路：文本标签（照爱语，但
 ```bash
 .venv/bin/python -m pytest tests host/tests -q -p no:cacheprovider \
   --deselect tests/test_plugin_host_e2e.py::test_router_matches_real_implementation_live
-# → 1142 passed, 1 deselected
+# → 1858 passed, 1 deselected, 0 skipped
 ```
 ⚠️ 那条 `--deselect` 是**项目惯例**（它要真连上游，不适合放进回归）。
+🔴 **出现 `skipped` 就要查 —— 跳过判据 = 假通过。**
 
 ### 判据文化（**本项目最特别的地方**）
 
@@ -257,11 +259,11 @@ TOKEN=$(grep '^EMOTION_AUTH_ACCESS_TOKEN=' .env | cut -d= -f2- | tr -d "'")
 │   └── platform_manager.py     #   ★ send_by_session（插件主动消息出口）
 ├── data/                       # 🔴 真实数据（不进 git）
 │   ├── emotion.db(+wal/shm)    #   聊天记录/会话/人设
-│   ├── plugins/                #   插件运行时数据
-│   ├── plugin_src/             #   插件源码镜像（92M，自包含）
+│   ├── plugins/                #   插件运行时数据（配置/记忆/上传图）
 │   └── images/                 #   生成的图
-├── docs/                       # 文档（API.md / APP_PLAN.md / …）
-├── tests/ + host/tests/        # 判据（1142 条）
+├── plugins/                    # ★ 插件源码（随仓库走，6 个）
+├── docs/                       # 文档（API.md / APP_PLAN.md / PLUGIN_ACTIONS_CONTRACT.md …）
+├── tests/ + host/tests/        # 判据（1858 条）
 └── tools/                      # 诊断/验证脚本（含注入验证）
 ```
 
@@ -277,11 +279,39 @@ TOKEN=$(grep '^EMOTION_AUTH_ACCESS_TOKEN=' .env | cut -d= -f2- | tr -d "'")
    → 已用**源码镜像**隔离（`EMOTION_PLUGINS_MIRROR_SOURCES=true`）
 2. 某插件 `initialize()` 会联网下载 26MB 字体 → 已加**超时隔离**（启动 181.6s → 20.8s）
 
-**插件目录**：`EMOTION_PLUGINS_PLUGIN_DIRS` 默认指向 `/opt/astrbot/data/plugins`。
-⚠️ **换设备时**若没有 AstrBot，改指向 `data/plugin_src`（已镜像好的自包含副本）。
+### 两个目录，职责不重叠
+
+```bash
+EMOTION_PLUGINS_PLUGIN_DIRS=plugins        # 源码（随仓库走，可版本控制）
+EMOTION_PLUGINS_DATA_DIR=data/plugins      # 运行时数据（配置/记忆/上传图，不进 git）
+```
+
+⚠️ **绝不指向 `/opt/astrbot/data/plugins`** —— 那是别人 AstrBot 的生产目录，只读。
+
+**装新插件** = 把目录放进 `plugins/` + 重启。`PluginLoader.discover()` **是扫目录、没有名单**，
+不用改代码（判据 `tests/test_plugin_dir_extensibility.py`）。
+当前只放 **6 个**：「我会永远陪着你」「我会牢牢记住你」「我会和你在一起」「我会替你留住故事」
+「我会画给你看」+「NAI生图」。**别的插件不许进。**
 
 **停用/启用插件**：面板可改，落点是 `data/config_profile.json` 的 `plugins.inactivated_plugins`。
-⚠️ **保存即落盘，但需重启服务才生效。**
+⚠️ **停用需重启服务才生效**；但**热重载 / 删除 / 看 README 不需要重启**（见下）。
+
+### 插件动作（`docs/PLUGIN_ACTIONS_CONTRACT.md` 是唯一权威）
+
+| 动作 | 接口 | 说明 |
+|---|---|---|
+| 热重载 | `POST /api/v1/plugins/<id>/reload` | 同目录重新 import，**不需要重启服务** |
+| 删除 | `DELETE /api/v1/plugins/<id>` | 源码**直接删**（与官方一致）；配置/数据由两个勾选项决定，**默认都不删** |
+| README | `GET /api/v1/plugins/<id>/readme` | 200KB 截断 |
+
+🔴 **不做回收站、不自动备份**：插件代码可再生（`metadata.yaml` 的 `repo:` + 「重新安装」一条命令拉回），
+真正不可再生的是**配置与持久化数据**，由 `delete_config` / `delete_data` 显式决定。
+⇒ **卸载 → 重新安装后，配置与记忆仍在，开箱即用。**
+
+🔴 **重载/卸载清 `sys.modules` 时绝不能清"别人的共用包"**（踩过生产事故）：
+`companion_v2` / `astrbot_host` 这两个顶层包只有陪伴插件拥有。清掉它们会让陪伴插件
+`isinstance(error, TaskError)` 恒 False → 整个 host `faulted`，而**面板上的表现是
+「消息测试 · 卡在管理员身份」—— 离真因十万八千里**。判据是「这两个包是否物理位于本次 path 内」。
 
 ---
 
@@ -289,8 +319,10 @@ TOKEN=$(grep '^EMOTION_AUTH_ACCESS_TOKEN=' .env | cut -d= -f2- | tr -d "'")
 
 | 文档 | 内容 |
 |---|---|
-| **`docs/API.md`** | **接口文档**（67 条路由 + 字段 + 注意事项） |
+| **`docs/API.md`** | **接口文档**（65 条路由 + 字段 + 注意事项） |
 | **`docs/APP_PLAN.md`** | **手机 App 接入计划**（下一步任务） |
+| **`docs/PLUGIN_ACTIONS_CONTRACT.md`** | **插件动作契约**（重载/删除/README 的唯一权威） |
+| `docs/ASTRBOT_PROVIDER_CONTRACT.md` | 插件对 Provider 端口的期望（真机验证过的） |
 | `docs/GAP_TO_GOAL.md` | 离最终目标还差什么 |
 | `docs/NEXT_STEPS.md` | 规划 |
 | `host/README.md` | 兼容层细节 |
@@ -300,7 +332,8 @@ TOKEN=$(grep '^EMOTION_AUTH_ACCESS_TOKEN=' .env | cut -d= -f2- | tr -d "'")
 
 ## 上游
 
-OpenAI 兼容即可。当前实测配置见 `.env`（`api.syuan.org`）。
+OpenAI 兼容即可。当前实测配置见 `.env`
+（jp-vps 上指向本机破限网关 `http://127.0.0.1:8318/v1` → CPA `:8317`）。
 ⚠️ **key 按渠道组隔离**：用 A 组 key 调 B 组模型会 **503**（`No available channel`），100% 确定性。
 
 ---
@@ -312,4 +345,5 @@ OpenAI 兼容即可。当前实测配置见 `.env`（`api.syuan.org`）。
 | 1 | 服务曾**"无声消失"约 2 小时**（6191 未监听、无 traceback、磁盘正常） | ⚠️ **死因未查明**，留意 |
 | 2 | `tts` 宿主能力未接 | 启动自检会报，**设计内**的如实降级 |
 | 3 | 三个功能缺口（生图到 UI / `/sticker` / TTS-ASR） | 见 `docs/APP_PLAN.md` §4 |
-| 4 | 未提交 git 的改动较多 | 作者要求"先本地验证、不急着提交" |
+| 4 | **`HTTPS_ONLY=false`**，公网 `:6191` 令牌走明文 http | ⚠️ 要长期用需前置 Caddy/Nginx 出 443 再改 true |
+| 5 | 上游陪伴插件：**人设改名后核心窗口失配**（`_core_target` 精确名比较） | 📤 已报上游 issue [#467](https://github.com/menglimi/astrbot_plugin_private_companion/issues/467)；重置死锁已提 PR [#443](https://github.com/menglimi/astrbot_plugin_private_companion/pull/443) |

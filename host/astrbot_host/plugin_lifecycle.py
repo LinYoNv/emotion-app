@@ -436,6 +436,13 @@ async def reload_plugin(host: Any, plugin_id: str) -> ReloadResult:
 
         PluginLoader._purge_plugin_modules(plugin_id, path, force=True)  # noqa: SLF001
 
+        # 🔴 清理该插件目录下的 __pycache__，避免快速/等长改动撞 CPython .pyc 缓存（同秒同大小）
+        try:
+            for pyc_dir in path.rglob("__pycache__"):
+                shutil.rmtree(pyc_dir, ignore_errors=True)
+        except OSError:
+            pass
+
         # 🔴 `force=True` 要**一路传下去**：`load_one` 内部还会再清一次
         #    （`_import_plugin` 在来源不同源时），那次若不传 force 会用默认范围
         #    ⇒ 把 `companion_v2` 重新清掉，本次修复形同虚设。

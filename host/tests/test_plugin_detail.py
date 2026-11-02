@@ -417,8 +417,8 @@ def test_real_companion_components(real_host):
     # 7.0.0 实测 listener=4（6.7.0 是 ≥11）
     assert by_type.get("listener") >= 4, f"监听器数退化了：{by_type}"
     # ⚠️ 同上：夹具确定 ⇒ 可以写精确值（原来写 `>= 76` 是因为会漂到 76/77）
-    # 7.0.0 实测 hook=12（6.7.0 是 77）
-    assert by_type.get("hook") == 12, f"钩子数变了：{by_type}"
+    # 7.0.0 是 12；7.0.13 实测 hook=14
+    assert by_type.get("hook") == 14, f"钩子数变了：{by_type}"
 
     # ⭐ 数量自洽判据（⚠️ **注意减掉 page**）：
     #     `components` = **handler 类**（command/llm_tool/listener/hook）
