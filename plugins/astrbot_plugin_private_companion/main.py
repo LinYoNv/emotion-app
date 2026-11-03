@@ -1108,8 +1108,10 @@ class PrivateCompanionV2StagingPlugin(Star):
                 with measure_core_preparation(event, "tool_injection", now=self.staging.now):
                     inject_core_reply_tools(event, req, application=application)
             except Exception as error:
-                logger.warning("[CompanionV2] V2 工具暂不可用，保留 AstrBot 核心工具 error_type=%s",
-                               type(error).__name__)
+                # 🔴 诊断：只打 error_type 等于没说（AttributeError 可能来自任何一处）。
+                #    这是本项目通则「错误信息会撒谎」的现场，补 traceback。
+                logger.warning("[CompanionV2] V2 工具暂不可用，保留 AstrBot 核心工具 error_type=%s detail=%s",
+                               type(error).__name__, str(error)[:200], exc_info=True)
         prepare_native_host_request(self.staging, event, req)
         inject_core_turn_notes(event, req)
         inject_functional_command_instruction(

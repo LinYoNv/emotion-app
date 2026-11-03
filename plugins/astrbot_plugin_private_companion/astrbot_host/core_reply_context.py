@@ -257,8 +257,11 @@ def build_core_reply_prompt(application, context, native_input, *, at, keyword_m
             state = "ready" if block else "empty"
         except Exception as error:
             state = "unavailable"
-            logger.warning("[CompanionV2] 核心回复背景降级 section=%s error_type=%s",
-                           name, type(error).__name__)
+            # 🔴 诊断：`TaskError` 的 `.code` 才是真因，只打 error_type 等于没说。
+            #    （这正是本项目通则里那条「错误信息会撒谎」的现场。）
+            logger.warning("[CompanionV2] 核心回复背景降级 section=%s error_type=%s code=%r detail=%s",
+                           name, type(error).__name__, getattr(error, "code", None),
+                           str(error)[:160])
             return
         finally:
             measured.append({"owner": "private_companion.v2", "purpose": name, "state": state,

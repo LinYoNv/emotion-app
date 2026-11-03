@@ -96,6 +96,15 @@ def external_message_parts(event: Any) -> list[dict[str, Any]]:
     getter = getattr(event, "get_messages", None)
     components = getter() if callable(getter) else []
     parts: list[dict[str, Any]] = []
+    #: 引用消息的文本不放进 `parts`，而是**并进最终的 prompt**（见下）。
+    #:
+    #: 🔴 为什么不能作为独立 text part（2026-11-03 被自己的判据抓出来的）：
+    #:    `provider_request_to_messages` 会用 `_replace_prompt()` 把当前 user
+    #:    的**第一个 text part 换成 prompt**，其余 text part **全部丢弃**
+    #:    （`provider_content.py:164-175`）。于是"引用文本"要么被覆盖，
+    #:    要么被丢掉 —— 两种都是静默的，模型依然看不到引用。
+    #:    ⇒ 唯一稳的做法是把它揉进 prompt 本身。
+    quoted_notes: list[str] = []
     for component in components or []:
         raw_type = component.get("type", "") if isinstance(component, dict) else getattr(component, "type", "")
         kind = str(getattr(raw_type, "value", raw_type) or type(component).__name__).lower()
@@ -105,6 +114,25 @@ def external_message_parts(event: Any) -> list[dict[str, Any]]:
             text = get("text", "")
             if text:
                 parts.append({"type": "text", "text": str(text)})
+        elif kind == "reply":
+            # 🔴 引用消息**必须转成文本喂给模型**（情绪 2026-11-03 报障：
+            #    「无法识别引用消息」——她回了「看不到具体引用的那句」）。
+            #
+            #    宿主那边已经把引用解析得很完整（`onebot.py:730-770` 调
+            #    `get_msg` 拿到被引用消息，构造 `Reply` 带 `message_str` /
+            #    `sender_nickname` / `chain`）。但这里以前**完全不认 reply**
+            #    ⇒ 走不进任何分支 ⇒ 静默丢弃。
+            #    ⚠️ 这正是铁律点名的形态：「凡过滤/丢弃用户输入的分支必须留日志」。
+            quoted = str(get("message_str", "") or get("text", "") or "").strip()
+            sender = str(get("sender_nickname", "") or get("qq", "") or "").strip()
+            if not quoted:
+                logger.warning(
+                    "引用消息没有可读正文（可能已被撤回或取消息失败）umo=%s",
+                    event.unified_msg_origin,
+                )
+            else:
+                prefix = f"{sender}：" if sender else ""
+                quoted_notes.append(f"【引用回复】{prefix}{quoted}")
         elif kind in ("image", "record", "audio"):
             locator = next((get(key) for key in ("url", "file", "path") if get(key)), "")
             parts.append(to_media_part("image" if kind == "image" else "audio", str(locator)))
@@ -114,6 +142,11 @@ def external_message_parts(event: Any) -> list[dict[str, Any]]:
             logger.error("默认模型视频输入尚未接入（umo=%s）", event.unified_msg_origin)
             raise ChatError("默认模型视频输入尚未接入")
     text = str(getattr(event, "message_str", "") or "")
+    # 🔴 引用文本并进 prompt（理由见上面 `quoted_notes` 的注释：
+    #    `_replace_prompt` 会丢掉除第一个以外的所有 text part）。
+    #    顺序是「引用在前、本轮正文在后」—— 模型先看到"回的是哪句"。
+    if quoted_notes:
+        text = "\n".join([*quoted_notes, text]) if text.strip() else "\n".join(quoted_notes)
     if text.strip() and not any(part.get("type") == "text" for part in parts):
         parts.insert(0, {"type": "text", "text": text})
     if parts:

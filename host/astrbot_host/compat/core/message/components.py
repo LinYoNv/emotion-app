@@ -207,18 +207,55 @@ class AtAll(At):
 
 @dataclass
 class Reply(BaseMessageComponent):
-    """引用回复（**33 次**）。"""
+    """引用回复（**33 次**）。
 
-    id: str | None = ""
+    🔴 **字段必须照官方实现补齐**（`astrbot/core/message/components.py:584-604`）。
+       我们原来只有 `id` 和 `text`，其余全靠 `**_` 静默吞掉：
+       于是适配器明明把被引用消息解析出来了（`chain` / `sender_nickname` /
+       `message_str`），**一塞进构造函数就全没了**，而且不报错。
+       表现就是「引用回复时她说看不到引用的那句」（情绪 2026-11-03 报障），
+       我加诊断后拿到真因：`'Reply' object has no attribute 'chain'`。
+       ⇒ 这正是本项目通则「`**_` 会静默丢弃字段」的现场，别再省字段。
+    """
+
+    id: str | int | None = ""
+    chain: list[Any] | None = None
+    sender_id: int | str | None = 0
+    sender_nickname: str | None = ""
+    time: int | None = 0
+    message_str: str | None = ""
+    #: deprecated（官方保留，插件可能还在读）
     text: str | None = ""
+    qq: int | None = 0
+    seq: int | None = 0
     type: ComponentType = ComponentType.Reply
 
     def __init__(
-        self, id: str | None = "", text: str | None = "", **_: Any
+        self,
+        id: str | int | None = "",
+        chain: list[Any] | None = None,
+        sender_id: int | str | None = 0,
+        sender_nickname: str | None = "",
+        time: int | None = 0,
+        message_str: str | None = "",
+        text: str | None = "",
+        qq: int | None = 0,
+        seq: int | None = 0,
+        **_: Any,
     ) -> None:
         self.id = id
-        self.text = text
+        self.chain = chain if chain is not None else []
+        self.sender_id = sender_id
+        self.sender_nickname = sender_nickname
+        self.time = time
+        self.message_str = message_str or text or ""
+        self.text = text or message_str or ""
+        self.qq = qq
+        self.seq = seq
         self.type = ComponentType.Reply
+
+    def toDict(self) -> dict[str, Any]:
+        return {"type": "reply", "data": {"id": self.id, "text": self.message_str}}
 
 
 @dataclass

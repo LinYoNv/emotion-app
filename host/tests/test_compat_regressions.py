@@ -876,3 +876,59 @@ def test_plugin_sources_construct_event_only_with_supported_shape():
         "扫描逻辑失效（零命中不是证据，是判据坏了）"
     )
     assert not bad, "插件的构造形状我们的签名接不住：\n" + "\n".join(bad)
+
+
+# ---------------------------------------------------------------------------
+# 引用回复组件的字段完整性（2026-11-03）
+#
+# 🔴 情绪报障「无法识别引用消息」，她的回话是「看不到具体引用的那句」。
+#    根因不是适配器没解析（`onebot.py` 调 `get_msg` 拿得很完整），而是
+#    我们的 `Reply` 兼容类**只有 id/text 两个字段**，其余被 `**_` 静默吞掉。
+#    加诊断后拿到的真因：`'Reply' object has no attribute 'chain'`。
+#
+#    这条判据守「字段必须照官方实现带全」。只断言"能构造"是抓不住的 ——
+#    `**_` 让任何字段都能"构造成功"，只是**全都丢了**。
+# ---------------------------------------------------------------------------
+
+
+def test_reply_component_keeps_every_official_field():
+    """`Reply` 必须像官方那样带全字段，不能靠 `**_` 吞掉。"""
+    from astrbot_host.compat.core.message.components import Reply
+
+    chain = [object()]
+    reply = Reply(
+        id="123456789",
+        chain=chain,
+        sender_id="3412642082",
+        sender_nickname="情緒",
+        time=1793600000,
+        message_str="想我就去翻冰箱，光想能顶饱吗。",
+        qq="3412642082",
+    )
+
+    # 逐字段核对（不是只看"构造没报错"）
+    assert reply.id == "123456789"
+    assert reply.chain == chain, "chain（被引用消息段）必须保留"
+    assert reply.sender_id == "3412642082"
+    assert reply.sender_nickname == "情緒", "昵称必须保留，引用文本要用它"
+    assert reply.time == 1793600000
+    assert reply.message_str == "想我就去翻冰箱，光想能顶饱吗。"
+    assert reply.qq == "3412642082"
+
+
+def test_reply_component_tolerates_missing_fields():
+    """只给 id 也要能构造（官方默认值齐全），别把兼容层做成强约定。"""
+    from astrbot_host.compat.core.message.components import Reply
+
+    reply = Reply(id="1")
+    assert reply.chain == []
+    assert reply.message_str == ""
+    assert reply.sender_nickname == ""
+
+
+def test_reply_component_backfills_text_from_message_str():
+    """官方 `text` 是 deprecated 别名；适配器可能只填 message_str。"""
+    from astrbot_host.compat.core.message.components import Reply
+
+    reply = Reply(id="1", message_str="被引用的原文")
+    assert reply.text == "被引用的原文", "message_str 要回填到 text，旧代码读 text 才不空"
