@@ -387,6 +387,88 @@ class OneBotAdapter:
             return await self._convert_request_event(event)
         return None
 
+    async def _resolve_image_segment(
+        self, data: dict[str, Any], event: Any, routing_params: dict[str, Any]
+    ) -> None:
+        """把图片段里的定位符换成**真能取到字节**的形式（就地改写 `data`）。
+
+        🔴 为什么必须有这一步（情绪 2026-11-03 报障，实测现场见下面）：
+            NapCat 给的 `url` 是 `https://multimedia.nt.qq.com.cn/download?appid=…`，
+            它**只对 QQ 客户端有效**；裸请求返回
+            `HTTP 400 {"retcode":-55030022,"retmsg":"appid is not supported"}`。
+            而 `file` 字段往往只有个文件名、磁盘上没有实体
+            （容器里 `enableLocalFile2Url: false`，缓存目录是空的）。
+            原样往上送 ⇒ 上游下载失败 ⇒ `400 unsupported content part: image_url`
+            ⇒ **整轮回复失败**，用户只看到"她不回我"。
+
+        做法照官方 `astrbot/core/utils/quoted_message/image_resolver.py`：
+        依次试 `get_image` 的几种参数名，取回 `url` / `file` / `base64`。
+        拿到 http(s) / file:// / base64:// 任一种，后续转换就能落地成真实字节。
+
+        ⚠️ **拿不到就保持原样**，不抛异常：这条消息其余段（文本等）仍应正常处理，
+           由下游 `to_media_part` 给出明确的 unavailable 原因（它不静默）。
+        """
+        # 已经是能直接用的形式（http(s) 且不是那个 QQ 鉴权下载口 / file URI /
+        # base64）就不用再问 NapCat 了。
+        current_url = str(data.get("url") or "")
+        if current_url.startswith("base64://") or current_url.startswith("file://"):
+            return
+        if current_url.startswith(("http://", "https://")) and "multimedia.nt.qq.com.cn/download" not in current_url:
+            return
+
+        file_ref = str(data.get("file") or "").strip()
+        candidates: list[str] = []
+        for candidate in (file_ref, str(data.get("file_id") or "").strip(), current_url):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        # 带扩展名的文件名也试一次去掉扩展名的（官方 `_build_image_id_candidates`）
+        if file_ref:
+            stem, dot, ext = file_ref.rpartition(".")
+            if dot and stem and stem not in candidates:
+                candidates.append(stem)
+        if not candidates:
+            return
+
+        for candidate in candidates:
+            for params in ({"file": candidate}, {"file_id": candidate}, {"id": candidate}):
+                try:
+                    ret = await self._bot.call_action(
+                        action="get_image", **params, **routing_params
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("get_image(%r) 失败：%s", params, exc)
+                    continue
+                if not isinstance(ret, dict):
+                    continue
+                # 优先 file（常常是本地绝对路径），其次 url
+                resolved = ""
+                for key in ("file", "url"):
+                    value = ret.get(key)
+                    if isinstance(value, str) and value.strip():
+                        data[key] = value.strip()
+                        resolved = value.strip()
+                        break
+                if resolved:
+                    # 🔴 **必须把原来那个 QQ 鉴权下载口清掉**。
+                    #    下游取值顺序是 url → file → path（见
+                    #    `default_llm_reply.external_message_parts`），
+                    #    只覆盖 file 不动 url 的话，下游仍会先拿到那个
+                    #    `multimedia.nt.qq.com.cn/download` —— 等于白解析一场。
+                    #    （这条是被判据当场抓出来的，不是推理。）
+                    residual = str(data.get("url") or "")
+                    if "multimedia.nt.qq.com.cn/download" in residual:
+                        data.pop("url", None)
+                    logger.info(
+                        "图片已通过 get_image 解析：locator=%s",
+                        resolved[:100],
+                    )
+                    return
+        logger.warning(
+            "图片定位符解析失败，将按原样交给下游（可能无法使用）：file=%r url=%s",
+            file_ref[:80],
+            current_url[:80],
+        )
+
     async def _convert_request_event(self, event: Any) -> Any:
         """请求类事件（加好友 / 加群）。照真实现 `_convert_handle_request_event`。"""
         from astrbot_host.compat.core.platform.astrbot_message import (  # noqa: PLC0415
@@ -638,6 +720,34 @@ class OneBotAdapter:
             elif seg_type == "mface":
                 # 照真实现：mface（商城表情）直接跳过
                 continue
+
+            elif seg_type == "image":
+                # 🔴🔴 **图片必须在这里落成"真实字节"，否则后面一定发不出去**
+                #    （情绪 2026-11-03 报障「发图片给她她没回应」）。
+                #
+                #    实测现场：NapCat 给的 message 段是
+                #      {"type":"image","data":{
+                #          "file":"7EA9...DB.png",          ← 只有文件名，不是路径
+                #          "url":"https://multimedia.nt.qq.com.cn/download?appid=1406&fileid=E..."
+                #      }}
+                #    那个 url **不能直接请求** —— 裸打返回
+                #      HTTP 400 {"retcode":-55030022,"retmsg":"appid is not supported"}
+                #    它是给 QQ 客户端用的下载入口，要凭据。而文件也不在磁盘上
+                #    （NapCat 缓存目录是空的，`enableLocalFile2Url: false`）。
+                #
+                #    于是以前这个段原样带着 url 往上走 ⇒ CPA 去下载 ⇒ 拿到 JSON
+                #    错误 ⇒ `400 unsupported content part: image_url` ⇒ 整轮失败。
+                #    用户看到的就是「她没理我」，而模型其实根本没收到图。
+                #
+                #    正确做法照官方 `quoted_message/image_resolver.py`：调 OneBot 的
+                #    `get_image` 拿到可用的定位符（http / file:// / base64://）。
+                for m in group:
+                    data = dict(m.get("data") or {})
+                    await self._resolve_image_segment(data, event, routing_params)
+                    try:
+                        abm.message.append(component_types["image"](**data))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("图片段构造失败，已忽略：data=%r（%s）", data, exc)
 
             elif seg_type == "markdown":
                 for m in group:

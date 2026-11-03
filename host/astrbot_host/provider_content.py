@@ -67,6 +67,21 @@ def to_media_part(kind: str, locator: str) -> dict[str, Any]:
         _unavailable("media kind requires explicit image/audio support; video needs conversion")
     if not isinstance(locator, str) or not locator:
         _unavailable("image requires an HTTP(S)/data URL or local file")
+    # 🔴 `base64://` 是 AstrBot/OneBot 的**原生编码形式**
+    #    （真实现 `astrbot/core/message/components.py:524` 就是
+    #    `Image(f"base64://{b64}")`）。NapCat 对**小图 / 表情包 / 转发图**
+    #    经常走这条，不是罕见路径。
+    #    以前它落进"既不是 http 也不是 data:"的分支 ⇒ 抛
+    #    MediaContentUnavailable ⇒ **整轮回复失败**（情绪 2026-11-03 报障：
+    #    发表情包没反应）。这里转成标准 data URL 即可，不改上层任何契约。
+    if locator.startswith("base64://"):
+        encoded = locator[len("base64://"):].strip()
+        if not encoded:
+            _unavailable("base64 image payload is empty")
+        # 没带 mime 时按 png 兜底：OpenAI 兼容层只认 `data:` 前缀，
+        # 真实格式由解码方按字节判定，这个声明不改变内容。
+        return {"type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{encoded}"}}
     if locator.startswith(("http://", "https://", "data:image/")):
         return {"type": "image_url", "image_url": {"url": locator}}
     parsed = urlsplit(locator)

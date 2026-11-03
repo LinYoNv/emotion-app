@@ -137,6 +137,43 @@ def test_http_image_is_passed_without_download():
     assert to_media_part("image", "https://example.invalid/synthetic.png")["image_url"]["url"] == "https://example.invalid/synthetic.png"
 
 
+# ---------------------------------------------------------------------------
+# `base64://` —— NapCat 对**小图/表情包/转发图**的原生编码形式
+#
+# 🔴 情绪 2026-11-03 报障「发图片给她她没回应」。这条守的是：
+#    `Image.fromBase64()`（真实现 `components.py:524`）产出的
+#    `base64://<b64>` 必须能转成上游认的 data URL，而不是抛异常。
+#    ⚠️ 只断言"能转换"不够 —— 必须验**转换出来的 URL 真能被解回原字节**，
+#    否则 base64 里混进前缀/换行也不会被发现。
+# ---------------------------------------------------------------------------
+
+
+def test_base64_locator_becomes_a_real_data_url():
+    """`base64://` 要变成标准 data URL，且载荷逐字节不变。"""
+    import base64 as _b64
+
+    payload = b"\x89PNG\r\n\x1a\n" + b"synthetic-image-bytes" * 4
+    locator = "base64://" + _b64.b64encode(payload).decode("ascii")
+
+    part = to_media_part("image", locator)
+    assert part["type"] == "image_url"
+    url = part["image_url"]["url"]
+    assert url.startswith("data:image/")
+    assert ";base64," in url
+
+    # 关键：解回来的字节必须与原始完全一致
+    encoded = url.split(";base64,", 1)[1]
+    assert _b64.b64decode(encoded) == payload
+
+
+def test_empty_base64_locator_is_refused_not_silently_accepted():
+    """空载荷要显式拒绝 —— 静默返回一个空的 data URL 会让上游报更难懂的错。"""
+    with pytest.raises(MediaContentUnavailable, match="unavailable"):
+        to_media_part("image", "base64://")
+    with pytest.raises(MediaContentUnavailable, match="unavailable"):
+        to_media_part("image", "base64://   ")
+
+
 @pytest.mark.parametrize("kind,locator", [
     ("audio", "https://example.invalid/voice.wav"),
     ("audio", "voice.silk"), ("audio", "video.mp4"),
