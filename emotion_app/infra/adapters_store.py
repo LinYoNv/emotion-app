@@ -113,6 +113,19 @@ ADAPTER_TYPES: dict[str, dict[str, Any]] = {
                 "required": False,
                 "help": "每行一个 QQ 号。空白名单 + 启用白名单 = 谁都进不来（如实拒绝，不默认放行）。",
             },
+            {
+                "key": "image_path_map",
+                "label": "图片路径映射（协议端在容器里时填）",
+                "type": "string_list",
+                "default": [],
+                "required": False,
+                "help": (
+                    "每行一条 `容器内前缀=宿主机前缀`。协议端跑在 Docker 里时，"
+                    "它返回的图片路径是**容器内**的，宿主进程读不到 —— 这里做映射。"
+                    "例如 NapCat 把 /app/.config/QQ 挂到宿主机 /opt/napcat/bot1/ntqq，"
+                    "就填 `/app/.config/QQ=/opt/napcat/bot1/ntqq`。留空 = 不做映射。"
+                ),
+            },
         ],
     },
     "webchat": {

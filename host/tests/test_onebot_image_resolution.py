@@ -227,3 +227,132 @@ async def test_convert_message_event_actually_resolves_images():
     assert "Ori/abc.png" in str(getattr(images[0], "file", "")), (
         f"应当带上解析后的真实路径，实际 {getattr(images[0], 'file', '')!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# ⑤ 协议端在容器里：拿到的是**它那边的路径**，我们必须读成 base64
+#
+# 实测（第二次）：`get_image` 返回
+#     /app/.config/QQ/nt_qq_.../nt_data/Pic/2026-11/Ori/xxx.jpg
+# 而宿主进程读这个路径必然 FileNotFoundError —— NapCat 在容器里。
+# ⇒ 解析成功后必须立刻把字节读出来（base64），不能指望"两边路径一样"。
+# ---------------------------------------------------------------------------
+
+
+async def test_resolved_local_path_is_read_into_base64(tmp_path):
+    """拿到能读到的路径 → 必须变成 `base64://`，下游不再依赖路径。"""
+    import base64
+
+    payload = b"\xff\xd8\xff\xe0" + b"jpeg-bytes" * 8
+    image_file = tmp_path / "pic.jpg"
+    image_file.write_bytes(payload)
+
+    bot = FakeBot([{"file": str(image_file)}])
+    data = {"file": "abc.png", "url": QQ_URL}
+
+    await resolve(data, bot)
+
+    assert str(data.get("file", "")).startswith("base64://"), (
+        f"应当转成 base64，实际 {str(data.get('file'))[:40]!r}"
+    )
+    encoded = str(data["file"])[len("base64://"):]
+    assert base64.b64decode(encoded) == payload, "base64 必须逐字节还原原图"
+
+
+async def test_unreadable_container_path_keeps_a_truthful_result():
+    """读不到（跨容器路径）时不能假装成功：不留 QQ 下载口，但也别造数据。"""
+    bot = FakeBot([{"file": "/app/.config/QQ/never-exists-on-host.jpg"}])
+    data = {"file": "abc.png", "url": QQ_URL}
+
+    await resolve(data, bot)   # 不抛异常
+
+    assert not str(data.get("file", "")).startswith("base64://"), "读不到就不要编 base64"
+    assert "multimedia.nt.qq.com.cn/download" not in str(data.get("url", "")), (
+        "那个不可用的下载口必须清掉，否则下游又拿它去下载"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ⑥ 协议端在容器里：容器内路径必须能按映射读到
+#
+# 实测（2026-11-03 第二次）：`get_image` 返回
+#     /app/.config/QQ/nt_qq_.../nt_data/Pic/2026-11/Ori/xxx.jpg
+# 宿主进程读它必然 FileNotFoundError。该目录挂到宿主机
+#     /opt/napcat/bot1/ntqq
+# 同一个文件 250815 字节，两边一致。所以要做 `容器前缀=宿主前缀` 的映射，
+# 且**不能写死容器名/路径**（换机器、换容器名都要能用）。
+# ---------------------------------------------------------------------------
+
+
+def adapter_with_map(bot, mapping):
+    adapter = OneBotAdapter(
+        adapter_id="t",
+        config={"ws_reverse_port": 6399, "image_path_map": mapping},
+    )
+    adapter._bot = bot
+    return adapter
+
+
+async def test_container_path_is_translated_through_the_configured_map(tmp_path):
+    """容器内路径 → 按映射找到宿主路径 → 读成 base64。"""
+    import base64
+
+    payload = b"\xff\xd8\xff\xe0" + b"container-image" * 10
+    host_root = tmp_path / "hostntqq"
+    (host_root / "nt_qq_x" / "Pic").mkdir(parents=True)
+    (host_root / "nt_qq_x" / "Pic" / "a.jpg").write_bytes(payload)
+
+    bot = FakeBot([{"file": "/app/.config/QQ/nt_qq_x/Pic/a.jpg"}])
+    adapter = adapter_with_map(bot, [f"/app/.config/QQ={host_root}"])
+    data = {"file": "abc.png", "url": QQ_URL}
+
+    await adapter._resolve_image_segment(data, {"post_type": "message"}, {})
+
+    assert str(data.get("file", "")).startswith("base64://"), (
+        f"应当按映射读到并转 base64，实际 {str(data.get('file'))[:50]!r}"
+    )
+    assert base64.b64decode(str(data["file"])[len("base64://"):]) == payload
+
+
+async def test_longest_matching_prefix_wins(tmp_path):
+    """`/app` 与 `/app/.config/QQ` 都能匹配时，必须用更长的那个。
+
+    否则会拼出 `/hostapp/.config/QQ/...` 这种不存在的路径 —— 静默失败。
+    """
+    import base64
+
+    payload = b"payload-bytes"
+    specific = tmp_path / "specific"
+    (specific / "sub").mkdir(parents=True)
+    (specific / "sub" / "b.jpg").write_bytes(payload)
+
+    bot = FakeBot([{"file": "/app/.config/QQ/sub/b.jpg"}])
+    adapter = adapter_with_map(bot, [
+        "/app=/nonexistent-root",                 # 短前缀，会拼出错误路径
+        f"/app/.config/QQ={specific}",            # 长前缀，才对
+    ])
+    data = {"file": "x.png", "url": QQ_URL}
+
+    await adapter._resolve_image_segment(data, {"post_type": "message"}, {})
+
+    assert str(data.get("file", "")).startswith("base64://")
+    assert base64.b64decode(str(data["file"])[len("base64://"):]) == payload
+
+
+async def test_malformed_mapping_lines_are_skipped_not_fatal(tmp_path):
+    """写错的行只跳过，不能让整条映射失效。"""
+    import base64
+
+    payload = b"ok-bytes"
+    root = tmp_path / "r"
+    root.mkdir()
+    (root / "c.jpg").write_bytes(payload)
+
+    bot = FakeBot([{"file": "/c/c.jpg"}])
+    adapter = adapter_with_map(bot, ["这条没有等号", "=/只有右边", f"/c={root}"])
+    data = {"file": "x.png", "url": QQ_URL}
+
+    await adapter._resolve_image_segment(data, {"post_type": "message"}, {})
+
+    assert str(data.get("file", "")).startswith("base64://"), "好行必须仍然生效"
+    assert base64.b64decode(str(data["file"])[len("base64://"):]) == payload

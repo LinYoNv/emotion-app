@@ -403,15 +403,22 @@ class OneBotAdapter:
 
         做法照官方 `astrbot/core/utils/quoted_message/image_resolver.py`：
         依次试 `get_image` 的几种参数名，取回 `url` / `file` / `base64`。
-        拿到 http(s) / file:// / base64:// 任一种，后续转换就能落地成真实字节。
 
-        ⚠️ **拿不到就保持原样**，不抛异常：这条消息其余段（文本等）仍应正常处理，
-           由下游 `to_media_part` 给出明确的 unavailable 原因（它不静默）。
+        🔴🔴 **拿到的是「协议端那边的路径」，不是我们的路径**（第二次实测）：
+            NapCat 在容器里，`get_image` 返回
+              `/app/.config/QQ/nt_qq_.../nt_data/Pic/2026-11/Ori/xxx.jpg`
+            而宿主进程读这个路径必然 `FileNotFoundError`。
+            ⇒ 所以解析成功后**立刻把它读成 base64 塞回去**，
+            不再依赖"两边路径恰好一样"这种脆弱假设。
+            读得到 → `base64://…`；读不到 → 保留协议端给的路径，
+            让下游如实报「读不到这个文件」，而不是假装成功。
+
+        ⚠️ **全程失败也不抛异常**：这条消息里可能还有文本，
+           为一张坏图丢掉整条是更糟的故障。
         """
-        # 已经是能直接用的形式（http(s) 且不是那个 QQ 鉴权下载口 / file URI /
-        # base64）就不用再问 NapCat 了。
         current_url = str(data.get("url") or "")
-        if current_url.startswith("base64://") or current_url.startswith("file://"):
+        # 已经是能直接用的形式就不用再问协议端了。
+        if current_url.startswith(("base64://", "file://", "data:image/")):
             return
         if current_url.startswith(("http://", "https://")) and "multimedia.nt.qq.com.cn/download" not in current_url:
             return
@@ -423,7 +430,7 @@ class OneBotAdapter:
                 candidates.append(candidate)
         # 带扩展名的文件名也试一次去掉扩展名的（官方 `_build_image_id_candidates`）
         if file_ref:
-            stem, dot, ext = file_ref.rpartition(".")
+            stem, dot, _ext = file_ref.rpartition(".")
             if dot and stem and stem not in candidates:
                 candidates.append(stem)
         if not candidates:
@@ -440,7 +447,6 @@ class OneBotAdapter:
                     continue
                 if not isinstance(ret, dict):
                     continue
-                # 优先 file（常常是本地绝对路径），其次 url
                 resolved = ""
                 for key in ("file", "url"):
                     value = ret.get(key)
@@ -448,26 +454,146 @@ class OneBotAdapter:
                         data[key] = value.strip()
                         resolved = value.strip()
                         break
-                if resolved:
-                    # 🔴 **必须把原来那个 QQ 鉴权下载口清掉**。
-                    #    下游取值顺序是 url → file → path（见
-                    #    `default_llm_reply.external_message_parts`），
-                    #    只覆盖 file 不动 url 的话，下游仍会先拿到那个
-                    #    `multimedia.nt.qq.com.cn/download` —— 等于白解析一场。
-                    #    （这条是被判据当场抓出来的，不是推理。）
-                    residual = str(data.get("url") or "")
-                    if "multimedia.nt.qq.com.cn/download" in residual:
-                        data.pop("url", None)
+                if not resolved:
+                    continue
+                # 🔴 关键一步：读成 base64，摆脱跨容器路径问题。
+                encoded = await asyncio.to_thread(self._read_image_as_base64, resolved)
+                if encoded:
+                    data["file"] = encoded
+                    data.pop("url", None)
                     logger.info(
-                        "图片已通过 get_image 解析：locator=%s",
-                        resolved[:100],
+                        "图片已解析并转为 base64：来源=%s 大小=%dKB",
+                        resolved[:70], len(encoded) // 1024,
                     )
                     return
+                # 读不到（典型的跨容器路径）—— 保留并如实告知
+                residual = str(data.get("url") or "")
+                if "multimedia.nt.qq.com.cn/download" in residual:
+                    data.pop("url", None)
+                logger.warning(
+                    "图片定位符已解析但本地读不到（多半是协议端在容器里、路径不通用）：%s",
+                    resolved[:120],
+                )
+                return
         logger.warning(
             "图片定位符解析失败，将按原样交给下游（可能无法使用）：file=%r url=%s",
             file_ref[:80],
             current_url[:80],
         )
+
+    def _read_image_as_base64(self, locator: str) -> str:
+        """把协议端给的图片定位符读成 `base64://…`；读不到返回空串。
+
+        🔴 **同步函数**（会读盘 / 发 HTTP）—— 调用方必须用
+           `asyncio.to_thread(...)`，否则一张 300KB 的图就能卡住整个事件循环
+           （本项目通则：同步 SQLite/IO 不得跑在循环上）。
+        
+
+        支持三种来源，按可靠性排：
+        1. 已经是 `base64://` —— 直接用。
+        2. `http(s)` 且**不是** QQ 那个鉴权下载口 —— 下载后转 base64。
+           （鉴权口不行，前面已经验证过会 400。）
+        3. 本地绝对路径 —— 直接读文件。
+        """
+        import base64 as _b64
+
+        value = (locator or "").strip()
+        if not value:
+            return ""
+        if value.startswith("base64://"):
+            return value
+        if value.startswith(("http://", "https://")):
+            if "multimedia.nt.qq.com.cn/download" in value:
+                return ""
+            return self._download_as_base64(value)
+        path = value
+        if path.startswith("file://"):
+            from urllib.parse import unquote, urlsplit
+
+            split = urlsplit(path)
+            path = unquote(split.path)
+        payload = self._read_local_with_map(path)
+        if not payload:
+            return ""
+        return "base64://" + _b64.b64encode(payload).decode("ascii")
+
+    def _read_local_with_map(self, path: str) -> bytes:
+        """按需做**容器内路径 → 宿主机路径**映射后读文件；读不到返回 b""。
+
+        🔴 为什么需要（2026-11-03 第二次实测）：
+            协议端在 Docker 里时，`get_image` 返回的是**容器内**路径，例如
+              `/app/.config/QQ/nt_qq_.../nt_data/Pic/2026-11/Ori/xxx.jpg`
+            而宿主进程读这个路径必然 `FileNotFoundError`。
+            实测该目录挂到宿主机的 `/opt/napcat/bot1/ntqq`，同一个文件
+            250815 字节，两边一致。
+
+        映射由适配器配置项 `image_path_map` 提供（`容器前缀=宿主前缀`），
+        **不写死容器名或路径** —— 换机器/换容器名都能用，没配就不做映射。
+        顺序：先直读（同机部署不需要映射，也不该多一次 stat），
+        再按映射逐条替换前缀重试。
+        """
+        from pathlib import Path as _Path
+
+        try:
+            direct = _Path(path)
+            if direct.is_file():
+                return direct.read_bytes()
+        except OSError:
+            pass
+
+        for container_prefix, host_prefix in self._image_path_map():
+            if not path.startswith(container_prefix):
+                continue
+            candidate = _Path(host_prefix + path[len(container_prefix):])
+            try:
+                if candidate.is_file():
+                    logger.debug("图片路径已按映射转换：%s -> %s", path[:60], str(candidate)[:60])
+                    return candidate.read_bytes()
+            except OSError:
+                continue
+        return b""
+
+    def _image_path_map(self) -> list[tuple[str, str]]:
+        """解析 `image_path_map` 配置（每行 `容器前缀=宿主前缀`）。
+
+        ⚠️ 格式不对的行**跳过并 warn**，不让一条写错的映射挡住其余映射 ——
+           面板是自由文本，写错是常态。
+        """
+        raw = self.config.get("image_path_map") or []
+        if isinstance(raw, str):
+            raw = [line for line in raw.splitlines()]
+        pairs: list[tuple[str, str]] = []
+        for line in raw:
+            if not isinstance(line, str) or "=" not in line:
+                continue
+            container_prefix, _, host_prefix = line.partition("=")
+            container_prefix = container_prefix.strip().rstrip("/")
+            host_prefix = host_prefix.strip()
+            if not container_prefix or not host_prefix:
+                logger.warning("图片路径映射格式不对，已跳过：%r", line[:80])
+                continue
+            pairs.append((container_prefix, host_prefix.rstrip("/")))
+        # 长的前缀优先，避免 `/app` 抢在 `/app/.config/QQ` 前面
+        pairs.sort(key=lambda item: len(item[0]), reverse=True)
+        return pairs
+
+    @staticmethod
+    def _download_as_base64(url: str) -> str:
+        """同步下载（调用方已在线程外，这里用 httpx 的同步客户端）。"""
+        import base64 as _b64
+
+        try:
+            import httpx
+
+            with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+                resp = client.get(url)
+            if resp.status_code >= 400 or not resp.content:
+                logger.warning("图片下载失败 HTTP %s：%s", resp.status_code, url[:100])
+                return ""
+            return "base64://" + _b64.b64encode(resp.content).decode("ascii")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("图片下载异常 %s：%s", type(exc).__name__, url[:100])
+            return ""
 
     async def _convert_request_event(self, event: Any) -> Any:
         """请求类事件（加好友 / 加群）。照真实现 `_convert_handle_request_event`。"""
