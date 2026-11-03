@@ -41,14 +41,16 @@ MAX_PROPOSAL_CHARS = 1200
 # observation, a proposal, an applicability map and a concrete expression form.
 # Measured answers (2026-10-30): summary plus three short candidates and their
 # JSON envelope occupied 1098-1318 output tokens, i.e. 300-370 tokens per
-# candidate. The ceiling such a request executes under is
-# ``model.role.expression.learn.max_output_tokens``, which defaults to the
-# reply-sized ceiling of the same window, and a thinking model spends part of it
-# on its own reasoning before it writes one visible character (Gemini 3 counts
-# thinking inside max_output_tokens). Asking for the product maximum regardless
-# of that ceiling is how one run ended with a 123-character body while ~1968
-# tokens of its ceiling never became visible text, so the count is derived here
-# instead of fixed.
+# candidate. The ceiling such a request executes under is the one its resolved
+# route carries — the value the window saved for
+# ``model.role.expression.learn.max_output_tokens``, which routing refuses when a
+# selected provider cannot emit it. The registered profile default is only what an
+# installation that never saved one inherits, so it is not that ceiling and must
+# not be substituted for it. A thinking model spends part of the ceiling on its
+# own reasoning before it writes one visible character (Gemini 3 counts thinking
+# inside max_output_tokens). Asking for the product maximum regardless of that
+# ceiling is how one run ended with a 123-character body while ~1968 tokens of its
+# ceiling never became visible text, so the count is derived here instead of fixed.
 LEARNING_SIGNAL_TOKENS = 400
 LEARNING_SUMMARY_TOKENS = 150
 LEARNING_ANSWER_SHARE = (2, 3)
@@ -277,8 +279,17 @@ class ExpressionLearningOutput:
     signals: tuple[StyleSignal, ...]
 
 
-def parse_output(raw: object, *, allowed_evidence: set[str] | frozenset[str], default_channels=None) -> ExpressionLearningOutput:
-    """Validate a model-authored candidate; never persists or activates the result."""
+def parse_output(raw: object, *, allowed_evidence: set[str] | frozenset[str], default_channels=None,
+                 limit: int = MAX_SIGNALS_PER_RUN) -> ExpressionLearningOutput:
+    """Validate a model-authored candidate; never persists or activates the result.
+
+    ``limit`` is the candidate count the dispatched request actually declared
+    through ``schema(limit)``. It narrows the per-run maximum but never raises
+    it: an answer that stays under the product maximum yet over the narrowed ask
+    broke the contract its own run sent, so it is refused instead of accepted
+    beyond what was paid for, while a caller asking for more than the maximum
+    still gets the maximum.
+    """
     if type(raw) is str:
         try:
             raw = json.loads(raw)
@@ -287,8 +298,9 @@ def parse_output(raw: object, *, allowed_evidence: set[str] | frozenset[str], de
     if not isinstance(raw, Mapping) or set(raw) != {"summary", "signals"}:
         raise ValueError("invalid_shape")
     summary, signals = raw["summary"], raw["signals"]
+    ceiling = MAX_SIGNALS_PER_RUN if type(limit) is not int else min(limit, MAX_SIGNALS_PER_RUN)
     if (type(summary) is not str or len(summary) > MAX_SUMMARY_CHARS
-            or not isinstance(signals, list) or len(signals) > MAX_SIGNALS_PER_RUN):
+            or not isinstance(signals, list) or len(signals) > ceiling):
         raise ValueError("invalid_shape")
     accepted = []
     for item in signals:

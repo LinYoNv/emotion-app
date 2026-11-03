@@ -50,8 +50,15 @@ window.CompanionLearningOverviewPage = (() => {
   async function read(current) {
     if (!root || current !== ticket || data?.writing) return;
     const request = ++readTicket;
-    const notice = data?.notice || "", error = !!data?.error;
-    data = {loading:true, writing:false, confirming:null, notice, error, errors:0, growth:[], counts:{pending:0,active:0,adopted:0,rules:null,scan:null}};
+    // Keep the last settled view while re-reading. Replacing it with zeros made
+    // every refresh flash an empty KPI row and collapse the growth track, which
+    // the browser then answered by clamping the scroll position to the top.
+    const previous = data;
+    const notice = previous?.notice || "", error = !!previous?.error;
+    data = previous
+      ? {...previous, loading:true, writing:false, confirming:null, notice, error}
+      : {loading:true, settled:false, writing:false, confirming:null, notice, error, errors:0,
+         failedSources:0, growth:[], counts:{pending:0,active:0,adopted:0,rules:null,scan:null}};
     render();
     const tasks = sources.map(async source => {
       const growth = relative(source.growthApi || source.api), reply = relative(source.replyApi);
@@ -65,17 +72,27 @@ window.CompanionLearningOverviewPage = (() => {
       ]);
       const value = index => requests[index].status === "fulfilled" ? requests[index].value || {} : null;
       const growthItems=value(0)?.items||[];
-      const settings=value(5)?.settings;
+      const expression=value(5);
+      const settings=expression?.settings, learning=expression?.learning||null;
+      // A group source may have no growth route at all, so count only the reads
+      // that were actually attempted. A source with no readable route cannot be
+      // read at all: treat it as a failed owner, never as an empty one.
+      const attempted=(growth?3:0)+(reply?3:0);
+      const rejected=requests.filter(result => result.status === "rejected").length;
       return {
-        errors: requests.filter(result => result.status === "rejected").length,
+        errors: rejected + (attempted ? 0 : 1),
+        failed: attempted === 0 || rejected >= attempted,
         growth: growthItems.map(item=>({...item,_scope:source.label,_source:source})),
         pending: (value(1)?.items||[]).length
           + (value(2)?.items||[]).filter(item=>item.kind==="ask_user").length
           + (value(3)?.items||[]).length,
         active: growthItems.filter(item=>item.state==="active").length,
         adopted: (value(4)?.items||[]).length,
-        rules: Number.isInteger(settings?.rules_per_turn) ? settings.rules_per_turn : null,
-        learning: value(5)?.learning || null,
+        // The per-turn injection ceiling is role-wide policy, so it travels with
+        // the learning status; only the local window switches live in `settings`.
+        rules: Number.isInteger(learning?.rules_per_turn) ? learning.rules_per_turn
+          : Number.isInteger(settings?.rules_per_turn) ? settings.rules_per_turn : null,
+        learning,
         review: value(2)?.status || null,
         access: value(0)?.access || null,
       };
@@ -93,16 +110,24 @@ window.CompanionLearningOverviewPage = (() => {
     const valid = sourceResults.filter(result => result.status === "fulfilled").map(result => result.value);
     data.errors = sourceResults.reduce((total, result) => total +
       (result.status === "fulfilled" ? result.value.errors : 1), 0) + semanticResult.errors;
-    data.growth = valid.flatMap(result => result.growth);
-    data.counts.pending = valid.reduce((total,result)=>total+result.pending,0);
-    data.counts.active = valid.reduce((total,result)=>total+result.active,0);
-    data.counts.adopted = valid.reduce((total,result)=>total+result.adopted,0);
-    const configured = valid.find(result=>Number.isInteger(result.rules));
-    data.counts.rules = configured?.rules ?? null;
-    data.counts.scan = semanticResult.scan;
-    data.learning = valid.map(result=>result.learning).find(item=>item&&typeof item==="object"&&item.state)||null;
-    data.review = valid.map(result=>result.review).find(item=>item&&typeof item==="object"&&item.state)||null;
-    data.access = valid.map(result=>result.access).find(item=>item&&typeof item==="object"&&item.settings)||null;
+    data.failedSources = sourceResults.reduce((total, result) => total +
+      (result.status === "fulfilled" ? (result.value.failed ? 1 : 0) : 1), 0);
+    // A failed refresh must not turn the last known numbers into zeros: with no
+    // readable owner there is nothing left to recompute from, so keep the
+    // previous view and let the error line explain it. A first load has none.
+    if (!(sources.length > 0 && data.failedSources >= sources.length)) {
+      data.growth = valid.flatMap(result => result.growth);
+      data.counts.pending = valid.reduce((total,result)=>total+result.pending,0);
+      data.counts.active = valid.reduce((total,result)=>total+result.active,0);
+      data.counts.adopted = valid.reduce((total,result)=>total+result.adopted,0);
+      const configured = valid.find(result=>Number.isInteger(result.rules));
+      data.counts.rules = configured?.rules ?? null;
+      data.counts.scan = semanticResult.scan;
+      data.learning = valid.map(result=>result.learning).find(item=>item&&typeof item==="object"&&item.state)||null;
+      data.review = valid.map(result=>result.review).find(item=>item&&typeof item==="object"&&item.state)||null;
+      data.access = valid.map(result=>result.access).find(item=>item&&typeof item==="object"&&item.settings)||null;
+    }
+    data.settled = true;
     data.loading=false;
     render();
   }
@@ -124,16 +149,22 @@ window.CompanionLearningOverviewPage = (() => {
     capacity_reached: "待审与启用规则已达上限",
     daily_budget_reached: "今日群聊学习批次已用完",
     already_attempted: "本批素材已学习，等待新消息",
+    succeeded: "上次学习已产出",
+    retry_backoff: "上次失败，等待下次重试",
+    retry_exhausted: "本批素材重试已达上限，等待新素材",
     failed: "上次学习失败",
     blocked: "来源校验未通过",
   };
+  // 重试相关状态的中文文案已经把处置说清楚（等待或停止），不再回显
+  // expression_retry_exhausted 这类机器码，否则同一行会同时出现中文与机器码。
+  const RETRY_STATES = new Set(["retry_exhausted", "retry_backoff"]);
   // 失败码的中文原因：只解释稳定 code 的含义与处置动作，原始 code 仍照常显示，
   // 便于和日志、台账对照。
   const LEARNING_FAILURE_CODES = {
     model_estimation_failed: "本地预估没能完成，先按日志里的 error_type 排查",
     host_model_limit_input: "要发送的材料超过本地输入上限；请调大「最大输入估算」或减少参考规则",
     host_model_limit_output: "输出上限不足以写完这次结果；请调高该任务的输出上限",
-    model_output_truncated: "模型输出被输出上限截断；请调高该任务的输出上限",
+    model_output_truncated: "模型没写完就被输出上限截断：思考型模型会把上限大量花在思考上，可见输出只占一小部分。可把「模型 → 学习 → 表达学习」的「单次输出上限」调到约 4 倍以上（例如 4096 → 16384，仍失败就继续加倍），或在 Provider 处调低思考等级/关闭思考、改用非思考模型，也可减少参考规则与样本；改完到「表达学习 → 观察素材」点「立即学习」重试。",
   };
   function learningLine(item) {
     if (!item || typeof item !== "object" || !item.state) return "";
@@ -143,7 +174,9 @@ window.CompanionLearningOverviewPage = (() => {
       : Number.isInteger(item.available)
         ? `（${item.available}/${Number.isInteger(item.required) ? item.required : "?"} 条样本）` : "";
     const reason = item.code && LEARNING_FAILURE_CODES[item.code] ? `（${e(LEARNING_FAILURE_CODES[item.code])}）` : "";
-    const failure = item.code ? ` · ${item.code}` : "";
+    // 重试类状态的中文文案已经说明了该怎么办；同一行再挂上
+    // expression_retry_exhausted 只会让「已停止、等待新素材」看起来像故障码。
+    const failure = item.code && !RETRY_STATES.has(item.state) ? ` · ${item.code}` : "";
     const last = item.last_run_at ? ` · 上次 ${when(item.last_run_at)}` : "";
     return `表达学习：${e(label)}${e(counts)}${reason}${e(failure)}${e(last)}`;
   }
@@ -195,6 +228,9 @@ window.CompanionLearningOverviewPage = (() => {
   function render() {
     if (!root || !data) return;
     const counts=data.counts;
+    // Every record owner failed: this is an outage, not an empty workspace, so
+    // the page must not conclude that learning produced nothing yet.
+    const allFailed=sources.length>0&&data.failedSources>=sources.length;
     const cards=[
       ["待裁决",counts.pending,"progress-review","clipboard-list"],
       ["培育中",counts.active,"active-growth","sprout"],
@@ -206,9 +242,12 @@ window.CompanionLearningOverviewPage = (() => {
       return `<section class="lh-overview-lane" data-state="${state}"><header><span class="lh-lane-dot" style="--lane:${color}"></span><strong>${label}</strong><span>${items.length}</span></header>
         <div class="lh-lane-items">${items.length?items.slice(0,4).map(growthCard).join(""):`<p class="lh-lane-empty">—</p>`}</div></section>`;
     }).join("");
-    root.innerHTML=`<div class="lh-overview-toolbar"><span>${data.errors?"部分记录归属暂不可用":`汇总 ${sources.length} 个记录归属`}</span>
+    const summary=allFailed?"全部记录归属读取失败":data.errors?"部分记录归属暂不可用":`汇总 ${sources.length} 个记录归属`;
+    root.setAttribute?.("aria-busy",data.loading?"true":"false");
+    root.innerHTML=`<div class="lh-overview-toolbar"><span>${summary}</span>
       <button type="button" class="lh-refresh" data-lh-refresh aria-label="重新读取" title="重新读取" ${data.loading||data.writing?"disabled":""}><i data-lucide="refresh-cw"></i></button></div>
-      ${data.notice?`<p class="lh-inline-status${data.error?" is-error":""}" role="status">${e(data.notice)}</p>`:""}
+      ${allFailed?`<p class="lh-inline-status is-error" role="status">来源读取失败，请检查来源配置后重新读取。<button type="button" class="lh-command" data-lh-refresh ${data.loading||data.writing?"disabled":""}>重新读取</button></p>`
+        :data.notice?`<p class="lh-inline-status${data.error?" is-error":""}" role="status">${e(data.notice)}</p>`:""}
       ${data.learning?`<p class="lh-inline-status" role="status">${learningLine(data.learning)}</p>`:""}
       ${data.review?`<p class="lh-inline-status" role="status">${reviewLine(data.review)}</p>`:""}
       ${data.access?`<p class="lh-inline-status" role="status">${growthLine(data.access)}</p>`:""}
@@ -219,10 +258,10 @@ window.CompanionLearningOverviewPage = (() => {
         <div class="lh-track-axis" aria-hidden="true">${STAGES.map(([state,label])=>`<span data-state="${state}"><i></i><b>${label}</b></span>`).join("")}</div>
         <div class="lh-overview-lanes">${lanes}</div></section>
       ${data.confirming?`<div class="lh-review-confirm" role="alertdialog" aria-label="确认${ACTIONS[data.confirming.action]}"><span>${ACTIONS[data.confirming.action]}这条记录？</span><button type="button" data-lh-confirm="yes">确认${ACTIONS[data.confirming.action]}</button><button type="button" data-lh-confirm="no">取消</button></div>`:""}
-      ${data.loading&&!data.growth.length?`<p class="lh-empty">正在读取…</p>`:""}
-      ${!data.loading&&!data.growth.length&&!counts.pending&&!counts.active&&!counts.adopted
+      ${data.loading&&!data.settled?`<p class="lh-empty">正在读取…</p>`:""}
+      ${!data.loading&&!data.errors&&!data.growth.length&&!counts.pending&&!counts.active&&!counts.adopted
         ?`<p class="lh-empty">学习还没有产出。每日复盘会在后台自动运行，表达学习可在「表达学习」点「立即学习」，成长记录需要先给对应用户开启成长提案权限。</p>`
-        :!data.loading&&!data.growth.length?`<p class="lh-empty">暂无成长记录</p>`:""}`;
+        :!data.loading&&!data.errors&&!data.growth.length?`<p class="lh-empty">暂无成长记录</p>`:""}`;
     window.lucide?.createIcons({attrs:{"aria-hidden":"true"}});
   }
 
@@ -278,7 +317,7 @@ window.CompanionLearningOverviewPage = (() => {
     root?.addEventListener("click",onClick);
     const current=++ticket;
     if(sources.length)void read(current);
-    else{data={loading:false,errors:0,growth:[],counts:{pending:0,active:0,adopted:0,rules:null,scan:null}};render();}
+    else{data={loading:false,settled:true,errors:0,failedSources:0,growth:[],counts:{pending:0,active:0,adopted:0,rules:null,scan:null}};render();}
   }
   function unmount() { ticket++;readTicket++; root?.removeEventListener("click",onClick); root=null; sources=[]; semantic=null; data=null; }
   return {mount,unmount,get state(){return data;}};

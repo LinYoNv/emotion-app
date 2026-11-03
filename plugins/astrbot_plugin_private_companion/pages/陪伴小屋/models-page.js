@@ -124,12 +124,45 @@ window.CompanionModelsPage = (() => {
   const available = (s, task) => s.status.providers.filter(p => task.capabilities.every(cap => p.capabilities.includes(cap)));
   const effective = (task, draft, name) => draft.inherited[name] ? task.fields[name].inherited_value : draft.values[name];
   const providerFor = (task, draft) => coreReply(task) ? "" : effective(task, draft, "provider");
-  const limitFor = (s, task, draft) => Math.min(MAX_MODEL_OUTPUT_TOKENS, ...["provider", "fallback"]
-    .map(name => effective(task, draft, name)).filter(Boolean)
+  /* The routing ceiling of one draft: the strictest output capability among the
+     providers this task can be sent to. Replacement-rule targets count too,
+     because routing may pick one of them for the same task. */
+  const limitFor = (s, task, draft) => Math.min(MAX_MODEL_OUTPUT_TOKENS, ...[...new Set([
+      effective(task, draft, "provider"), effective(task, draft, "fallback"),
+      ...ruleOf(s, task.kind).map(rule => String(rule.provider_id || ""))])]
+    .filter(Boolean)
     .map(id => s.status.providers.find(provider => provider.id === id)?.max_output_tokens || MAX_MODEL_OUTPUT_TOKENS));
-  function fitLimit(s, task, draft) { const limit = limitFor(s, task, draft);
-    if (effective(task, draft, "max_output_tokens") <= limit) return false;
-    draft.values.max_output_tokens = limit; draft.inherited.max_output_tokens = false; return true; }
+  const limitExcess = (s, task, draft) => { const limit = limitFor(s, task, draft);
+    const value = effective(task, draft, "max_output_tokens");
+    return value > limit ? {value, limit} : null; };
+  /* A registry default is clamped by routing at send time, so a task may keep
+     following it even when the ceiling is lower. */
+  const limitIsDefault = task => (task.fields.max_output_tokens.inherited_source || "default") === "default";
+  /* Only a value the user saved explicitly is clamped to the ceiling. An
+     inherited value keeps following its source: pinning it would silently turn
+     "follow the default" into a saved number, which is exactly what the larger
+     registry defaults must not cause. */
+  function fitLimit(s, task, draft) { const excess = limitExcess(s, task, draft);
+    if (!excess) return null;
+    if (draft.inherited.max_output_tokens) return {basis: "inherited", ...excess};
+    draft.values.max_output_tokens = excess.limit; draft.inherited.max_output_tokens = false;
+    return {basis: "adjusted", ...excess}; }
+  function limitNotice(task, draft, fit) { const label = taskName(task.kind).label;
+    if (fit.basis === "adjusted") return `${label} 的输出上限已调整为 ${fit.limit}，请核对后保存。`;
+    return limitIsDefault(task)
+      ? `${label}：继承的默认输出上限 ${fit.value} 高于所选模型提供方的 ${fit.limit}，发送时会按 ${fit.limit} 生效。`
+      : `${label}：继承的输出上限 ${fit.value} 超过所选模型提供方的 ${fit.limit}；跟随上级不会被改写，请显式设置上限或改回上级。`; }
+  function limitHint(s, task, draft) { const excess = limitExcess(s, task, draft); if (!excess) return "";
+    if (!draft.inherited.max_output_tokens)
+      return `输出上限 ${excess.value} 超过所选模型提供方的 ${excess.limit}，保存会被拒绝。`;
+    return limitIsDefault(task)
+      ? `继承的默认输出上限 ${excess.value} 高于所选模型提供方的 ${excess.limit}，发送时会按 ${excess.limit} 生效。`
+      : `继承的输出上限 ${excess.value} 超过所选模型提供方的 ${excess.limit}，发出时会被拒绝；请显式设置上限或改回上级。`; }
+  function limitProblem(s, task, draft) { const excess = limitExcess(s, task, draft); if (!excess) return "";
+    if (!draft.inherited.max_output_tokens)
+      return `输出上限 ${excess.value} 超过所选模型提供方的 ${excess.limit}，请调低后再保存`;
+    return limitIsDefault(task) ? ""
+      : `继承的输出上限 ${excess.value} 超过所选模型提供方的 ${excess.limit}，请显式设置上限或改回上级`; }
   const storageKey = kind => key + ":" + kind;
   const shown = (s, task) => { const info = taskName(task.kind), custom = taskFields(task).some(name => !s.drafts.get(task.kind).inherited[name]);
     return (!s.providerFilter || s.providerFilter === providerFor(task, s.drafts.get(task.kind)))
@@ -242,7 +275,7 @@ window.CompanionModelsPage = (() => {
     if (s.expanded && !kinds.has(s.expanded)) s.expanded = null; }
   const projected = (task, patch, name) => Object.hasOwn(patch.changes, name) ? patch.changes[name]
     : (patch.reset.includes(name) ? task.fields[name].inherited_value : task.fields[name].value);
-  function validatePatch(task, p) { if (!Object.keys(p.changes).length && !p.reset.length) return false;
+  function validatePatch(task, draft, p) { if (!Object.keys(p.changes).length && !p.reset.length) return false;
     if (Object.hasOwn(p.changes, "prompt") && (typeof p.changes.prompt !== "string" || p.changes.prompt.length > 8000)) return false;
     if (Object.hasOwn(p.changes, "max_output_tokens") && (!Number.isInteger(p.changes.max_output_tokens) || p.changes.max_output_tokens < 1 || p.changes.max_output_tokens > MAX_MODEL_OUTPUT_TOKENS)) return false;
     if (Object.hasOwn(p.changes, "timeout_seconds") && (!Number.isInteger(p.changes.timeout_seconds) || p.changes.timeout_seconds < 1 || p.changes.timeout_seconds > 600)) return false;
@@ -255,8 +288,15 @@ window.CompanionModelsPage = (() => {
     const picked = [primary, ...(fallback ? [fallback] : [])], providers = picked.map(id => state.status.providers.find(provider => provider.id === id));
     const fallbackExplicit = Object.hasOwn(p.changes, "fallback")
       || (!p.reset.includes("fallback") && task.fields.fallback.explicit);
+    /* A registry default is clamped by routing at send time, so a task may keep
+       following it even when the selected provider is smaller: the save only
+       carries the provider, and the sent envelope fits. */
+    const limitDefault = !Object.hasOwn(p.changes, "max_output_tokens")
+      && (p.reset.includes("max_output_tokens") || !task.fields.max_output_tokens.explicit)
+      && limitIsDefault(task);
     return (!fallbackExplicit || !fallback || fallback !== primary)
-      && providers.every(provider => provider && task.capabilities.every(cap => provider.capabilities.includes(cap)) && limit <= provider.max_output_tokens); }
+      && providers.every(provider => provider && task.capabilities.every(cap => provider.capabilities.includes(cap)))
+      && (limitDefault || limit <= limitFor(state, task, draft)); }
   /* ---------- functional markup (design alignment: MODEL_CONFIG_UI_UX_DESIGN_20260926) ---------- */
   /* Stable per-provider hue for the colored routing pills and map dots. */
   const hue = id => { let h = 0; for (const ch of String(id || "")) h = (h * 31 + ch.charCodeAt(0)) % 360; return h; };
@@ -360,7 +400,7 @@ window.CompanionModelsPage = (() => {
     if (coreReply(task)) return coreReplyCard(s, task);
     const fieldLocked = locked || !!draft.pending;
     const picked = s.selection.includes(task.kind), open = s.expanded === task.kind, waiting = dirty(task, draft) && !draft?.pending;
-    const limit = limitFor(s, task, draft);
+    const limit = limitFor(s, task, draft), limitMessage = limitHint(s, task, draft);
     const main = providerFor(task, draft), fallback = effective(task, draft, "fallback");
     const own = fields.some(name => !draft.inherited[name]);
     const caps = available(s, task);
@@ -387,6 +427,7 @@ window.CompanionModelsPage = (() => {
           <label class="model-fd"><span class="model-cap">单次输出上限</span>
             <span class="model-unit"><input type="number" min="1" max="${limit}" step="1" data-model-field="max_output_tokens" data-model-kind="${esc(task.kind)}" value="${esc(effective(task, draft, "max_output_tokens"))}" ${fieldLocked ? "disabled" : ""}><i>令牌</i></span></label>
         </div>
+        ${limitMessage ? `<div class="model-alert" role="alert">${esc(limitMessage)}</div>` : ""}
         <label class="model-fd dash"><span class="model-cap">任务附加提示词 <em>最多 8000 字</em></span>
           <textarea rows="3" maxlength="8000" data-model-field="prompt" data-model-kind="${esc(task.kind)}" ${fieldLocked ? "disabled" : ""}>${esc(draft.inherited.prompt ? task.fields.prompt.inherited_value : draft.values.prompt)}</textarea></label>
         <div class="model-inh"><span class="lab">未单独设置时跟随上级</span>
@@ -494,7 +535,7 @@ window.CompanionModelsPage = (() => {
       let payload = draft.pending;
       if (!payload) {
         const patch = patchFor(task, draft);
-        if (!validatePatch(task, patch)) { failed.push(`${taskName(kind).label}：字段校验未通过`); continue; }
+        if (!validatePatch(task, draft, patch)) { failed.push(`${taskName(kind).label}：${limitProblem(s, task, draft) || "字段校验未通过"}`); continue; }
         payload = {kind, layer: draft.layer, operation_key: crypto.randomUUID(), edit_token: draft.token, ...patch};
         draft.pending = payload; storePending(kind, payload); render();
       }
@@ -574,7 +615,7 @@ window.CompanionModelsPage = (() => {
       ? (Number.isFinite(target.valueAsNumber) ? target.valueAsNumber : draft.values[name]) : target.value;
     draft.inherited[name] = false;
     const adjusted = (name === "provider" || name === "fallback") && fitLimit(s, task, draft);
-    if (adjusted) { s.notice = `${taskName(kind).label} 的输出上限已调整为 ${draft.values.max_output_tokens}，请核对后保存。`; s.bad = false; }
+    if (adjusted) { s.notice = limitNotice(task, draft, adjusted); s.bad = false; }
     draft.touched = true;
     if (event.type === "change") render(); else syncInput(kind); }
   function fnClick(event) { const s = state; if (!s) return;
@@ -1058,40 +1099,47 @@ window.CompanionModelsPage = (() => {
   async function layaRefreshQuiet(s, ticket) { try { const [data, history] = await Promise.all([api("GET", path + "/laya"), api("GET", path + "/laya/logs")]); if (current(ticket, s)) { s.laya.data = data; s.laya.draft = layaDraftFrom(data); s.laya.logs = history.events || []; } } catch {} }
   /* ---------- DeepSeek search binding ---------- */
   const searchDirty = x => !!x.data && !!x.draft
-    && x.draft.deepseek_provider_id !== x.data.deepseek_provider_id;
+    && (x.draft.deepseek_provider_id !== x.data.deepseek_provider_id
+        || (x.draft.source_priority || "auto") !== (x.data.source_priority || "auto"));
   async function searchRefresh(s) { const x = s.search, ticket = version; if (x.loading || x.busy) return;
     x.loading = true; x.notice = "正在读取搜索服务配置…"; render();
     try { const data = await api("GET", path + "/search"); if (!current(ticket, s)) return;
-      if (!searchDirty(x) || x.stale) x.draft = {deepseek_provider_id: data.deepseek_provider_id || ""};
+      if (!searchDirty(x) || x.stale) x.draft = {deepseek_provider_id: data.deepseek_provider_id || "", source_priority: data.source_priority || "auto"};
       x.data = data; x.loaded = true; x.stale = false; x.bad = false;
-      x.notice = data.provider_available ? "已读取 DeepSeek 搜索 Provider。" : "当前选择的 Provider 未加载或已失效；搜索不会自动切换。";
+      x.notice = data.provider_available ? "已读取 DeepSeek 搜索 Provider。" : "当前选择的 Provider 未加载或已失效；搜索会改用 AstrBot 里配置的搜索服务。";
     } catch (err) { if (!current(ticket, s)) return; x.bad = true; x.notice = fail(err, "无法读取搜索服务配置。"); }
     finally { x.loading = false; if (current(ticket, s)) render(); } }
   async function searchSave(s) { const x = s.search; if (x.busy || x.loading || !x.data || x.stale || !searchDirty(x)) return;
-    const ticket = version, changes = {deepseek_provider_id: x.draft.deepseek_provider_id};
+    const ticket = version, changes = {deepseek_provider_id: x.draft.deepseek_provider_id,
+      source_priority: x.draft.source_priority || "auto"};
     x.busy = true; x.notice = "正在保存搜索服务配置…"; render();
     try { const data = await api("POST", path + "/search/save", {revision: x.data.revision, changes}); if (!current(ticket, s)) return;
-      x.data = data; x.draft = {deepseek_provider_id: data.deepseek_provider_id || ""}; x.stale = false; x.bad = false;
-      x.notice = data.provider_available ? "搜索 Provider 已保存，后续搜索立即生效。" : "配置已保存，但 Provider 当前不可用；搜索不会自动切换。";
+      x.data = data; x.draft = {deepseek_provider_id: data.deepseek_provider_id || "", source_priority: data.source_priority || "auto"}; x.stale = false; x.bad = false;
+      x.notice = data.provider_available ? "搜索 Provider 已保存，后续搜索立即生效。" : "配置已保存，但 Provider 当前不可用；搜索会改用 AstrBot 里配置的搜索服务。";
     } catch (err) { if (!current(ticket, s)) return; x.bad = true; x.notice = fail(err, "搜索服务配置保存未完成。"); }
     finally { x.busy = false; if (current(ticket, s)) render(); } }
-  function searchPane(s) { const x = s.search, data = x.data, draft = x.draft || {deepseek_provider_id: ""};
+  function searchPane(s) { const x = s.search, data = x.data, draft = x.draft || {deepseek_provider_id: "", source_priority: "auto"};
     const providers = data?.providers || [], selected = draft.deepseek_provider_id || "";
     const unavailable = selected && !providers.some(item => item.id === selected);
     return `<div class="model-subpane model-laya-pane">
-      <div class="model-card"><div class="model-phead"><div class="model-grow"><span class="model-eb">网页搜索与内容抓取</span><h3>DeepSeek 搜索服务</h3><p class="model-note">搜索使用 DeepSeek 官方 Search / Fetch API，不对应聊天模型任务。API 密钥由 AstrBot Provider 管理；V2 只保存 Provider 标识。选择自动时沿用环境变量、当前 DeepSeek Provider 和 AstrBot 网页搜索回退。</p></div><button type="button" class="button small" data-search-refresh ${x.loading || x.busy ? "disabled" : ""}>刷新</button></div>
+      <div class="model-card"><div class="model-phead"><div class="model-grow"><span class="model-eb">网页搜索与内容抓取</span><h3>DeepSeek 搜索服务</h3><p class="model-note">搜索使用 DeepSeek 官方 Search / Fetch API，不对应聊天模型任务。API 密钥由 AstrBot Provider 管理；V2 只保存 Provider 标识。优先级决定两条来源谁先试：自动＝优先 DeepSeek Provider（未选则 AstrBot 网页搜索）、优先 AstrBot＝先 AstrBot 网页搜索、优先 DeepSeek＝先 DeepSeek Provider。首选不可用时自动改用另一条。</p></div><button type="button" class="button small" data-search-refresh ${x.loading || x.busy ? "disabled" : ""}>刷新</button></div>
         <label class="model-fd"><span class="model-cap">DeepSeek API 凭据来源<em>只列出已加载且配置了 api.deepseek.com 的 Provider</em></span><select data-search-provider ${x.loading || x.busy || !data ? "disabled" : ""}>
           <option value="" ${selected ? "" : "selected"}>自动选择</option>${providers.map(item => `<option value="${esc(item.id)}" ${selected === item.id ? "selected" : ""}>${esc(item.name)} · ${esc(item.id)}</option>`).join("")}
           ${unavailable ? `<option value="${esc(selected)}" selected>${esc(selected)} · 当前不可用</option>` : ""}</select></label>
         ${data && !providers.length ? '<p class="model-note">未发现可用的 DeepSeek Provider。可在 AstrBot 模型提供方中配置官方 API，再刷新此页。</p>' : ""}
-        ${unavailable ? '<div class="model-alert">已选 Provider 当前不可用。请重新加载该 Provider，或改选其他来源。</div>' : ""}
+        ${unavailable ? '<div class="model-alert">已选 Provider 当前不可用；若 AstrBot 网页搜索已配置，搜索会改用它。</div>' : ""}
+        <label class="model-fd"><span class="model-cap">搜索来源优先级<em>只影响“先试谁”，首选不可用时自动改用另一条</em></span><select data-search-priority ${x.loading || x.busy || !data ? "disabled" : ""}>
+          ${[["auto","自动"],["astrbot","优先 AstrBot 网页搜索"],["deepseek","优先 DeepSeek Provider"]].map(([value,label])=>`<option value="${value}" ${(draft.source_priority || "auto") === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>
         <div class="model-editor-actions"><button type="button" class="button primary" data-search-save ${!data || !searchDirty(x) || x.busy || x.loading || x.stale ? "disabled" : ""}>保存搜索配置</button></div>
         ${x.stale ? '<div class="model-alert">配置已在别处变化，请刷新后核对。</div>' : ""}${x.notice ? `<div class="model-notice${x.bad || unavailable ? " error" : ""}">${esc(x.notice)}</div>` : ""}
       </div>
     </div>`; }
   function searchInput(s, event) { const x = s.search, target = event.target;
-    if (!target.matches("[data-search-provider]") || !x.draft || x.loading || x.busy) return;
-    x.draft.deepseek_provider_id = target.value; x.bad = false; x.notice = "";
+    if (!x.draft || x.loading || x.busy) return;
+    if (target.matches("[data-search-provider]")) x.draft.deepseek_provider_id = target.value;
+    else if (target.matches("[data-search-priority]")) x.draft.source_priority = target.value;
+    else return;
+    x.bad = false; x.notice = "";
     if (event.type === "change") render(); }
   function searchClick(s, event) { const target = event.target;
     if (target.closest("[data-search-refresh]")) { searchRefresh(s); return; }
@@ -1206,7 +1254,7 @@ window.CompanionModelsPage = (() => {
   const IMAGE_LABELS = {"image.generate": "文生图", "image.edit": "参考图改图", "image.mask_edit": "蒙版局部改图"};
   const IMAGE_VIEWS = {generate: {label: "文生图", operation: "generate", actions: ["image.generate"]},
     edit: {label: "改图", operation: "edit", actions: ["image.edit", "image.mask_edit"]}};
-  const IMAGE_LOCAL_LABELS = {comfyui: "ComfyUI", sd_webui: "SD WebUI"};
+  const IMAGE_LOCAL_LABELS = {comfyui: "ComfyUI", sd_webui: "SD WebUI", nai: "NAI 生图插件"};
   const IMAGE_DIAGNOSTICS = {native_registry_unavailable: "V2 原生能力注册表尚未就绪",
     native_extension_unavailable: "Image 模块未创建，启动过程未提供具体错误码",
     native_provider_unavailable: "Image 模块没有创建生图 Provider",
@@ -1236,6 +1284,7 @@ window.CompanionModelsPage = (() => {
     if (["auto", "online_api"].includes(selected)) routes.push(...(config.endpoints || []).map(item => `online:${item.id}`));
     if (["auto", "comfyui"].includes(selected)) routes.push("comfyui");
     if (["auto", "sd_webui"].includes(selected)) routes.push("sd_webui");
+    if (selected === "nai") routes.push("nai");
     return {generate: [...routes], edit: [...routes]};
   };
   const IMAGE_PLATFORMS = {auto: "自动识别", openai: "OpenAI 兼容", openrouter: "OpenRouter", agnes: "Agnes", sensenova: "商汤日日新", minimax: "MiniMax", bailian: "阿里云百炼", modelscope: "魔搭社区", doubao: "火山引擎 / 豆包", gemini: "Google Gemini"};
@@ -1503,7 +1552,10 @@ window.CompanionModelsPage = (() => {
   const imageCurrentOperation = i => IMAGE_VIEWS[i.view || "generate"].operation;
   const imageEndpointLabel = (item, fallback = "未命名图片模型") =>
     String(item?.name || "").trim() || String(item?.model || "").trim() || fallback;
-  function imageRouteAvailable(config, route, operation) {
+  function imageRouteAvailable(config, route, operation, nai = null) {
+    if (route === "nai") return !nai?.available ? "NAI 插件未就绪" :
+      !config.enabled ? "生图后端已关闭" : nai.operations?.includes(operation) ?
+        (operation === "generate" ? "可用于文生图" : "可用于参考图改图") : "当前接入方式不支持";
     if (route.startsWith("online:")) {
       const endpoint = config.endpoints.find(item => item.id === route.slice(7));
       if (!endpoint) return "模型配置缺失";
@@ -1560,6 +1612,11 @@ window.CompanionModelsPage = (() => {
     const disabled = i.configSaving || i.configLoading || !!i.endpointTesting;
     const expanded = i.expandedImageRoutes?.[ref] ?? index === 0;
     const controls = `<div class="model-img-route-tools"><button type="button" class="output-icon-button" data-img-route-move="up" data-img-route-index="${index}" aria-label="上移优先级"${disabled || index === 0 ? " disabled" : ""}><i data-lucide="arrow-up" aria-hidden="true"></i></button><button type="button" class="output-icon-button" data-img-route-move="down" data-img-route-index="${index}" aria-label="下移优先级"${disabled || index === (config.operation_routes[imageCurrentOperation(i)] || []).length - 1 ? " disabled" : ""}><i data-lucide="arrow-down" aria-hidden="true"></i></button><button type="button" class="output-icon-button" data-img-route-remove="${esc(ref)}" aria-label="从当前功能移除" title="从当前功能移除"${disabled ? " disabled" : ""}><i data-lucide="x" aria-hidden="true"></i></button></div>`;
+    if (ref === "nai") {
+      const status = i.config?.nai || {}, support = imageRouteAvailable(config, ref, imageCurrentOperation(i), status);
+      const service = status.call_mode === "openai" ? (status.api_profile === "starbridge" ? "星桥（Almoon）" : "OpenAI 兼容接口") : "nai.sta1n.cn 直连";
+      return `<article class="model-img-route" data-img-route-card="nai"><header><span class="model-img-priority">${index + 1}</span><div class="model-img-route-title"><strong>NAI 生图插件</strong><div class="model-img-route-meta"><span>${esc(status.default_model || service)}</span></div></div><span class="model-img-route-support ${imageRouteSupportTone(support)}">${esc(support)}</span>${controls}</header><div class="model-note">配置来源：NAI 生图插件 · ${esc(service)}${status.default_size ? ` · ${esc(status.default_size)}` : ""}</div></article>`;
+    }
     if (ref.startsWith("online:")) {
       const endpointId = ref.slice(7), endpointIndex = config.endpoints.findIndex(item => item.id === endpointId), item = config.endpoints[endpointIndex];
       if (!item) return `<article class="model-img-route"><header><span class="model-img-priority">${index + 1}</span><strong>模型配置缺失</strong>${controls}</header></article>`;
@@ -1607,8 +1664,13 @@ window.CompanionModelsPage = (() => {
     if (!config) return `<div class="model-img-loading" role="status">${esc(i.configNotice || "尚未读取生图模型配置。")}<button type="button" class="button small" data-img-config-refresh>读取模型配置</button></div>`;
     const operation = imageCurrentOperation(i), routes = config.operation_routes[operation] || [], current = new Set(routes);
     const choices = [...config.endpoints.filter(item => !current.has(`online:${item.id}`)).map(item => [`online:${item.id}`, `${imageEndpointLabel(item, "图片模型")} · ${item.model || item.id}`]),
-      ...Object.entries(IMAGE_LOCAL_LABELS).filter(([key]) => !current.has(key)).map(([key, label]) => [key, label])];
+      ...Object.entries(IMAGE_LOCAL_LABELS).filter(([key]) => !current.has(key)
+        && (key !== "nai" || i.config.nai?.available && i.config.nai?.operations?.includes(operation))).map(([key, label]) => [key, label])];
     const dirty = imageConfigDirty(i), locked = i.configSaving || i.configLoading || !!i.endpointTesting;
+    const nai = i.config.nai, naiSupported = nai?.available && nai.operations?.includes(operation);
+    const naiState = !nai ? "状态暂不可读" : !nai.available ? "插件尚未就绪" :
+      !naiSupported ? "当前接入方式不支持此功能" : [nai.default_model, nai.default_size].filter(Boolean).join(" · ") || "已就绪";
+    const naiSource = current.has("nai") || nai?.installed === false ? "" : `<div class="model-img-nai-source" data-img-nai-source><div><strong>NAI 生图插件</strong><span>${esc(naiState)}</span></div><button type="button" class="button small" data-img-nai-add${locked || !naiSupported ? " disabled" : ""}><i data-lucide="plus" aria-hidden="true"></i>加入${IMAGE_VIEWS[i.view || "generate"].label}队列</button></div>`;
     const legacyOptions = config.legacy_options || {}, selectedWorkflows = legacyOptions.image_companion_selected_workflows || {};
     const extraWorkflows = legacyOptions.image_companion_extra_workflows || [];
     const workflowLabels = {generate: "文生图", edit: "改图", mask_edit: "蒙版局部改图"};
@@ -1624,6 +1686,7 @@ window.CompanionModelsPage = (() => {
     return `<section class="model-img-route-editor" aria-label="生图模型与优先级">
       ${migrationBanner}
       <header class="model-imgconfig-head"><div><span class="model-eb">${operation === "generate" ? "文本提示生成图片" : "参考图片编辑"}</span><h3>${IMAGE_VIEWS[i.view || "generate"].label}模型与优先级</h3><p>${operation === "generate" ? "按列表顺序选择文生图模型；首个成功执行的模型结束本次尝试。" : "普通改图与蒙版局部改图共用模型队列；不支持当前操作的模型会跳过。"}</p></div><label class="model-img-enable"><input type="checkbox" data-img-config-field="enabled"${config.enabled ? " checked" : ""}${locked ? " disabled" : ""}>启用 V2 生图后端</label></header>
+      ${naiSource}
       <div class="model-img-main"><div class="model-img-sectionhead"><div><b>当前功能的模型顺序</b><span>数字越小越先尝试 · 使用上下移按钮调整优先级</span></div><span class="model-tag">${routes.length} 个模型</span></div>
         <div class="model-img-routes">${routes.map((route, index) => imageRouteCard(i, route, index, config)).join("") || '<div class="model-img-empty">此功能尚未配置模型。添加在线图片模型或本地后端后，调用会按此列表顺序尝试。</div>'}</div>
         <div class="model-img-addbar"><label><span>添加已配置模型</span><select data-img-route-choice aria-label="选择要加入当前功能的模型"${locked || !choices.length ? " disabled" : ""}><option value="">选择模型或后端</option>${choices.map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="button small" data-img-route-add${locked || !choices.length ? " disabled" : ""}>添加</button><button type="button" class="button small primary" data-img-model-add${locked || config.endpoints.length >= (i.config.limits?.max_endpoints || 24) ? " disabled" : ""}>新增在线模型</button></div>
@@ -1788,7 +1851,18 @@ window.CompanionModelsPage = (() => {
     }
     if (t.closest("[data-img-route-add]") && i.configDraft && !i.configSaving) {
       const choice = root?.querySelector("[data-img-route-choice]")?.value, queue = i.configDraft.operation_routes[imageCurrentOperation(i)];
-      if (choice && !queue.includes(choice)) queue.push(choice);
+      if (choice && !queue.includes(choice)) {
+        queue.push(choice);
+        if (choice === "nai") i.configDraft.enabled = true;
+      }
+      render(); return;
+    }
+    if (t.closest("[data-img-nai-add]") && i.configDraft && !i.configSaving && !i.configLoading && !i.endpointTesting) {
+      const operation = imageCurrentOperation(i), nai = i.config?.nai;
+      if (!nai?.available || !nai.operations?.includes(operation)) return;
+      const queue = i.configDraft.operation_routes[operation];
+      if (!queue.includes("nai")) queue.push("nai");
+      i.configDraft.enabled = true;
       render(); return;
     }
     if (t.closest("[data-img-model-add]") && i.configDraft && !i.configSaving) {
@@ -2164,7 +2238,7 @@ window.CompanionModelsPage = (() => {
       if (!task || !draft || draft.pending || s.busy || s.loading || s.denied) return;
       draft.values.fallback = t.value; draft.inherited.fallback = false;
       const adjusted = fitLimit(s, task, draft); draft.touched = true; s.bad = false;
-      s.notice = adjusted ? `${taskName(task.kind).label} 的输出上限已调整为 ${draft.values.max_output_tokens}。`
+      s.notice = adjusted ? limitNotice(task, draft, adjusted)
         : `${taskName(task.kind).label} 的拒答备用模型已改动，保存本任务后生效。`;
       render(); return; }
     if (t.matches("[data-peak-start]") || t.matches("[data-peak-end]")) { s.peak[t.matches("[data-peak-start]") ? "start" : "end"] = t.value;

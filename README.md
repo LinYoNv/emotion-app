@@ -327,6 +327,7 @@ EMOTION_PLUGINS_DATA_DIR=data/plugins      # 运行时数据（配置/记忆/上
 | `docs/NEXT_STEPS.md` | 规划 |
 | `host/README.md` | 兼容层细节 |
 | `docs/WIKI_REVIEW_结论.md` | 陪伴插件 wiki 审读结论 |
+| **`docs/UPSTREAM_COLLAB.md`** | **与上游的 PR/issue 全部记录**（提完立刻登记，别靠记忆） |
 
 ---
 

@@ -86,7 +86,7 @@ def test_plugin_class_and_instance(loaded):
 def test_version_from_metadata(loaded):
     """metadata.yaml 要被解析到（版本号可用于诊断）。"""
     # 🔴 2026-11-01：7.0.0 → 7.0.13
-    assert loaded.records[0].version == "7.0.13"
+    assert loaded.records[0].version == "7.0.14"
 
 
 def test_handler_count(loaded):

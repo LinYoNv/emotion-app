@@ -60,6 +60,7 @@ let route='life', lifeTab='home', manageTab='host', selfPane='profile', libraryF
 let navigationIntent=0;
 let outputTabId='visual';
 let selfProfileSection='identity';
+let personaRecreationMode='questionnaire';
 let maintenancePane='';
 let dataPane='storage';
 let tokenTaskSettingsJump=0;
@@ -899,7 +900,7 @@ function mountPanelWorkspaces(){
     :window.CompanionSelfReviewPage?.unmount());
   const decisionHost=$('#decisionWorkspace');
   guarded('决策页',()=>decisionHost
-    ?window.CompanionDecisionPage?.mount(decisionHost,{groupSettingsMarkup:renderDecisionOriginal()})
+    ?window.CompanionDecisionPage?.mount(decisionHost,{groupSettingsMarkup:renderDecisionOriginal(),harassmentApi:(()=>{const role=product.role?.();return typeof role?.reply_api==="string"?role.reply_api+"/harassment":"";})()})
     :window.CompanionDecisionPage?.unmount());
   const memoryHost=$('#memoryWorkspace');
   guarded('事实与经历',()=>memoryHost
@@ -3428,7 +3429,13 @@ function outputProviderLine(id,label){
   return `<div class="output-provider-line"><span class="output-provider-dot${provider?.integration_state==='connected'?' is-ready':''}" aria-hidden="true"></span><span>${escapeHTML(label||provider?.label||id)}</span><span class="output-status-chip${provider?.integration_state==='connected'?' is-ready':''}">${escapeHTML(status)}</span></div>`;
 }
 function renderOutputCapabilitiesPanel(){
-  return `<section class="output-capabilities-panel" aria-label="生图能力与提示词">
+  return `<section class="output-capabilities-panel" aria-label="模型路线">
+    <section class="output-model-routing">
+      <header class="output-panel-heading"><h2>模型路线</h2><button type="button" class="output-inline-link" data-go="manage" data-manage="models">模型与优先级 ${I('arrow-up-right')}</button></header>
+      <div data-output-native-selector></div>
+      <div class="output-native-notice" data-output-native-notice role="status" hidden></div>
+    </section>
+    <div id="outputNaiWorkspace"></div>
     <div id="outputBackendWorkspace"></div>
     <div class="output-capability-columns">
       <div id="outputLocalWorkspace"></div>
@@ -3452,7 +3459,6 @@ function renderOutputOriginal(){
   const previewTab=(id,label,icon,index)=>`<button type="button" role="tab" id="output-mode-${id}" aria-controls="output-preview-${id}" aria-selected="${index===0?'true':'false'}" tabindex="${index===0?'0':'-1'}" class="output-mode-tab" data-output-mode="${id}">${I(icon)}<span>${label}</span></button>`;
   const configTab=(id,label,icon,index,extra='')=>`<button type="button" role="tab" id="output-tab-${id}" aria-controls="output-panel-${id}" aria-selected="${index===0?'true':'false'}" tabindex="${index===0?'0':'-1'}" class="output-config-tab${extra}" data-output-tab="${id}">${I(icon)}<strong>${label}</strong></button>`;
   return `<div class="output-page" data-output-tab-active="visual" data-output-preview-active="image">
-    <div class="output-page-tools" hidden><button type="button" class="output-back-link" data-output-open="visual">${I('arrow-left')}返回产出</button></div>
     <div class="output-overview">
       <section class="output-showcase" aria-label="作品预览">
         <div class="output-showcase-topline">
@@ -3494,21 +3500,19 @@ function renderOutputOriginal(){
       <section class="output-config" id="output-config" aria-label="产出配置">
         <div class="output-config-tabs" role="tablist" aria-label="产出配置分区">
           ${configTab('visual','生图与审核','image',0)}
-          ${configTab('gallery','产出图库','images',1)}
-          ${configTab('materials','参考素材','images',2)}
-          ${configTab('creation','创作与作品','notebook-pen',3)}
-          ${configTab('capabilities','生图能力与提示词','sparkles',4,' output-config-tab--capabilities')}
+          ${configTab('capabilities','模型路线','route',1)}
+          ${configTab('gallery','产出图库','images',2)}
+          ${configTab('materials','参考素材','images',3)}
+          ${configTab('creation','创作与作品','notebook-pen',4)}
         </div>
         <div class="output-config-panels">
           <section class="output-config-panel" id="output-panel-visual" role="tabpanel" aria-labelledby="output-tab-visual" tabindex="0" data-output-panel>
             <section class="output-trigger-card">
-              <header class="output-panel-heading"><h2>生图后端与触发</h2><button type="button" class="output-inline-link" data-output-open="capabilities">地址 / Key / 模型 / 队列 ${I('arrow-up-right')}</button></header>
-              <div data-output-native-selector></div>
+              <header class="output-panel-heading"><h2>生图触发</h2></header>
               <div id="outputTriggerPreferences"><div id="imageOutputWorkspace" class="output-workbench-block" data-output-config aria-label="生图触发与提示词设置">${consoleLoading('正在读取生图偏好…')}</div></div>
-              <div class="output-native-notice" data-output-native-notice role="status" hidden></div>
             </section>
             <div class="output-workbench-block" id="imageControlWorkspace" data-output-config aria-label="生图额度与审核配置">${consoleLoading('正在读取生图额度与审核设置…')}</div>
-            <div class="output-provider-strip"><header><h2>生成能力</h2><button type="button" class="output-inline-link" data-output-open="capabilities">模型路线 ${I('arrow-up-right')}</button></header>${outputProviderLine('image','图像生成')}</div>
+            <div class="output-provider-strip"><header><h2>生成能力</h2></header>${outputProviderLine('image','图像生成')}</div>
           </section>
           <section class="output-config-panel" id="output-panel-gallery" role="tabpanel" aria-labelledby="output-tab-gallery" tabindex="0" data-output-panel hidden>
             <section class="output-gallery-panel" aria-labelledby="output-gallery-heading">
@@ -3577,15 +3581,13 @@ function activateOutputTab(id,{focus=false,scroll=false}={}){
   const page=$('.output-page');
   if(page){
     page.dataset.outputTabActive=id;
-    const tools=page.querySelector('.output-page-tools');
-    if(tools)tools.hidden=id==='visual';
     const preferences=page.querySelector('#imageOutputWorkspace');
     const destination=page.querySelector(id==='capabilities'?'#outputPromptHost':'#outputTriggerPreferences');
     if(preferences&&destination)destination.append(preferences);
     page.querySelector('.output-showcase').hidden=id!=='visual';
-    page.querySelector('.output-config-tabs').hidden=id!=='visual';
+    page.querySelector('.output-config-tabs').hidden=false;
   }
-  if(focus)(id==='visual'?target:page?.closest('.shell-panel-body')?.previousElementSibling?.querySelector('h2'))?.focus();
+  if(focus)target.focus();
   if(scroll){
     const reduced=state.reduceMotion||window.matchMedia('(prefers-reduced-motion: reduce)').matches
       ||['low','off'].includes(document.documentElement.dataset.motion);
@@ -3743,7 +3745,7 @@ function renderGovernanceOriginal(){
   const tabs=[
     ['profile','user-round-pen','角色档案'],
     ['relationship','heart-handshake','相处资料'],
-    ['questionnaire','notebook-pen','人格问卷'],
+    ['questionnaire','notebook-pen','人格处理'],
     ['knowledge','book-open-text','世界知识']];
   const liveLabel=role?'已识别当前角色':connectionLabel;
   return `<div class="self-page${selfPane==='questionnaire'?' is-questionnaire-focus':''}">
@@ -4023,7 +4025,11 @@ function renderConfigEditors(){
   }
 }
 document.addEventListener('companion:role-profile-updated',()=>roleProfileConfigMount?.read?.());
-function renderPersonaPage(){return product.workspace("persona");}
+function renderPersonaPage(){
+  const modes=[['questionnaire','规范人格'],['create','创建人格'],['optimize','拟人优化']];
+  const workspace=personaRecreationMode==='questionnaire'?product.workspace('persona'):product.workspace('designer',personaRecreationMode);
+  return `<nav class="section-chips" aria-label="人格处理">${modes.map(([id,label])=>`<button type="button" class="section-chip${personaRecreationMode===id?' is-active':''}" data-persona-recreation="${id}" aria-pressed="${personaRecreationMode===id}">${label}</button>`).join('')}</nav>${workspace}`;
+}
 function renderHostWorkspace(){return product.workspace("host");}
 function renderAppearancePageOriginal(){
   return `<div class="settings-heading"><div><h2>外观与设置</h2></div>${chip('仅影响拓展页','lavender')}</div><section class="panel content-panel appearance-card"><div data-appearance-inline>${appearancePanel()}</div></section>`;
@@ -4635,7 +4641,7 @@ const searchIndex=[
   ['生活观察','日记、梦境、生活轨迹、状态与交互影响','scan-eye','home-section','observation'],['家具与能力','基础生活与拓展家具，启用状态和连接','armchair','home-section','furniture'],
   ['首页与小屋','生活总览、观察与家具能力','house','life','home'],['日记与生活','日记、睡眠、阅读与作息配置','notebook-pen','life','diary'],['关系网','只查看用户与群聊之间的连接关系','network','manage','identity'],['用户','用户目录、逐人资料与私聊默认权限','users-round','manage','identity-people'],['群聊','群聊目录、群内成员与成员线索','messages-square','manage','identity-groups'],['共同经历','记录、原话、来源与记忆策略','orbit','manage','memory'],['作品与相册','原稿、照片与收藏','images','home-section','furniture'],['一起活动','共读、棋桌与通话','coffee','home-section','furniture'],['能力目录','可选拓展当前能不能用','blocks','home-section','furniture'],
   ['感知','环境、消息与媒体来源','scan-eye','manage','perception'],['决策','本轮上下文与群聊参与判断','brain','manage','decision'],['行动','生活行为与社交发布','play','manage','action'],['产出','图像生成与创作作品','shapes','manage','output'],['表达','文本、语音、表情与投递','message-square-more','manage','expression'],['自我','世界知识、角色设定与自身档案','user-round','manage','governance'],
-  ['开始使用','首次连接、选择对象与决定是否发送','rocket','manage','setup'],['人格问卷','结构化整理角色设定并保存多个版本','notebook-pen','manage','persona'],['外观与设置','主题、密度、圆角、字号与动效','palette','manage','appearance'],['主动联系','主动契机、联系节奏与免打扰','heart-handshake','manage','contact'],['事实与经历','事实、原话与群词义','orbit','manage','memory'],['模型与连接','公共模型与任务路由','sliders-horizontal','manage','models'],['运行诊断','运行状态与排障','settings-2','manage','maintenance'],['便签','下次去书店，找一本植物随笔','sticky-note',null,'notes'],['窗边的一页','照片与相关经历','image',null,'photo-window'],['创作书架','Content 能力状态','library-big',null,'cap-content'],['现实触及','Reality 设备与授权','radio','manage','perception'],
+  ['开始使用','首次连接、选择对象与决定是否发送','rocket','manage','setup'],['人格处理','规范人格、创建人格与拟人优化','notebook-pen','manage','persona'],['外观与设置','主题、密度、圆角、字号与动效','palette','manage','appearance'],['主动联系','主动契机、联系节奏与免打扰','heart-handshake','manage','contact'],['事实与经历','事实、原话与群词义','orbit','manage','memory'],['模型与连接','公共模型与任务路由','sliders-horizontal','manage','models'],['运行诊断','运行状态与排障','settings-2','manage','maintenance'],['便签','下次去书店，找一本植物随笔','sticky-note',null,'notes'],['窗边的一页','照片与相关经历','image',null,'photo-window'],['创作书架','Content 能力状态','library-big',null,'cap-content'],['现实触及','Reality 设备与授权','radio','manage','perception'],
 ];
 const configSearchLocations={
   quota:{next:'manage',tab:'output',root:'#imageControlWorkspace'},image_review:{next:'manage',tab:'output',root:'#imageControlWorkspace'},
@@ -5054,6 +5060,14 @@ document.addEventListener('click',event=>{
       event.preventDefault();navigate(next,tab,subtab);return;
     }
     if(scrollToPageAnchor(hash)){event.preventDefault();return;}
+  }
+  if(el.dataset.personaRecreation){
+    if(!['questionnaire','create','optimize'].includes(el.dataset.personaRecreation))return;
+    personaRecreationMode=el.dataset.personaRecreation;
+    paintPanel();
+    product.mountWorkspace();
+    requestAnimationFrame(()=>document.querySelector('[data-persona-recreation="'+personaRecreationMode+'"]')?.focus({preventScroll:true}));
+    return;
   }
   if(el.dataset.selfPane){
     const pane=el.dataset.selfPane;

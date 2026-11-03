@@ -52,6 +52,7 @@ from companion_v2.identity_policy.models import AuthenticatedHostPrincipal, Auth
 from companion_v2.identity_policy.personas import ConversationRoute
 from companion_v2.identity_policy.personas import RuntimeIdentity
 from companion_v2.model_gateway.models import MAX_MODEL_OUTPUT_TOKENS, ModelTaskProfile
+from companion_v2.model_gateway.output_defaults import with_thinking_margins
 from companion_v2.model_gateway.routing import configuration_fields
 from companion_v2.memory.reflection import reflection_profile
 from companion_v2.proactive.service import contact_profile, persona_judge_profile
@@ -113,6 +114,18 @@ class MultiPrivateBridge(NativePrivateBridge):
                          "forward_type": kwargs.get("forward_type") if group_forward_loader is not None else None}
         self.groups = MultiGroupBridge(*args, group_targets=settings.group_targets, authority=authority,
                                        settings=settings, **group_options)
+
+    def sync_settings(self, settings):
+        """Replace this bridge's routing snapshot with the confirmed mapping.
+
+        Confirming the first core window adds a precise private target while the
+        bridge keeps the wildcard snapshot it was assembled with. Without this,
+        ``target_for_scope`` returns the old target and the admission check fails
+        with ``host_target_mismatch`` until the plugin is reloaded.
+        """
+        self.settings = settings
+        self.targets = {target.route_key: target for target in settings.targets}
+        self.groups.sync_settings(settings)
 
     def target_for_scope(self, scope):
         if scope.kind is ScopeKind.GROUP:
@@ -284,6 +297,10 @@ class MultiGroupBridge(NativeGroupBridge):
         self.authority, self.settings = authority, settings
         super().__init__(*args, **kwargs)
 
+    def sync_settings(self, settings):
+        """让运行中的桥接看到刚确认的群目标，而不必重载插件。"""
+        self.settings = settings
+
     def target_for_route(self, platform_id, account_id, group_id):
         return (super().target_for_route(platform_id, account_id, group_id)
                 or self.settings.group_target(platform_id, account_id, group_id))
@@ -404,12 +421,20 @@ class CoreReplyOutcome(Outcome):
 
 
 class MultiHostSession:
+    def sync_settings(self, settings):
+        """Adopt a mapping confirmed while this session is already running."""
+        self.settings = settings
+        self.authority.settings = settings
+        self.bridge.sync_settings(settings)
+
     def __init__(self, runtime, native_context, *, settings, personas, authority, native_types,
                  provider_fingerprint, runtime_instance_id, now, native_tool_port=None, news_port=None,
                  solar_term_port=None, qzone_transport=None, balance_port=None, weather_ports=None,
-                 persona_window_snapshot_lookup=None, persona_window_snapshot_update=None):
+                 persona_window_snapshot_lookup=None, persona_window_snapshot_update=None,
+                 search_port_factory=None):
         self.runtime, self.settings, self.authority, self.types, self.now = runtime, settings, authority, native_types, now
         self.native_tool_port = native_tool_port
+        self.search_port_factory = search_port_factory
         self.huawei_health = get_huawei_health_service_for_root(runtime.data_root, logger=logger)
         common = settings.common
         weather_port, weather_alert_port = weather_ports or configured_weather_ports(None)
@@ -478,6 +503,8 @@ class MultiHostSession:
                     *((video_narration_profile(next(model.binding.provider for model in self.models
                         if "video" in model.local_provider().capabilities)),)
                       if any("video" in model.local_provider().capabilities for model in self.models) else ()))
+        # The host budget is a reply budget; structural tasks register a larger default.
+        profiles = with_thinking_margins(profiles)
         modes = ["onebot_private", "onebot_group"]
         self.sender_binding = ProviderBinding("message.delivery", "astrbot-multi." + ".".join(modes),
             native_types.version, digest([runtime.installation_id, *modes]))
@@ -504,6 +531,7 @@ class MultiHostSession:
             weather_alert_port=weather_alert_port,
             balance_port=balance_port,
             news_port=news_port,
+            search_port_factory=search_port_factory,
             solar_term_port=solar_term_port,
             qzone_transport=qzone_transport,
             voice_policy=common.voice_reply_policy if common.voice_reply_enabled else None,
@@ -1029,10 +1057,15 @@ class MultiHostSession:
                         from .external_memory import prepare_external_memory
                         external_memory = await prepare_external_memory(
                             self.bridge.context, self.application, context, captured)
-                        prompt = build_core_reply_prompt(self.application, context, captured, at=self.now(),
-                                                         keyword_materials=keyword_entries,
-                                                         health_material=health_material,
-                                                         external_memory=external_memory)
+                        prompt_at = self.now()
+                        # 组装提示词要遍历来源依赖并逐节点读库；放在事件循环上会
+                        # 让整条消息（以及同进程的群聊）一起卡住十几秒。
+                        # 这一步是纯读：放到工作线程，锁仍是同一把，顺序不变。
+                        prompt = await asyncio.to_thread(
+                            build_core_reply_prompt, self.application, context, captured, at=prompt_at,
+                            keyword_materials=keyword_entries,
+                            health_material=health_material,
+                            external_memory=external_memory)
                         prompt_instruction = getattr(prompt, "context_instruction", prompt.instruction)
                         stable_prompt_instruction = getattr(prompt, "stable_instruction", "")
                         context_sections = prompt.sections

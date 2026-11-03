@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import replace
 from datetime import timedelta
@@ -7,7 +7,7 @@ import unittest
 
 from companion_v2.agenda.models import AgendaError
 from companion_v2.agenda.service import AgendaService
-from companion_v2.conversation.agenda_tools import AgendaRoleSession
+from companion_v2.conversation.agenda_tools import AgendaRoleSession, TOOL_FIELDS
 from companion_v2.conversation.foreground import (
     ClaimKind, DraftClaim, EvidencePromptCompiler, ForegroundContextAssembler, ModelDraft, PromptMaterial,
 )
@@ -239,3 +239,46 @@ class AgendaToolTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class AgendaToolSchemaTests(unittest.TestCase):
+    def test_reminder_create_schema_declares_absolute_schedule_and_message(self):
+        from companion_v2.conversation.tool_loop import specification
+
+        schema = json.loads(specification("reminder.create", *TOOL_FIELDS["reminder.create"]).parameters_json)
+        schedule = schema["properties"]["schedule"]
+
+        self.assertEqual(schedule["type"], "object")
+        self.assertEqual(set(schedule["required"]), {"anchor", "timezone_name"})
+        self.assertEqual(schedule["properties"]["anchor"]["type"], "string")
+        self.assertIn("ISO-8601", schedule["properties"]["anchor"]["description"])
+        self.assertEqual(schedule["properties"]["timezone_name"]["type"], "string")
+        self.assertEqual(schema["properties"]["message"]["type"], "string")
+        self.assertFalse(schema["additionalProperties"])
+        # 直接给时间，或关联已有便签；两种合法用法都不能被 required 拦死。
+        self.assertEqual(len(schema["anyOf"]), 2)
+        self.assertEqual(set(schema["anyOf"][0]["required"]), {"schedule", "message"})
+        self.assertEqual(set(schema["anyOf"][1]["required"]), {"memo_id", "expected_memo_revision"})
+
+    def test_schedule_fold_stays_a_bounded_integer_instead_of_an_enum(self):
+        from companion_v2.conversation.tool_loop import specification
+
+        schedule = json.loads(specification(
+            "reminder.create", *TOOL_FIELDS["reminder.create"]).parameters_json)["properties"]["schedule"]
+
+        fold = schedule["properties"]["fold"]
+        # 整数 enum 会让 Gemini 在本地构造请求时失败；边界与说明承担同样的约束。
+        self.assertEqual(fold["type"], "integer")
+        self.assertNotIn("enum", fold)
+        self.assertEqual((fold["minimum"], fold["maximum"]), (0, 1))
+        self.assertIn("0", fold["description"])
+        self.assertIn("1", fold["description"])
+        # 字符串 enum 本来就是每个 provider 都能构造的，修复不能把它们一起删掉。
+        self.assertEqual(schedule["properties"]["frequency"]["enum"],
+                         ["once", "daily", "weekly", "monthly", "yearly"])
+        self.assertEqual(schedule["properties"]["gap_policy"]["enum"], ["reject", "shift_forward"])
+
+    def test_reminder_instruction_forbids_memo_substitution(self):
+        from companion_v2.conversation.tool_loop import TOOL_INSTRUCTION
+
+        self.assertIn("reminder.create", TOOL_INSTRUCTION)
+        self.assertIn("memo.create", TOOL_INSTRUCTION)

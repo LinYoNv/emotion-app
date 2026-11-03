@@ -46,6 +46,7 @@ from .astrbot_host.core_reply_decision import prepare_core_reply_decision
 from .astrbot_host.core_reply_closing import prepare_private_closing_decision
 from .astrbot_host.native import warm_session_settings
 from .astrbot_host.core_reply_tool_dispatch import observe_core_tool_dispatch_begin, restore_core_tool_dispatch
+from .astrbot_host.core_reply_turn_gate import close_core_reply_turn, install_core_reply_turn
 from .astrbot_host.core_reply_native_send import inject_core_reply_send_tool
 from .astrbot_host.core_reply_perception import (
     inject_core_reply_perception_context, inject_core_reply_perception_policy,
@@ -265,6 +266,43 @@ class PrivateCompanionV2StagingPlugin(Star):
                 logger.error("[CompanionV2] 未回复排障记录写入失败 event_ref=%s error_type=%s",
                              event_ref, type(error).__name__)
         return event_ref
+
+    def _harassment_guard(self):
+        guard = getattr(self, "_harassment", None)
+        if guard is None:
+            from .astrbot_host.harassment import HarassmentGuard
+            guard = HarassmentGuard()
+            self._harassment = guard
+        return guard
+
+    @staticmethod
+    def _harassment_features(event):
+        message = getattr(getattr(event, "message_obj", None), "message", None)
+        mentions = 0
+        media = False
+        if isinstance(message, (list, tuple)):
+            for part in message:
+                kind = getattr(part, "type", None)
+                name = getattr(kind, "value", kind)
+                if name == "At":
+                    mentions += 1
+                elif name in ("Image", "Record", "Video", "File"):
+                    media = True
+        return mentions, media
+
+    @staticmethod
+    def _harassment_scope(event):
+        origin = getattr(event, "unified_msg_origin", "")
+        return str(origin or getattr(event, "session_id", "") or "")
+
+    @staticmethod
+    def _harassment_user(event):
+        sender = getattr(getattr(event, "message_obj", None), "sender", None)
+        user_id = getattr(sender, "user_id", "")
+        if not user_id:
+            getter = getattr(event, "get_sender_id", None)
+            user_id = getter() if callable(getter) else ""
+        return str(user_id or "")
 
     def _private_debounce_manager(self):
         manager = getattr(self, "_private_debounce", None)
@@ -748,6 +786,27 @@ class PrivateCompanionV2StagingPlugin(Star):
         origin_key = self._origin_key_for_event(event)
         kind = getattr(getattr(getattr(event, "message_obj", None), "type", None), "value", None)
         channel = "private" if kind == "FriendMessage" else "group" if kind == "GroupMessage" else "unknown"
+        if channel == "private":
+            now = self.staging.now()
+            mentions, media = self._harassment_features(event)
+            verdict = self._harassment_guard().check(
+                self.staging.runtime, scope=self._harassment_scope(event),
+                user_id=self._harassment_user(event),
+                text=str(getattr(event, "message_str", "") or ""),
+                mentions=mentions, media=media,
+                now=now.timestamp() if hasattr(now, "timestamp") else None)
+            if verdict.get("blocked"):
+                notice = verdict.get("notice") or ""
+                if notice:
+                    try:
+                        from astrbot.core.message.components import Plain
+                        from astrbot.core.message.message_event_result import MessageChain
+                        await event.send(MessageChain([Plain(notice)]))
+                    except Exception:
+                        pass
+                # 名单在决策页管理；命中后本条不再进入模型或记忆。
+                suppress_default_reply(event)
+                return
         if channel == "private" and getattr(target, "participant_id", None):
             processor = getattr(self.staging, "process_private_relay_receipts", None)
             if callable(processor):
@@ -1108,8 +1167,7 @@ class PrivateCompanionV2StagingPlugin(Star):
                 with measure_core_preparation(event, "tool_injection", now=self.staging.now):
                     inject_core_reply_tools(event, req, application=application)
             except Exception as error:
-                # 🔴 诊断：只打 error_type 等于没说（AttributeError 可能来自任何一处）。
-                #    这是本项目通则「错误信息会撒谎」的现场，补 traceback。
+                # 🔴 AttributeError 可能来自任何一处，只打类型查不出（2026-11-03）
                 logger.warning("[CompanionV2] V2 工具暂不可用，保留 AstrBot 核心工具 error_type=%s detail=%s",
                                type(error).__name__, str(error)[:200], exc_info=True)
         prepare_native_host_request(self.staging, event, req)
@@ -1144,7 +1202,13 @@ class PrivateCompanionV2StagingPlugin(Star):
         finalize_core_reply_media_prompt(event, run_context)
         from .astrbot_host.core_reply_voice_authoring import prepare_core_voice_authoring
         prepare_core_voice_authoring(event, run_context)
+        # One reply per turn: hold a tool round's prose until the turn says which
+        # text is the answer. The dispatch observer installs first because it owns
+        # the point where withheld text goes back before the tool runs. Neither
+        # install raises; a host that cannot host the gate keeps today's delivery,
+        # and the send-side net still applies.
         observe_core_tool_dispatch_begin(event, run_context)
+        install_core_reply_turn(event, run_context)
         observe_core_agent_begin(event, run_context)
 
     @filter.on_agent_done()
@@ -1152,6 +1216,7 @@ class PrivateCompanionV2StagingPlugin(Star):
         from .astrbot_host.core_reply_voice_authoring import restore_core_voice_authoring
         self._private_reply_followups().finish(event)
         restore_core_voice_authoring(event)
+        await close_core_reply_turn(event, response, release=True)
         restore_core_tool_dispatch(event, run_context)
         observe_core_agent_done(event, run_context, response)
         state = event.get_extra(CORE_REPLY_CONTEXT_EXTRA)
@@ -1189,6 +1254,7 @@ class PrivateCompanionV2StagingPlugin(Star):
         from .astrbot_host.core_reply_voice_authoring import restore_core_voice_authoring
         self._private_reply_followups().finish(event)
         restore_core_voice_authoring(event)
+        await close_core_reply_turn(event)
         state = event.get_extra(CORE_REPLY_CONTEXT_EXTRA)
         if isinstance(state, dict):
             if not state.get("delivery_guard_active"):

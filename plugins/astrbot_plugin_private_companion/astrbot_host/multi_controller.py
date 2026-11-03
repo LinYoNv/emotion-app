@@ -259,10 +259,13 @@ class AstrBotMultiController:
         if binding.persona_id:
             from .identity_derivation import normalize_persona_id
             wanted = normalize_persona_id(binding.persona_id)
-            if not any(persona.bot_id == match.bot_id
-                       and normalize_persona_id(persona.persona_id) == wanted
-                       for persona in settings.personas):
-                return None
+            candidates = [persona for persona in settings.personas if persona.bot_id == match.bot_id]
+            if not any(normalize_persona_id(persona.persona_id) == wanted for persona in candidates):
+                # 上游把人设改名后，parked binding 里还是旧名。单人格窗口的结果唯一，
+                # 直接认它并在后续 _repair_parked_binding() 里把名字写回；
+                # 同一 Bot 下有多个人格时无法判断，仍然拒绝，避免猜错。
+                if len(candidates) != 1:
+                    return None
         return match
 
     async def proactive_diagnostic_target(self):
@@ -376,6 +379,37 @@ class AstrBotMultiController:
         self.refresh_settings()
         if self.settings_error is not None:
             raise TaskError(self.settings_error.code, str(self.settings_error))
+        self._sync_confirmed_binding()
+
+    def _sync_confirmed_binding(self):
+        """Make a just-confirmed core window effective without a plugin reload.
+
+        ``confirm_binding`` saves the new target and refreshes the controller's
+        settings, but the running session, its private bridge and the pinned
+        manifest were assembled from the old mapping. Re-pin the manifest (so a
+        later restart does not report ``host_binding_changed``) and hand the new
+        settings to the live bridge.
+        """
+        from dataclasses import asdict
+        from .multi_authority import MANIFEST
+
+        session = getattr(self, "session", None)
+        if session is None or getattr(getattr(session, "application", None), "state", "") != "running":
+            return
+        settings = self.settings
+        current = self.authority.require_manifest() if self.authority is not None else None
+        if current is not None:
+            updated = {key: value for key, value in current.items()
+                       if key not in {"fingerprint", "binding_contract", "settings_fingerprint", "personas"}}
+            updated.update(binding_contract=settings.binding_contract,
+                           settings_fingerprint=settings.fingerprint,
+                           personas=[asdict(persona) for persona in settings.personas])
+            updated["fingerprint"] = digest(updated)
+            with self.runtime.transaction():
+                self.authority.initialize(updated, reviewed=True,
+                                          allow_legacy_staging=self._adopting_legacy_profile)
+        session.sync_settings(settings)
+        logger.info("[CompanionV2] 已把确认的核心管理员窗口同步到运行中的会话")
 
     def handles_binding(self, event):
         from .recalls import is_notice_event
@@ -470,6 +504,35 @@ class AstrBotMultiController:
             write_binding(self.binding_root, PendingBinding(parked.platform_id, parked.account_id,
                 parked.participant_id, parked.persona_id, confirmed=True))
         return {"confirmed": True, "binding": self.binding_state()}
+
+    def reset_binding(self):
+        """Withdraw the confirmation so the reviewed window can be re-confirmed.
+
+        ``receive_binding`` refuses a rebind with "reset the first-run setup
+        first", but nothing implemented that reset: the confirmed file could only
+        be replaced by editing the data directory. Worse, deleting the file is
+        *not* a reset here -- ``binding_state`` then recovers the window from the
+        persistent identity ledger and still reports ``confirmed``, so the guide
+        jumps straight back to "已绑定".
+
+        So the file stays and only ``confirmed`` flips to ``False``. The page then
+        reads ``pending``, re-renders step 1 and its「确认此窗口」button re-pins
+        whatever mapping is current at that moment. Configured targets, personas,
+        the storage installation and every stored memory are untouched.
+        """
+        parked = self._parked_binding()
+        if parked is None or not parked.confirmed:
+            return {"reset": False, "reason": "setup_binding_missing",
+                    "detail": "there is no confirmed core administrator window to reset"}
+        try:
+            write_binding(self.binding_root, PendingBinding(
+                parked.platform_id, parked.account_id, parked.participant_id,
+                parked.persona_id, confirmed=False))
+        except (OSError, ValueError):
+            return {"reset": False, "reason": "setup_binding_write_failed",
+                    "detail": "the setup binding could not be rewritten"}
+        logger.info("[CompanionV2] 核心管理员窗口已重置为待确认 target=%s", parked.participant_id)
+        return {"reset": True, "binding": self.binding_state()}
 
     def _failure(self, error, *, operation=""):
         code = (error.code if isinstance(error, (TaskError, HostControlError)) else

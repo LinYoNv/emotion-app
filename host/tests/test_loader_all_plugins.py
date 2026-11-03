@@ -251,7 +251,7 @@ def test_main_companion_plugin_specifics(report):
         if r.dir_name == "astrbot_plugin_private_companion"
     )
     # 🔴 2026-11-01：7.0.0 → 7.0.13
-    assert rec.version == "7.0.13"
+    assert rec.version == "7.0.14"
     assert rec.handler_count >= 10
     assert rec.star_cls is not None
 

@@ -392,12 +392,14 @@ test('provider search narrows tasks and a routed task opens its editor', async (
   assert.doesNotMatch(node.innerHTML, /\bProvider\b|MODEL ROUTING/);
 });
 
-test('a lower-capacity provider adjusts the draft output limit before saving', async () => {
+test('a lower-capacity provider adjusts an explicit draft output limit before saving', async () => {
   const {page, requests, root} = harness();
   const node = root();
   page.mount(node);
   const constrained = status();
   constrained.providers[1].max_output_tokens = 2048;
+  constrained.tasks[1].fields.max_output_tokens = {value: 8192, inherited_value: 8192,
+    source: 'window', inherited_source: 'installation', explicit: true};
   requests[0].resolve(constrained);
   await flush();
   node.click('[data-model-sub]', {modelSub: 'cfg'});
@@ -411,6 +413,75 @@ test('a lower-capacity provider adjusts the draft output limit before saving', a
   post.resolve({replayed: false, task: saved});
   await flush();
   assert.match(node.innerHTML, /已保存 1 项/);
+});
+
+/* 默认值提高后，选中低上限 Provider 是常事：继承的默认值必须继续跟随，
+   只提示「发送时按上限生效」，绝不能被写成显式值钉死。 */
+test('a lower-capacity provider never pins an inherited default output limit', async () => {
+  const {page, requests, root} = harness();
+  const node = root();
+  page.mount(node);
+  const data = status();
+  data.providers[1].max_output_tokens = 2048;
+  data.tasks[1].fields.max_output_tokens = {value: 8192, inherited_value: 8192,
+    source: 'default', inherited_source: 'default', explicit: false};
+  requests[0].resolve(data);
+  await flush();
+  node.click('[data-model-sub]', {modelSub: 'cfg'});
+  node.change('[data-model-field]', {modelField: 'provider', modelKind: 'memory.reflect', value: 'secondary'});
+  assert.doesNotMatch(node.innerHTML, /输出上限已调整为/);
+  assert.match(node.innerHTML, /继承的默认输出上限 8192 高于所选模型提供方的 2048，发送时会按 2048 生效/);
+  const card = node.innerHTML.split('data-fncard="memory.reflect"')[1].split('</article>')[0];
+  assert.match(card, /data-model-inherit="max_output_tokens"[^>]*checked/);
+  assert.match(card, /data-model-field="max_output_tokens"[^>]*value="8192"/);
+  assert.doesNotMatch(card, /value="2048"/);
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
+  const post = requests.find(request => request.method === 'POST');
+  assert.deepEqual({...post.values.changes}, {provider: 'secondary'});
+  assert.deepEqual([...post.values.reset], []);
+  post.resolve({replayed: false, task: task('memory.reflect', 'secondary', ['text'], 'background')});
+  await flush();
+  assert.match(node.innerHTML, /已保存 1 项/);
+});
+
+/* 值来自上级显式配置（安装级保存、页面在角色层编辑）时，路由会按显式值拒绝；
+   页面只提示，不偷偷改成显式。 */
+test('an output limit saved upstream warns instead of being rewritten', async () => {
+  const {page, requests, root} = harness();
+  const node = root();
+  page.mount(node);
+  const data = status();
+  data.providers[1].max_output_tokens = 2048;
+  data.tasks[1].fields.max_output_tokens = {value: 8192, inherited_value: 8192,
+    source: 'installation', inherited_source: 'installation', explicit: false};
+  requests[0].resolve(data);
+  await flush();
+  node.click('[data-model-sub]', {modelSub: 'cfg'});
+  node.change('[data-model-field]', {modelField: 'provider', modelKind: 'memory.reflect', value: 'secondary'});
+  assert.match(node.innerHTML, /跟随上级不会被改写/);
+  const card = node.innerHTML.split('data-fncard="memory.reflect"')[1].split('</article>')[0];
+  assert.match(card, /data-model-inherit="max_output_tokens"[^>]*checked/);
+  assert.match(card, /value="8192"/);
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'memory.reflect'});
+  assert.equal(requests.some(request => request.method === 'POST'), false);
+  assert.match(node.innerHTML, /继承的输出上限 8192 超过所选模型提供方的 2048，请显式设置上限或改回上级/);
+});
+
+/* 页面与路由共用同一条上限：替换规则的目标 Provider 也算在内。 */
+test('the editor ceiling follows replacement-rule targets like routing does', async () => {
+  const {page, requests, root} = harness();
+  const node = root();
+  page.mount(node);
+  const data = status();
+  data.providers.push({id: 'small', capabilities: ['text'], max_output_tokens: 1024});
+  data.tasks[1].fields.max_output_tokens = {value: 8192, inherited_value: 8192,
+    source: 'default', inherited_source: 'default', explicit: false};
+  data.tasks[1].fields.replacement_rules = {value: JSON.stringify([{id: 'small-rule', provider_id: 'small',
+    keywords: ['私有']}]), inherited_value: '[]', source: 'window', inherited_source: 'default', explicit: true};
+  requests[0].resolve(data);
+  await flush();
+  node.click('[data-model-sub]', {modelSub: 'cfg'});
+  assert.match(node.innerHTML, /发送时会按 1024 生效/);
 });
 
 test('typing a prompt keeps the editor mounted until the field changes', async () => {
@@ -919,6 +990,100 @@ test('image page separates generation and editing model queues and saves paramet
   assert.match(node.innerHTML, /已注册，可由后续真实任务调用/);
 });
 
+test('NAI routes show plugin defaults in each operation queue without duplicate credentials', async () => {
+  const {page, requests, root} = harness();
+  const node = root();
+  page.mount(node);
+  requests[0].resolve(status());
+  await flush();
+  node.click('[data-model-tab]', {modelTab: 'image'});
+  requests.find(item => item.route === 'model/image').resolve({actions: [], enabled: {
+    'image.generate': true, 'image.edit': true, 'image.mask_edit': false,
+  }});
+  await flush();
+  requests.find(item => item.route.endsWith('/image/output')).resolve({
+    revision: 'nai-r1', nai: {available: true, api_profile: 'starbridge', call_mode: 'openai',
+      default_model: 'nai-diffusion-5-full', default_size: '竖图', operations: ['generate', 'edit']},
+    settings: {enabled: true, backend: 'nai', endpoints: [], comfyui: {}, sd_webui: {},
+      operation_routes: {generate: ['nai'], edit: ['nai']}},
+  });
+  await flush();
+  assert.match(node.innerHTML, /data-img-route-card="nai"/);
+  assert.match(node.innerHTML, /星桥（Almoon）/);
+  assert.match(node.innerHTML, /nai-diffusion-5-full/);
+  assert.doesNotMatch(node.innerHTML, /data-img-config-field="nai\.(api_key|base_url)"/);
+  node.click('[data-img-view]', {imgView: 'edit'});
+  assert.match(node.innerHTML, /可用于参考图改图/);
+  page.unmount();
+});
+
+test('NAI has a visible add entry that enables output and blocks unsupported direct editing', async () => {
+  const {page, requests, root} = harness();
+  const node = root();
+  page.mount(node);
+  requests[0].resolve(status());
+  await flush();
+  node.click('[data-model-tab]', {modelTab: 'image'});
+  requests.find(item => item.route === 'model/image').resolve({actions: [], enabled: {
+    'image.generate': true, 'image.edit': true, 'image.mask_edit': false,
+  }});
+  await flush();
+  const config = {
+    revision: 'nai-add-r1', nai: {available: true, call_mode: 'direct',
+      default_model: 'nai-diffusion-4-5-full', operations: ['generate']},
+    settings: {enabled: false, backend: 'auto', endpoints: [], comfyui: {}, sd_webui: {},
+      operation_routes: {generate: [], edit: []}},
+  };
+  requests.find(item => item.route.endsWith('/image/output')).resolve(config);
+  await flush();
+  assert.match(node.innerHTML, /data-img-nai-source/);
+  assert.match(node.innerHTML, /加入文生图队列/);
+  node.click('[data-img-nai-add]');
+  assert.match(node.innerHTML, /data-img-route-card="nai"/);
+  assert.match(node.innerHTML, /生图后端已启用/);
+  node.click('[data-img-config-save]');
+  const saved = requests.find(item => item.route.endsWith('/image/output/save'));
+  assert.ok(saved);
+  assert.equal(saved.values.changes.enabled, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(saved.values.changes.operation_routes)),
+    {generate: ['nai'], edit: []});
+  saved.resolve({...config, revision: 'nai-add-r2', settings: saved.values.changes});
+  await flush();
+  node.click('[data-img-view]', {imgView: 'edit'});
+  assert.match(node.innerHTML, /当前接入方式不支持此功能/);
+  assert.match(node.innerHTML, /data-img-nai-add disabled/);
+  node.click('[data-img-nai-add]');
+  assert.doesNotMatch(node.innerHTML, /data-img-route-card="nai"/);
+  page.unmount();
+});
+
+test('an uninstalled NAI plugin has no add entry and preserves saved routes for removal', async () => {
+  const {page, requests, root} = harness();
+  const node = root();
+  page.mount(node);
+  requests[0].resolve(status());
+  await flush();
+  node.click('[data-model-tab]', {modelTab: 'image'});
+  requests.find(item => item.route === 'model/image').resolve({actions: [], enabled: {
+    'image.generate': true, 'image.edit': false, 'image.mask_edit': false,
+  }});
+  await flush();
+  requests.find(item => item.route.endsWith('/image/output')).resolve({
+    revision: 'nai-missing', nai: {installed: false, available: false, operations: []},
+    settings: {enabled: true, backend: 'auto', endpoints: [], comfyui: {}, sd_webui: {},
+      operation_routes: {generate: ['nai'], edit: []}},
+  });
+  await flush();
+  assert.match(node.innerHTML, /data-img-route-card="nai"/);
+  assert.match(node.innerHTML, /NAI 插件未就绪/);
+  assert.doesNotMatch(node.innerHTML, /data-img-nai-source/);
+  node.click('[data-img-route-remove]', {imgRouteRemove: 'nai'});
+  assert.doesNotMatch(node.innerHTML, /data-img-route-card="nai"/);
+  assert.doesNotMatch(node.innerHTML, /data-img-nai-add/);
+  assert.doesNotMatch(node.innerHTML, /option value="nai"/);
+  page.unmount();
+});
+
 test('switching tabs round-trip keeps the functional matrix without reloading', async () => {
   const {page, requests, root} = harness();
   const node = root();
@@ -1389,9 +1554,9 @@ test('search service binds and saves an AstrBot DeepSeek Provider id', async () 
   node.click('[data-search-save]');
   const save = requests.find(item => item.method === 'POST' && item.route === 'model/search/save');
   assert.deepEqual(JSON.parse(JSON.stringify(save.values)), {
-    revision: 'search-r1', changes: {deepseek_provider_id: 'deepseek_main'},
+    revision: 'search-r1', changes: {deepseek_provider_id: 'deepseek_main', source_priority: 'auto'},
   });
-  save.resolve({deepseek_provider_id: 'deepseek_main', revision: 'search-r2', provider_available: true,
+  save.resolve({deepseek_provider_id: 'deepseek_main', source_priority: 'auto', revision: 'search-r2', provider_available: true,
     providers: [{id: 'deepseek_main', name: 'DeepSeek 主账号'}]});
   await flush();
   assert.match(node.innerHTML, /后续搜索立即生效/);
