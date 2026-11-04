@@ -6,7 +6,7 @@
  */
 
 import { loadHistory, markSessionRead, renderUnreadBadge } from "./chat.js";
-import { $, MODE_HINTS, api, state, switchToTab, toast } from "../core/core.js";
+import { $, MODE_HINTS, api, apiData, state, switchToTab, toast } from "../core/core.js";
 import { renderChatPersonaHint } from "./persona.js";
 import { buildConfigField, makeProviderSelect, saveConfigSection } from "./settings.js";
 
@@ -69,8 +69,14 @@ export function renderSessionList() {
     }
     li.appendChild(main);
 
+    // 🔴 **这条会话用哪份配置文件**（情绪 2026-11-04：
+    //    「设置界面就只有配置文件…然后"会话"界面切换配置文件」）。
+    //
+    //    所以「会话」页负两件事：①点一下开聊 ②给每条会话选配置文件。
+    //    配置文件本身的内容在「设置」页改。
+    li.appendChild(buildProfilePicker(s));
+
     // 🔴 **点一下就进聊天**（情绪 2026-10-09：「单击所选会话跳转到聊天」）。
-    //    配置不再在这里改 —— 全搬到「设置 → 配置文件 → 会话」。
     li.onclick = () => openSessionInChat(s.id);
     li.title = "点一下进这条会话聊天";
 
@@ -94,6 +100,94 @@ export function renderSessionList() {
   }
   // 列表有内容时隐藏空态
   if ($("session-empty")) $("session-empty").classList.toggle("hidden", !!state.sessions.length);
+}
+
+/** 行内的「用哪份配置文件」下拉。
+ *
+ * ⚠️ 必须 `stopPropagation`：`li` 上有"点一下就开聊"的 onclick，
+ *    不挡住的话**一碰下拉就跳进聊天**了（本项目踩过同型的坑：
+ *    删除按钮没挡冒泡 → "点了删除却进了聊天"）。
+ */
+export function buildProfilePicker(session) {
+  const wrap = document.createElement("label");
+  wrap.className = "sess-profile";
+
+  const text = document.createElement("span");
+  text.className = "sess-profile-label";
+  text.textContent = "配置";
+  wrap.appendChild(text);
+
+  const sel = document.createElement("select");
+  sel.className = "sess-profile-select";
+  sel.dataset.sessionProfile = session.id;
+
+  const list = state.cfgProfiles || [];
+  if (!list.length) {
+    // 列表没读到 ⇒ **如实说**，不画一个空下拉让用户以为"没有配置文件可选"
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "（还没读到配置文件）";
+    sel.appendChild(opt);
+    sel.disabled = true;
+  } else {
+    const current = String(session.config_profile_id || "");
+    for (const p of list) {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = p.name + (p.is_default ? "（默认）" : "");
+      // 空 = 用默认那份 ⇒ 选中项就该是默认那份（后端也是这么解析的）
+      if (current ? p.id === current : p.is_default) opt.selected = true;
+      sel.appendChild(opt);
+    }
+  }
+
+  sel.onclick = (e) => e.stopPropagation();
+  sel.onchange = (e) => {
+    e.stopPropagation();
+    saveSessionProfile(session.id, sel.value);
+  };
+  wrap.appendChild(sel);
+  return wrap;
+}
+
+/** 保存"这条会话用哪份配置文件" —— **写进 umo 路由表**（照 AstrBot abconf）。
+ *
+ * 🔴 情绪 2026-11-04：「要么你就学 astrbot，在配置器页面按 umo/会话选配置文件」。
+ *
+ *    所以不是改会话字段，而是往路由表里加一条
+ *    `{umop: "<这条会话的 umo 模式>", profile_id: "<id>"}`。
+ *
+ *    ⚠️ umop 用**这条会话的完整 umo**（不是 `"::"`）：
+ *       模式里的空段/`*` 是通配，写全会只命中这一条会话。
+ */
+export async function saveSessionProfile(sessionId, profileId) {
+  const hint = $("session-page-hint") || $("cfg-session-hint");
+  try {
+    const session = state.sessions.find((x) => x.id === sessionId);
+    // 原生会话有 `native_origin`（完整 umo）；否则用 user_id 拼三段式
+    const umo = String(
+      (session && (session.umo || session.native_origin)) || "",
+    ).trim();
+    if (!umo) {
+      showHint(
+        hint,
+        "这条会话还没有绑定 umo，先在「设置」里给它填插件用户 ID（= umo 第三段）。",
+        true,
+      );
+      return;
+    }
+    const current = await apiData("GET", "/api/v1/config-routing");
+    const routes = (current.routes || []).filter((r) => r.umop !== umo);
+    routes.push({ umop: umo, profile_id: profileId });
+    await apiData("PUT", "/api/v1/config-routing", { routes });
+
+    const s = state.sessions.find((x) => x.id === sessionId);
+    if (s) s.config_profile_id = profileId || "";
+    const name = (state.cfgProfiles || []).find((p) => p.id === profileId);
+    showHint(hint, `已保存：这条会话用「${name ? name.name : "默认配置"}」`);
+  } catch (e) {
+    showHint(hint, "保存配置文件失败：" + e.message, true);
+  }
 }
 
 /** 点会话 → 进聊天（「会话」页唯一的主动作）。 */

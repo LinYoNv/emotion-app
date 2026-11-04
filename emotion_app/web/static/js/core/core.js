@@ -11,7 +11,7 @@ import { loadChat, loadHistory, refreshUnread } from "../views/chat.js";
 import { loadPersonas, renderPersonaList, selectPersona } from "../views/persona.js";
 import { closePluginPage, loadPluginPages, loadPluginSwitch, openPluginConfig, openPluginDetail, openPluginPage, syncNavPluginActive } from "../views/plugins.js";
 import { clearProviderDetail, isChatSource, loadProviderSources, loadProviderSourcesOnce, resetProviderSourcesOnce, saveProviderSource, selectProviderSource, updateProviderSourcesHint } from "../views/providers.js";
-import { loadSessions, selectSession } from "../views/session.js";
+import { loadSessions, renderSessionList, selectSession } from "../views/session.js";
 import { loadConfigProfile, loadConfigProfiles, loadLogs, loadSettings, stopLogsAutoRefresh } from "../views/settings.js";
 
 
@@ -222,7 +222,14 @@ export const NAV_LOADERS = {
   //    → 刷新进来永远"没有聊天记录"，必须先去「会话」点一下。
   //    实测证据与边界见 `loadChat()` 的 docstring。
   chat: () => loadChat(),
-  session: () => loadSessions(),
+  // 🔴 会话页也要**先拿配置文件列表**（2026-11-04：「会话界面切换配置文件」）。
+  //    每行的下拉选项来自 `state.cfgProfiles` —— 不先拉就是空的那个
+  //    「（还没读到配置文件）」，用户以为一个配置文件都没有。
+  //    ⚠️ 顺序：配置文件列表先到位，`loadSessions()` 才能在渲染行时用到它。
+  session: async () => {
+    await Promise.all([loadSessions(), loadConfigProfiles()]);
+    renderSessionList();
+  },
   persona: () => loadPersonas(),
   plugins: () => Promise.all([loadPluginSwitch(), loadPluginPages()]),
   // ⚠️ 适配器页的 loader 直接调 `loadAdapters()`：它会**自己**把失败原因写进

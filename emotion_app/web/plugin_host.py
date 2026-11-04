@@ -403,12 +403,10 @@ class PluginHostService:
         if registry is None:
             return None
         try:
-            profile_id = registry.default_id()
             session = self._session_by_umo(umo)
-            if session is not None:
-                profile_id = registry.resolve(
-                    str(getattr(session, "config_profile_id", "") or "")
-                )
+            explicit = str(getattr(session, "config_profile_id", "") or "") if session else ""
+            # 显式指定 > 路由表（照 AstrBot abconf）> 默认
+            profile_id = registry.resolve_for_umo(str(umo), explicit)
             return registry.store(profile_id).load()
         except Exception:  # noqa: BLE001 — 读配置失败不该打断插件
             logger.warning("按 umo 解析配置文件失败（回落全局配置）umo=%s", umo, exc_info=True)

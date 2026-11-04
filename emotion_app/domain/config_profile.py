@@ -692,6 +692,26 @@ class ConfigProfileRegistry:
         info = self.info(profile_id)
         return ConfigProfileStore(self.root / info.path)
 
+    def resolve_for_umo(self, umo: str, explicit_id: str | None = None) -> str:
+        """**给这条 umo 解析该用哪份配置** —— 三级优先（情绪 2026-11-04）。
+
+            ① 会话**显式**指定的 `config_profile_id`（用户在会话上用下拉选过）
+            ② **路由表**按 umo 模式匹配（`UmopConfigRouter`，照 AstrBot abconf）
+            ③ 默认那份
+
+        ⚠️ 顺序不能反：显式指定是"我就这条要这样"，必须压过批量规则；
+           反过来会让用户明明选了却被路由表覆盖 —— 静默不生效。
+        """
+        pid = str(explicit_id or "").strip()
+        if pid and self.exists(pid):
+            return pid
+        routed = UmopConfigRouter(self).resolve_umo(umo)
+        if routed and self.exists(routed):
+            return routed
+        if pid:
+            logger.warning("会话指定的配置文件 %r 不存在，按路由/默认处理", pid)
+        return self.default_id()
+
     def resolve(self, profile_id: str | None) -> str:
         """把"可能是空"的 profile_id 解析成**实际可用的** id。
 
@@ -783,3 +803,153 @@ class ConfigProfileRegistry:
 
 __all__ += ["ConfigProfileRegistry", "ProfileInfo", "ProfileNotFound",
             "PROFILES_DIR", "DEFAULT_PROFILE_ID"]
+
+
+# ===========================================================================
+# UMOP 配置路由（照 AstrBot 的 `umop_config_router.py`）
+# ===========================================================================
+#
+# 🔴 **这才是情绪要的形状**（2026-11-04）：
+#    > 「要么你就学 astrbot，在配置器页面按 umo/会话选配置文件」
+#
+#    AstrBot 的做法（`core/umop_config_router.py`，全文 90 行）：
+#      * 路由表 `{umop: conf_id}`，`umop` = `[platform_id]:[message_type]:[session_id]`
+#      * 每段支持 `fnmatch` 通配；**空串 = 匹配该段的任何值**
+#      * `"::"` = 所有
+#      * **按顺序遍历，命中第一个就用它**（先配的优先）
+#      * 全都不匹配 ⇒ 默认配置
+#
+#    ⇒ 于是"某条会话用哪份配置"**不需要存在会话对象上**，
+#      而是存在**路由表**里。会话删了路由还在也没关系（匹配不到而已）。
+#
+# ⚠️ 与 `Session.config_profile_id` 的关系：
+#    那个字段是"显式指定"，优先级更高（用户在那条会话上直接选过）。
+#    没选过才走路由表。两者**不冲突**，路由表是批量规则、字段是精确覆盖。
+
+
+def split_umo(umo: str) -> tuple[str, str, str] | None:
+    """把 umo 拆成三段；**保留第三段里的冒号**（`split(":", 2)`）。
+
+    ⚠️ 第三段（session_id）自己可能含冒号 —— 用 `split(":")` 会把它切碎。
+       实测我们的原生会话 id 就是
+       `onebot-napcat1:FriendMessage:3412642082:conversation:7eced1a3-...`
+       （比三段多），所以**必须**只切两刀。
+    """
+    if not isinstance(umo, str):
+        return None
+    parts = umo.split(":", 2)
+    if len(parts) != 3:
+        return None
+    return parts[0], parts[1], parts[2]
+
+
+def umo_matches(pattern: str, umo: str) -> bool:
+    """`pattern` 是否**逻辑包含** `umo`（照 AstrBot `_is_umo_match`）。
+
+    * 每段：`""` = 该段任意；否则 `fnmatch.fnmatchcase` 通配比较；
+    * 三段**全部**满足才算命中。
+    """
+    import fnmatch as _fnmatch
+
+    left = split_umo(pattern)
+    right = split_umo(umo)
+    if left is None or right is None:
+        return False
+    return all(p == "" or _fnmatch.fnmatchcase(t, p) for p, t in zip(left, right))
+
+
+class UmopConfigRouter:
+    """umo 模式 → 配置文件 id 的路由表。
+
+    落盘在 `index.json` 的 `routing` 字段（与配置文件元数据同一个文件，
+    这样"有哪些配置"和"谁用哪份"永远一起读写，不会出现半套状态）。
+    """
+
+    def __init__(self, registry: "ConfigProfileRegistry") -> None:
+        self._registry = registry
+
+    # ---- 读写 ----
+
+    def table(self) -> dict[str, str]:
+        with self._registry._lock:
+            index = self._registry._read_index()
+            raw = index.get("routing")
+            return dict(raw) if isinstance(raw, dict) else {}
+
+    def routes(self) -> list[dict[str, str]]:
+        """列表形态（**保序**：先后顺序就是匹配优先级）。"""
+        return [
+            {"umop": pattern, "profile_id": conf_id}
+            for pattern, conf_id in self.table().items()
+        ]
+
+    def replace(self, routes: list[dict[str, Any]]) -> list[dict[str, str]]:
+        """整体替换路由表（面板一次提交整个列表）。
+
+        🔴 **每一条都要校验**，只要有一条不合法就整批拒绝 ——
+           半套生效的路由表比没有更危险（用户以为配好了，实际走了别的）。
+        """
+        table: dict[str, str] = {}
+        for item in routes or []:
+            if not isinstance(item, dict):
+                raise ConfigProfileError("路由项必须是对象")
+            pattern = str(item.get("umop") or "").strip()
+            conf_id = str(item.get("profile_id") or "").strip()
+            if split_umo(pattern) is None:
+                raise ConfigProfileError(
+                    f"umop 格式不对：{pattern!r}（应为 "
+                    "[platform_id]:[message_type]:[session_id]，可用空串或 * 通配）"
+                )
+            if not self._registry.exists(conf_id):
+                raise ConfigProfileError(f"路由指向的配置文件不存在：{conf_id!r}")
+            table[pattern] = conf_id
+        with self._registry._lock:
+            index = self._registry._read_index()
+            index["routing"] = table
+            self._registry._write_index(index)
+        logger.info("配置路由表已更新：%d 条", len(table))
+        return self.routes()
+
+    def upsert(self, umop: str, profile_id: str) -> list[dict[str, str]]:
+        """加/改**一条**（会话页给单条会话选配置时用）。"""
+        pattern = str(umop or "").strip()
+        conf_id = str(profile_id or "").strip()
+        if split_umo(pattern) is None:
+            raise ConfigProfileError(f"umop 格式不对：{pattern!r}")
+        if not self._registry.exists(conf_id):
+            raise ConfigProfileError(f"配置文件不存在：{conf_id!r}")
+        with self._registry._lock:
+            index = self._registry._read_index()
+            routing = index.get("routing")
+            if not isinstance(routing, dict):
+                routing = {}
+            routing[pattern] = conf_id
+            index["routing"] = routing
+            self._registry._write_index(index)
+        return self.routes()
+
+    def remove(self, umop: str) -> list[dict[str, str]]:
+        pattern = str(umop or "").strip()
+        with self._registry._lock:
+            index = self._registry._read_index()
+            routing = index.get("routing")
+            if isinstance(routing, dict):
+                routing.pop(pattern, None)
+                index["routing"] = routing
+                self._registry._write_index(index)
+        return self.routes()
+
+    # ---- 匹配 ----
+
+    def resolve_umo(self, umo: str) -> str | None:
+        """按 umo 找配置 id。**按表顺序，命中第一个就返回**（照 AstrBot）。"""
+        target = str(umo or "").strip()
+        if not target:
+            return None
+        for pattern, conf_id in self.table().items():
+            if umo_matches(pattern, target):
+                return conf_id
+        return None
+
+
+__all__ += ["split_umo", "umo_matches", "UmopConfigRouter"]

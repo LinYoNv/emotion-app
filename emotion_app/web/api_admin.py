@@ -506,6 +506,44 @@ def build_blueprint(require_auth: Any) -> Blueprint:
             "schema": schema(),
         }), 200
 
+    @bp.get("/config-routing")
+    async def list_config_routing():  # type: ignore[no-untyped-def]
+        """umo 模式 → 配置文件的路由表（照 AstrBot `umop_config_routing`）。
+
+        🔴 情绪 2026-11-04：「在配置器页面按 umo/会话选配置文件」。
+           `umop` = `[platform_id]:[message_type]:[session_id]`，
+           每段可用空串或 `*` 通配，`"::"` 表示所有。
+           **按顺序匹配，命中第一个就用它**；全不中 ⇒ 默认配置。
+        """
+        denied = require_auth()
+        if denied is not None:
+            return denied
+        from ..domain.config_profile import UmopConfigRouter
+
+        return jsonify({
+            "routes": UmopConfigRouter(_registry()).routes(),
+            "profiles": [p.to_dict() for p in _registry().list()],
+            "default_id": _registry().default_id(),
+        }), 200
+
+    @bp.put("/config-routing")
+    async def replace_config_routing():  # type: ignore[no-untyped-def]
+        """整体替换路由表。body: `{routes: [{umop, profile_id}]}`。"""
+        denied = require_auth()
+        if denied is not None:
+            return denied
+        from ..domain.config_profile import ConfigProfileError, UmopConfigRouter
+
+        body = await request.get_json(silent=True) or {}
+        routes = (body or {}).get("routes")
+        if not isinstance(routes, list):
+            return _err("routes 必须是数组", "bad_request", 400)
+        try:
+            updated = UmopConfigRouter(_registry()).replace(routes)
+        except ConfigProfileError as exc:
+            return _err(str(exc), "invalid_config_routing", 400)
+        return jsonify({"routes": updated}), 200
+
     @bp.post("/config-profiles")
     async def create_config_profile():  # type: ignore[no-untyped-def]
         """新建配置文件。body: `{name, clone_from?}`。"""

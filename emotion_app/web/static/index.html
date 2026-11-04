@@ -21,7 +21,7 @@
 <link rel="preload" href="/static/fonts/geist-latin.woff2" as="font" type="font/woff2" crossorigin />
 <!-- ⚠️ `?v=` 必须与文件末尾 `<script src="js/main.js?v=…">` 的版本号**一起改** ——
      改 CSS 不改版本号 = 用户看不到新样式（本项目 2026-09-26 真事故）。 -->
-<link rel="stylesheet" href="/static/app.css?v=20261104p" />
+<link rel="stylesheet" href="/static/app.css?v=20261104s" />
 </head>
 <body>
 <!--
@@ -186,6 +186,32 @@
       <div class="row">
         <button id="new-session-2" class="primary" type="button">+ 新建会话</button>
       </div>
+
+      <!-- 🔴 **主动消息 umo 说明**（2026-11-04 从「设置」页搬回来）。
+           它讲的是"这条会话怎么被插件认出来"，属于**会话本身**的信息，
+           放在设置页（那份是配置文件的内容）反而是错位的。
+
+           ⚠️ 判据 `tests/test_mobile_nav.py::test_session_page_explains_how_to_route_proactive_to_this_session`
+              守着这四件事：default 前提 / 复制 umo / 陪伴面板添加 / 回落说明。
+              搬动时**逐字保留**，少一句就会红。 -->
+      <details class="umo-howto">
+                  <summary>怎么让主动消息落到<strong>这个</strong>会话（而不是 default）</summary>
+                  <ol>
+                    <li>确认上面的「插件用户 ID」<strong>不是 <code>default</code></strong>
+                        —— 老会话会沿用旧的 <code>default</code>（新建会话才会自动分配），
+                        这时点「换一个专用 umo」即可。</li>
+                    <li>点「复制 umo」，拿到 <code>11:FriendMessage:&lt;这个 ID&gt;</code>。</li>
+                    <li>到<strong>陪伴插件面板</strong>（插件 → 陪伴 → 拓展页）的
+                        <strong>用户 / 身份</strong>里<strong>添加这个 umo</strong>，
+                        并给它<strong>打开主动消息</strong>。</li>
+                  </ol>
+                  <p class="hint">
+                    ⚠️ 插件侧还没有这个用户时，主动消息会落到<strong>全局兜底 umo</strong>
+                    （就是列表里那条「陪伴（主动消息）」会话，绑的是 <code>default</code>）——
+                    那是<strong>回落</strong>，不是「只能给 default」。
+                    插件侧建好用户后，之后的主动消息就按这个会话投递。
+                  </p>
+                </details>
 
       <ul id="session-list" class="list session-grid"></ul>
 
@@ -759,137 +785,33 @@
       </div>
     </section>
 
+    <!-- ======================================================================
+         🔴 **「配置文件」编辑区**（情绪 2026-11-04 定的结构）
+
+         > 「设置界面就只有配置文件，不按会话。然后"会话"界面切换配置文件。」
+
+         所以这里：
+           * **只管一份配置文件里的字段**（全部由 `schema.session` 驱动）；
+           * **不再有"选哪条会话"** —— 那是「会话」页的事；
+           * 会话用什么配置，在「会话」页给每条会话选。
+
+         对标 AstrBot：设置页编辑 abconf，会话绑 abconf。
+
+         ⚠️ `#cfg-session-fields` 这个 id **保留原名** ——
+            `renderConfigSections()` 靠它取容器，改名等于把渲染打断。
+            （名字里的 "session" 是历史遗留：它曾经真的叫"会话"段。）
+     ====================================================================== -->
     <section class="cfg-section" id="cfg-session-section">
       <header class="cfg-head">
-        <h4>会话</h4>
-        <span class="hint">先选一条会话，再配它自己的对话模型</span>
+        <h4>这份配置文件的设置</h4>
+        <span class="hint">改的是上面选中的那份；不同会话可以在「会话」页绑不同的配置文件</span>
       </header>
 
-      <!-- 🔴 **按会话选模型**（情绪 2026-10-09 的要求）。
-           「会话」页只管开聊，配置全搬到这里 —— 所以这里必须先有个"配哪条"的选择器。
-           ⚠️ 与聊天页的 `#session-select` **是两个不同的控件、各自独立**：
-              聊天页那个是"我现在要跟谁聊"，这个是"我正在配谁"。
-              复用同一个会互相干扰（切去配 B 就换了聊天对象）—— 刻意不复用。 -->
-      <div class="sev-picker">
-        <label class="sev-picker-label" for="cfg-session-picker">选择会话</label>
-        <select id="cfg-session-picker"></select>
-        <button type="button" id="cfg-session-new">+ 新建会话</button>
-        <button type="button" id="cfg-session-del" class="danger">删除这条会话</button>
+      <div class="cfg-fields" id="cfg-session-fields"></div>
+      <div class="row cfg-actions">
+        <button type="button" id="cfg-session-save" class="primary">保存这份配置</button>
+        <p class="hint" id="cfg-session-hint"></p>
       </div>
-      <p class="hint" id="cfg-session-model-hint"></p>
-
-      <form id="cfg-session-form" class="cfg-form">
-        <!-- 「对话模型」由 JS 注入到这里（复用 provider_select 控件，见 renderSessionModelField）。
-             ⚠️ 它**不在**后端 schema 里 —— 因为它是**每条会话各自**的字段
-                （存在会话记录上），不是全局配置，所以不走 renderConfigSections。 -->
-        <div class="cfg-fields" id="cfg-session-model-fields"></div>
-
-        <!-- ======================================================================
-             🔴 以下整块是从「会话」页**搬过来**的（情绪 2026-10-09「其他的配置移动到
-                设置-配置文件-会话里」）。**id 一律保留原样** —— JS 全靠这些 id 取数，
-               改名等于把那一整套逻辑（含 umo 说明、上下文模式提示）全部打断。
-             ⚠️ 搬运时**逐字保留**，包括那些长注释：它们记的都是真机踩出来的坑。
-             ====================================================================== -->
-        <div id="session-form">
-          <label>标题 <input id="s-title" /></label>
-          <label>绑定人设（留空 = 用当前人设）
-            <select id="s-persona"><option value="">（当前人设）</option></select>
-          </label>
-          <!-- 🔴 **边界必须写在界面上**（情绪 2026-10-31 要求，方案 C）。
-               用户之前以为改这里就能给 QQ 那边换角色 —— 而实际有两套：
-                 * 这里 → 影响**本面板/网页聊天**用哪个系统提示词
-                 * QQ 那边 → 由陪伴插件自己的「角色绑定」决定
-               两套数据我们已经打通（会把人设名同步进 plugin_conversations，
-               供插件兜底时读），但**插件已绑好的角色优先**，不会被这里覆盖。
-               ⚠️ 不写这一句，用户会一直以为"改了没生效 = 有 bug"。 -->
-          <p class="hint persona-scope-hint">
-            <strong>只影响网页聊天</strong>的人设。
-            QQ 那边用什么角色由陪伴插件的「角色绑定」决定
-            —— 已绑好的不会被这里覆盖；没绑过时会用这里选的人设兜底。
-          </p>
-          <label>插件用户 ID（= umo 第三段）
-            <input id="s-user-id" placeholder="例如 sess-a1b2c3d4e5f6" />
-          </label>
-          <p class="hint">
-            陪伴插件<strong>按这个 ID 认人</strong>：记忆 / 关系 / 主动消息开关都挂在它下面，
-            完整 umo 就是 <code>11:FriendMessage:&lt;它&gt;</code>。
-            新建会话时<strong>自动分配一个独有的</strong>，所以可以直接拿它到陪伴面板里
-            建档、开主动消息。<strong>同一个 ID 绑到多个会话时，主动消息只会落到最早建的那个。</strong>
-          </p>
-          <!-- 🔴 这段回答的是"主动消息是不是只能给 default"（情绪 2026-09-27 问）。
-               真相：`default` 只是**存量会话**的回落值，新会话本来就自动分配独有 umo；
-               但光有 umo 还不够 —— 插件那边得**认这个用户**，主动消息才会按它投递。
-               把三步写出来用户照着做就行；否则只能靠猜，而猜错的表现是
-               "主动消息一直落到那条『陪伴（主动消息）』会话"，
-               看起来**像产品不支持**（实际只是没在插件侧建用户）。 -->
-          <details class="umo-howto">
-            <summary>怎么让主动消息落到<strong>这个</strong>会话（而不是 default）</summary>
-            <ol>
-              <li>确认上面的「插件用户 ID」<strong>不是 <code>default</code></strong>
-                  —— 老会话会沿用旧的 <code>default</code>（新建会话才会自动分配），
-                  这时点「换一个专用 umo」即可。</li>
-              <li>点「复制 umo」，拿到 <code>11:FriendMessage:&lt;这个 ID&gt;</code>。</li>
-              <li>到<strong>陪伴插件面板</strong>（插件 → 陪伴 → 拓展页）的
-                  <strong>用户 / 身份</strong>里<strong>添加这个 umo</strong>，
-                  并给它<strong>打开主动消息</strong>。</li>
-            </ol>
-            <p class="hint">
-              ⚠️ 插件侧还没有这个用户时，主动消息会落到<strong>全局兜底 umo</strong>
-              （就是列表里那条「陪伴（主动消息）」会话，绑的是 <code>default</code>）——
-              那是<strong>回落</strong>，不是「只能给 default」。
-              插件侧建好用户后，之后的主动消息就按这个会话投递。
-            </p>
-          </details>
-          <div class="row">
-            <button type="button" id="s-umo-copy">复制 umo</button>
-            <button type="button" id="s-umo-new">换一个专用 umo</button>
-          </div>
-          <p class="hint" id="s-umo-hint"></p>
-          <label>上下文模式
-            <select id="s-mode">
-              <option value="recent_only">滚动上下文（只留最近 N 条）</option>
-              <option value="rolling_summary">动态上下文（摘要 + 最近原文）</option>
-              <option value="semantic">混合模式（前缀稳定，缓存友好）</option>
-            </select>
-          </label>
-          <p class="hint" id="mode-hint"></p>
-          <label>保护窗口（最近 N 条保留原文） <input id="s-tail" type="number" min="1" /></label>
-          <label>总结触发（超出窗口多少条后总结） <input id="s-trigger" type="number" min="1" /></label>
-          <!-- 🔴 **总结用哪个模型**（情绪 2026-10-09：上下文策略改成会话级）。
-               选项由 `renderSessionSummaryModelField()` 从模型供应商里填。
-               ⚠️ 与「对话模型」是**两个独立的下拉**：主对话与总结可以各用一个模型
-                  （总结是低频但可能很贵的调用，让总结走便宜快的模型是常见诉求）。 -->
-          <label>总结用的模型
-            <select id="s-summary-model"></select>
-          </label>
-          <p class="hint" id="s-summary-model-hint"></p>
-          <label>总结提示词（留空 = 用内置）
-            <textarea id="s-summary-instruction" rows="3"
-                      placeholder="留空则用内置提示词"></textarea>
-          </label>
-          <p class="hint">留空 = 用内置提示词（要求模型输出一段简洁摘要）。填了就整段替换它 —— 想保留格式要求请自己写上。</p>
-          <label>摘要（手动编辑；动态/混合模式会注入） <textarea id="s-summary" rows="4"></textarea></label>
-          <p class="hint" id="session-hint"></p>
-        </div>
-
-        <!-- 🔴 **整节包进 `.cfg-section` 方框**（2026-10-18 情绪：
-             「这些文本都没有明确的分割线，能不能用方框圆角包裹住」）。
-             原来这里只有 header + 裸 `.cfg-fields` —— 而 `.cfg-section`
-             只加在「会话」那一段上 ⇒ 「其他会话设置」整段**没有任何边界**，
-             十几个字段和它们的说明文字在视觉上连成一片，分不出哪句属于哪个控件。 -->
-        <section class="cfg-section">
-          <header class="cfg-head cfg-head-sub">
-            <h4>其他会话设置</h4>
-            <span class="hint">这一节是**所有会话共用**的默认值（后端 schema 提供）</span>
-          </header>
-          <!-- 其余字段由 renderConfigSections() 按 schema.session 注入 -->
-          <div class="cfg-fields" id="cfg-session-fields"></div>
-          <div class="row cfg-actions">
-            <button type="submit" id="cfg-session-save" class="primary">保存</button>
-            <p class="hint" id="cfg-session-hint"></p>
-          </div>
-        </section>
-      </form>
     </section>
 
     <!-- 🔴 **「上下文管理策略」整段已删除**（情绪 2026-10-09：「上下文策略一样做成会话级的，
@@ -1230,6 +1152,6 @@
      ⇒ 改 `js/` 或 `app.css` **必须**同时改这里的版本号，两边一起走。
      ⚠️ 子模块（`js/views/*.js`）**不加** `?v=`：它们由 `main.js` 的静态 `import`
         决定 URL，加不了参数，改了子模块就靠 bump 这里来打破整张模块图的缓存。 -->
-<script type="module" src="/static/js/main.js?v=20261104p"></script>
+<script type="module" src="/static/js/main.js?v=20261104s"></script>
 </body>
 </html>
