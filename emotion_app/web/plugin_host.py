@@ -1036,11 +1036,23 @@ class PluginHostService:
 
         ⚠️ 读失败**如实回落空串**（= 用第一个人设）并记日志 ——
            不编造、不抛错：人格读不出来**不该**让整个插件宿主起不来。
+
+        🔴 **2026-11-04 改：从「注册表的默认配置文件」读，不再读旧的单文件。**
+           多配置文件之后，`data/config_profile.json` 只是迁移来源；
+           权威值在 `data/config_profiles/default.json`。
+           ⚠️ 继续读旧路径的后果：用户改了配置面板上显示成功，
+              但插件的"默认人格"永远停在旧文件的值 —— **假成功**。
         """
         try:
-            from emotion_app.domain.config_profile import ConfigProfileStore
+            registry = self.config_profiles
+            if registry is not None:
+                profile = registry.store(registry.default_id()).load()
+            else:
+                # 未注入注册表（测试/降级）⇒ 回落旧路径，**并留痕**
+                from emotion_app.domain.config_profile import ConfigProfileStore
 
-            profile = ConfigProfileStore().load()
+                logger.debug("配置文件注册表未注入，按旧的单文件路径读默认人格")
+                profile = ConfigProfileStore().load()
             session = profile.get("session") or {}
             return str(session.get("default_persona_id") or "").strip()
         except Exception:  # noqa: BLE001

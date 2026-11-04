@@ -235,3 +235,49 @@ def test_two_profiles_can_have_different_fallbacks(registry):
 
     assert a.load()[SECTION_SESSION]["fallback_chat_provider_ids"] == ["x/fast"]
     assert b.load()[SECTION_SESSION]["fallback_chat_provider_ids"] == ["y/fast", "z/fast"]
+
+
+# ---------------------------------------------------------------------------
+# ⑧ 装配判据：默认人格必须从**注册表**读，不能读旧的单文件
+#
+# 这条是被真机验证抓出来的：改造后 `_default_persona_id` 还读
+# `ConfigProfileStore()`（旧的单文件路径），于是"面板改了、插件不认"= 假成功。
+# ---------------------------------------------------------------------------
+
+
+def test_default_persona_reads_from_the_registry_not_the_legacy_file(tmp_path):
+    """`_default_persona_id()` 必须走注册表的默认那份。"""
+    from emotion_app.domain.config_profile import SECTION_SESSION
+
+    registry = ConfigProfileRegistry(tmp_path / "profiles")
+    registry.store(registry.default_id()).patch(
+        {SECTION_SESSION: {"default_persona_id": "liloth-from-registry"}}
+    )
+
+    # 造一个最小的 bridge（只有这个方法需要的属性）
+    from emotion_app.web.plugin_host import PluginHostService
+
+    class _Stub(PluginHostService):
+        def __init__(self, reg):  # noqa: D107
+            self.config_profiles = reg
+            self.config = None
+            self.host = None
+
+    got = _Stub(registry)._default_persona_id()
+    assert got == "liloth-from-registry", (
+        f"没有从注册表读默认人格（读到了 {got!r}）"
+        "—— 说明还在用旧的单文件路径，面板改了插件不认"
+    )
+
+
+def test_default_persona_falls_back_gracefully_without_registry():
+    """注册表未注入时不能崩（回落到旧路径或空串，都行）。"""
+    from emotion_app.web.plugin_host import PluginHostService
+
+    class _Stub(PluginHostService):
+        def __init__(self):  # noqa: D107
+            self.config_profiles = None
+            self.config = None
+            self.host = None
+
+    assert isinstance(_Stub()._default_persona_id(), str)
