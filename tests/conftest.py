@@ -81,6 +81,11 @@ async def mk(tmp_path):
         app.config["EMOTION_CONFIG_PROFILE_PATH"] = str(
             tmp_path / "data" / "config_profile.json"
         )
+        #: 🔴 **2026-11-04 多配置文件**（「设置以配置文件分级」）：
+        #:    现在读配置走的是**注册表目录**，不是单文件路径。
+        #:    只隔离 `EMOTION_CONFIG_PROFILE_PATH` 不够 —— 注册表会去项目
+        #:    `data/config_profiles/` 下建文件（实测：判据当场抓到写进了仓库）。
+        app.config["EMOTION_PROFILES_DIR"] = str(tmp_path / "data" / "config_profiles")
         app.config["EMOTION_CHAT_BACKEND"] = FakeBackend()
         c = app.test_client()
         # 测试专用的两个挂件（test_client 是普通对象，可以挂属性）

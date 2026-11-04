@@ -32,6 +32,7 @@ import logging
 import os
 import tempfile
 import threading
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -136,6 +137,21 @@ SPECS: dict[str, tuple[FieldSpec, ...]] = {
         FieldSpec(
             "default_chat_provider_id", "默认对话模型", "provider_select", "",
             hint="留空时使用第一个可用模型。插件与面板都按它选模型。",
+            provider_type="chat_completion",
+        ),
+        # 🔴 **2026-11-04 重新加回**，但这次是**真接上的**：
+        #    上一版有个同名字段（`fallback_chat_provider_ids`）从来没被读取过，
+        #    是个死字段，已按情绪要求删掉。
+        #    现在它属于**配置文件**（不是全局单例），由
+        #    `ChatService` 通过「会话 → 配置文件」解析出来，
+        #    接在 `_chat_with_fallback()` 上（超时/连不上/5xx/疑似拒答 都会用它）。
+        FieldSpec(
+            "fallback_chat_provider_ids", "回退对话模型", "provider_multi", [],
+            hint=(
+                "主对话模型**超时、连不上或疑似拒答**时，按顺序切换到这些模型。"
+                "⚠️ 只在「换一个模型可能成功」时才换；400/401/403 不换"
+                "（那只会把真正的错误盖掉）。"
+            ),
             provider_type="chat_completion",
         ),
         # 🔴 **2026-11-04 删掉了 `fallback_chat_provider_ids`（「回退对话模型」）**。
@@ -497,3 +513,273 @@ __all__ = [
     "schema",
     "validate_patch",
 ]
+
+
+# ===========================================================================
+# 多配置文件（照 AstrBot 的 `abconf` 分级）
+# ===========================================================================
+#
+# 🔴 **为什么要多份**（情绪 2026-11-04）：
+#    「astrbot 那边的设置是以"配置文件"进行分级，给会话选择用什么配置文件。合理了」
+#
+#    原来我们只有**一份全局配置**（`data/config_profile.json`），所有会话共用。
+#    改成：**多份命名配置文件 + 每个会话绑一份**。
+#
+# AstrBot 的对应机制（实读 `core/astrbot_config_mgr.py`）：
+#   * `abconf_data: {conf_id: {path, name}}` —— 所有配置文件的元数据；
+#   * `ucr.get_conf_id_for_umop(umo)` —— **umo → 配置文件 id** 的绑定；
+#   * 找不到绑定 ⇒ `DEFAULT_CONFIG_CONF_INFO`（默认那份）。
+#     ⚠️ 注意它**绑定在 umo 上**，不是绑在某个会话对象上 ——
+#        我们照这个做（`Session` 的 config_profile_id 只是 umo 绑定的本地镜像）。
+#
+# 落盘布局（**一个配置文件 = 一个文件**，迁移/备份/手改都直观）：
+#     data/config_profiles/
+#     ├── index.json          ← {version, profiles: {id: {name, path}}, default_id}
+#     ├── default.json        ← 默认那份（旧 `data/config_profile.json` 迁过来）
+#     └── <id>.json
+
+
+PROFILES_DIR = "data/config_profiles"
+#: 默认配置文件的固定 id（对标 AstrBot 的 `DEFAULT_CONFIG_CONF_INFO`）。
+DEFAULT_PROFILE_ID = "default"
+INDEX_NAME = "index.json"
+
+
+class ProfileNotFound(KeyError):
+    """配置文件不存在。"""
+
+
+@dataclass(frozen=True)
+class ProfileInfo:
+    """一个配置文件的元数据（列表页用）。"""
+
+    id: str
+    name: str
+    path: str
+    is_default: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "path": self.path,
+            "is_default": self.is_default,
+        }
+
+
+class ConfigProfileRegistry:
+    """多配置文件的**元数据 + 校验**。每个配置文件自己一个 `ConfigProfileStore`。
+
+    ⚠️ 与 `ConfigProfileStore` 的分工：
+      * `ConfigProfileRegistry` 管"有哪些配置文件、谁绑谁"（本类）；
+      * `ConfigProfileStore` 管"某一份里面每个字段的值"（已有，不动）。
+    """
+
+    def __init__(self, root: str | Path = PROFILES_DIR) -> None:
+        self.root = Path(root)
+        self._lock = threading.RLock()
+
+    # ---- 索引 ----
+
+    @property
+    def _index_path(self) -> Path:
+        return self.root / INDEX_NAME
+
+    def _read_index(self) -> dict[str, Any]:
+        """读索引。**缺失 = 首次运行**（自动建 default），损坏 = 备份并重建。"""
+        if not self._index_path.is_file():
+            return self._bootstrap_index()
+        try:
+            data = json.loads(self._index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            # 🔴 索引坏了**不能静默重建**：那会把用户建的配置文件全部"弄丢"
+            #    （文件还在，但没人知道它们叫什么）。备份 + 报错 + 重建索引。
+            backup = self._index_path.with_suffix(".corrupt")
+            try:
+                self._index_path.replace(backup)
+            except OSError:
+                pass
+            logger.error(
+                "配置文件索引损坏（已另存 %s），将重建：%s", backup, exc
+            )
+            return self._bootstrap_index()
+        if not isinstance(data, dict) or not isinstance(data.get("profiles"), dict):
+            logger.error("配置文件索引形状不对，按空处理（文件保留）：%r", type(data).__name__)
+            return self._bootstrap_index()
+        return data
+
+    def _bootstrap_index(self) -> dict[str, Any]:
+        """建一个只含 default 的索引，并把旧单文件配置迁过来。"""
+        self.root.mkdir(parents=True, exist_ok=True)
+        legacy = Path(DEFAULT_PATH)
+        default_file = self.root / f"{DEFAULT_PROFILE_ID}.json"
+        if not default_file.exists() and legacy.is_file():
+            try:
+                default_file.write_text(
+                    legacy.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+                logger.info("已把旧的单文件配置迁移为默认配置文件：%s", default_file)
+            except OSError as exc:
+                logger.error("迁移旧配置失败（默认配置将从空开始）：%s", exc)
+        index = {
+            "version": SCHEMA_VERSION,
+            "default_id": DEFAULT_PROFILE_ID,
+            "profiles": {
+                DEFAULT_PROFILE_ID: {
+                    "name": "默认配置",
+                    "path": f"{DEFAULT_PROFILE_ID}.json",
+                }
+            },
+        }
+        self._write_index(index)
+        return index
+
+    def _write_index(self, index: dict[str, Any]) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        index["version"] = SCHEMA_VERSION
+        fd, tmp = tempfile.mkstemp(dir=str(self.root), prefix=INDEX_NAME + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(index, fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self._index_path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    # ---- 查询 ----
+
+    def list(self) -> list[ProfileInfo]:
+        with self._lock:
+            index = self._read_index()
+            default_id = str(index.get("default_id") or DEFAULT_PROFILE_ID)
+            out: list[ProfileInfo] = []
+            for pid, meta in sorted(index.get("profiles", {}).items()):
+                if not isinstance(meta, dict):
+                    continue
+                out.append(
+                    ProfileInfo(
+                        id=pid,
+                        name=str(meta.get("name") or pid),
+                        path=str(meta.get("path") or f"{pid}.json"),
+                        is_default=(pid == default_id),
+                    )
+                )
+            return out
+
+    def default_id(self) -> str:
+        with self._lock:
+            return str(self._read_index().get("default_id") or DEFAULT_PROFILE_ID)
+
+    def exists(self, profile_id: str) -> bool:
+        with self._lock:
+            return profile_id in self._read_index().get("profiles", {})
+
+    def info(self, profile_id: str) -> ProfileInfo:
+        for item in self.list():
+            if item.id == profile_id:
+                return item
+        raise ProfileNotFound(profile_id)
+
+    def store(self, profile_id: str) -> ConfigProfileStore:
+        """取某个配置文件的读写器。**不存在的 id 直接拒绝**（不悄悄给默认）。"""
+        if not self.exists(profile_id):
+            raise ProfileNotFound(profile_id)
+        info = self.info(profile_id)
+        return ConfigProfileStore(self.root / info.path)
+
+    def resolve(self, profile_id: str | None) -> str:
+        """把"可能是空"的 profile_id 解析成**实际可用的** id。
+
+        🔴 空 / 不存在 ⇒ 回落到默认那份，**并记一条日志**。
+           这和"偷偷用别的"不同：默认配置文件是**明确定义的兜底**，
+           而且我们留痕，用户能在日志里看到是谁回落了。
+        """
+        pid = str(profile_id or "").strip()
+        if pid and self.exists(pid):
+            return pid
+        fallback = self.default_id()
+        if pid:
+            logger.warning(
+                "会话绑定的配置文件 %r 不存在，已回落到默认配置 %r", pid, fallback
+            )
+        return fallback
+
+    # ---- 增删改 ----
+
+    def create(self, name: str, *, clone_from: str | None = None) -> ProfileInfo:
+        """新建配置文件。`clone_from` 给了就复制那份的内容。"""
+        title = str(name or "").strip()
+        if not title:
+            raise ConfigProfileError("配置文件名字不能为空")
+        with self._lock:
+            index = self._read_index()
+            profiles = index.setdefault("profiles", {})
+            if any(
+                isinstance(m, dict) and str(m.get("name") or "") == title
+                for m in profiles.values()
+            ):
+                raise ConfigProfileError(f"已经有叫 {title!r} 的配置文件")
+
+            pid = f"p{uuid.uuid4().hex[:10]}"
+            path = f"{pid}.json"
+            target = self.root / path
+            source = ""
+            if clone_from:
+                src_id = self.resolve(clone_from)
+                src_info = self.info(src_id)
+                try:
+                    source = (self.root / src_info.path).read_text(encoding="utf-8")
+                except OSError as exc:
+                    logger.warning("复制配置文件 %r 的内容失败（将从默认值开始）：%s", src_id, exc)
+            self.root.mkdir(parents=True, exist_ok=True)
+            target.write_text(source or "{}", encoding="utf-8")
+
+            profiles[pid] = {"name": title, "path": path}
+            self._write_index(index)
+            logger.info("已新建配置文件：%r (id=%s, 复制自 %r)", title, pid, clone_from or "默认值")
+            return ProfileInfo(id=pid, name=title, path=path)
+
+    def rename(self, profile_id: str, name: str) -> ProfileInfo:
+        title = str(name or "").strip()
+        if not title:
+            raise ConfigProfileError("配置文件名字不能为空")
+        with self._lock:
+            index = self._read_index()
+            profiles = index.get("profiles", {})
+            if profile_id not in profiles:
+                raise ProfileNotFound(profile_id)
+            for pid, meta in profiles.items():
+                if pid != profile_id and isinstance(meta, dict) and str(meta.get("name")) == title:
+                    raise ConfigProfileError(f"已经有叫 {title!r} 的配置文件")
+            profiles[profile_id]["name"] = title
+            self._write_index(index)
+            return self.info(profile_id)
+
+    def delete(self, profile_id: str) -> None:
+        """删除。**默认那份不许删**（它就是兜底，删了没有回落目标）。"""
+        with self._lock:
+            index = self._read_index()
+            if profile_id not in index.get("profiles", {}):
+                raise ProfileNotFound(profile_id)
+            if profile_id == str(index.get("default_id")):
+                raise ConfigProfileError(
+                    "默认配置文件不能删除 —— 它是所有未绑定会话的回落目标"
+                )
+            path = self.root / str(index["profiles"][profile_id].get("path") or "")
+            index["profiles"].pop(profile_id, None)
+            self._write_index(index)
+            # ⚠️ 先改索引再删文件：反过来的话，文件没了但索引还指着它 ⇒ 读的时候报错
+            try:
+                if path.is_file():
+                    path.unlink()
+            except OSError as exc:
+                logger.warning("配置文件已从索引移除，但删除文件失败（可手动清理）：%s", exc)
+
+
+__all__ += ["ConfigProfileRegistry", "ProfileInfo", "ProfileNotFound",
+            "PROFILES_DIR", "DEFAULT_PROFILE_ID"]

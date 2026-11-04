@@ -450,7 +450,9 @@ async def test_get_returns_profile_and_schema(mk):
     r = await c.get("/api/v1/config-profile")
     assert r.status_code == 200, await r.get_data(as_text=True)
     body = await r.get_json()
-    assert set(body) == {"profile", "schema"}, sorted(body)
+    # ⚠️ 2026-11-04 多配置文件：响应多了一个 `profile_id`（告诉前端"这份是谁"）。
+    #    不是放宽 —— 断言仍要求**恰好**这三个键，多一个少一个都红。
+    assert set(body) == {"profile", "schema", "profile_id"}, sorted(body)
     assert set(body["profile"]) == set(SECTIONS)
     assert set(body["schema"]) == set(SECTIONS), sorted(body["schema"])
     assert "context" not in body["schema"], "全局 context 段又回来了"
@@ -539,8 +541,13 @@ async def test_client_writes_to_its_own_isolated_path(mk, tmp_path):
     await c.patch("/api/v1/config-profile",
                   json={SECTION_SESSION: {"request_max_retries": 3}})
 
-    # 值确实写进了那个隔离路径
-    written = Path(configured)
+    # ⚠️ 2026-11-04 多配置文件：写盘目标是**注册表目录**下的默认那份，
+    #    不再是单文件 `EMOTION_CONFIG_PROFILE_PATH`。
+    profiles_dir = Path(c.app.config["EMOTION_PROFILES_DIR"])
+    assert str(tmp_path) in str(profiles_dir), (
+        f"注册表目录没有隔离到 tmp：{profiles_dir!r}"
+    )
+    written = profiles_dir / "default.json"
     assert written.is_file(), f"没有写到隔离路径：{written}"
     assert json.loads(written.read_text(encoding="utf-8"))[SECTION_SESSION][
         "request_max_retries"

@@ -12,7 +12,7 @@ import { loadPersonas, renderPersonaList, selectPersona } from "../views/persona
 import { closePluginPage, loadPluginPages, loadPluginSwitch, openPluginConfig, openPluginDetail, openPluginPage, syncNavPluginActive } from "../views/plugins.js";
 import { clearProviderDetail, isChatSource, loadProviderSources, loadProviderSourcesOnce, resetProviderSourcesOnce, saveProviderSource, selectProviderSource, updateProviderSourcesHint } from "../views/providers.js";
 import { loadSessions, selectSession } from "../views/session.js";
-import { loadConfigProfile, loadLogs, loadSettings, stopLogsAutoRefresh } from "../views/settings.js";
+import { loadConfigProfile, loadConfigProfiles, loadLogs, loadSettings, stopLogsAutoRefresh } from "../views/settings.js";
 
 
 /* 潮汐引力 面板 —— 原生 JS，零构建工具（照 docs/REF_ASTRBOT_COMPANION_STACK.md §2.3 的选型） */
@@ -98,6 +98,15 @@ export let state = {
   // 🔴 语义：用户**连接自己的 agent 平台**；平台本身不带 agent 能力。
   // ⚠️ 初值 `null` = "还没读到"，与 `{}`（读到了但空）语义不同 ——
   //    把两者混起来会让"读取失败"显示成"你没配"，用户会去配一个已经配好的东西。
+  // ---- 多配置文件（2026-11-04）----
+  // 🔴 情绪：「设置以配置文件分级，给会话选择用什么配置文件」。
+  //: 当前**正在编辑**的那份配置文件 id（空 = 还没读到，之后会落到默认那份）
+  cfgProfileId: "",
+  //: 列表 [{id,name,path,is_default}]
+  cfgProfiles: [],
+  //: 默认那份的 id（后端明确给的，不靠列表顺序猜）
+  cfgDefaultProfileId: "",
+
   subagentConfig: null,
   // 后端目录（`GET /api/v1/subagents/backends` 的 types）；`null` = 还没读到。
   // 🔴 与 `subagentConfig` 一样，`null`（没读到）和 `[]`（读到了、后端就是没有）
@@ -254,8 +263,13 @@ export const NAV_LOADERS = {
   //
   //    ⇒ 进设置页时补一次"选会话"。**只做一次**（已有 currentSessionId 就不动），
   //      否则会抢用户手动选的那条。
-  settings: () =>
-    Promise.all([loadSettings(), loadConfigProfile(), ensureSessionSelected()]),
+  // ⚠️ **顺序要紧**：先拿配置文件列表（决定"编辑哪一份"），再拿那份的内容。
+  //    反过来会先读默认那份、然后才发现应该读别的 —— 多一次无谓往返，
+  //    而且中途有一瞬间界面显示的是**错的配置文件**（用户可能正好在那时点保存）。
+  settings: async () => {
+    await Promise.all([loadSettings(), loadConfigProfiles()]);
+    await Promise.all([loadConfigProfile(), ensureSessionSelected()]);
+  },
   // ⚠️ 日志页的 loader **顺便管自动刷新的开关**：进来开、离开必须关 ——
   //    否则用户切走后定时器还在跑（白刷 + 用户看不到却仍在发请求）。
   //    停表在 `applyRoute`（见那里的 `stopLogsAutoRefresh`）。

@@ -2410,3 +2410,16 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   .subagent-agent-head > .subagent-agent-remove { align-self: flex-start; }
 }
 
+
+/* ---------------- 配置文件选择器（2026-11-04）----------------
+ *
+ * 🔴 情绪：「astrbot 那边的设置是以"配置文件"进行分级」
+ * ⚠️ 沿用全站的 `.cfg-section / .cfg-field`，**不要另造一套**。
+ */
+#cfg-profiles-section .row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+#cfg-profile-picker { min-width: 240px; }

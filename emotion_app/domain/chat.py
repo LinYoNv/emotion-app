@@ -201,6 +201,10 @@ class ChatService:
         self._sessions = None          # SessionRepository（可选，S3 起注入）
         self._tools: ToolRegistry | None = None   # 工具表（可选，S6 起注入）
         self._dispatch: Any = None                # 工具下发方式（可替换）
+        #: 🔴 **多配置文件注册表**（2026-11-04）。未注入 ⇒ 回退模型只认
+        #:    `req.fallback_models` 与旧的 `session.fallback_model`
+        #:    （如实降级，不猜）。
+        self._profiles: Any = None
         self._refusal_keywords = DEFAULT_REFUSAL_KEYWORDS
         self._summarizer: Any = None       # Summarizer（S6b 注入）
         #: 🔴 **LLM 钩子端口**（P0-4）：让 AstrBot 插件在调模型**之前**介入。
@@ -493,6 +497,18 @@ class ChatService:
         return self._sessions
 
     # ---- 目标解析（人设可覆盖全局）----
+
+    def _profile_fallbacks(self, session: Any) -> list[str]:
+        """会话绑定的那份配置文件里的「回退对话模型」列表。
+
+        🔴 解析链：`session.config_profile_id` → 注册表 `resolve()`（空/不存在回落默认）
+           → 那份 `ConfigProfileStore` 的 `session.fallback_chat_provider_ids`。
+        """
+        registry = self._profiles
+        profile_id = registry.resolve(str(getattr(session, "config_profile_id", "") or ""))
+        profile = registry.store(profile_id).load()
+        values = (profile.get("session") or {}).get("fallback_chat_provider_ids")
+        return list(values) if isinstance(values, list) else []
 
     def resolve_target(
         self,
@@ -934,17 +950,33 @@ class ChatService:
                     prepared.execute_tool = authorized_tool
             tool_payload = {"tools": prepared.tools}
 
-        # 🔴 会话上的「回退模型」要并进候选（2026-11-04 情绪要的）。
-        #    来源两处：`req.fallback_models`（调用方显式给的）+ `session.fallback_model`
-        #    （用户在设置页选的）。去重后按「先显式、后会话」排。
-        session_fallback = (
+        # 🔴 回退模型来自**会话绑定的那份配置文件**（2026-11-04 情绪定的分级）。
+        #
+        #    来源三处，按优先级：
+        #      ① `req.fallback_models` —— 调用方显式给的（最高，便于测试/高级用法）
+        #      ② 会话绑定的配置文件里的 `fallback_chat_provider_ids`
+        #      ③ `session.fallback_model` —— **旧字段**，只为进一步兼容老数据
+        #
+        #    ⚠️ 为什么权威值在配置文件而不是会话字段：
+        #       情绪：「astrbot 那边的设置是以"配置文件"进行分级」——
+        #       回退策略属于"这套设置怎么跑"，不是"这条会话单独怎么跑"。
+        profile_fallbacks: tuple[str, ...] = ()
+        if session is not None and self._profiles is not None:
+            try:
+                profile_fallbacks = tuple(
+                    str(m).strip() for m in self._profile_fallbacks(session) if str(m).strip()
+                )
+            except Exception:  # noqa: BLE001 — 读配置失败不该让聊天挂掉
+                log.warning("读取会话绑定的配置文件失败（本轮不回退）", exc_info=True)
+        legacy_fallback = (
             str(getattr(session, "fallback_model", "") or "").strip()
             if session is not None else ""
         )
         fallback_candidates = tuple(
             dict.fromkeys(
                 [m for m in req.fallback_models if m]
-                + ([session_fallback] if session_fallback else [])
+                + list(profile_fallbacks)
+                + ([legacy_fallback] if legacy_fallback else [])
             )
         )
         result = await self._chat_with_fallback(

@@ -474,6 +474,90 @@ def build_blueprint(require_auth: Any) -> Blueprint:
         path = current_app.config.get("EMOTION_CONFIG_PROFILE_PATH") or DEFAULT_PATH
         return ConfigProfileStore(path)
 
+    def _registry() -> Any:
+        """多配置文件注册表（情绪 2026-11-04：「设置以配置文件分级」）。
+
+        ⚠️ 路径可覆盖（`EMOTION_PROFILES_DIR`）：单测绝不能写进项目的 `data/`。
+        """
+        from quart import current_app
+
+        from ..domain.config_profile import PROFILES_DIR, ConfigProfileRegistry
+
+        root = current_app.config.get("EMOTION_PROFILES_DIR") or PROFILES_DIR
+        return ConfigProfileRegistry(root)
+
+    def _profile_store(profile_id: str | None) -> Any:
+        """按 id 取某个配置文件；`None`/空 = 默认那份。"""
+        registry = _registry()
+        return registry.store(registry.resolve(profile_id))
+
+    @bp.get("/config-profiles")
+    async def list_config_profiles():  # type: ignore[no-untyped-def]
+        """列出所有配置文件（对标 AstrBot 的 abconf 列表）。"""
+        denied = require_auth()
+        if denied is not None:
+            return denied
+        registry = _registry()
+        from ..domain.config_profile import schema
+
+        return jsonify({
+            "profiles": [p.to_dict() for p in registry.list()],
+            "default_id": registry.default_id(),
+            "schema": schema(),
+        }), 200
+
+    @bp.post("/config-profiles")
+    async def create_config_profile():  # type: ignore[no-untyped-def]
+        """新建配置文件。body: `{name, clone_from?}`。"""
+        denied = require_auth()
+        if denied is not None:
+            return denied
+        from ..domain.config_profile import ConfigProfileError
+
+        body = await request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return _err("请求体必须是 JSON 对象", "bad_request", 400)
+        try:
+            info = _registry().create(
+                str(body.get("name") or ""),
+                clone_from=str(body.get("clone_from") or "") or None,
+            )
+        except ConfigProfileError as exc:
+            return _err(str(exc), "invalid_config_profile", 400)
+        return jsonify({"profile": info.to_dict()}), 201
+
+    @bp.patch("/config-profiles/<profile_id>")
+    async def rename_config_profile(profile_id: str):  # type: ignore[no-untyped-def]
+        denied = require_auth()
+        if denied is not None:
+            return denied
+        from ..domain.config_profile import ConfigProfileError, ProfileNotFound
+
+        body = await request.get_json(silent=True) or {}
+        try:
+            info = _registry().rename(profile_id, str((body or {}).get("name") or ""))
+        except ProfileNotFound:
+            return _err(f"找不到配置文件 {profile_id!r}", "not_found", 404)
+        except ConfigProfileError as exc:
+            return _err(str(exc), "invalid_config_profile", 400)
+        return jsonify({"profile": info.to_dict()}), 200
+
+    @bp.delete("/config-profiles/<profile_id>")
+    async def delete_config_profile(profile_id: str):  # type: ignore[no-untyped-def]
+        denied = require_auth()
+        if denied is not None:
+            return denied
+        from ..domain.config_profile import ConfigProfileError, ProfileNotFound
+
+        try:
+            _registry().delete(profile_id)
+        except ProfileNotFound:
+            return _err(f"找不到配置文件 {profile_id!r}", "not_found", 404)
+        except ConfigProfileError as exc:
+            # 默认那份不许删 ⇒ 403（这是"规则不允许"，不是格式错）
+            return _err(str(exc), "profile_protected", 403)
+        return jsonify({"ok": True, "deleted": profile_id}), 200
+
     @bp.get("/config-profile")
     async def get_config_profile():  # type: ignore[no-untyped-def]
         """读配置 + **字段元数据**（前端照 `schema` 渲染，不在 JS 里再抄一份）。
@@ -485,8 +569,15 @@ def build_blueprint(require_auth: Any) -> Blueprint:
             return denied
         from ..domain.config_profile import schema
 
-        store = _cfg_profile()
-        return jsonify({"profile": store.load(), "schema": schema()}), 200
+        # ⚠️ `?profile=<id>` 可选：不给就用**默认那份**（向后兼容旧前端）。
+        wanted = (request.args.get("profile") or "").strip() or None
+        store = _profile_store(wanted)
+        registry = _registry()
+        return jsonify({
+            "profile": store.load(),
+            "schema": schema(),
+            "profile_id": registry.resolve(wanted),
+        }), 200
 
     @bp.patch("/config-profile")
     async def patch_config_profile():  # type: ignore[no-untyped-def]
@@ -509,7 +600,8 @@ def build_blueprint(require_auth: Any) -> Blueprint:
                 "请求体是空的：至少给一段（session / context）",
                 "bad_request", 400,
             )
-        store = _cfg_profile()
+        wanted = (request.args.get("profile") or "").strip() or None
+        store = _profile_store(wanted)
         try:
             profile = store.patch(body)
         except ConfigProfileError as exc:
@@ -523,7 +615,8 @@ def build_blueprint(require_auth: Any) -> Blueprint:
         denied = require_auth()
         if denied is not None:
             return denied
-        store = _cfg_profile()
+        wanted = (request.args.get("profile") or "").strip() or None
+        store = _profile_store(wanted)
         return jsonify({"profile": store.reset()}), 200
 
     @bp.post("/settings/ping")

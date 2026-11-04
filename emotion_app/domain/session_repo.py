@@ -99,14 +99,27 @@ class Session:
     #:    理由：本项目最贵的 bug 类型是"静默用了别的东西，用户以为生效了"。
     model: str = ""
 
+    #: 🔴 **这条会话用哪一份「配置文件」**（2026-11-04 情绪定的分级方案）。
+    #:
+    #: 情绪：「astrbot 那边的设置是以"配置文件"进行分级，给会话选择用什么配置文件。合理了」
+    #:
+    #: 对标 AstrBot 的 `abconf`：
+    #:   `abconf_mapping` 是 **umo → 配置文件 id** 的绑定
+    #:   （`core/astrbot_config_mgr.py:103-128`），找不到就回落默认那份。
+    #:
+    #: 空串 = 用默认配置文件（`ConfigProfileRegistry.default_id()`）。
+    #: ⚠️ 这里存的是**本地镜像**：真正决定"插件看到哪份配置"的是 umo 绑定
+    #:    （`Context.get_config(umo)` 那条链路），本字段负责面板这边的一致性。
+    config_profile_id: str = ""
+
     #: 🔴 **回退模型**（2026-11-04 情绪要的）。
     #:
-    #: 语义：主模型**超时/连不上/疑似拒答**时，用它再试一次。
-    #: 典型场景：把对话模型换成推理模型（`cpa/gemini-4-argon-high`）后
-    #: 60 秒超时 —— 回退到一个快的模型，比让用户干等或直接失败好得多。
+    #: ⚠️ **已改为冗余镜像**：权威值在**配置文件**里（`session.fallback_models`），
+    #:    由 `ChatService` 从会话绑定的那份配置里读。
+    #:    本字段只保留给"旧的单会话覆盖"用，**新代码不要写它**。
     #:
-    #: 取值口径与 `model` 完全相同（`<源id>/<模型名>`）。
-    #: 空串 = 不回退（此时失败就如实报错，**不会**偷偷换成别的模型 ——
+    #: 语义：主模型**超时/连不上/疑似拒答**时，用它再试一次。
+    #: 空串 = 不回退（失败就如实报错，**不会**偷偷换成别的模型 ——
     #: 本项目的铁律：静默用了别的东西比失败更糟）。
     fallback_model: str = ""
 
@@ -145,6 +158,8 @@ class Session:
             "persona_id": self.persona_id,
             "user_id": self.user_id,
             "model": self.model,
+            # 🔴 配置文件绑定必须出现在 to_dict 里（漏了前端拿不到 ⇒ 控件永远显示默认）
+            "config_profile_id": self.config_profile_id,
             # 🔴 回退模型必须出现在 to_dict 里：`_session_payload()` 全靠它，
             #    漏了 ⇒ 前端拿不到值 ⇒ 控件永远显示"未选"，用户以为没存上
             #    （实测：我第一版就漏了，被验证脚本当场抓到）。
@@ -178,6 +193,8 @@ class Session:
             user_id=str(d.get("user_id") or ""),
             # ⚠️ 旧数据没有这个字段 → 空串（不是"用了某个默认模型"，就是"没选"）
             model=str(d.get("model") or ""),
+            # ⚠️ 旧数据没有这个字段 → 空串 = 用默认配置文件（向后兼容）
+            config_profile_id=str(d.get("config_profile_id") or ""),
             # ⚠️ 旧数据没有这个字段 → 空串 = 不回退（向后兼容）
             fallback_model=str(d.get("fallback_model") or ""),
             created_at=float(d.get("created_at", time.time())),
@@ -438,6 +455,32 @@ class SessionRepository:
             )
         return earliest
 
+    async def by_umo(self, umo: str) -> Session | None:
+        """按**完整 umo** 找会话（`<platform_id>:FriendMessage:<user_id>`）。
+
+        🔴 为什么需要它（情绪 2026-11-04：「设置以配置文件分级，
+           给会话选择用什么配置文件」）：
+           插件的 `context.get_config(umo)` 拿到的是**完整 umo**，
+           我们要据此找到"这条 umo 对应哪个会话"，再取它绑定的配置文件。
+
+        ⚠️ 与 `by_user_id` 的区别：那个只要第三段（插件用户 id），
+           这个要**整串**。原生会话的 `native_origin` 就是完整 umo，
+           非原生会话没有它 ⇒ 用 `user_id` 段拼一个比较。
+        """
+        target = str(umo or "").strip()
+        if not target:
+            return None
+        sessions = await self._load_sessions()
+        # ① 原生会话直接比 `native_origin`（权威）
+        for session in sessions.values():
+            if str(getattr(session, "native_origin", "") or "") == target:
+                return session
+        # ② 退回：用 user_id 段比（`11:FriendMessage:3412642082` 的第三段）
+        tail = target.rsplit(":", 1)[-1]
+        if tail:
+            return await self.by_user_id(tail)
+        return None
+
     async def ensure(self, session_id: str, **kwargs: Any) -> Session:
         """取会话；不存在就建（聊天时用，省一次往返）。"""
         def change(sessions, messages):
@@ -531,7 +574,7 @@ class SessionRepository:
             #: ⚠️ 加字段必须同改这里，否则前端传了也被**静默忽略**。
             #: `fallback_model` 于 2026-11-04 加入（主模型超时/拒答时改用它）。
             allowed = {"title", "persona_id", "user_id", "summary", "summarized_upto",
-                       "model", "fallback_model"}
+                       "model", "fallback_model", "config_profile_id"}
             for k, v in patch.items():
                 if k == "policy":
                     if not isinstance(v, dict):

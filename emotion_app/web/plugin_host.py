@@ -325,6 +325,12 @@ class PluginHostService:
         #: ⚠️ 与上面几个同款：由装配层注入；缺席时对话端口**如实不接**
         #:    （插件的主动消息存档会失败，但投递不受影响）。
         self.store: Any = None
+        #: 🔴 **多配置文件注册表**（`emotion_app.domain.config_profile.ConfigProfileRegistry`）。
+        #:
+        #: 情绪 2026-11-04：「设置以配置文件分级，给会话选择用什么配置文件」。
+        #: 插件 `context.get_config(umo)` 靠它按 umo 查出**这条会话**绑定的那份。
+        #: ⚠️ 未注入 ⇒ `get_config(umo)` 忽略 umo、返回全局那份（旧行为，如实降级）。
+        self.config_profiles: Any = None
         #: 🔴 **子代理注册表**（`astrbot_host.subagent.SubagentRegistry`）。
         #:
         #: 语义（情绪 2026-11-03 定）：「平台本身不带 agent 能力，是子代理。
@@ -355,6 +361,58 @@ class PluginHostService:
         #: 覆盖（`create_app` 之后才设 `EMOTION_CONFIG_PROFILE_PATH`），
         #: 所以用**回调延迟取值**；真实部署下回落 `DEFAULT_PATH`。
         self._config_profile_path: Any = None
+
+    def _session_by_umo(self, umo: str) -> Any:
+        """**同步**按 umo 取会话（`get_config` 是同步接口，不能在这里 await）。
+
+        🔴 做法：读会话仓库的**内存快照**（`_load_sessions()` 的缓存），
+           不做 IO。缓存没预热时返回 `None`（调用方回落默认配置）并留 debug 日志。
+           ⚠️ **不在同步上下文里跑异步 IO** —— 那会卡住整个事件循环
+              （本项目通则：同步 SQLite/IO 不得跑在循环上）。
+        """
+        sessions = self.sessions
+        if sessions is None:
+            return None
+        cache = getattr(sessions, "_cache", None)
+        items = None
+        if isinstance(cache, dict):
+            items = cache.get("sessions")
+        if not isinstance(items, dict):
+            logger.debug("会话缓存未预热，按 umo 取配置回落默认：umo=%s", umo)
+            return None
+        target = str(umo or "").strip()
+        for session in items.values():
+            if str(getattr(session, "native_origin", "") or "") == target:
+                return session
+        tail = target.rsplit(":", 1)[-1]
+        if not tail:
+            return None
+        matches = [s for s in items.values() if getattr(s, "user_id", "") == tail]
+        return sorted(matches, key=lambda s: (s.created_at, s.id))[0] if matches else None
+
+    def _config_for_umo(self, umo: str) -> Any:
+        """把 umo 解析成它绑定的那份配置文件内容（对标 AstrBot 的 `abconf`）。
+
+        链路：`umo` → 会话 → `config_profile_id` → 注册表 `resolve()` → 那份配置。
+
+        🔴 任何一步失败都**回落到默认配置文件**并留日志 ——
+           插件不能因为"读不到会话绑定"就整个不可用。
+           这与"偷偷用别的"不同：默认配置是**明确定义的兜底**，且我们留痕。
+        """
+        registry = getattr(self, "config_profiles", None)
+        if registry is None:
+            return None
+        try:
+            profile_id = registry.default_id()
+            session = self._session_by_umo(umo)
+            if session is not None:
+                profile_id = registry.resolve(
+                    str(getattr(session, "config_profile_id", "") or "")
+                )
+            return registry.store(profile_id).load()
+        except Exception:  # noqa: BLE001 — 读配置失败不该打断插件
+            logger.warning("按 umo 解析配置文件失败（回落全局配置）umo=%s", umo, exc_info=True)
+            return None
 
     def _subagent_registry(self) -> Any:
         """取用户配置的子代理注册表（**没配就返回 None，由宿主如实拒绝**）。
@@ -608,6 +666,10 @@ class PluginHostService:
                     #       （`cmd_config.json` **带 BOM**），且读不到会记 ERROR
                     #       —— 不静默给空字典（否则就是我们又造了一遍同类 bug）。
                     config=self._load_global_config(),
+                    # 🔴 **按 umo 取配置文件**（情绪 2026-11-04：
+                    #    「设置以配置文件分级，给会话选择用什么配置文件」）。
+                    #    未注入 ⇒ 插件读到的是全局那份（旧行为）。
+                    config_for_umo=self._config_for_umo,
                     llm=llm_port,
                     # 🔴 两条投递路径都要接（插件不同调用点走不同路）：
                     #   * `delivery=` → `context.send_message`（路径 A）

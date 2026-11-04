@@ -185,6 +185,7 @@ class HostPorts:
         provider_manager: Any = None,
         persona_manager: Any = None,
         subagents: Any = None,
+        config_for_umo: Any = None,
     ) -> None:
         self.conversation_manager = conversation_manager
         self.llm = llm
@@ -213,6 +214,12 @@ class HostPorts:
         #: 未提供 ⇒ `tool_loop_agent()` 走 `NullBackend`，**如实报「没接子代理」**
         #: （不返回空串 —— 那会让模型以为佣人说没事，进而编造结果）。
         self.subagents = subagents
+        #: 🔴 **按 umo 取配置文件**（`Callable[[str], dict | None]`）。
+        #:
+        #: 情绪 2026-11-04：「设置以配置文件分级，给会话选择用什么配置文件」。
+        #: 对标 AstrBot `abconf`：`umo → conf_id → 那份配置`。
+        #: 未注入 ⇒ `get_config(umo)` **忽略 umo**、返回全局那份（旧行为）。
+        self.config_for_umo = config_for_umo
 
     def capabilities(self) -> dict[str, bool]:
         """当前可用能力（诊断用 —— 让"缺什么"可观测）。"""
@@ -462,10 +469,38 @@ class Context:
               只在**为空**时才兜 `{}`（别做无谓的拷贝，插件的
               `save_config()` 之类要作用在同一个对象上）。
         """
-        if umo:
-            logger.debug("get_config(umo=%s)：宿主当前单用户，忽略 umo", umo)
+        # 🔴🔴 **2026-11-04 起不再忽略 umo**（情绪：「设置以配置文件分级，
+        #    给会话选择用什么配置文件」）。
+        #
+        #    原来这里是「单用户 ⇒ 忽略 umo」，直接返回全局那份。
+        #    现在按 **umo → 会话 → config_profile_id → 配置文件** 解析，
+        #    与 AstrBot 的 `abconf` 机制对齐
+        #    （`core/astrbot_config_mgr.py:103-128`：`ucr.get_conf_id_for_umop(umo)`
+        #      → 找不到就回落默认那份）。
+        #
+        #    ⚠️ 解析失败/端口未注入时**如实回落到全局那份**并留日志 ——
+        #       不能让插件因为读配置失败就整个不可用。
+        resolved = self._config_for_umo(umo)
+        if resolved is not None:
+            return resolved
         cfg = self._ports.config
         return cfg if cfg is not None else {}
+
+    def _config_for_umo(self, umo: str | None) -> Any:
+        """按 umo 取它绑定的那份配置；取不到返回 `None`（调用方回落全局）。"""
+        if not umo:
+            return None
+        resolver = getattr(self._ports, "config_for_umo", None)
+        if resolver is None:
+            return None
+        try:
+            resolved = resolver(str(umo))
+        except Exception as exc:  # noqa: BLE001 — 读配置失败不该打断插件
+            logger.warning("按 umo 解析配置文件失败（回落全局配置）：%s", exc)
+            return None
+        if resolved is None:
+            logger.debug("umo=%s 没有绑定配置文件，回落全局配置", umo)
+        return resolved
 
     @property
     def conversation_manager(self) -> Any:

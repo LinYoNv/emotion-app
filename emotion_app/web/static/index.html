@@ -21,7 +21,7 @@
 <link rel="preload" href="/static/fonts/geist-latin.woff2" as="font" type="font/woff2" crossorigin />
 <!-- ⚠️ `?v=` 必须与文件末尾 `<script src="js/main.js?v=…">` 的版本号**一起改** ——
      改 CSS 不改版本号 = 用户看不到新样式（本项目 2026-09-26 真事故）。 -->
-<link rel="stylesheet" href="/static/app.css?v=20261104n" />
+<link rel="stylesheet" href="/static/app.css?v=20261104p" />
 </head>
 <body>
 <!--
@@ -725,6 +725,40 @@
          成功时它说的是"读到几段/几项"，所以"空"和"错"在界面上永远长得不一样。 -->
     <p class="hint" id="cfg-hint">正在读取配置…</p>
 
+    <!-- ======================================================================
+         🔴 **配置文件选择器**（情绪 2026-11-04）
+
+         > 「astrbot 那边的设置是以"配置文件"进行分级，给会话选择用什么配置文件。合理了」
+
+         对标 AstrBot 的 `abconf`（`core/astrbot_config_mgr.py`）：
+           `abconf_mapping` 是 **umo → 配置文件 id** 的绑定，找不到就回落默认那份。
+
+         所以下面「会话」那一整节，编辑的是**当前选中的这份配置文件**，
+         不是"全局唯一的那份"。要改哪个配置文件，先在这里选。
+
+         ⚠️ 列表由 `GET /api/v1/config-profiles` 驱动，**不硬编码任何 id**。
+     ====================================================================== -->
+    <section class="cfg-section" id="cfg-profiles-section">
+      <header class="cfg-head">
+        <h4>配置文件</h4>
+        <span class="hint">下面是这份配置文件里所有会话共用的设置。不同会话可以绑不同的配置文件。</span>
+      </header>
+      <div class="cfg-fields">
+        <label class="cfg-field">
+          <span class="cfg-label">正在编辑</span>
+          <select id="cfg-profile-picker"></select>
+          <span class="hint" id="cfg-profile-hint">
+            新建会话时可以在「会话」里给它指定用哪份配置。
+          </span>
+        </label>
+        <div class="row" id="cfg-profile-actions">
+          <button type="button" id="cfg-profile-new">+ 新建配置文件</button>
+          <button type="button" id="cfg-profile-rename">重命名</button>
+          <button type="button" id="cfg-profile-delete" class="danger">删除</button>
+        </div>
+      </div>
+    </section>
+
     <section class="cfg-section" id="cfg-session-section">
       <header class="cfg-head">
         <h4>会话</h4>
@@ -1196,6 +1230,6 @@
      ⇒ 改 `js/` 或 `app.css` **必须**同时改这里的版本号，两边一起走。
      ⚠️ 子模块（`js/views/*.js`）**不加** `?v=`：它们由 `main.js` 的静态 `import`
         决定 URL，加不了参数，改了子模块就靠 bump 这里来打破整张模块图的缓存。 -->
-<script type="module" src="/static/js/main.js?v=20261104n"></script>
+<script type="module" src="/static/js/main.js?v=20261104p"></script>
 </body>
 </html>

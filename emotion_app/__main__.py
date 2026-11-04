@@ -92,6 +92,11 @@ async def _serve() -> int:
     #    ⚠️ 独立 section，不塞进 settings —— 换上游模型和换子代理平台是两件事。
     subagents = SubagentService(store)
     await subagents.load()
+    # 🔴 **多配置文件注册表**（情绪 2026-11-04：「设置以配置文件分级，
+    #    给会话选择用什么配置文件」）。对标 AstrBot 的 `abconf`。
+    from .domain.config_profile import ConfigProfileRegistry
+
+    config_profiles = ConfigProfileRegistry()
     personas = PersonaRepository(store)
     await personas._ensure()  # 预热，让"载入失败"在启动时就暴露
 
@@ -118,6 +123,8 @@ async def _serve() -> int:
     upstream = OpenAIChatBackend()
     await upstream.open()
     chat = ChatService(config, upstream, settings=settings, personas=personas)
+    # 🔴 回退模型从「会话绑定的那份配置文件」里读（不是会话字段）
+    chat._profiles = config_profiles
     chat.bind_sessions(sessions)
     # ⭐ 总结器（S6b）：后台异步跑，**不阻塞回复**
     #    ⚠️ 实测踩到：写完模块与测试却**忘了在这里绑定** →
@@ -184,6 +191,13 @@ async def _serve() -> int:
     #      * API 层不该知道宿主的内部对象（低耦合）；
     #      * 装配顺序上插件宿主可能晚于蓝图注册，回调保证拿到**当时最新的那个**。
     _install_subagents(app, subagents)
+    app.config["EMOTION_CONFIG_PROFILES"] = config_profiles
+    # 插件宿主也要它：`context.get_config(umo)` 按 umo 查会话绑定的那份配置
+    # （对标 AstrBot `abconf`）。桥可能在 `create_app` 之后才建好，所以用回调
+    # 兜一遍 —— 与 `_install_subagents` 里同一个理由。
+    _bridge = app.config.get("EMOTION_PLUGIN_BRIDGE")
+    if _bridge is not None:
+        _bridge.config_profiles = config_profiles
 
     from hypercorn.asyncio import serve
     from hypercorn.config import Config as HypercornConfig

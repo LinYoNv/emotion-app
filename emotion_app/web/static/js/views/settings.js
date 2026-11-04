@@ -233,13 +233,21 @@ export async function copyLogs() {
 export async function loadConfigProfile() {
   const hint = $("cfg-hint");
   try {
-    const d = await api("GET", "/api/v1/config-profile");
+    // 🔴 带上 `?profile=`（2026-11-04 多配置文件）。
+    //    不带就用默认那份 —— 与旧后端兼容。
+    const pid = state.cfgProfileId || "";
+    const d = await api(
+      "GET",
+      "/api/v1/config-profile" + (pid ? "?profile=" + encodeURIComponent(pid) : ""),
+    );
     if (!d || typeof d !== "object" || !d.profile || !d.schema) {
       // 形状不对 → 抛错，**不许** `d.profile || {}` 那样把"没读懂"装成"没配置"
       throw new Error("响应里缺少 profile / schema（后端形状不符）");
     }
     state.cfgProfile = d.profile;
     state.cfgSchema = d.schema;
+    // 后端会回实际生效的 id（空/不存在时是默认那份）—— 用它，别自己猜
+    if (d.profile_id) state.cfgProfileId = d.profile_id;
     renderConfigSections();
     // 顺带把"已配置的模型"拉回来（provider_select 的选项来源）
     await loadConfigModels();
@@ -558,5 +566,134 @@ export async function resetConfigProfile() {
     toast($("cfg-hint"), "已恢复默认（两段一起）。");
   } catch (e) {
     toast($("cfg-hint"), "恢复默认失败：" + e.message, true);
+  }
+}
+
+/* ===========================================================================
+ * 多配置文件（2026-11-04）
+ * ===========================================================================
+ *
+ * 🔴 情绪：「astrbot 那边的设置是以"配置文件"进行分级，给会话选择用什么配置文件。合理了」
+ *
+ * 对标 AstrBot 的 `abconf`：
+ *   `abconf_mapping` 是 **umo → 配置文件 id** 的绑定，找不到就回落默认那份。
+ *
+ * 所以「会话」那一整节编辑的是**当前选中这份配置文件**的内容，
+ * 不是一个全局单例。要改哪份，先在这里选。
+ */
+
+/** 读配置文件列表（进设置页时调）。 */
+export async function loadConfigProfiles() {
+  const hint = $("cfg-profile-hint");
+  try {
+    const d = await apiData("GET", "/api/v1/config-profiles");
+    state.cfgProfiles = Array.isArray(d.profiles) ? d.profiles : [];
+    state.cfgDefaultProfileId = String(d.default_id || "");
+    // ⚠️ 没有选中项时落到默认那份 —— **不要**自己挑"第一个"，
+    //    列表顺序会变，而默认那份是后端明确定义的。
+    if (!state.cfgProfileId) state.cfgProfileId = state.cfgDefaultProfileId;
+    renderProfilePicker();
+    return true;
+  } catch (e) {
+    state.cfgProfiles = [];
+    // 🔴 失败要说失败，不能画个空下拉让用户以为"一个配置文件都没有"
+    toast(hint, `读取配置文件列表失败：${e.message || e}`, true);
+    return false;
+  }
+}
+
+/** 画配置文件下拉。 */
+export function renderProfilePicker() {
+  const sel = $("cfg-profile-picker");
+  if (!sel) return;
+  const list = state.cfgProfiles || [];
+  sel.innerHTML = "";
+  if (!list.length) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "（还没读到配置文件）";
+    sel.appendChild(opt);
+    return;
+  }
+  for (const p of list) {
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    opt.textContent = p.name + (p.is_default ? "（默认，新会话用它）" : "");
+    if (p.id === state.cfgProfileId) opt.selected = true;
+    sel.appendChild(opt);
+  }
+
+  // 🔴 默认那份**不许删**（后端也会拒 403，但前端先禁用，别让用户白跑一趟）
+  const delBtn = $("cfg-profile-delete");
+  if (delBtn) {
+    const current = list.find((p) => p.id === state.cfgProfileId);
+    const isDefault = !!(current && current.is_default);
+    delBtn.disabled = isDefault;
+    delBtn.title = isDefault ? "默认配置文件不能删除（它是所有未绑定会话的回落目标）" : "";
+  }
+}
+
+/** 切换正在编辑的配置文件 → 重新拉内容。 */
+export async function selectConfigProfile(profileId) {
+  state.cfgProfileId = String(profileId || "");
+  await loadConfigProfile();
+}
+
+/** 新建配置文件。 */
+export async function createConfigProfile() {
+  const hint = $("cfg-profile-hint");
+  const name = (window.prompt("新配置文件的名字：", "") || "").trim();
+  if (!name) return;
+  try {
+    const d = await apiData("POST", "/api/v1/config-profiles", {
+      name,
+      // 从**当前这份**复制内容 —— 这才是"分级"的实用价值，不用从头填
+      clone_from: state.cfgProfileId || "",
+    });
+    state.cfgProfileId = String((d && d.profile && d.profile.id) || "");
+    await loadConfigProfiles();
+    await loadConfigProfile();
+    toast(hint, `已新建配置文件「${name}」（复制自当前这份）`);
+  } catch (e) {
+    toast(hint, `新建失败：${e.message || e}`, true);
+  }
+}
+
+/** 重命名当前配置文件。 */
+export async function renameConfigProfile() {
+  const hint = $("cfg-profile-hint");
+  const current = (state.cfgProfiles || []).find((p) => p.id === state.cfgProfileId);
+  if (!current) return;
+  const name = (window.prompt("新名字：", current.name) || "").trim();
+  if (!name || name === current.name) return;
+  try {
+    await apiData("PATCH", `/api/v1/config-profiles/${encodeURIComponent(current.id)}`, { name });
+    await loadConfigProfiles();
+    await loadConfigProfile();
+    toast(hint, `已改名为「${name}」`);
+  } catch (e) {
+    toast(hint, `改名失败：${e.message || e}`, true);
+  }
+}
+
+/** 删除当前配置文件。 */
+export async function deleteConfigProfile() {
+  const hint = $("cfg-profile-hint");
+  const current = (state.cfgProfiles || []).find((p) => p.id === state.cfgProfileId);
+  if (!current) return;
+  if (current.is_default) {
+    toast(hint, "默认配置文件不能删除。", true);
+    return;
+  }
+  if (!window.confirm(`确定删除配置文件「${current.name}」？绑定它的会话会回落到默认配置。`)) return;
+  try {
+    await apiData("DELETE", `/api/v1/config-profiles/${encodeURIComponent(current.id)}`);
+    // 删完回到默认那份（不是"上一份"，那可能也不存在了）
+    state.cfgProfileId = state.cfgDefaultProfileId;
+    await loadConfigProfiles();
+    await loadConfigProfile();
+    toast(hint, `已删除「${current.name}」`);
+  } catch (e) {
+    toast(hint, `删除失败：${e.message || e}`, true);
   }
 }

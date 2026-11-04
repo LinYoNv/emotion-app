@@ -17,7 +17,7 @@ import { downloadExport, loadPersonas, refreshPersonaInState, renderPersonaList,
 import { NAV_PLUGIN_OPEN_KEY, collectPluginConfigChanges, openPluginConfig, savePluginSwitch, syncNavPluginGroupOpen } from "./views/plugins.js";
 import { PROVIDER_FILTER_ALL, addHeaderRow, addProviderModel, clearProviderDetail, closeModelsModal, closePresetPicker, closeTestModal, deleteProviderSource, fetchSourceModels, newProviderSourceFlow, removeProviderModel, renderAvailableModels, saveProviderSource, setAdapterType, setProviderFilter, showModal, testProviderModel } from "./views/providers.js";
 import { currentUmo, deleteSessionById, fillSessionForm, loadSessions, refreshSessionInfo, renderSessionList, renderSessionPicker, renderSessionSelect, saveSessionConfig, selectSession, showHint } from "./views/session.js";
-import { copyLogs, loadLogs, resetConfigProfile, saveConfigSection, stopLogsAutoRefresh } from "./views/settings.js";
+import { copyLogs, createConfigProfile, deleteConfigProfile, loadLogs, renameConfigProfile, resetConfigProfile, saveConfigSection, selectConfigProfile, stopLogsAutoRefresh } from "./views/settings.js";
 
 window.addEventListener("hashchange", () => { applyRoute(); });
 
@@ -489,6 +489,19 @@ $("modal").onclick = (e) => { if (e.target.id === "modal") $("modal").classList.
  * ⚠️ `remove-agent` 用**事件委托**（`#subagent-agent-list` 上监听）：
  *    清单是动态重建的，逐个绑会在每次 render 后丢一次。
  */
+
+/* ---------------- 多配置文件（2026-11-04）----------------
+ *
+ * 🔴 情绪：「astrbot 那边的设置是以"配置文件"进行分级，给会话选择用什么配置文件」
+ * ⚠️ 事件绑定集中在 bootstrap（views/settings.js 零模块级副作用）。
+ */
+$("cfg-profile-picker").onchange = (e) => selectConfigProfile(e.target.value);
+
+$("cfg-profile-new").onclick = () => createConfigProfile();
+
+$("cfg-profile-rename").onclick = () => renameConfigProfile();
+
+$("cfg-profile-delete").onclick = () => deleteConfigProfile();
 
 $("subagent-save").onclick = () => saveSubagents();
 
