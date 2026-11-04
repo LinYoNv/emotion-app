@@ -752,9 +752,35 @@ export function boot() {
   refreshStatus();
   refreshUnread();
   // 先预热人设/会话（聊天页要用它们渲染下拉），再按当前 hash 落地页面。
-  Promise.all([loadPersonas().catch(() => {}), loadSessions().catch(() => {})])
-    .then(() => applyRoute())
-    .catch(() => applyRoute());
+  //
+  // 🔴 **2026-11-04 修：这是竞态，用户会偶发"设置页空着"**。
+  //    原来写的是：
+  //        Promise.all([...]).then(() => applyRoute()).catch(() => applyRoute());
+  //    `.then` 里返回的是一个 **Promise**（applyRoute 是 async），
+  //    `.catch` 挂在**那个内层 Promise** 上 —— 于是第一次失败会再跑一次，
+  //    而两次都可能撞上同一个竞态；而**两次都失败时没有任何日志**，
+  //    用户只看到"正在读取配置…"永远不动（实测 reload 5 次，后 3 次全空）。
+  //
+  //    现在：**串行**预热、只调一次 applyRoute、失败**如实打日志**
+  //    （静默失败比报错贵 —— 本项目铁律）。
+  (async () => {
+    try {
+      await loadPersonas();
+    } catch (e) {
+      console.warn("[boot] 预热人设失败（继续）:", e);
+    }
+    try {
+      await loadSessions();
+    } catch (e) {
+      console.warn("[boot] 预热会话失败（继续）:", e);
+    }
+    try {
+      await applyRoute();
+    } catch (e) {
+      // ⚠️ 绝不能吞：这里失败就等于"当前页面永远加载不出来"
+      console.error("[boot] applyRoute 失败（当前页面没加载）:", e);
+    }
+  })();
   if (!window.__emotionTimer) {
     window.__emotionTimer = setInterval(refreshStatus, 30000);
   }
