@@ -35,6 +35,38 @@ log = get_logger(__name__)
 SESSION_COOKIE = "emotion_session"
 
 
+async def _gzip_response(resp: Any) -> Any:
+    """同上，异步版（`get_data()` 要 await）。"""
+    import gzip as _gzip
+
+    ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    compressible = (
+        ctype.startswith("text/")
+        or ctype in {
+            "application/javascript",
+            "application/json",
+            "application/xml",
+            "image/svg+xml",
+        }
+    )
+    if not compressible or resp.status_code != 200:
+        return resp
+    accepts = "gzip" in (request.headers.get("Accept-Encoding") or "").lower()
+    if not accepts:
+        return resp
+    body = await resp.get_data()
+    if len(body) < 1024:
+        return resp
+    packed = _gzip.compress(body, compresslevel=6)
+    if len(packed) >= len(body):
+        return resp
+    resp.set_data(packed)
+    resp.headers["Content-Encoding"] = "gzip"
+    resp.headers["Content-Length"] = str(len(packed))
+    resp.headers["Vary"] = "Accept-Encoding"
+    return resp
+
+
 def create_app(
     config: Config,
     store: StoreBackend,
@@ -817,7 +849,9 @@ def create_app(
         """
         resp = await send_from_directory(static_dir, "index.html")
         resp.headers["Cache-Control"] = "no-cache, must-revalidate"
-        return resp
+        # 🔴 **首页必须压**：它是**串行链的第一个**（浏览器拿到 HTML 才知道要加载什么），
+        #    67KB 未压缩 = 手机上先白等 2 秒才开始加载 JS。
+        return await _gzip_response(resp)
 
     @app.get("/static/<path:filename>")
     async def static_files(filename: str):  # type: ignore[no-untyped-def]
