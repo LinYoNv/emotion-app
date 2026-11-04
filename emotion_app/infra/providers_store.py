@@ -124,7 +124,7 @@ SUPPORTED_PROVIDER_TYPES: tuple[str, ...] = (
 #:   现在**存得进**，`provider_presets` 里那 3 条 STT 预设也随之下发。
 #:   ⚠️ 但"存得进" ≠ "能执行" —— 3 条 STT 适配器我们**一个都跑不了**，
 #:   由 `adapter_is_executable()` 如实标注 `executable_by_us=false`。
-#: * `agent_runner`：**永远不支持**（情绪明确：情绪app 不需要 agent 能力）。
+#: * `agent_runner`：**永远不支持**（情绪明确：潮汐引力 不需要 agent 能力）。
 KNOWN_UNSUPPORTED_PROVIDER_TYPES: tuple[str, ...] = (
     "rerank",
     "agent_runner",
@@ -455,7 +455,7 @@ class ProviderSource:
             )
 
         # 🔴 provider_type 白名单（**这是唯一被白名单拒绝的字段**）。
-        #    ⚠️ 必须**如实拒绝**（情绪明确说情绪app 不需要 Agent 能力）——
+        #    ⚠️ 必须**如实拒绝**（情绪明确说潮汐引力 不需要 Agent 能力）——
         #       假装支持会在插件真去调语音/重排时炸在更远的地方，更难查。
         #    ⚠️ 但 `type`（适配器协议）**不在这里校验**：用户能从预设里选
         #       `anthropic_chat_completion` 并存下来（只保存不执行），
@@ -465,7 +465,7 @@ class ProviderSource:
                 raise UnsupportedProviderType(
                     f"本平台暂不支持该类型：provider_type={self.provider_type}"
                     f"（支持的是 {list(SUPPORTED_PROVIDER_TYPES)}）。"
-                    "情绪app 不做 Agent 能力；重排（rerank）、"
+                    "潮汐引力 不做 Agent 能力；重排（rerank）、"
                     "生图（image_generation）本轮也不做。"
                 )
             raise UnsupportedProviderType(

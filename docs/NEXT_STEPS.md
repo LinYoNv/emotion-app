@@ -176,12 +176,12 @@ PLUGINS_EXTRA_PLATFORMS='[{"id":"21","name":"aiocqhttp","description":"QQ 机器
 
 #### ⚠️ 而我们**自己就埋着一颗**（约束②的活例子）
 
-`OurPlatform` 原来的默认描述是 **`"情绪app 内置 Web 端（非 OneBot）"`** ——
+`OurPlatform` 原来的默认描述是 **`"潮汐引力 内置 Web 端（非 OneBot）"`** ——
 含 `onebot` 子串，插件做子串兜底时会判成 **onebot**。
 **否定句被当成断言**（"非 OneBot" 里就有 "OneBot"）。
 
 之前没出事**只因为 `name="webchat"` 先被检查到了** —— 而"先被检查到"不是保证
-（改 `name` 就失效）。已改成 **`"情绪app WebChat"`**，并把校验下沉到 `PlatformSpec`。
+（改 `name` 就失效）。已改成 **`"潮汐引力 WebChat"`**，并把校验下沉到 `PlatformSpec`。
 
 ### 判据与注入验证
 

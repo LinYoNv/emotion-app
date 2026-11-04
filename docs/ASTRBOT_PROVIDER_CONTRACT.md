@@ -155,7 +155,7 @@ config.provider_settings.default_provider_id = "deepseek/deepseek-v4-flash"
 └──────────────┴──────────────────────────────────────────┘
 ```
 
-⚠️ **情绪明确说：`情绪app` 不需要 Agent 能力 → 不做「Agent 执行器」那一栏**。
+⚠️ **情绪明确说：`潮汐引力` 不需要 Agent 能力 → 不做「Agent 执行器」那一栏**。
    我们只做**对话**（`chat_completion`）。其余分类（embedding/tts/stt/rerank）
    **如实不显示**（不是假装有）。
 

@@ -12,6 +12,7 @@
 import { send } from "./views/chat.js";
 import { $, MODE_HINTS, api, applyRoute, boot, closeDrawer, go, hideLogin, isMobile, recheckLogin, showLogin, state, switchToTab, toast, toggleSidebar } from "./core/core.js";
 import { closeAdapterForm, deleteAdapter, loadAdapters, onAdapterTypeChange, openAdapterCreate, openAdapterEdit, saveAdapter, setAdapterEnabled } from "./views/adapters.js";
+import { addAgent, onSubagentBackendChange, removeAgent, saveSubagents, testSubagentConnection } from "./views/subagents.js";
 import { downloadExport, loadPersonas, refreshPersonaInState, renderPersonaList, renderPromptStats, selectPersona } from "./views/persona.js";
 import { NAV_PLUGIN_OPEN_KEY, collectPluginConfigChanges, openPluginConfig, savePluginSwitch, syncNavPluginGroupOpen } from "./views/plugins.js";
 import { PROVIDER_FILTER_ALL, addHeaderRow, addProviderModel, clearProviderDetail, closeModelsModal, closePresetPicker, closeTestModal, deleteProviderSource, fetchSourceModels, newProviderSourceFlow, removeProviderModel, renderAvailableModels, saveProviderSource, setAdapterType, setProviderFilter, showModal, testProviderModel } from "./views/providers.js";
@@ -481,6 +482,30 @@ $("provider-source-form").onsubmit = (ev) => {
 $("modal-close").onclick = () => $("modal").classList.add("hidden");
 
 $("modal").onclick = (e) => { if (e.target.id === "modal") $("modal").classList.add("hidden"); };
+
+/* ---------------- 子代理页 ----------------
+ *
+ * 🔴 绑定集中在 bootstrap（`views/subagents.js` 零模块级副作用）。
+ * ⚠️ `remove-agent` 用**事件委托**（`#subagent-agent-list` 上监听）：
+ *    清单是动态重建的，逐个绑会在每次 render 后丢失。
+ */
+$("subagent-save").onclick = () => saveSubagents();
+
+$("subagent-test").onclick = () => testSubagentConnection();
+
+$("subagent-backend").onchange = () => onSubagentBackendChange();
+
+$("subagent-add-agent").onclick = () => addAgent();
+
+// 委托：卡片里的「移除」按钮
+$("subagent-agent-list").onclick = (ev) => {
+  const btn = ev.target && ev.target.closest
+    ? ev.target.closest('[data-action="remove-agent"]')
+    : null;
+  if (!btn) return;
+  const index = Number(btn.dataset.index);
+  if (Number.isFinite(index)) removeAgent(index);
+};
 
 $("plugin-switch-save").onclick = savePluginSwitch;
 

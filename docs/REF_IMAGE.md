@@ -84,7 +84,7 @@ reference_image_multiple → 400
 ### 怎么复核
 
 ```bash
-cd /root/Ai-works/情绪app
+cd /root/Ai-works/潮汐引力
 .venv/bin/python -m pytest tests/test_s6_image_reference.py -q      # 23 passed
 .venv/bin/python tools/inject_ref_image_check.py                   # 10 组全抓住
 .venv/bin/python tools/ref_image_live_check.py                     # 真上游，会产生费用
@@ -266,7 +266,7 @@ context 副本（PEP 567 只给 Task 发），`yield` 期间挂着会让"当前�
 ### 复核命令
 
 ```bash
-cd /root/Ai-works/情绪app
+cd /root/Ai-works/潮汐引力
 .venv/bin/python -m pytest tests/test_persona_ref_http.py tests/test_persona_ref_e2e.py -q   # 20 passed
 .venv/bin/python -m pytest tests/test_assembly.py -q                                          # 19 passed
 .venv/bin/python tools/persona_ref_panel_check.py                                             # 17/17（真浏览器）

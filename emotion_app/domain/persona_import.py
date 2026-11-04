@@ -776,8 +776,8 @@ def to_export_dict(persona: Persona) -> dict[str, Any]:
         "mes_example": "",
         "first_mes": greetings[0] if greetings else "",
         "alternate_greetings": greetings[1:] if len(greetings) > 1 else [],
-        "tags": ["情绪app"],
-        "creator": "情绪app",
+        "tags": ["潮汐引力"],
+        "creator": "潮汐引力",
         "character_version": "1.0",
         "extensions": {
             "emotion_app": {

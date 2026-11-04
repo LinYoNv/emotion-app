@@ -29,9 +29,9 @@
   "can_uninstall": true,   // 现在能不能删除（= 能解析出源码目录）
   "reloadable_reason": "",  // can_reload=false 时**必须**说明原因，否则前端只能显示一个灰按钮
   "uninstallable_reason": "",
-  "source_path": "/root/Ai-works/情绪app/plugins/astrbot_plugin_x",  // 源码目录（= 会被删掉的那个）
-  "config_path": "/root/Ai-works/情绪app/data/plugins/config/astrbot_plugin_x_config.json",  // 勾"删配置"时会删的**具体文件**
-  "data_path":   "/root/Ai-works/情绪app/data/plugins/astrbot_plugin_x"                       // 勾"删数据"时会删的**具体目录**
+  "source_path": "/root/Ai-works/潮汐引力/plugins/astrbot_plugin_x",  // 源码目录（= 会被删掉的那个）
+  "config_path": "/root/Ai-works/潮汐引力/data/plugins/config/astrbot_plugin_x_config.json",  // 勾"删配置"时会删的**具体文件**
+  "data_path":   "/root/Ai-works/潮汐引力/data/plugins/astrbot_plugin_x"                       // 勾"删数据"时会删的**具体目录**
 }
 ```
 

@@ -2272,3 +2272,125 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   background: transparent;
 }
 .persona-scope-hint strong { color: var(--fg); font-weight: 600; }
+
+/* ---------------- 子代理接入页 ----------------
+ *
+ * 🔴 这一页的语义（情绪 2026-11-03）：「平台本身不带 agent 能力，是子代理。
+ *    她把任务发出去等回收就行」—— 这里配的是"佣人住哪儿"。
+ *
+ * ⚠️ 字段两列沿用全站的 `.field-labeled / .fl-text`，**不要在这里另造一套**：
+ *    实测踩过 —— 少了 `.fl-text` 包裹层，标签和输入框会各占一格导致整行错位。
+ */
+
+.subagent-section {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: var(--sp-4, 16px);
+  margin-bottom: var(--sp-4, 16px);
+  background: var(--panel-2);
+}
+
+.subagent-section h4 { margin: 0; font-size: 14px; }
+
+.subagent-toggle {
+  display: inline-flex;
+  /* ⚠️ 同 `.subagent-agent-enabled`：全局 `label { flex-direction: column }`
+   *    会把它变纵排，必须显式扭回横排。 */
+  flex-direction: row;
+  /* ⚠️ 必须 `flex-start`：`center` 会让"两行文案"的标签把复选框拉到垂直中间，
+   *    看起来像"复选框浮在文字上方"（真浏览器截图抓到过）。 */
+  align-items: flex-start;
+  gap: 8px;
+  cursor: pointer;
+  font-weight: 500;
+  line-height: 1.5;
+}
+/* 复选框本身不参与拉伸，钉在首行基线上 */
+.subagent-toggle input[type="checkbox"] { margin: 3px 0 0; flex: 0 0 auto; }
+
+/* 状态徽标：三态（未启用 / 已启用但没配好 / 已配置）用颜色区分。
+ * 🔴 不许只用一个"已启用"布尔 —— 三种情况的修法完全不同。 */
+.subagent-toggle-text { flex: 0 0 auto; }
+
+.subagent-status {
+  display: inline-block;
+  /* ⚠️ 不设 `margin-left: auto`（那会把它推到行尾）；徽标紧跟文字 */
+  margin-left: 2px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: var(--hover);
+  color: var(--muted);
+}
+.subagent-status[data-tone="ok"] { color: #1a7f37; background: rgba(26, 127, 55, 0.12); }
+.subagent-status[data-tone="warn"] { color: #9a6700; background: rgba(154, 103, 0, 0.14); }
+.subagent-status[data-tone="bad"] { color: #cf222e; background: rgba(207, 34, 46, 0.12); }
+
+/* 连接测试结果：成功绿、失败红 —— 用户要能一眼看出"试了但不行" */
+#subagent-test-result[data-tone="ok"] { color: #1a7f37; }
+#subagent-test-result[data-tone="bad"] { color: #cf222e; }
+
+.subagent-agent-list { display: flex; flex-direction: column; gap: var(--sp-3, 12px); }
+
+.subagent-agent-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: var(--sp-3, 12px);
+  background: var(--bg);
+}
+
+.subagent-agent-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2, 8px);
+  margin-bottom: 4px;
+}
+/* ⚠️ 名字框 `flex-basis: 220px` + `flex-grow: 1` 会**贪婪**吃掉剩余空间，
+ *    把「启用」压到 26px → 文字被迫竖排。给兄弟元素留出它的固有宽度。 */
+.subagent-agent-name { flex: 1 1 220px; min-width: 0; }
+.subagent-agent-head > .subagent-agent-enabled,
+.subagent-agent-head > .subagent-agent-remove { flex: 0 0 auto; }
+/* 🔴 span 也要自己的 `nowrap`：label 上的那条**不会继承到匿名/嵌套 flex item 的
+ *    度量**（实测：label 有 nowrap，内部 span 仍被压成两行）。
+ *    这条是"看着该管用、实际不管用"的典型，靠 getBoundingClientRect 才抓到。 */
+.subagent-agent-enabled > span { white-space: nowrap; }
+.subagent-agent-enabled {
+  display: inline-flex;
+  /* 🔴🔴 **必须显式 `flex-direction: row`**！
+   *    全局有一条 `label { display: flex; flex-direction: column; gap: 4px }`
+   *    （全站表单标签都是纵排 label + 控件）。我们的类只覆盖了 `display`，
+   *    没覆盖 `flex-direction` ⇒ 复选框和文字**继续纵向排列**，
+   *    表现为"复选框在上、'启用'在下"。
+   *    ⚠️ 这个坑很难从 CSS 上看出：类里明明写了 `align-items: center`，
+   *       看着就该横排 —— 真因是一条**元素选择器**的继承属性。
+   *       靠列出"所有匹配该元素的规则"才揪出来（`el.matches(sel)` 遍历 cssRules）。
+   *    ⚠️ 这也解释了为什么之前的 `white-space: nowrap` / `min-width: max-content`
+   *       全都不管用：竖排时宽度由最长的单个字决定，不是"两字并排"。
+   */
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  /* 🔴 **明确的宽度下限**（不是 `max-content`、不是 `auto`）：
+   *    实测 label 被 flex 压到 26px 后，`white-space: nowrap` 与
+   *    `min-width: max-content` **都不生效**（它们约束的是自身盒子，
+   *    而这里的问题是 flex 给它分配的**可用空间**就不够）。
+   *    给一个"够放 checkbox + 两个字"的硬下限，最简单也最可靠。 */
+  min-width: 68px;
+  /* ⚠️ 三重保险，缺一不可：
+   *    ① `nowrap` —— 文字本身不换行；
+   *    ② `flex: 0 0 auto` —— 不被 flex 挤窄；
+   *    ③ `min-width: max-content` —— 即使被挤也不收缩。
+   *    少任何一条，「启用」都会被压成竖排两行（真浏览器截图抓到过）。 */
+  white-space: nowrap;
+  flex: 0 0 auto;
+  min-width: max-content;
+  font-size: 13px;
+  cursor: pointer;
+}
+.subagent-agent-remove { white-space: nowrap; flex: 0 0 auto; }
+
+.subagent-agent-preview {
+  margin: 2px 0 var(--sp-2, 8px);
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+}

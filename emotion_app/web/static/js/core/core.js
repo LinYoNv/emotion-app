@@ -6,6 +6,7 @@
  */
 
 import { loadAdapters } from "../views/adapters.js";
+import { loadSubagents } from "../views/subagents.js";
 import { loadChat, loadHistory, refreshUnread } from "../views/chat.js";
 import { loadPersonas, renderPersonaList, selectPersona } from "../views/persona.js";
 import { closePluginPage, loadPluginPages, loadPluginSwitch, openPluginConfig, openPluginDetail, openPluginPage, syncNavPluginActive } from "../views/plugins.js";
@@ -14,7 +15,7 @@ import { loadSessions, selectSession } from "../views/session.js";
 import { loadConfigProfile, loadLogs, loadSettings, stopLogsAutoRefresh } from "../views/settings.js";
 
 
-/* 情绪app 面板 —— 原生 JS，零构建工具（照 docs/REF_ASTRBOT_COMPANION_STACK.md §2.3 的选型） */
+/* 潮汐引力 面板 —— 原生 JS，零构建工具（照 docs/REF_ASTRBOT_COMPANION_STACK.md §2.3 的选型） */
 
 export const $ = (id) => document.getElementById(id);
 export let state = {
@@ -93,6 +94,16 @@ export let state = {
   // null = 还没读到 —— 打开"添加"时会补拉一次。
   adapterTypes: null,
   adaptersError: "",        // 非空 = 列表读取失败的原因（hint 正在显示它）
+  // ---- 子代理接入（`/api/v1/subagents`）----
+  // 🔴 语义：用户**连接自己的 agent 平台**；平台本身不带 agent 能力。
+  // ⚠️ 初值 `null` = "还没读到"，与 `{}`（读到了但空）语义不同 ——
+  //    把两者混起来会让"读取失败"显示成"你没配"，用户会去配一个已经配好的东西。
+  subagentConfig: null,
+  subagentBackendTypes: [],
+  //: 当前后端要渲染的 `fields[]`（后端给什么画什么，前端不硬编码）
+  subagentFormFields: [],
+  subagentError: "",
+
   adapterCreating: false,   // 表单是"新增"态（true）还是"编辑"态（false）
   adapterEditingId: "",     // 正在编辑的适配器 id（空 = 没有在编辑）
   adapterEditingType: "",   // 表单对应的类型（新增=下拉选中的那个；编辑=它自己的类型）
@@ -202,6 +213,9 @@ export const NAV_LOADERS = {
   //    ⚠️ 别在这里顺手把 `state.adapters` 预置成 `[]` —— 那是"读到 0 个"的语义，
   //    而"还没读到/读失败"必须是 `null`（见 state 里的注释）。
   adapters: () => loadAdapters(),
+  // ⚠️ 子代理页的 loader 自己把失败原因写进 `#subagents-hint` 并返回 false（不抛），
+  //    所以这里不需要再包 try（与 adapters 同款）。
+  subagents: () => loadSubagents(),
   // ⚠️ 供应商页的 loader 走 `loadProviderSourcesOnce()` 而不是直接调：
   //    `saveProviderSource()` 保存成功后**自己已经 load 过一次**了，
   //    紧接着它调 `selectProviderSource()` 改 hash → 触发 hashchange → applyRoute()
@@ -298,7 +312,7 @@ export function showPanel(name) {
   syncNavPluginActive();
 
   // 🔴 手机端顶栏标题跟随当前页（2026-09-27 加）。
-  //    手机上抽屉是浮层、关着时看不见导航，若顶栏只写死"情绪app"，
+  //    手机上抽屉是浮层、关着时看不见导航，若顶栏只写死"潮汐引力"，
   //    用户**没法知道自己现在在哪一页** —— 顶栏存在的意义就只剩个汉堡。
   //    ⚠️ 放在 `showPanel` 这个**唯一**的面板切换点，而不是各 `switchToTab` 调用处：
   //       十几处调用点各写一遍必然漂移（本项目反复踩）。
@@ -306,7 +320,7 @@ export function showPanel(name) {
   if (bar) {
     const active = document.querySelector(`.nav-item[data-nav="${name}"]`);
     const label = active ? (active.querySelector(".nav-label") || {}).textContent : "";
-    bar.textContent = (label || "").trim() || "情绪app";
+    bar.textContent = (label || "").trim() || "潮汐引力";
   }
 }
 

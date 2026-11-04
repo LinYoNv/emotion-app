@@ -1,6 +1,6 @@
 # 陪伴插件「独立 WebUI」调研（只读静态分析）
 
-> 调研对象：`/root/Ai-works/情绪app/data/plugin_src/astrbot_plugin_private_companion/`（v6.6.2，我们实际在跑的那份镜像）
+> 调研对象：`/root/Ai-works/潮汐引力/data/plugin_src/astrbot_plugin_private_companion/`（v6.6.2，我们实际在跑的那份镜像）
 > 结论口径：**先结论后证据**，每条给 `文件:行号`。查不到的一律写「未找到」+ 搜了什么。
 > 禁忌遵守：全程**只读**。没有启动任何 standalone webui、没有绑定任何端口、没有写 `data/plugins/**`。
 > 实测环境：服务在跑（`python -m emotion_app serve`，`0.0.0.0:6191`，pid 3905246）；端口 6190 **空闲**。

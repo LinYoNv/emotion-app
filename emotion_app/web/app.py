@@ -876,6 +876,12 @@ def create_app(
 
     app.register_blueprint(build_adapters_blueprint(_require_auth_or_api_key))
 
+    # 子代理接入 API（`/api/v1/subagents`）—— 让用户连接自己的 agent 平台。
+    # 🔴 情绪 2026-11-03：「平台本身不带 agent 能力，是子代理。她把任务发出去等回收就行。」
+    from .api_subagents import build_blueprint as build_subagents_blueprint
+
+    app.register_blueprint(build_subagents_blueprint(_require_auth_or_api_key))
+
     # ------------------------------------------------------------------
     # 插件 Web API（把 266 条插件路由挂上路）
     # ------------------------------------------------------------------
@@ -1182,7 +1188,7 @@ def create_app(
         #
         #    实测证据（2026-10-29 15:02）：
         #      `[DIAG] readiness pid='onebot-napcat1' platform=None`
-        #      日志只有一行 `平台实例已装载：情绪app Web 端[11/webchat]`
+        #      日志只有一行 `平台实例已装载：潮汐引力 Web 端[11/webchat]`
         await runtime.reload(store_obj.all())
 
         if svc is not None:

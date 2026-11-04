@@ -135,7 +135,7 @@
 ## 7. 怎么复核这份清单
 
 ```bash
-cd /root/Ai-works/情绪app
+cd /root/Ai-works/潮汐引力
 # 基线（必须主 + host 一起跑 —— 单文件跑会漏掉"重载"类 bug）
 .venv/bin/python -m pytest tests host/tests -q \
   --deselect tests/test_plugin_host_e2e.py::test_router_matches_real_implementation_live

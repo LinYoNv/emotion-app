@@ -74,7 +74,7 @@
 
 ## 关于 `provider_type`
 
-情绪明确说：情绪app **不需要 Agent 能力**。所以只支持 `chat_completion`，
+情绪明确说：潮汐引力 **不需要 Agent 能力**。所以只支持 `chat_completion`，
 其它分类（embedding / text_to_speech / rerank …）**如实 400 拒绝**并说明
 "本平台暂不支持该类型"，**不假装支持**（作者验收判据③：能力不对等要如实 degraded）。
 """

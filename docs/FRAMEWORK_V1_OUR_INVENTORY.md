@@ -1,6 +1,6 @@
-# 情绪app — 兼容性审计清单（只读侦察）
+# 潮汐引力 — 兼容性审计清单（只读侦察）
 
-> 生成方式：只读遍历 `/root/Ai-works/情绪app`。**本次审计未修改任何既有文件**，只新建本文件。
+> 生成方式：只读遍历 `/root/Ai-works/潮汐引力`。**本次审计未修改任何既有文件**，只新建本文件。
 > 每条断言都带 `file:line`。凡「ABSENT」= 在指定搜索范围内**零匹配**。
 > 搜索范围约定：`OUR CODE` = `emotion_app/` + `host/astrbot_host/`（排除 `__pycache__`、`data/`）。
 
@@ -55,7 +55,7 @@
 
 - 搜索 `emotion_app/domain/` 全部 15 个 `.py` 的 **148 行 import 语句**：`import astrbot` / `from astrbot...` / `from host...` / `import host...` → **零匹配**（0/148）。
 - `emotion_app/domain/` 里唯一出现 `astrbot` 这个词的地方全在**注释**：`chat.py:83`、`:93`、`config_profile.py:2`、`:6`、`:7`、`:10`、`:14`、`:22`、`:51`、`:56`、`:59`、`:158`、`:178`、`:188`、`:201`。
-- 反向：`host/astrbot_host/__init__.py:14-15` 显式写明「`情绪app/emotion_app/domain/` **绝不能** import 本包」；`host/astrbot_host/host_app.py:26-28` 同样声明「接线动作只能发生在这里（或 web 层）」。
+- 反向：`host/astrbot_host/__init__.py:14-15` 显式写明「`潮汐引力/emotion_app/domain/` **绝不能** import 本包」；`host/astrbot_host/host_app.py:26-28` 同样声明「接线动作只能发生在这里（或 web 层）」。
 - 实际跨层引用（唯一一处领域层 → host 名）是**字符串级端口注入**，不是 import：`ChatService._llm_hook` 由装配层注入（`emotion_app/web/app.py:695-696` 调 `_chat_svc.bind_llm_hook(service.apply_llm_hooks)`）。
 
 **结论**：领域层 → `host/` 的 import 依赖 = **零匹配**。
@@ -317,7 +317,7 @@ CREATE TABLE meta  (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 - 格式：`<platform_id>:<message_type>:<session_id>`（`umo.py:14`）。
 - `PLATFORM_ID: str = "11"`（`umo.py:113`）—— umo **第一段**，即平台**实例** id（对应真实现 `PlatformMetadata.id`）。
 - `PLATFORM_NAME: str = "webchat"`（`umo.py:124`）—— 平台**类型**名（`PlatformMetadata.name`），**与第一段不是一回事**。
-- `PLATFORM_DESCRIPTION = "情绪app WebChat"`（`umo.py:131`）。
+- `PLATFORM_DESCRIPTION = "潮汐引力 WebChat"`（`umo.py:131`）。
 - `build_umo(user_id: str, *, group: bool = False) -> str`（`:174`）：**委托真实现** `str(MessageSession(platform_name=PLATFORM_ID, message_type=..., session_id=user_id))`（`:208-214`），不手写 f-string；`user_id` 为空 / 非 str → **抛 `ValueError`**（`:199-205`）。
 - 解析：`parse_umo(umo) -> Umo | None`（`:217`，失败返回 None）；`parse_umo_strict`（`:263`，失败抛 `ValueError`）；都走真实现 `MessageSession.from_str`（`split(":", 2)` 语义 → `session_id` 允许含冒号）。
 - 派生：`session_id_of`（`:286`）、`user_id_of`（`:298`）、`is_our_umo`（`:303`）、`is_private`（`:313`）。
@@ -331,7 +331,7 @@ CREATE TABLE meta  (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ### 5.2 `platform_manager.py`（243 行）
 
 - `DEFAULT_PLATFORM_ID = _UMO_PLATFORM_ID`（`:57`）、`DEFAULT_PLATFORM_NAME = _UMO_PLATFORM_NAME`（`:60`）—— 从 `umo.py` 取，不二次定义。
-- `class OurPlatform(Platform)`（`:63`）：`__init__(*, platform_id=…, platform_name=…, delivery=None, description="情绪app 内置 Web 端（非 OneBot）")`（`:75-99`）；`meta()`（`:103`）；`describe()`（`:148`）。元数据带 `support_proactive_message=True`、`support_streaming_message=True`（`:94-95`），`set_status(PlatformStatus.RUNNING)`（`:99`）。
+- `class OurPlatform(Platform)`（`:63`）：`__init__(*, platform_id=…, platform_name=…, delivery=None, description="潮汐引力 内置 Web 端（非 OneBot）")`（`:75-99`）；`meta()`（`:103`）；`describe()`（`:148`）。元数据带 `support_proactive_message=True`、`support_streaming_message=True`（`:94-95`），`set_status(PlatformStatus.RUNNING)`（`:99`）。
 - **`send_by_session(session, message_chain)`（`:106-144`）返回语义**：
   - `self.delivery is None`（**未接端口**）→ 打 WARNING，**返回 `False`**（`:126-132`）—— 如实失败，不伪造送达。
   - 端口抛异常 → 记 ERROR，**返回 `False`**（不让异常穿出去，`:137-143`）。
@@ -727,7 +727,7 @@ CREATE TABLE meta  (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 **⚠️ 静态计数与文档数字的差异（事实记录，不解释）**
 
 - 磁盘上 `def test_` 静态计数：主 **584**、host **136**；文档最新自述为 主 **614**、host **139**（`docs/ASTRBOT_CONFIG_PAGE.md:163-164`）。静态计数不含 `@pytest.mark.parametrize` 展开，因此**小于**运行数属预期方向。
-- `docs/P0_P1_TASKS.md:724` 给出的复现命令：`pytest -q`（主，cwd=`情绪app`）与 `pytest -q`（host，cwd=`host`）—— **分开跑**，因为 `pyproject.toml:24` 的 `testpaths=["tests"]` 不管 `host/`，且 `host/tests/conftest.py` 自己把 `host/` 加进 `sys.path`。
+- `docs/P0_P1_TASKS.md:724` 给出的复现命令：`pytest -q`（主，cwd=`潮汐引力`）与 `pytest -q`（host，cwd=`host`）—— **分开跑**，因为 `pyproject.toml:24` 的 `testpaths=["tests"]` 不管 `host/`，且 `host/tests/conftest.py` 自己把 `host/` 加进 `sys.path`。
 - `1 deselected`：需真 AstrBot 解释器的 `live` 用例（`docs/P0_P1_TASKS.md:764` 说明「**故意不 skip**」）。
 
 ---

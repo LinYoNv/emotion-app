@@ -19,6 +19,7 @@ from .domain.persona_repo import PersonaRepository
 from .domain.session_repo import SessionRepository
 from .domain.summarizer import Summarizer
 from .domain.settings import SettingsService
+from .domain.subagents import SubagentService
 import json
 from pathlib import Path
 
@@ -87,6 +88,10 @@ async def _serve() -> int:
     # 领域服务
     settings = SettingsService(store, config)
     await settings.load()
+    # 🔴 子代理接入配置（情绪 2026-11-03：「平台本身不带 agent 能力，是子代理」）。
+    #    ⚠️ 独立 section，不塞进 settings —— 换上游模型和换子代理平台是两件事。
+    subagents = SubagentService(store)
+    await subagents.load()
     personas = PersonaRepository(store)
     await personas._ensure()  # 预热，让"载入失败"在启动时就暴露
 
@@ -173,6 +178,13 @@ async def _serve() -> int:
         chat_backend=upstream,
     )
 
+    # 🔴 子代理：把配置服务和"应用器"挂进 app.config，API 与插件宿主都从这里取。
+    #
+    #    为什么应用器是回调而不是让 API 直接改注册表：
+    #      * API 层不该知道宿主的内部对象（低耦合）；
+    #      * 装配顺序上插件宿主可能晚于蓝图注册，回调保证拿到**当时最新的那个**。
+    _install_subagents(app, subagents)
+
     from hypercorn.asyncio import serve
     from hypercorn.config import Config as HypercornConfig
 
@@ -189,6 +201,43 @@ async def _serve() -> int:
         await upstream.close()
         await image_client.close()
     return 0
+
+
+def _install_subagents(app: Any, service: Any) -> None:
+    """把子代理配置服务挂进 `app.config`，并告诉 API「怎么把配置应用到运行时」。
+
+    🔴 **为什么要有 applier**（而不是让 API 自己改注册表）：
+      * API 层不该知道宿主内部对象（低耦合）；
+      * 装配顺序上插件宿主可能晚于蓝图注册 —— 回调保证拿到**当时最新的那个**。
+
+    ⚠️ 宿主还没装配时，applier 会**如实返回失败**（API 会把它变成
+       "配置已保存，但尚未生效"），**不假装成功**。本项目最忌的就是那个。
+    """
+    from astrbot_host.subagent import SubagentOrchestrator, SubagentRegistry
+    from .web.subagent_backends import build_backend
+
+    registry = SubagentRegistry()
+    orchestrator = SubagentOrchestrator(registry)
+
+    app.config["EMOTION_SUBAGENTS_SERVICE"] = service
+    app.config["EMOTION_SUBAGENTS"] = registry
+    app.config["EMOTION_SUBAGENTS_ORCHESTRATOR"] = orchestrator
+
+    async def apply_config(target: Any) -> None:
+        """把最新配置灌进注册表 + 后端，并刷新 `transfer_to_*` 工具表。"""
+        connection = target.connection()
+        # 总开关关掉时**显式回到 NullBackend**：用户关掉就该真的不派活，
+        # 而不是留着上一次的后端继续偷偷工作。
+        registry.set_backend(
+            build_backend(connection) if target.config.enabled else None
+        )
+        orchestrator.reload_from_config(target.orchestrator_config())
+        # 宿主那边的端口持有的是**同一个 registry 实例**，所以装配后自动生效。
+        bridge = app.config.get("EMOTION_PLUGIN_BRIDGE")
+        if bridge is not None:
+            bridge.subagents = registry
+
+    app.config["EMOTION_SUBAGENTS_APPLY"] = apply_config
 
 
 def main(argv: list[str] | None = None) -> int:

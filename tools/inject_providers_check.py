@@ -42,7 +42,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path("/root/Ai-works/情绪app")
+ROOT = Path("/root/Ai-works/tidal-gravity-system-station")
 STORE = ROOT / "emotion_app/infra/providers_store.py"
 API = ROOT / "emotion_app/web/api_providers.py"
 APP = ROOT / "emotion_app/web/app.py"

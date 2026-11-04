@@ -16,7 +16,7 @@ import pathlib
 import subprocess
 import sys
 
-ROOT = pathlib.Path("/root/Ai-works/情绪app")
+ROOT = pathlib.Path("/root/Ai-works/tidal-gravity-system-station")
 PY = str(ROOT / ".venv/bin/python")
 
 RUNNER = ROOT / "host/astrbot_host/compat/core/astr_main_agent.py"

@@ -26,7 +26,7 @@ import pathlib
 import subprocess
 import sys
 
-ROOT = pathlib.Path("/root/Ai-works/情绪app")
+ROOT = pathlib.Path("/root/Ai-works/tidal-gravity-system-station")
 PY = str(ROOT / ".venv/bin/python")
 
 TOOL = ROOT / "emotion_app/domain/image_tool.py"

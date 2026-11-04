@@ -1,8 +1,8 @@
-# 兼容性审计：陪伴新框架 v1 终稿 × 情绪app（已做 / 将做）
+# 兼容性审计：陪伴新框架 v1 终稿 × 潮汐引力（已做 / 将做）
 
 > 审计日期：2026-09-20。审计人：良芙。
 > 被审对象：`COMPLETE_NEW_FRAMEWORK_DESIGN_V1.md`（作者 2026-09-20 终稿，590 行，sha256 `8a3a82da`）。
-> 对照物：`情绪app` 现役代码（`emotion_app/` + `host/astrbot_host/`）+ `docs/NEXT_STEPS.md` 规划。
+> 对照物：`潮汐引力` 现役代码（`emotion_app/` + `host/astrbot_host/`）+ `docs/NEXT_STEPS.md` 规划。
 >
 > **证据口径**：所有引用逐字摘录并带 `file:line`。凡"缺"的，写"零命中"而不是"应该有"。
 > 两份支撑材料（本报告的下挂证据，不重复粘贴）：
@@ -455,7 +455,7 @@ for hk in ['embedded_app','plugin_hosted','standalone_service','split_services',
 #    缺失的就是 FRAMEWORK_ZERO_BUILD_READINESS_20260920.md
 
 # ③ 新框架身份字段在我们代码里的零命中清单
-cd /root/Ai-works/情绪app
+cd /root/Ai-works/潮汐引力
 for t in ecosystem_id installation_id runtime_instance_id host_kind host_id bot_id \
          persona_binding_revision conversation_ref platform_conversation_id subject_ref \
          canonical_subject sharing_mode sharing_anchor visibility_namespace \

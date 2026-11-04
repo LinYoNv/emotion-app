@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""把「AstrBot 插件宿主」接进情绪app 主服务（**可开关、可缺席**）。
+"""把「AstrBot 插件宿主」接进潮汐引力 主服务（**可开关、可缺席**）。
 
 ## 三道边界（都是刻意设计的）
 
@@ -325,6 +325,14 @@ class PluginHostService:
         #: ⚠️ 与上面几个同款：由装配层注入；缺席时对话端口**如实不接**
         #:    （插件的主动消息存档会失败，但投递不受影响）。
         self.store: Any = None
+        #: 🔴 **子代理注册表**（`astrbot_host.subagent.SubagentRegistry`）。
+        #:
+        #: 语义（情绪 2026-11-03 定）：「平台本身不带 agent 能力，是子代理。
+        #:   **她把任务发出去等回收就行**。」—— 平台只做"传话的"。
+        #:
+        #: ⚠️ 与 `store`/`personas` 同款：由装配层注入，**缺席时如实不接**
+        #:    （`tool_loop_agent()` 抛「端口未装配」，而不是冒充成功）。
+        self.subagents: Any = None
         #: 对话历史端口实例（`StoreConversationManager`；诊断/测试可读）
         self.conversation_manager: Any = None
         #: 投递端口实例（`SessionDelivery`；诊断/测试可读）
@@ -347,6 +355,19 @@ class PluginHostService:
         #: 覆盖（`create_app` 之后才设 `EMOTION_CONFIG_PROFILE_PATH`），
         #: 所以用**回调延迟取值**；真实部署下回落 `DEFAULT_PATH`。
         self._config_profile_path: Any = None
+
+    def _subagent_registry(self) -> Any:
+        """取用户配置的子代理注册表（**没配就返回 None，由宿主如实拒绝**）。
+
+        🔴 语义（情绪 2026-11-03 定）：「平台本身不带 agent 能力，是子代理。
+           她把任务发出去等回收就行。」⇒ 这里只把**用户接的那套**交进去，
+           **绝不内置任何 agent 实现**。
+
+        ⚠️ 返回 `None` 而不是一个空注册表：`tool_loop_agent()` 对 `None`
+           会抛「宿主端口未装配」，那是**更准确的诊断**（"你还没接"）；
+           而空注册表会让报错变成"没有名为 X 的子代理"，指向错误的方向。
+        """
+        return self.subagents
 
     def _load_global_config(self) -> dict:
         """读 AstrBot 全局配置（`cmd_config.json`）—— 插件的 `get_config()` 就靠它。
@@ -597,6 +618,11 @@ class PluginHostService:
                     provider_manager=provider_manager,
                     persona_manager=persona_manager,
                     conversation_manager=conversation_manager,
+                    # 🔴 **子代理委派端口**（情绪 2026-11-03 定：
+                    #    「平台本身不带 agent 能力，是子代理。她把任务发出去等回收就行。」）
+                    #    未装配/后端是 Null 时，`tool_loop_agent()` 会**如实拒绝**
+                    #    （抛 SubagentUnavailable），不会冒充成功。
+                    subagents=self._subagent_registry(),
                 )
             )
         except Exception as exc:  # noqa: BLE001
@@ -743,7 +769,7 @@ class PluginHostService:
         实测后果（2026-10-29 15:02）：
 
         ```
-        平台实例已装载：情绪app Web 端[11/webchat]          ← 只有 1 个
+        平台实例已装载：潮汐引力 Web 端[11/webchat]          ← 只有 1 个
         [DIAG] readiness pid='onebot-napcat1' platform=None  ← 插件查不到
         ```
 

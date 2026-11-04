@@ -35,7 +35,7 @@ import signal
 import subprocess
 import sys
 
-ROOT = pathlib.Path("/root/Ai-works/情绪app")
+ROOT = pathlib.Path("/root/Ai-works/tidal-gravity-system-station")
 PY = str(ROOT / ".venv/bin/python")
 
 REPO = ROOT / "emotion_app/domain/session_repo.py"

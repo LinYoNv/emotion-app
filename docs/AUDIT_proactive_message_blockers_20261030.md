@@ -1,6 +1,6 @@
 # 只读审计：主动消息投递被什么卡住（2026-10-30）
 
-> 审计对象：`/root/Ai-works/情绪app`（本机）+ 生产 `root@64.81.114.30:/root/apps/情绪app`；
+> 审计对象：`/root/Ai-works/潮汐引力`（本机）+ 生产 `root@64.81.114.30:/root/apps/潮汐引力`；
 > 官方插件存档 `/tmp/emotion-v7-official-2xr71_m6/astrbot_plugin_private_companion`（7.0.0，只读）。
 > 本文件**只记录证据与判定，未改任何源码/生产数据**。
 
@@ -157,7 +157,7 @@ BackgroundCoordinator.advance / Application._drive            companion_v2/host/
 
 ## 4. 线上真实证据（只读）
 
-### 4.1 日志（`/root/apps/情绪app/logs/serve.out`，4091 行）
+### 4.1 日志（`/root/apps/潮汐引力/logs/serve.out`，4091 行）
 
 - `:1497` `[CompanionV2] AstrBot 核心回复阶段结束 … send_attempted=True send_state=returned`
 - `:3948` 同上（`13:02:21`）
@@ -337,13 +337,13 @@ BackgroundCoordinator.advance / Application._drive            companion_v2/host/
 
 ```bash
 # 1) 生产 query 修复是否生效（期望：acquaintance_request_invalid）
-ssh -i /root/.ssh/id_ed25519_jpvps root@64.81.114.30 'cd /root/apps/情绪app && bash -c "
+ssh -i /root/.ssh/id_ed25519_jpvps root@64.81.114.30 'cd /root/apps/潮汐引力 && bash -c "
   set -a; source .env; set +a; T=\$EMOTION_AUTH_ACCESS_TOKEN
   curl -s -H \"Authorization: Bearer \$T\" \
     http://127.0.0.1:6191/api/plugins/extensions/astrbot_plugin_private_companion/acquaintance?read_mode=bogus"' 
 
 # 2) 候选集为空（期望：completed 0 行）
-ssh -i /root/.ssh/id_ed25519_jpvps root@64.81.114.30 'cd /root/apps/情绪app && python3 -c "
+ssh -i /root/.ssh/id_ed25519_jpvps root@64.81.114.30 'cd /root/apps/潮汐引力 && python3 -c "
 import sqlite3
 p=\"data/plugins/astrbot_plugin_private_companion/companion-7/installations/main/runtime/companion-v2.sqlite3\"
 c=sqlite3.connect(\"file:%s?mode=ro\"%p,uri=True)

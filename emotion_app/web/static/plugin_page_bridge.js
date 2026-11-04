@@ -203,7 +203,7 @@
       if (!r.ok) throw new Error("HTTP " + r.status);
     } catch (err) {
       throw new Error(
-        "面板会话不可用（请先在情绪app 面板登录）：" +
+        "面板会话不可用（请先在潮汐引力 面板登录）：" +
           (err && err.message ? err.message : err),
       );
     }

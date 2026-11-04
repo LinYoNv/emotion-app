@@ -20,7 +20,7 @@ import sys
 import tempfile
 
 REAL_ROOT = "/root/.local/share/uv/tools/astrbot/lib/python3.12/site-packages"
-HOST_ROOT = "/root/Ai-works/情绪app/host"
+HOST_ROOT = "/root/Ai-works/tidal-gravity-system-station/host"
 
 failures: list[str] = []
 checks = 0

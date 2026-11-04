@@ -184,6 +184,7 @@ class HostPorts:
         platform_manager: Any = None,
         provider_manager: Any = None,
         persona_manager: Any = None,
+        subagents: Any = None,
     ) -> None:
         self.conversation_manager = conversation_manager
         self.llm = llm
@@ -205,6 +206,13 @@ class HostPorts:
         #: 🔴 供应商管理器。未提供 = 插件拿不到模型供应商
         #: → 依赖模型的机制（记忆抽取/日程/关系分析）**如实降级**为模板兜底。
         self.provider_manager = provider_manager
+        #: 🔴 **子代理委派端口**（`astrbot_host/subagent.py` 的 `SubagentRegistry`）。
+        #:
+        #: 语义（情绪 2026-11-03 定）：**平台本身不带 agent 能力** ——
+        #: 角色是"主人"，把活派给外部 agent（"佣人"），等结果回收。
+        #: 未提供 ⇒ `tool_loop_agent()` 走 `NullBackend`，**如实报「没接子代理」**
+        #: （不返回空串 —— 那会让模型以为佣人说没事，进而编造结果）。
+        self.subagents = subagents
 
     def capabilities(self) -> dict[str, bool]:
         """当前可用能力（诊断用 —— 让"缺什么"可观测）。"""
@@ -230,7 +238,39 @@ class HostPorts:
             "persona_usable": bool(
                 getattr(self.persona_manager, "personas_v3", None)
             ),
+            # 子代理：有端口 ≠ 能派活（默认 NullBackend = 未接入）。
+            # 分开暴露 —— 否则"诊断说可用、真派活时全失败"。
+            "subagents": self.subagents is not None,
+            "subagents_usable": _subagents_usable(self.subagents),
         }
+
+
+def _iter_tools(tools: Any) -> list[Any]:
+    """从官方 `ToolSet` / 列表 / None 里取出工具对象（**不猜、不吞错**）。
+
+    ⚠️ 官方 `ToolSet` 有自己的遍历协议；传 list 或 None 也要能处理 ——
+       `tool_loop_agent` 的调用方三种都可能给。
+    """
+    if tools is None:
+        return []
+    try:
+        return list(tools)
+    except TypeError:
+        return []
+
+
+def _subagents_usable(registry: Any) -> bool:
+    """子代理端口**是否真的能派活**（不只是"有个对象"）。
+
+    ⚠️ 判据是"注册表里有 agent **且**后端不是 NullBackend" ——
+       只看 `subagents is not None` 会把"配好了但没接后端"报成可用，
+       而那正是最容易自欺的一种：诊断全绿、真派活全失败。
+    """
+    if registry is None:
+        return False
+    if str(getattr(registry, "backend_name", "null")) == "null":
+        return False
+    return bool(getattr(registry, "agents", ()))
 
 
 def _provider_usable(pm: Any) -> bool:
@@ -310,6 +350,9 @@ class Context:
         #: 插件按**供应商 ID** 选模型（陪伴有 20+ 个 `*_PROVIDER_ID` 配置项），
         #: 没有它 → `get_provider_by_id` 永远拿不到 → 模型的活全退化成模板。
         self.provider_manager: Any = getattr(self._ports, "provider_manager", None)
+        #: 🔴 **子代理委派端口**。`tool_loop_agent()` 靠它把活派出去。
+        #: 未注入 ⇒ 走 `NullBackend` 的如实拒绝（绝不冒充成功）。
+        self.subagents: Any = getattr(self._ports, "subagents", None)
         #: 🔴 **人格管理器**（真实现是构造参数注入的属性，`context.py:141,161`）。
         #:
         #: 为什么必须存在（2026-09-21 情绪报障，已实测复现）：
@@ -641,6 +684,99 @@ class Context:
         if isinstance(inst_map, dict):
             return list(inst_map.values())
         return []
+
+    async def tool_loop_agent(
+        self,
+        *,
+        event: Any,
+        chat_provider_id: str,
+        prompt: str | None = None,
+        image_urls: list[str] | None = None,
+        audio_urls: list[str] | None = None,
+        tools: Any = None,
+        system_prompt: str | None = None,
+        contexts: list[Any] | None = None,
+        max_steps: int = 30,
+        tool_call_timeout: int = 120,
+        **kwargs: Any,
+    ) -> Any:
+        """「把这个任务做掉，给我结果」—— **执行者是外部 agent，不是我们**。
+
+        🔴🔴 **为什么是这个语义**（情绪 2026-11-03 定）：
+
+        > 「我想要的是**平台本身不带 agent 能力**，是子代理。**她把任务发出去等回收就行**。
+        >  就像是我们是主人，把任务发给佣人，明白不。」
+
+        官方实现（`astrbot/core/star/context.py:215-323`）是**自己跑 agent 循环**：
+        `ToolLoopAgentRunner.reset()` → `step_until_done()` → `get_final_llm_resp()`。
+        那要复刻 1568 行 runner + 812 行 tool executor，而且**语义不是我们要的**
+        （那是"平台自己当 agent"）。
+
+        这里只做**转调**：交给 `self.subagents`（`SubagentRegistry`），
+        由它送往用户配置的后端（DSH / 任意 HTTP agent）。
+        返回形状对齐官方（`LLMResponse.completion_text`，`HandoffTool` 读的就是它）。
+
+        ## 入参映射
+
+        官方 `HandoffTool` 调用时：`system_prompt` = 子代理 instructions、
+        `prompt` = 主模型写的 `input`、`tools` = 该子代理允许用的工具。
+        `contexts`（begin_dialogs）/ `max_steps` / `image_urls` 交给后端自行决定 ——
+        不同 agent 平台能接的东西不一样，我们**不在这里猜**，统一塞进 `extra`。
+
+        ## 失败怎么表达
+
+        未装配 / `NullBackend` / 未注册 agent ⇒ 抛 `SubagentUnavailable`。
+        **绝不返回空串** —— `HandoffTool` 把返回值当工具结果交给主模型，
+        空串等于让模型以为"佣人说没事"，它就会**编造一个结果**。
+        """
+        from astrbot_host.subagent import SubagentUnavailable
+
+        if self.subagents is None:
+            raise SubagentUnavailable(
+                "宿主的子代理端口未装配：平台还没有接上任何 agent 服务。"
+            )
+
+        # 子代理标识从哪来：官方 `HandoffTool` 把名字编进工具名（`transfer_to_<name>`），
+        # 但调用 `tool_loop_agent` 时**不再传这个名字**。
+        # ⇒ 由 HandoffTool 侧通过 `kwargs["subagent_name"]` 显式带下来；
+        #    带不下来时只有**单 agent** 才敢推断。
+        name = str(kwargs.get("subagent_name") or "").strip()
+        if not name:
+            known = tuple(getattr(self.subagents, "agents", ()) or ())
+            if len(known) == 1:
+                # 唯一候选才认领（对齐作者在 `_core_target()` 人设改名处用过的同一原则）。
+                name = known[0]
+            else:
+                raise SubagentUnavailable(
+                    "无法确定要委派给哪个子代理：调用方没有传 subagent_name，"
+                    f"而当前配置了 {len(known)} 个子代理。"
+                )
+
+        extra = {
+            "contexts": contexts,
+            "max_steps": max_steps,
+            "tool_call_timeout": tool_call_timeout,
+            "image_urls": image_urls,
+            "audio_urls": audio_urls,
+            "event_umo": getattr(event, "unified_msg_origin", ""),
+        }
+        result = await self.subagents.dispatch(
+            name, str(prompt or ""), provider_id=str(chat_provider_id or ""), extra=extra
+        )
+
+        # 🔴 返回值形状必须对齐官方：`HandoffTool` 读 `llm_resp.completion_text`。
+        #
+        # ⚠️ **不许在这里手拼 `LLMResponse`** —— 仓库有判据专门禁这个
+        #    （`host/tests/test_response_bridge.py:422`，我第一版就是手拼，
+        #     被它当场打红）。手拼会让"某些字段在某些路径上悄悄丢失"，
+        #    那正是该判据存在的原因。统一走 `to_llm_response()` 这个唯一入口。
+        from astrbot_host.response_bridge import to_llm_response
+
+        logger.info(
+            "子代理已回收结果：subagent=%s backend=%s elapsed=%dms chars=%d",
+            name, result.backend, result.elapsed_ms, len(result.text or ""),
+        )
+        return to_llm_response(result.text)
 
     def get_using_provider(self, umo: str | None = None) -> Any:
         """当前默认对话供应商（真实现 `context.py:457`）。

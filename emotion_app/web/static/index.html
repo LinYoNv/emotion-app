@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>情绪app</title>
+<title>潮汐引力 · Tidal Gravity System Station</title>
 <meta name="color-scheme" content="dark" />
-<meta name="description" content="情绪app 面板 —— 自托管的虚拟聊天伙伴后端" />
+<meta name="description" content="潮汐引力（Tidal Gravity System Station）面板 —— 自托管的虚拟聊天伙伴后端" />
 <!-- 🔴 favicon **之前是 404**（实测 `curl /favicon.ico` → 404）。
      浏览器每次打开面板都会去要它，拿不到就在标签页上显示一个默认的空白页图标，
      而且每个页面都会往服务端打一条 404 日志（噪音）。
@@ -21,7 +21,7 @@
 <link rel="preload" href="/static/fonts/geist-latin.woff2" as="font" type="font/woff2" crossorigin />
 <!-- ⚠️ `?v=` 必须与文件末尾 `<script src="js/main.js?v=…">` 的版本号**一起改** ——
      改 CSS 不改版本号 = 用户看不到新样式（本项目 2026-09-26 真事故）。 -->
-<link rel="stylesheet" href="/static/app.css?v=20261031a" />
+<link rel="stylesheet" href="/static/app.css?v=20261104k" />
 </head>
 <body>
 <!--
@@ -43,7 +43,7 @@
               aria-label="收起/展开侧边栏" aria-expanded="true" title="收起/展开侧边栏">
         <span class="burger" aria-hidden="true"></span>
       </button>
-      <span class="brand">情绪app</span>
+      <span class="brand">潮汐引力<span class="brand-sub">Tidal Gravity System Station</span></span>
     </div>
 
     <nav id="sidebar-nav" class="sidebar-nav" aria-label="主导航">
@@ -97,6 +97,12 @@
       <a class="nav-item" href="#/providers" data-nav="providers" data-nav-title="模型供应商">
         <span class="nav-ico" aria-hidden="true">🔌</span><span class="nav-label">模型供应商</span>
       </a>
+      <!-- ⚠️ 图标用 🧑‍🔧（不是 🔗/🔌/🧩）—— 侧边栏收起态只剩图标，重复就分不出来。
+           结构（class/层级/nav-ico/nav-label）与其它 nav-item 逐字一致。
+           语义：子代理 = 「主人把活交给佣人」，扳手工人刚好对得上。 -->
+      <a class="nav-item" href="#/subagents" data-nav="subagents" data-nav-title="子代理">
+        <span class="nav-ico" aria-hidden="true">🧑‍🔧</span><span class="nav-label">子代理</span>
+      </a>
       <!-- ⚠️ 图标用 📜（不是 ⚙️/🔌）—— 侧边栏收起态只剩图标，重复就分不出来。
            结构（class/层级/nav-ico/nav-label）与其它 nav-item 逐字一致。 -->
       <a class="nav-item" href="#/logs" data-nav="logs" data-nav-title="日志">
@@ -132,7 +138,7 @@
             title="打开导航菜单">
       <span class="burger" aria-hidden="true"></span>
     </button>
-    <span class="mobile-bar-title" id="mobile-bar-title">情绪app</span>
+    <span class="mobile-bar-title" id="mobile-bar-title">潮汐引力</span>
   </header>
 
   <div class="content-body">
@@ -311,7 +317,7 @@
             「保存配置」在右上
 
        🔴 只做「对话」一类（`provider_type == "chat_completion"`）：
-          情绪明确说情绪app 不需要 Agent 能力，其余分类（agent/tts/stt/embedding/rerank）
+          情绪明确说潮汐引力 不需要 Agent 能力，其余分类（agent/tts/stt/embedding/rerank）
           **如实不做**，也不摆一排点了没用的页签。
           省略页签的理由：单元素分类栏没有可切换的对象，留一个孤零零的「对话」
           等于用一个假控件占位（比不画更糟）。
@@ -533,6 +539,54 @@
           而写 hash 会多一次 hashchange → applyRoute → 重复拉一次列表。
        ⚠️ 空态 `#adapters-empty` 的文案由 JS 写（三种"空"要说清是哪一种）：
           "还没读到" / "读到 0 个" / "读取失败"。 -->
+  <!-- 子代理：让用户**连接自己的 agent 平台**。
+       🔴 语义（情绪 2026-11-03）：「平台本身不带 agent 能力，是子代理。
+          她把任务发出去等回收就行」—— 这一页配的是"佣人住哪儿"，不是"平台怎么当 agent"。
+       ⚠️ 字段一律由后端 `fields[]` 驱动渲染（见 views/subagents.js 的纪律 ②），
+          这里只放**固定骨架**，不加任何后端专有字段名。 -->
+  <section id="tab-subagents" class="panel hidden">
+    <div class="adapters-head">
+      <h3>子代理 <small>（把活派给外部 agent，结果回收给角色）</small></h3>
+      <div class="row">
+        <button type="button" id="subagent-test" class="">测试连接</button>
+        <button type="button" id="subagent-save" class="primary">保存</button>
+      </div>
+    </div>
+    <p class="hint" id="subagents-hint"></p>
+
+    <div class="subagent-section">
+      <!-- ⚠️ 状态徽标放在 label **内部**，跟着文字走。
+           放外面会让它按 flex 主轴的中间位置漂移（真浏览器截图抓到过）。 -->
+      <label class="subagent-toggle">
+        <input type="checkbox" id="subagent-enabled" />
+        <span class="subagent-toggle-text">启用子代理</span>
+        <span id="subagent-status" class="subagent-status" data-tone="muted">读取中…</span>
+      </label>
+    </div>
+
+    <div class="subagent-section">
+      <div class="field-labeled">
+        <label for="subagent-backend">agent 平台类型</label>
+        <select id="subagent-backend"></select>
+      </div>
+      <p class="hint" id="subagent-backend-desc"></p>
+      <div id="subagent-backend-fields"></div>
+      <p class="hint" id="subagent-test-result"></p>
+    </div>
+
+    <div class="subagent-section">
+      <div class="adapters-head">
+        <h4>子代理清单</h4>
+        <button type="button" id="subagent-add-agent">+ 添加子代理</button>
+      </div>
+      <div id="subagent-agent-list" class="subagent-agent-list"></div>
+      <div id="subagent-agents-empty" class="empty hidden">
+        <span class="empty-ico" aria-hidden="true">🧑‍🔧</span>
+        <span class="empty-text">还没有子代理。</span>
+      </div>
+    </div>
+  </section>
+
   <section id="tab-adapters" class="panel hidden">
     <div class="adapters-head">
       <h3>适配器 <small>（把消息平台接进来：OneBot v11 / 内置 Web 端）</small></h3>
@@ -989,7 +1043,7 @@
 <!-- 登录闸门：令牌换会话（HttpOnly cookie，JS 读不到） -->
 <div id="login" class="modal">
   <div class="modal-box login-box">
-    <h3>情绪app</h3>
+    <h3>潮汐引力</h3>
     <p class="hint" id="login-hint">输入访问令牌（首次部署时用 <code>python -m emotion_app token</code> 生成）。</p>
     <form id="login-form">
       <label>访问令牌
@@ -1124,6 +1178,6 @@
      ⇒ 改 `js/` 或 `app.css` **必须**同时改这里的版本号，两边一起走。
      ⚠️ 子模块（`js/views/*.js`）**不加** `?v=`：它们由 `main.js` 的静态 `import`
         决定 URL，加不了参数，改了子模块就靠 bump 这里来打破整张模块图的缓存。 -->
-<script type="module" src="/static/js/main.js?v=20261031a"></script>
+<script type="module" src="/static/js/main.js?v=20261104k"></script>
 </body>
 </html>

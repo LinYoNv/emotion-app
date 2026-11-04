@@ -129,7 +129,7 @@ ADAPTER_TYPES: dict[str, dict[str, Any]] = {
         ],
     },
     "webchat": {
-        "label": "情绪app 内置 Web 端",
+        "label": "潮汐引力 内置 Web 端",
         "description": "面板里自带的聊天入口。它是内置平台，不需要连接参数。",
         "fields": [],
         #: 内置适配器不可删除（它是面板聊天的来源）
@@ -374,7 +374,7 @@ class AdapterStore:
         rec = AdapterRecord(
             id="webchat",
             type="webchat",
-            name="情绪app 内置 Web 端",
+            name="潮汐引力 内置 Web 端",
             enabled=True,
             config={},
         )

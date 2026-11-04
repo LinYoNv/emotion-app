@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """差分：我们的路由匹配器 vs 真 AstrBot 的（同一批路由/输入，比输出）。"""
 import sys
-sys.path.insert(0, "/root/Ai-works/情绪app/host")
+sys.path.insert(0, "/root/Ai-works/tidal-gravity-system-station/host")
 
 from astrbot.dashboard.api.plugins import (          # 真实现
     _plugin_api_route_pattern as real_pattern,

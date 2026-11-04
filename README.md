@@ -1,4 +1,4 @@
-# 情绪app
+# 潮汐引力
 
 > 自用的「虚拟聊天伙伴」**后端**。**机制参照陪伴插件**。
 > 后端跑在自己的电脑/服务器上，**手机是前端**（接入计划见 `docs/APP_PLAN.md`）。
@@ -9,7 +9,7 @@
 | 端口 | 本地 **6191**（现绑公网 `0.0.0.0:6191` + 令牌鉴权） |
 | 判据 | **1858 passed, 1 deselected, 0 skipped** |
 | 接口 | **65 条路由** → 详见 **`docs/API.md`** |
-| 生成环境 | 生产跑在 jp-vps `root@64.81.114.30:/root/apps/情绪app` |
+| 生成环境 | 生产跑在 jp-vps `root@64.81.114.30:/root/apps/潮汐引力` |
 | 下一步 | 手机 App 接入 → **`docs/APP_PLAN.md`** |
 
 ---
@@ -237,7 +237,7 @@ TOKEN=$(grep '^EMOTION_AUTH_ACCESS_TOKEN=' .env | cut -d= -f2- | tr -d "'")
 ## 目录结构
 
 ```
-情绪app/
+潮汐引力/
 ├── run.sh                      # 入口（加载 .env 后跑 python -m emotion_app）
 ├── .env / .env.example         # 配置（.env 不进 git）
 ├── pyproject.toml              # 依赖（quart/hypercorn/aiosqlite/httpx）

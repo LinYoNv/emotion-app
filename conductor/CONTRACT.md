@@ -41,7 +41,7 @@ SUPPORTED_PROVIDER_TYPES = (PROVIDER_TYPE_CHAT, PROVIDER_TYPE_TTS, PROVIDER_TYPE
 
 - **STT（`speech_to_text`）本轮不加入**（情绪选"只做配置层"且 STT 未确认要；保持"已知不支持"如实 400）。
 - `KNOWN_UNSUPPORTED_PROVIDER_TYPES` 保留 `speech_to_text`/`rerank`/`agent_runner`/`image_generation`。
-- **`agent_runner` 永远不支持**（情绪明确：情绪app 不需要 agent 能力）。
+- **`agent_runner` 永远不支持**（情绪明确：潮汐引力 不需要 agent 能力）。
 
 ### 可执行适配器白名单（新概念，`providers_store.py`）
 

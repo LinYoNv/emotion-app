@@ -22,10 +22,10 @@
 ### 复现（⚠️ 一律走镜像 + 临时目录，绝不碰 `/opt/astrbot`）
 
 ```bash
-cd /root/Ai-works/情绪app
+cd /root/Ai-works/潮汐引力
 .venv/bin/python - "$(mktemp -d)" <<'EOF'
 import asyncio, sys
-sys.path.insert(0, "/root/Ai-works/情绪app/host")
+sys.path.insert(0, "/root/Ai-works/潮汐引力/host")
 from astrbot_host.compat.core.star.context import HostPorts
 from astrbot_host.loader import PluginLoader
 from astrbot_host.shadow import install_shadow_package
@@ -720,12 +720,12 @@ prompt group · prompt view · quota · 一起/一起看/陪我 · 创作 · 当
 * **3 个 BUG 各配一个能失败的回归测试**（BUG-1/BUG-2/BUG-3）。
 * 跑法（⚠️ 主项目与 host **分开跑**）：
   ```bash
-  cd /root/Ai-works/情绪app && .venv/bin/python -m pytest -q          # 主 440
-  cd /root/Ai-works/情绪app/host && ../.venv/bin/python -m pytest -q  # host 35
+  cd /root/Ai-works/潮汐引力 && .venv/bin/python -m pytest -q          # 主 440
+  cd /root/Ai-works/潮汐引力/host && ../.venv/bin/python -m pytest -q  # host 35
   ```
 * **差分对拍**（必须用真 AstrBot 解释器）：
   ```bash
-  cd /root/Ai-works/情绪app
+  cd /root/Ai-works/潮汐引力
   PYTHONPATH=$PWD/host /root/.local/share/uv/tools/astrbot/bin/python host/tests/tools_verify_compat.py
   ```
 * 🔴 **绝不在 `/opt/astrbot` 上做实验**；探针一律 `mirror_root` + 临时目录。
