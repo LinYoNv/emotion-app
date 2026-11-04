@@ -374,14 +374,24 @@ $("s-umo-new") && ($("s-umo-new").onclick = async () => {
     state.currentSession = d.session;
     const i = state.sessions.findIndex((x) => x.id === d.session.id);
     if (i >= 0) state.sessions[i] = d.session;
-    $("s-user-id").value = d.session.user_id ?? "";
+    // ⚠️ `s-user-id` 属于**旧的设置页表单**，2026-11-04 改造成「只编辑配置文件」
+    //    之后它已不在 DOM 里。这里必须判空 —— 否则用户点「换一个专用 umo」时
+    //    会抛 TypeError，而那一步**已经成功改了 umo**，用户却看到报错（假失败）。
+    const uidEl = $("s-user-id");
+    if (uidEl) uidEl.value = d.session.user_id ?? "";
     renderSessionList();
     renderSessionSelect();
     toast($("s-umo-hint"), `已换成 ${d.session.umo}`);
   } catch (e) { toast($("s-umo-hint"), "换 umo 失败：" + e.message, true); }
 });
 
-$("cfg-session-form").onsubmit = (e) => { e.preventDefault(); saveConfigSection("session"); };
+// 🔴 **`cfg-session-form` 已不存在**（2026-11-04 设置页改造成「只编辑配置文件」时
+//    删掉了那个 form）。直接赋值会在元素为 null 时抛 TypeError，
+//    **导致 bootstrap 后面所有初始化中断** —— 包括登录表单的绑定，
+//    表现为"输入令牌点进去就刷新、永远进不去"。
+//    ⇒ 保存按钮改成普通 button（见下面 `#cfg-session-save` 的绑定）。
+//    ⚠️ 通则：模块顶层的 `$("x").prop = ...` 必须先判空，
+//       少一个判空就能让**整页 JS 死掉**，而报错在 console 里离现场很远。
 
 $("cfg-reset").onclick = () => resetConfigProfile();
 
@@ -602,12 +612,15 @@ document.addEventListener("visibilitychange", () => {
 window.addEventListener("focus", recheckLogin);
 export const _cfgSessionSaveBtn = $("cfg-session-save");
 if (_cfgSessionSaveBtn) {
-  // 🔴 先摘掉外层 form 的 submit 行为：按钮在 form 里，默认 type=submit
-  //    会**同时**触发全局配置保存 —— 用户点"保存会话"却改了全局设置。
   _cfgSessionSaveBtn.type = "button";
+  // 🔴 **2026-11-04 修**：这个按钮原来调 `saveSessionConfig()`（旧的"会话表单"保存），
+  //    但那一整块表单在改造成「只编辑配置文件」时已经被删掉了。
+  //    后果：点「保存这份配置」什么也不发生，只提示"没有改动，无需保存"
+  //    —— 用户会以为自己的修改没被识别，而真相是**调错了函数**。
+  //    ⇒ 现在调 `saveConfigSection("session")`（保存**这份配置文件**的 session 段）。
   _cfgSessionSaveBtn.onclick = (e) => {
     e.preventDefault();
-    saveSessionConfig();
+    saveConfigSection("session");
   };
 }
 

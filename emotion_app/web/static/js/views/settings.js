@@ -248,9 +248,15 @@ export async function loadConfigProfile() {
     state.cfgSchema = d.schema;
     // 后端会回实际生效的 id（空/不存在时是默认那份）—— 用它，别自己猜
     if (d.profile_id) state.cfgProfileId = d.profile_id;
-    renderConfigSections();
-    // 顺带把"已配置的模型"拉回来（provider_select 的选项来源）
+    // 🔴 **顺序：先拉模型、再渲染**（2026-11-04 修）。
+    //    原来是「先 renderConfigSections()、再 loadConfigModels()」——
+    //    于是所有 `provider_select` / `provider_multi` 在**模型列表还是空**的时候
+    //    就画好了，之后没有任何一处重绘配置段 ⇒ 两个下拉都只有「（不指定）」。
+    //    用户的观感是"我明明配了模型，这里却选不了"，极易误判成模型没配上。
+    //    ⚠️ 同一个坑在会话那几行注释里已经记过一次，但只补了会话控件，
+    //       **配置段被漏掉了** —— 这次一起修。
     await loadConfigModels();
+    renderConfigSections();
 
     // 🔴 **模型列表拉回来之后**，必须重渲染会话相关的两个控件：
     //      * 设置页的「选择会话」下拉（它要显示每条会话用的模型名）
@@ -362,13 +368,22 @@ export function buildConfigField(section, f, value) {
   //    于是 `document.getElementById('cfg-session-default_tts_provider_id').value`
   //    取到的是 span 的 undefined，`collectConfigChanges` 也读不到真实值。
   //    → 让容器内的**可交互控件**继承同一个 id（容器自己不要 id，避免重复 id）。
-  const control = input.matches("input, select, textarea")
-    ? input
-    : input.querySelector("input, select, textarea");
-  if (control) {
-    control.id = `cfg-${section}-${f.key}`;
+  // 🔴 `provider_multi` 例外：它的值是**容器**上的 `dataset.value`（JSON 数组），
+  //    不是里面某个控件的 `.value`（那里有 ↑↓✕ 一堆按钮和一个挑选下拉）。
+  //    所以 id 必须挂在**容器**上，绝不能落到里面那个 picker 上 ——
+  //    落到 picker 上时 `collectConfigChanges` 会读到 `""`，
+  //    保存下去就把回退模型清空了（而且**不报错**）。
+  if (f.type === "provider_multi") {
+    input.id = `cfg-${section}-${f.key}`;
   } else {
-    input.id = `cfg-${section}-${f.key}`;   // 兜底：真没有控件时至少 id 存在
+    const control = input.matches("input, select, textarea")
+      ? input
+      : input.querySelector("input, select, textarea");
+    if (control) {
+      control.id = `cfg-${section}-${f.key}`;
+    } else {
+      input.id = `cfg-${section}-${f.key}`;   // 兜底：真没有控件时至少 id 存在
+    }
   }
   wrap.appendChild(input);
 
@@ -419,12 +434,7 @@ export function makeConfigInput(f, value) {
     return el;
   }
   if (t === "provider_multi") {
-    // 多选：用多行文本框最省事且不会漏（每行一个 id），并在下面说明格式
-    const el = document.createElement("textarea");
-    el.rows = 2;
-    el.value = Array.isArray(value) ? value.join("\n") : "";
-    el.placeholder = "每行一个模型 id，例如 fast/gemini-3.5-flash";
-    return el;
+    return makeProviderMulti(f, value);
   }
   if (t === "string_list") {
     // 通用字符串数组（如插件停用名单）：每行一项。
@@ -502,6 +512,169 @@ export function makeProviderSelect(f, value) {
   return box;
 }
 
+/** `provider_multi`：**有序多选**（照 AstrBot 的「回退对话模型列表」）。
+ *
+ * 🔴 为什么不是多行文本框（我第一版图省事写成了 textarea，被情绪指出）：
+ *
+ *   1. **顺序有语义**：回退是「按顺序切换」，第 1 个和第 3 个不一样。
+ *      文本框只能靠用户自己排，改一次要手动挪行 —— 极易出错。
+ *   2. **输入会写错**：模型 id 是 `源名/模型名`（`cpa/gemini-3.8-flash-high`），
+ *      手打必然拼错，而拼错之后**不会报错**，只会在真回退时静默失败。
+ *   3. AstrBot 就是这么做的：已选项列表 + ↑↓ 调序 + ✕ 移除 + 「+」从已配模型里挑。
+ *
+ * ⚠️ 返回的是一个**容器**（与 `provider_select` 一致），真实值存在
+ *    `box.dataset.value`（JSON 数组）—— `collectConfigChanges` 会读它。
+ */
+export function makeProviderMulti(f, value) {
+  const box = document.createElement("div");
+  box.className = "cfg-provider-multi";
+
+  //: 当前选中的 id 列表（**顺序即语义**）
+  let chosen = Array.isArray(value) ? value.map(String) : [];
+  const want = f.provider_type || "chat_completion";
+  const allModels = (state.cfgModels || []).filter((m) => {
+    const st = state.cfgSourceTypes[m.provider_source_id || ""] || "chat_completion";
+    return st === want;
+  });
+
+  const list = document.createElement("ul");
+  list.className = "cfg-pm-list";
+
+  const sync = () => {
+    // 真实值挂在这里，供 `collectConfigChanges` 读（避免满 DOM 找 input）
+    box.dataset.value = JSON.stringify(chosen);
+    list.innerHTML = "";
+    if (!chosen.length) {
+      const empty = document.createElement("li");
+      empty.className = "cfg-pm-empty hint";
+      empty.textContent = "还没有添加回退模型（留空 = 主模型失败时如实报错，不自动切换）";
+      list.appendChild(empty);
+      return;
+    }
+    chosen.forEach((id, index) => {
+      const row = document.createElement("li");
+      row.className = "cfg-pm-row";
+      row.dataset.id = id;
+
+      const order = document.createElement("span");
+      order.className = "cfg-pm-order";
+      order.textContent = String(index + 1);
+      row.appendChild(order);
+
+      const label = document.createElement("span");
+      label.className = "cfg-pm-name";
+      label.textContent = id;
+      // 模型被删了 ⇒ **显式标注**，不让它看起来像还能用
+      if (!allModels.some((m) => m.id === id)) {
+        label.classList.add("cfg-pm-missing");
+        label.textContent = `${id}（已不在已配置模型里）`;
+      }
+      row.appendChild(label);
+
+      const up = document.createElement("button");
+      up.type = "button";
+      up.className = "cfg-pm-btn";
+      up.textContent = "↑";
+      up.title = "上移（越靠前越先尝试）";
+      up.disabled = index === 0;
+      up.onclick = () => {
+        [chosen[index - 1], chosen[index]] = [chosen[index], chosen[index - 1]];
+        sync();
+      };
+      row.appendChild(up);
+
+      const down = document.createElement("button");
+      down.type = "button";
+      down.className = "cfg-pm-btn";
+      down.textContent = "↓";
+      down.title = "下移";
+      down.disabled = index === chosen.length - 1;
+      down.onclick = () => {
+        [chosen[index + 1], chosen[index]] = [chosen[index], chosen[index + 1]];
+        sync();
+      };
+      row.appendChild(down);
+
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "cfg-pm-btn cfg-pm-del";
+      del.textContent = "✕";
+      del.title = "移除";
+      del.onclick = () => {
+        chosen.splice(index, 1);
+        sync();
+      };
+      row.appendChild(del);
+
+      list.appendChild(row);
+    });
+  };
+
+  box.appendChild(list);
+
+  // 「+ 添加」：从**已配置的模型**里挑（不给手打框 —— 手打必拼错）
+  const addWrap = document.createElement("div");
+  addWrap.className = "cfg-pm-add";
+
+  const picker = document.createElement("select");
+  picker.className = "cfg-pm-picker";
+  const hintOpt = document.createElement("option");
+  hintOpt.value = "";
+  hintOpt.textContent = allModels.length ? "选择要添加的模型…" : "（还没有配置该类模型）";
+  picker.appendChild(hintOpt);
+  for (const m of allModels) {
+    if (chosen.includes(m.id)) continue;   // 已在列表里的不再列一遍
+    const op = document.createElement("option");
+    op.value = m.id;
+    op.textContent = m.id;
+    picker.appendChild(op);
+  }
+  picker.disabled = !allModels.length;
+  addWrap.appendChild(picker);
+
+  const add = document.createElement("button");
+  add.type = "button";
+  add.className = "primary";
+  add.textContent = "+ 添加";
+  add.disabled = !allModels.length;
+  add.onclick = () => {
+    const id = picker.value;
+    if (!id || chosen.includes(id)) return;
+    chosen.push(id);
+    sync();
+    // 重画 picker（把它从候选里去掉）
+    const keep = picker.value;
+    picker.innerHTML = "";
+    const h = document.createElement("option");
+    h.value = "";
+    h.textContent = "选择要添加的模型…";
+    picker.appendChild(h);
+    for (const m of allModels) {
+      if (chosen.includes(m.id)) continue;
+      const op = document.createElement("option");
+      op.value = m.id;
+      op.textContent = m.id;
+      picker.appendChild(op);
+    }
+    picker.value = "";
+    void keep;
+  };
+  addWrap.appendChild(add);
+  box.appendChild(addWrap);
+
+  if (!allModels.length) {
+    const h = document.createElement("small");
+    h.className = "hint";
+    h.textContent = state.cfgModelsError
+      ? state.cfgModelsError
+      : `还没有配置「${want}」类模型，请先到「模型供应商」添加。`;
+    box.appendChild(h);
+  }
+
+  sync();
+  return box;
+}
+
 /** 收集某段**改动过的**字段（只发改动项 —— 契约 §6）。 */
 export function collectConfigChanges(section, fields) {
   const values = (state.cfgProfile || {})[section] || {};
@@ -514,7 +687,15 @@ export function collectConfigChanges(section, fields) {
     else if (f.type === "int") v = el.value === "" ? f.default : parseInt(el.value, 10);
     else if (f.type === "float") v = el.value === "" ? f.default : parseFloat(el.value);
     else if (f.type === "provider_multi") {
-      v = el.value.split("\n").map((x) => x.trim()).filter(Boolean);
+      // 🔴 从容器上的 `dataset.value` 读（JSON 数组，**顺序即语义**）。
+      //    以前是 textarea 按行 split —— 换成有序列表后必须跟着改，
+      //    否则会读到空串（`<div>` 没有 `.value`），保存下去就把回退模型清空了。
+      try {
+        v = JSON.parse(el.dataset.value || "[]");
+      } catch {
+        v = [];
+      }
+      if (!Array.isArray(v)) v = [];
     } else if (f.type === "string_list") {
       v = el.value.split("\n").map((x) => x.trim()).filter(Boolean);
     } else v = el.value;
@@ -539,7 +720,13 @@ export async function saveConfigSection(section) {
     return;
   }
   try {
-    const d = await api("PATCH", "/api/v1/config-profile", { [section]: changes });
+    // 🔴 **必须带 `?profile=`**（2026-11-04）：多配置文件之后，不带这个参数
+    //    就会写到**默认那份**去 —— 用户明明在编辑「私聊」，保存却改了「默认配置」，
+    //    而界面照样显示"已保存 N 项"（**假成功**，最难查的一类）。
+    const savePid = state.cfgProfileId || "";
+    const saveUrl = "/api/v1/config-profile"
+      + (savePid ? "?profile=" + encodeURIComponent(savePid) : "");
+    const d = await api("PATCH", saveUrl, { [section]: changes });
     state.cfgProfile = d.profile;
     renderConfigSections();       // 用后端回来的真值重画（不假设自己写对了）
     toast(hintEl, `已保存 ${Object.keys(changes).length} 项。`);
@@ -560,7 +747,7 @@ export async function resetConfigProfile() {
   const ok = window.confirm("恢复默认会清掉「会话」与「上下文管理策略」的全部自定义值，确定？");
   if (!ok) return;
   try {
-    const d = await api("DELETE", "/api/v1/config-profile");
+    const d = await api("DELETE", ("/api/v1/config-profile" + (state.cfgProfileId ? `?profile=${encodeURIComponent(state.cfgProfileId)}` : "")));
     state.cfgProfile = d.profile;
     renderConfigSections();
     toast($("cfg-hint"), "已恢复默认（两段一起）。");

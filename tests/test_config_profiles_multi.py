@@ -281,3 +281,72 @@ def test_default_persona_falls_back_gracefully_without_registry():
             self.host = None
 
     assert isinstance(_Stub()._default_persona_id(), str)
+
+
+# ---------------------------------------------------------------------------
+# ⑨ 前端「回退对话模型」必须是有序多选，不是文本框
+#
+# 情绪 2026-11-04：「回退模型你咋不加下拉框嘞，ui也还用着默认的丑死了你看看 astrbot。
+#                   单选添加一个，多选就添加两个还支持上下切换顺序。」
+# ---------------------------------------------------------------------------
+
+
+def test_provider_multi_is_not_a_textarea():
+    """`provider_multi` 必须走 `makeProviderMulti`，不能退化成 textarea。
+
+    🔴 为什么这个必须守：
+       1. **顺序有语义**（回退是按顺序尝试），textarea 只能靠手挪行；
+       2. 模型 id 是 `源名/模型名`，手打必拼错，拼错后**不报错**，
+          只在真回退时静默失败。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "emotion_app" / "web" / "static" / "js" / "views" / "settings.js")
+    text = src.read_text(encoding="utf-8")
+
+    # 找到 provider_multi 分支
+    idx = text.find('if (t === "provider_multi") {')
+    assert idx > 0, "找不到 provider_multi 的渲染分支"
+    branch = text[idx:idx + 260]
+    assert "makeProviderMulti" in branch, (
+        "provider_multi 没有走 makeProviderMulti —— 说明又退化成文本框了"
+    )
+
+
+def test_ordered_multi_control_has_reorder_and_remove():
+    """控件必须支持 ↑↓ 调序与 ✕ 移除（照 AstrBot）。"""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "emotion_app" / "web" / "static" / "js" / "views" / "settings.js")
+    text = src.read_text(encoding="utf-8")
+
+    idx = text.find("export function makeProviderMulti")
+    assert idx > 0, "找不到 makeProviderMulti"
+    body = text[idx:idx + 4200]
+    for needle, why in (
+        ("↑", "没有上移按钮"),
+        ("↓", "没有下移按钮"),
+        ("✕", "没有移除按钮"),
+        ("dataset.value", "没有把值挂在容器上（collectConfigChanges 会读到空）"),
+    ):
+        assert needle in body, f"有序多选控件缺「{why}」"
+
+
+def test_provider_multi_value_is_read_from_dataset():
+    """`collectConfigChanges` 必须从容器 `dataset.value` 读。
+
+    ⚠️ 以前是 textarea 按行 split。换成有序列表后如果没跟着改，
+       会读到 `""`（`<div>` 没有 `.value`）⇒ 保存下去**把回退模型清空**。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "emotion_app" / "web" / "static" / "js" / "views" / "settings.js")
+    text = src.read_text(encoding="utf-8")
+
+    idx = text.find('else if (f.type === "provider_multi") {')
+    assert idx > 0
+    branch = text[idx:idx + 500]
+    assert "dataset.value" in branch, "取值没走 dataset.value（会读到空串）"
