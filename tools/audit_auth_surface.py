@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 
 TOKEN = ""
-for line in Path("/root/apps/情绪app/.env").read_text(encoding="utf-8").splitlines():
+for line in Path("/root/apps/潮汐引力/.env").read_text(encoding="utf-8").splitlines():
     if line.startswith("EMOTION_AUTH_ACCESS_TOKEN"):
         TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
         break

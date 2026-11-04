@@ -76,7 +76,7 @@ def test_normalize_matches_plugin_algorithm():
         "情感陪伴": "generic",
         "": "generic",
         None: "generic",
-        "情绪app Web 端": "generic",
+        "潮汐引力 Web 端": "generic",
     }
     for raw, expected in cases.items():
         assert normalize_platform_kind(raw) == expected, (
@@ -88,18 +88,18 @@ def test_the_old_dangerous_description_would_misclassify():
     """🔴 回归判据：**旧的那个 description 确实是危险的**（不是理论风险）。
 
     改之前 `OurPlatform` 的默认描述是
-    `"情绪app 内置 Web 端（非 OneBot）"` —— 含 `onebot` 子串，
+    `"潮汐引力 内置 Web 端（非 OneBot）"` —— 含 `onebot` 子串，
     插件用 description 做子串兜底时会判成 **onebot**。
 
     这条判据把"为什么必须改"钉死：如果哪天有人把描述改回去，
     它连同下面 `test_description_with_platform_alias_is_rejected` 一起红。
     """
-    old = "情绪app 内置 Web 端（非 OneBot）"
+    old = "潮汐引力 内置 Web 端（非 OneBot）"
     assert normalize_platform_kind(old) == "onebot", (
         "旧 description 会被插件判成 onebot —— 这正是必须改掉它的原因"
     )
     # 新值安全（且与 name 同类型）
-    assert normalize_platform_kind("情绪app WebChat") == "webchat"
+    assert normalize_platform_kind("潮汐引力 WebChat") == "webchat"
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +148,7 @@ def test_known_kinds_are_all_accepted():
 def test_description_with_platform_alias_is_rejected():
     """含**别的**平台别名子串的 description 必须被拒（否定句也不行）。"""
     dangerous = [
-        "情绪app 内置 Web 端（非 OneBot）",  # ← 真实踩过的那句
+        "潮汐引力 内置 Web 端（非 OneBot）",  # ← 真实踩过的那句
         "QQ 官方机器人 adapter",
         "telEgram 转发",
         "napcat relay",
@@ -160,8 +160,8 @@ def test_description_with_platform_alias_is_rejected():
 
 
 def test_description_matching_own_kind_is_allowed():
-    """与**自己**同类型的描述是允许的（`"情绪app WebChat"` 就该过）。"""
-    spec = PlatformSpec(id="11", name="webchat", description="情绪app WebChat")
+    """与**自己**同类型的描述是允许的（`"潮汐引力 WebChat"` 就该过）。"""
+    spec = PlatformSpec(id="11", name="webchat", description="潮汐引力 WebChat")
     assert spec.kind == "webchat"
     # 中文里不含任何平台名的描述也可以
     PlatformSpec(id="21", name="aiocqhttp", description="QQ 机器人")
@@ -169,7 +169,7 @@ def test_description_matching_own_kind_is_allowed():
 
 def test_description_with_plain_chinese_is_allowed():
     """纯中文描述（不含任何别名 token）必须放行 —— 别把校验做得过严。"""
-    PlatformSpec(id="99", name="webchat", description="情绪app 内置网页端")
+    PlatformSpec(id="99", name="webchat", description="潮汐引力 内置网页端")
     PlatformSpec(id="98", name="webchat", description="")
 
 
@@ -337,7 +337,7 @@ def test_default_platform_values_are_unchanged():
     """
     assert DEFAULT_PLATFORM_ID == "11"
     assert DEFAULT_PLATFORM_NAME == "webchat"
-    assert DEFAULT_PLATFORM.description == "情绪app WebChat"
+    assert DEFAULT_PLATFORM.description == "潮汐引力 WebChat"
     assert DEFAULT_PLATFORM.id == "11"
     assert DEFAULT_PLATFORM.name == "webchat"
 

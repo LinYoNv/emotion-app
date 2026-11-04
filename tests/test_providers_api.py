@@ -875,7 +875,7 @@ def test_dangling_reference_in_handwritten_file_is_reported(tmp_path, caplog):
 async def test_rejects_unsupported_provider_type(mk, bad_type):
     """🔴 我们**不支持**的 `provider_type` → **400**，且说明"本平台暂不支持该类型"。
 
-    情绪明确说：情绪app **不需要 Agent 能力**。
+    情绪明确说：潮汐引力 **不需要 Agent 能力**。
     ⚠️ 关键在"**不假装支持**"：放行一个我们根本执行不了的能力，
        面板会显示它，插件真去调用时才炸在更远的地方（更难查）。
        **如实拒绝 = 作者验收判据③（能力不对等要如实 degraded）。**

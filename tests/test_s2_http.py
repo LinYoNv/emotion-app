@@ -441,7 +441,7 @@ async def test_panel_served(ctx):
     assert r.status_code == 200
     html = await r.get_data(as_text=True)
     # 断言**页面真被发出**了（不是某个空壳）。
-    # ⚠️ 2026-11-04 品牌改名：「情绪app」→「潮汐引力 / Tidal Gravity System Station」。
+    # ⚠️ 2026-11-04 品牌改名：「潮汐引力」→「潮汐引力 / Tidal Gravity System Station」。
     #    改文案时要 grep 测试里的同款字面串，否则这条会永远绿（= 假判据）。
     assert "潮汐引力" in html
     assert "Tidal Gravity System Station" in html

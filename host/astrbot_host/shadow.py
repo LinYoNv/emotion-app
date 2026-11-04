@@ -12,7 +12,7 @@
     import astrbot.api.star           # 从此插件能正常 import
 
 ⚠️ **硬约束**（来自作者 `PLATFORM_PORTABILITY...` §7 验收判据）：
-   ① 领域层（`情绪app/emotion_app/domain/`）**绝不能** import 这个包；
+   ① 领域层（`潮汐引力/emotion_app/domain/`）**绝不能** import 这个包；
    ② 影子包只做协议转换，**不写业务规则**。
 """
 from __future__ import annotations

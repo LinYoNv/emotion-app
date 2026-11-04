@@ -62,7 +62,7 @@ if not NEW_TOKEN:
     raise SystemExit(
         "❌ 需要设置 EMOTION_AUDIT_TOKEN 环境变量（面板访问令牌）。\n"
         "   取法：ssh 到 jp-vps 后\n"
-        "   grep '^EMOTION_AUTH_ACCESS_TOKEN=' /root/apps/情绪app/.env | cut -d= -f2-\n"
+        "   grep '^EMOTION_AUTH_ACCESS_TOKEN=' /root/apps/潮汐引力/.env | cut -d= -f2-\n"
         "   ⚠️ 不要把它写进任何文件/命令历史。"
     )
 

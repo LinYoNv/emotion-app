@@ -114,7 +114,7 @@ def test_every_preset_type_is_in_supported_or_known_unsupported():
 
 
 def test_agent_runner_is_never_offered():
-    """🔴 情绪明确：情绪app **不需要 agent 能力** → 预设里不许出现 `agent_runner`。"""
+    """🔴 情绪明确：潮汐引力 **不需要 agent 能力** → 预设里不许出现 `agent_runner`。"""
     assert not [p for p in PRESETS if p.provider_type == "agent_runner"], (
         "预设里混进了 agent_runner —— 情绪明确说不需要 agent 能力"
     )

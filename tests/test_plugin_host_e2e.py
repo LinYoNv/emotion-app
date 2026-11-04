@@ -27,7 +27,7 @@ HOST_DIR = APP_ROOT / "host"
 #:
 #: 原来这里写的是 `/opt/astrbot/data/plugins` —— **别人 AstrBot 的生产插件目录**。
 #: 那违反两条已定铁律：
-#:   ① AGENTS.md：「只改 `情绪app`，绝不碰 AstrBot（`/opt/astrbot/**` 是别人的生产，只读）」；
+#:   ① AGENTS.md：「只改 `潮汐引力`，绝不碰 AstrBot（`/opt/astrbot/**` 是别人的生产，只读）」；
 #:   ② 本文件 `_cfg()` 在 `data_dir` 上已经写明「绝不能指向 /opt/astrbot/data」,
 #:      却在**上一行的 `plugin_dirs`** 上犯了同一件事。
 #:

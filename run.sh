@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 情绪app 启动包装：加载 .env 后执行 `python -m emotion_app "$@"`
+# 潮汐引力 启动包装：加载 .env 后执行 `python -m emotion_app "$@"`
 #
 # 为什么需要它：应用只读环境变量（不解析 .env 文件），
 # 而把令牌写进 shell 历史或每次手敲都不合适 —— 统一从这里注入。

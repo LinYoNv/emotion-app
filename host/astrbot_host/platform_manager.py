@@ -79,7 +79,7 @@ class OurPlatform(Platform):
     * `send_by_session(session, chain)` → **经端口投递**；端口没接就返回 False
 
     🔴 **为什么 `description` 不再有默认值**（2026-09-21 修）：
-       原来这里是 `description="情绪app 内置 Web 端（非 OneBot）"` ——
+       原来这里是 `description="潮汐引力 内置 Web 端（非 OneBot）"` ——
        那串里含 **`onebot`** 子串，而插件 `platform_compat.py:165-182`
        解析平台类型时会拿 `description` 做**子串兜底** ⇒
        **否定句被当成断言**，这个平台会被判成 `onebot`。

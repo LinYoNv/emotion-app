@@ -122,7 +122,7 @@ from astrbot_host.platforms import _FORBIDDEN_SENDER_NAME  # noqa: E402
 #     现在平台实例是个带校验的规格对象，这里只是它的**默认值投影** ——
 #     名字一个都没变（向后兼容），但"定义处"只有一处。
 #
-#   ⚠️ 取值本身**一个字都没改**（`"11"` / `"webchat"` / `"情绪app WebChat"`）：
+#   ⚠️ 取值本身**一个字都没改**（`"11"` / `"webchat"` / `"潮汐引力 WebChat"`）：
 #      它们是插件数据主键的一半，改了等于换库。
 
 #: 🔴 **平台实例 ID** —— umo 的**第一段**，对应真实现的 `PlatformMetadata.id`

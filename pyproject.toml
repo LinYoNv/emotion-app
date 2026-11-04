@@ -1,7 +1,7 @@
 [project]
 name = "emotion-app"
 version = "0.1.0"
-description = "情绪app —— 自用虚拟聊天伙伴后端（爱语形态参照，Quart + SQLite）"
+description = "潮汐引力 —— 自用虚拟聊天伙伴后端（爱语形态参照，Quart + SQLite）"
 requires-python = ">=3.11"
 dependencies = [
     "quart>=0.20",

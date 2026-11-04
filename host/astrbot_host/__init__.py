@@ -10,7 +10,7 @@
    * `registry.py` —— 事件总线（EventType / handler 注册表 / LLM 工具表）
    * `loader/`   —— 插件加载器（扫描/导入/实例化/生命周期）
 
-🔴 **硬约束**：`情绪app/emotion_app/domain/` **绝不能** import 本包
+🔴 **硬约束**：`潮汐引力/emotion_app/domain/` **绝不能** import 本包
    （照作者 §7「便携层不能依赖宿主」判据）。
 """
 __version__ = "0.1.0"

@@ -37,7 +37,7 @@ if not subject or not platform or platform == "generic" or not (adapter or bot_i
 
 插件 `platform_compat.py:165-182` 解析平台类型的顺序是
 `name` → `id` → `description`，且**先精确匹配、再子串扫描**别名表。
-所以 `description="情绪app 内置 Web 端（非 OneBot）"` 会被判成 **onebot**
+所以 `description="潮汐引力 内置 Web 端（非 OneBot）"` 会被判成 **onebot**
 —— **否定句被当成断言**（"非 OneBot" 里含 `onebot`）。
 
 ⚠️ 这一条**极危险**：onebot 的能力表把 `onebot_actions` / `poke` /
@@ -143,7 +143,7 @@ def normalize_platform_kind(value: Any) -> str:
 
     >>> normalize_platform_kind("webchat")
     'webchat'
-    >>> normalize_platform_kind("情绪app 内置 Web 端（非 OneBot）")
+    >>> normalize_platform_kind("潮汐引力 内置 Web 端（非 OneBot）")
     'onebot'
     >>> normalize_platform_kind("随便什么")
     'generic'
@@ -281,16 +281,16 @@ DEFAULT_PLATFORM_NAME: str = "webchat"
 
 #: 默认平台描述。
 #: 🔴 **`WebChat` 这个词是刻意的**：它与 `name` 同类型，不会被判成别的平台；
-#: 而旧值 `"情绪app 内置 Web 端（非 OneBot）"` 含 `onebot` 子串 ——
+#: 而旧值 `"潮汐引力 内置 Web 端（非 OneBot）"` 含 `onebot` 子串 ——
 #: **否定句会被插件当断言**（详见模块 docstring 约束②）。
-DEFAULT_PLATFORM_DESCRIPTION: str = "情绪app WebChat"
+DEFAULT_PLATFORM_DESCRIPTION: str = "潮汐引力 WebChat"
 
 #: 默认平台规格（宿主不带参数时用的就是它）。
 DEFAULT_PLATFORM: PlatformSpec = PlatformSpec(
     id=DEFAULT_PLATFORM_ID,
     name=DEFAULT_PLATFORM_NAME,
     description=DEFAULT_PLATFORM_DESCRIPTION,
-    label="情绪app Web 端",
+    label="潮汐引力 Web 端",
 )
 
 
