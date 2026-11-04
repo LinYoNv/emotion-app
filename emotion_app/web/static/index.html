@@ -21,7 +21,7 @@
 <link rel="preload" href="/static/fonts/geist-latin.woff2" as="font" type="font/woff2" crossorigin />
 <!-- ⚠️ `?v=` 必须与文件末尾 `<script src="js/main.js?v=…">` 的版本号**一起改** ——
      改 CSS 不改版本号 = 用户看不到新样式（本项目 2026-09-26 真事故）。 -->
-<link rel="stylesheet" href="/static/app.css?v=20261104k" />
+<link rel="stylesheet" href="/static/app.css?v=20261104m" />
 </head>
 <body>
 <!--
@@ -43,7 +43,9 @@
               aria-label="收起/展开侧边栏" aria-expanded="true" title="收起/展开侧边栏">
         <span class="burger" aria-hidden="true"></span>
       </button>
-      <span class="brand">潮汐引力<span class="brand-sub">Tidal Gravity System Station</span></span>
+      <!-- ⚠️ 顶栏只放中文名（情绪 2026-11-04：「只要中文得了，不要副标签英文」）。
+           英文全称保留在 `<title>` 与 meta description 里，供浏览器标签页与搜索引擎用。 -->
+      <span class="brand">潮汐引力</span>
     </div>
 
     <nav id="sidebar-nav" class="sidebar-nav" aria-label="主导航">
@@ -548,7 +550,10 @@
     <div class="adapters-head">
       <h3>子代理 <small>（把活派给外部 agent，结果回收给角色）</small></h3>
       <div class="row">
-        <button type="button" id="subagent-test" class="">测试连接</button>
+        <!-- 「重新读取」不是装饰：读取失败时提示区会让用户点它，
+             而没有这个按钮的话唯一出路是刷新整页（会丢掉别的未保存改动）。 -->
+        <button type="button" id="subagent-reload">重新读取</button>
+        <button type="button" id="subagent-test">测试连接</button>
         <button type="button" id="subagent-save" class="primary">保存</button>
       </div>
     </div>
@@ -560,17 +565,24 @@
       <label class="subagent-toggle">
         <input type="checkbox" id="subagent-enabled" />
         <span class="subagent-toggle-text">启用子代理</span>
-        <span id="subagent-status" class="subagent-status" data-tone="muted">读取中…</span>
+        <span id="subagent-status" class="subagent-status" data-tone="muted" data-state="unknown">读取中…</span>
       </label>
     </div>
 
     <div class="subagent-section">
+      <!-- 结构照适配器页的 `.field-labeled`（左说明 / 右控件两列），
+           ⚠️ 左列**必须**是 `.fl-text` 包裹层：少了它 label 与控件会各占一格导致整行错位。 -->
       <div class="field-labeled">
-        <label for="subagent-backend">agent 平台类型</label>
-        <select id="subagent-backend"></select>
+        <div class="fl-text">
+          <label for="subagent-backend">agent 平台类型</label>
+          <span class="hint">决定这个平台要怎么连、有哪些连接参数（选项来自后端目录）。</span>
+        </div>
+        <div class="fl-ctl"><select id="subagent-backend"></select></div>
       </div>
       <p class="hint" id="subagent-backend-desc"></p>
+      <!-- 🔴 字段区**只有空容器** —— 全部由 JS 按后端 `fields[]` 渲染，见 views/subagents.js -->
       <div id="subagent-backend-fields"></div>
+      <!-- 连通性测试的结果（成功/失败**都**写在这里，不弹 toast：用户要能回头对照参数） -->
       <p class="hint" id="subagent-test-result"></p>
     </div>
 
@@ -580,9 +592,15 @@
         <button type="button" id="subagent-add-agent">+ 添加子代理</button>
       </div>
       <div id="subagent-agent-list" class="subagent-agent-list"></div>
+      <!-- 空态的**标题与说明都由 JS 写**（三种"空"要说清是哪一种：
+           还没读到 / 读取失败 / 读到了但没有子代理 —— 后一种又分
+           "没选平台" 与 "选了平台但没加 agent"）。
+           ⚠️ 分成 `<strong>` + `<span>` 两个节点，而不是整块 `textContent=`：
+           那样会把上面的 `.empty-ico` 一起抹掉。 -->
       <div id="subagent-agents-empty" class="empty hidden">
         <span class="empty-ico" aria-hidden="true">🧑‍🔧</span>
-        <span class="empty-text">还没有子代理。</span>
+        <strong id="subagent-agents-empty-title">正在读取子代理配置…</strong>
+        <span id="subagent-agents-empty-text">正在读取子代理配置…</span>
       </div>
     </div>
   </section>
@@ -1178,6 +1196,6 @@
      ⇒ 改 `js/` 或 `app.css` **必须**同时改这里的版本号，两边一起走。
      ⚠️ 子模块（`js/views/*.js`）**不加** `?v=`：它们由 `main.js` 的静态 `import`
         决定 URL，加不了参数，改了子模块就靠 bump 这里来打破整张模块图的缓存。 -->
-<script type="module" src="/static/js/main.js?v=20261104k"></script>
+<script type="module" src="/static/js/main.js?v=20261104m"></script>
 </body>
 </html>

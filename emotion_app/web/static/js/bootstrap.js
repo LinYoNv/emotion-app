@@ -12,7 +12,7 @@
 import { send } from "./views/chat.js";
 import { $, MODE_HINTS, api, applyRoute, boot, closeDrawer, go, hideLogin, isMobile, recheckLogin, showLogin, state, switchToTab, toast, toggleSidebar } from "./core/core.js";
 import { closeAdapterForm, deleteAdapter, loadAdapters, onAdapterTypeChange, openAdapterCreate, openAdapterEdit, saveAdapter, setAdapterEnabled } from "./views/adapters.js";
-import { addAgent, onSubagentBackendChange, removeAgent, saveSubagents, testSubagentConnection } from "./views/subagents.js";
+import { addAgent, onSubagentBackendChange, onSubagentEnabledChange, onSubagentParamsChanged, reloadSubagents, removeAgent, saveSubagents, testSubagentConnection } from "./views/subagents.js";
 import { downloadExport, loadPersonas, refreshPersonaInState, renderPersonaList, renderPromptStats, selectPersona } from "./views/persona.js";
 import { NAV_PLUGIN_OPEN_KEY, collectPluginConfigChanges, openPluginConfig, savePluginSwitch, syncNavPluginGroupOpen } from "./views/plugins.js";
 import { PROVIDER_FILTER_ALL, addHeaderRow, addProviderModel, clearProviderDetail, closeModelsModal, closePresetPicker, closeTestModal, deleteProviderSource, fetchSourceModels, newProviderSourceFlow, removeProviderModel, renderAvailableModels, saveProviderSource, setAdapterType, setProviderFilter, showModal, testProviderModel } from "./views/providers.js";
@@ -487,25 +487,36 @@ $("modal").onclick = (e) => { if (e.target.id === "modal") $("modal").classList.
  *
  * 🔴 绑定集中在 bootstrap（`views/subagents.js` 零模块级副作用）。
  * ⚠️ `remove-agent` 用**事件委托**（`#subagent-agent-list` 上监听）：
- *    清单是动态重建的，逐个绑会在每次 render 后丢失。
+ *    清单是动态重建的，逐个绑会在每次 render 后丢一次。
  */
+
 $("subagent-save").onclick = () => saveSubagents();
 
 $("subagent-test").onclick = () => testSubagentConnection();
 
+// 读取失败时提示区让用户点这个（没有它，唯一出路是刷新整页 → 丢掉别的未保存改动）
+$("subagent-reload").onclick = () => reloadSubagents();
+
+// 切换平台：只重画字段区（**不重建下拉**，否则会把用户的选择弹回旧值）
 $("subagent-backend").onchange = () => onSubagentBackendChange();
+
+// 总开关：只改本地状态 + 徽标，不发请求（保存才落盘）
+$("subagent-enabled").onchange = () => onSubagentEnabledChange();
 
 $("subagent-add-agent").onclick = () => addAgent();
 
-// 委托：卡片里的「移除」按钮
 $("subagent-agent-list").onclick = (ev) => {
-  const btn = ev.target && ev.target.closest
-    ? ev.target.closest('[data-action="remove-agent"]')
-    : null;
+  // 委托：卡片里的「移除」按钮（卡片会随增删重建，逐张绑会丢）
+  const btn = ev.target && ev.target.closest ? ev.target.closest('[data-action="remove-agent"]') : null;
   if (!btn) return;
   const index = Number(btn.dataset.index);
   if (Number.isFinite(index)) removeAgent(index);
 };
+
+// 连接参数一改，上次的测试结论就作废（否则徽标会一直显示一个过期结论）。
+// ⚠️ 用**委托**：字段区是每次切换平台重建的，逐个绑会在重建后失效。
+$("subagent-backend-fields").addEventListener("input", () => onSubagentParamsChanged());
+$("subagent-backend-fields").addEventListener("change", () => onSubagentParamsChanged());
 
 $("plugin-switch-save").onclick = savePluginSwitch;
 

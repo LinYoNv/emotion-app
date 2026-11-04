@@ -1,6 +1,6 @@
 /* subagents —— 子代理接入（让用户**连接自己的 agent 平台**）（原生 ES 模块，零构建）
  *
- * 🔴 本文件只放**函数/常量声明**，**没有模块级副作用**
+ * 🔴 本文件只放**函数/常量声明**，**没有任何模块级副作用**
  *    （事件绑定统一在 `js/bootstrap.js`）。理由同 `adapters.js`：消除循环依赖
  *    在"模块顶层立即求值"时拿到未初始化绑定的风险。
  *
@@ -22,20 +22,32 @@
  * ## 🔴 四条本页必须守住的纪律
  *
  * ① **secret 只写不回显**：拿到的是打码值（`•` 开头）。用户不动 → 原样回传 →
- *    后端识别打码值并保持原值。**绝不能把打码值当新令牌**（那会把 token 洗成 `••••`，
- *    之后所有请求 401 而界面还显示"已配置"——本项目真踩过）。
+ *    后端识别打码值并保持原值。**绝不能把打码值当新令牌、也不能在保存时把它清空**
+ *    （清空 = 后端按"用户主动删除"处理，令牌就没了；之后全 401 而界面还显示"已配置"
+ *    —— 本项目真踩过这一类）。
  *
  * ② **表单字段一律由后端 `fields[]` 驱动**，前端**不硬编码字段名**。
- *    抄一份字段清单 = 早晚和后端漂移，且"漏渲染"会伪装成"这个后端没有这项配置"。
+ *    连"配没配好"的判定也必须从 `fields[]` 推（见 `missingRequiredFields`），
+ *    在 JS 里再抄一份字段清单 = 早晚和后端漂移，且"漏渲染"会伪装成"这个平台没这项配置"。
  *
- * ③ **连接测试要读 `data.ok`**，不能只看 HTTP 状态码 ——
- *    后端把"业务失败"也用 200 返回（那不是请求格式错误，是"试了，对面不通"）。
+ * ③ **状态分三态**（`subagentStateView` 是唯一判定处）：
+ *      未配置 / **已配置但未连通** / **已连通**
+ *    另加两个如实态：未启用、已配置但还没测过。合成一个"已启用"布尔会让用户
+ *    盯着一个绿点发呆 —— 那正是本项目最忌讳的静默失败。
  *
- * ④ **`applied=false` 必须显式告警**：后端说的是"配置保存了但没生效"。
- *    只弹"保存成功"会让用户以为改了没反应是界面坏了。
+ * ④ **配置没读到就禁止保存**：那时 `state.subagentConfig` 是 `null`，
+ *    保存会把"没读到"当成"空的"发回去 —— 一次误点就把用户的配置清空。
+ *    同理，`/test` 的**业务失败也用 HTTP 200** 返回，必须读 `data.ok`；
+ *    而 `PUT` 的 `applied:false` 必须显式告警（"保存了但没生效"不能只报"成功"）。
  */
 
-import { $, api, apiData, state, toast } from "../core/core.js";
+import { $, apiData, state, toast } from "../core/core.js";
+
+/** 后端目录里「未接入」那一项的 id（契约里约定的常量，**不是**可配置字段名）。 */
+const BACKEND_NONE = "null";
+
+/** 打码前缀：后端 `mask_secret()` 用的就是这个（`domain/subagents.py` 的 `MASK`）。 */
+const MASK_PREFIX = "•";
 
 /* ---------------- 错误文案 ---------------- */
 
@@ -43,6 +55,7 @@ import { $, api, apiData, state, toast } from "../core/core.js";
  *
  * 🔴 必须用信封里的 `message`，`reason` 存在时**一并显示** ——
  *    只写"保存失败"等于把后端说清的原因扔掉（用户没有任何可行动的线索）。
+ * ⚠️ `api()` 对非 2xx 抛的 Error 上带着 `status` / `reason`（见 core.js 的 api）。
  */
 export function subagentErrorText(e) {
   const msg = (e && e.message) || "未知错误";
@@ -50,119 +63,298 @@ export function subagentErrorText(e) {
   const status = e && e.status ? e.status : 0;
   const bits = [msg];
   if (reason && !msg.includes(reason)) bits.push(`（reason: ${reason}）`);
+  // 后端没给可读文案时 `api()` 会退成 `HTTP 500` —— 那种情况补一句是什么错
   if (status && /^HTTP \d+$/.test(msg)) bits.push(`（HTTP ${status}）`);
   return bits.join("");
 }
 
-/** 当前是不是"还没读到"的初始态。 */
-export function subagentConfigMissing() {
-  return state.subagentConfig === null;
+/** 这个值是不是后端给回来的打码值（用户没动过）。 */
+export function isMasked(value) {
+  return typeof value === "string" && value.startsWith(MASK_PREFIX);
+}
+
+/* ---------------- 形状校验（不许静默降级成空） ---------------- */
+
+/** 响应里的 `config` 必须是一个对象，`agents`（若有）必须是数组。
+ *
+ * ⚠️ 缺字段当空对象的后果："读取失败"会被显示成"你没配"，
+ *    用户于是去配一个已经配好的东西（本项目最贵的静默失败类型）。
+ */
+function requireConfig(d) {
+  const cfg = d && d.config;
+  if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) {
+    throw new Error("响应里缺少 config（后端形状不符）");
+  }
+  if (cfg.agents !== undefined && !Array.isArray(cfg.agents)) {
+    throw new Error("响应里 config.agents 不是数组（后端形状不符）");
+  }
+  return cfg;
+}
+
+/** 子代理清单（`cfg` 可能还没读到 → 空数组）。 */
+export function agentsOf(cfg) {
+  return cfg && Array.isArray(cfg.agents) ? cfg.agents : [];
 }
 
 /* ---------------- 读 ---------------- */
 
+/** 读后端目录（`GET /api/v1/subagents/backends`）。形状不符就抛。 */
+export async function fetchBackendTypes() {
+  const d = await apiData("GET", "/api/v1/subagents/backends");
+  const types = d && d.types;
+  if (!Array.isArray(types)) throw new Error("响应里 types 不是数组（后端形状不符）");
+  return types;
+}
+
 /** 进 `#/subagents` 时由 `NAV_LOADERS` 调。
  *
- * 返回 `true` 表示**配置真的读到了**；失败时返回 `false` 并把原因写进提示区
- * （`state.subagentError` 供其它函数判断"当前是不是失败态"）。
+ * 返回 `true` 表示**配置真的读到了**；失败时返回 `false` 且把原因写进
+ * `#subagents-hint`（`state.subagentError` 供其它函数判断"当前是不是失败态"）。
+ * ⚠️ 与 adapters 的 loader 同款：**自己吞错误、写进提示区、返回 false，不抛**。
  */
 export async function loadSubagents() {
   const hint = $("subagents-hint");
+  // 重新读取后，上一次的连通性结论不再成立（它可能是针对旧参数的）
+  state.subagentTest = null;
   try {
     const d = await apiData("GET", "/api/v1/subagents");
-    state.subagentConfig = (d && d.config) || {};
-    state.subagentBackendTypes = (d && Array.isArray(d.backend_types)) ? d.backend_types : [];
+    const cfg = requireConfig(d);
+    // 目录优先用列表接口带回来的那份；没带就问目录接口（两条路都不猜）
+    const types = Array.isArray(d.backend_types)
+      ? d.backend_types
+      : await fetchBackendTypes();
+
+    state.subagentConfig = cfg;
+    state.subagentBackendTypes = types;
     state.subagentError = "";
     renderSubagentForm();
     renderAgentList();
-    await ensureBackendTypes();
     renderBackendFields();
-    toast(hint, "");
+
+    const count = agentsOf(cfg).length;
+    toast(hint, `已读取：${backendLabel(cfg.backend)} · ${count} 个子代理`
+      + (cfg.enabled ? "。" : "（总开关关着，角色不会拿到 transfer_to_* 工具）。"));
     return true;
   } catch (e) {
-    // 🔴 失败要**明确显示失败**，不能白屏、不能把"没读到"显示成"你没配"
+    // 🔴 失败要**明确显示失败**：不白屏、不把"没读到"显示成"你没配"
     state.subagentConfig = null;
+    state.subagentBackendTypes = null;
+    state.subagentFormFields = [];
     state.subagentError = subagentErrorText(e);
     renderSubagentForm();
     renderAgentList();
-    toast(hint, `读取子代理配置失败：${state.subagentError}`, true);
+    renderBackendFields();
+    toast(hint, `读取子代理配置失败：${state.subagentError}。`
+      + "现在**不能保存**（保存会把没读到的配置覆盖成空），修好后点「重新读取」。", true);
     return false;
   }
 }
 
-/** 确保 `state.subagentBackendTypes` 有数据。 */
-export async function ensureBackendTypes() {
-  if (Array.isArray(state.subagentBackendTypes) && state.subagentBackendTypes.length) return true;
-  try {
-    const d = await apiData("GET", "/api/v1/subagents/backends");
-    state.subagentBackendTypes = (d && Array.isArray(d.types)) ? d.types : [];
-    return true;
-  } catch (e) {
-    toast($("subagents-hint"), `读取后端目录失败：${subagentErrorText(e)}`, true);
-    return false;
-  }
+/** 「重新读取」按钮：失败原因已经由 `loadSubagents` 落到提示区，这里只负责重试。 */
+export function reloadSubagents() {
+  return loadSubagents();
 }
 
-/** 某个后端的元数据；找不到返回 null。 */
+/* ---------------- 目录 / 后端元数据 ---------------- */
+
+/** 某个后端的元数据（`{id,label,description,fields}`）；找不到返回 null。 */
 export function backendMeta(id) {
-  const list = state.subagentBackendTypes || [];
+  const list = state.subagentBackendTypes;
+  if (!Array.isArray(list)) return null;
   return list.find((t) => t && t.id === id) || null;
 }
 
-/* ---------------- 渲染：总开关 / 后端 / 状态 ---------------- */
-
-/** 当前配置的"三态"（**不许合并成一个布尔**）。
- *
- * 未配置 / 已配置但未生效 / 已连通 —— 三件事的修法完全不同，
- * 合成一个"已启用"会让用户对着绿色发呆（照 adapters 的纪律）。
- */
-export function subagentStateView() {
-  const cfg = state.subagentConfig || {};
-  if (state.subagentConfig === null) return { key: "unknown", label: "读取中…", tone: "muted" };
-  if (state.subagentError) return { key: "error", label: "读取失败", tone: "bad" };
-  if (!cfg.enabled) return { key: "off", label: "未启用", tone: "muted" };
-  if (!cfg.backend || cfg.backend === "null") {
-    return { key: "no-backend", label: "已启用，但没选后端", tone: "warn" };
-  }
-  if (!cfg.endpoint) return { key: "no-endpoint", label: "已启用，但没填地址", tone: "warn" };
-  return { key: "configured", label: "已配置", tone: "ok" };
+/** 后端 id → 给人看的名字（读不到目录时退回 id 本身）。 */
+export function backendLabel(id) {
+  const meta = backendMeta(id);
+  if (meta) return meta.label || meta.id;
+  return id ? String(id) : "（还没选 agent 平台）";
 }
 
-export function renderSubagentForm() {
+/** 当前后端的 `fields[]`（**渲染与校验的唯一来源**）。 */
+export function currentBackendFields() {
   const cfg = state.subagentConfig || {};
+  const meta = backendMeta(cfg.backend || BACKEND_NONE);
+  return meta && Array.isArray(meta.fields) ? meta.fields : [];
+}
+
+/* ---------------- 配置完整性（**从 fields[] 推，不写字段名**） ---------------- */
+
+/** 这个字段算不算"已经配好了"。
+ *
+ * 🔴 secret 字段**不能**靠"值非空"判断：后端给的是打码值还是空串取决于它配没配，
+ *    而更权威的信号是后端同时给出的 `<key>_configured` 布尔（如 `token_configured`）。
+ *    这里按"有这个布尔就用它"的通用规则推，**不枚举字段名**（枚举就跟纪律 ② 冲突了）。
+ */
+export function fieldSatisfied(cfg, field) {
+  const key = field && field.key;
+  if (!key) return true;
+  if ((field.type || "string") === "secret") {
+    const flag = cfg ? cfg[key + "_configured"] : undefined;
+    if (typeof flag === "boolean") return flag;
+    // 兜底：打码值或真值都算已设置（只有空串 = 没设置）
+    return typeof cfg[key] === "string" && cfg[key] !== "";
+  }
+  const value = cfg ? cfg[key] : undefined;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "string") return value.trim() !== "";
+  return value !== undefined && value !== null;
+}
+
+/** 必填但还空着的字段（空数组 = 配全了）。 */
+export function missingRequiredFields(cfg, fields) {
+  return (fields || []).filter((f) => f && f.required && !fieldSatisfied(cfg, f));
+}
+
+/* ---------------- 状态：三态的唯一判定处 ---------------- */
+
+/** 当前配置 → 界面上的状态描述。
+ *
+ * 返回 `{key, text, tone, detail}`：
+ *   key    ∈ unknown / error / off / unconfigured / incomplete /
+ *            configured（已配置但**还没测**） / unreachable（**已配置但未连通**） /
+ *            connected（**已连通**）
+ *   text   = 给人看的**原文**（判据直接断言这几个字）
+ *   tone   = ok / warn / bad / muted（给 `data-tone`，样式与判据都靠它）
+ *   detail = 徽标的 `title`：为什么是这个状态、下一步该做什么
+ *
+ * ⚠️ "已配置"与"已连通"**必须分开**：配置全了不等于对面收得到活。
+ */
+export function subagentStateView() {
+  const cfg = state.subagentConfig;
+
+  if (cfg === null) {
+    return state.subagentError
+      ? { key: "error", text: "读取失败", tone: "bad", detail: state.subagentError }
+      : { key: "unknown", text: "读取中…", tone: "muted", detail: "正在读取子代理配置。" };
+  }
+  if (!cfg.enabled) {
+    return {
+      key: "off",
+      text: "未启用",
+      tone: "muted",
+      detail: "总开关关着：角色不会拿到 transfer_to_* 工具，任务不会被派出去。",
+    };
+  }
+  if (!cfg.backend || cfg.backend === BACKEND_NONE) {
+    return {
+      key: "unconfigured",
+      text: "未配置",
+      tone: "warn",
+      detail: "还没选 agent 平台 —— 选一个并填好连接参数。",
+    };
+  }
+  const missing = missingRequiredFields(cfg, currentBackendFields());
+  if (missing.length) {
+    return {
+      key: "incomplete",
+      text: "未配置",
+      tone: "warn",
+      detail: `还缺必填项：${missing.map((f) => f.label || f.key).join("、")}。`,
+    };
+  }
+  const tested = state.subagentTest;
+  if (tested && tested.ok) {
+    return {
+      key: "connected",
+      text: "已连通",
+      tone: "ok",
+      detail: "按当前参数测试通过。这个结论只在本次打开有效（参数一改就作废）。",
+    };
+  }
+  if (tested) {
+    return {
+      key: "unreachable",
+      text: "已配置 · 未连通",
+      tone: "bad",
+      detail: tested.reason || "测试没有通过（原因见下面的测试结果）。",
+    };
+  }
+  return {
+    key: "configured",
+    text: "已配置 · 未测试",
+    tone: "muted",
+    detail: "参数配全了，但还没测过能不能连上 —— 点「测试连接」。",
+  };
+}
+
+/** 只重画状态徽标（**不动表单**：重画表单会抢走输入焦点）。 */
+export function renderStatus() {
+  const el = $("subagent-status");
+  if (!el) return;
+  const view = subagentStateView();
+  el.textContent = view.text;
+  el.dataset.tone = view.tone;
+  el.dataset.state = view.key;
+  el.title = view.detail;
+}
+
+/** 总开关联动：只改本地状态 + 徽标，**不发请求**（保存才落盘）。 */
+export function onSubagentEnabledChange() {
+  if (state.subagentConfig === null) return;
+  const el = $("subagent-enabled");
+  state.subagentConfig = { ...state.subagentConfig, enabled: !!(el && el.checked) };
+  renderStatus();
+}
+
+/* ---------------- 渲染：后端下拉 / 字段 ---------------- */
+
+/** 画总开关 + 后端下拉 + 状态徽标（**重进页面 / 保存成功后**调）。 */
+export function renderSubagentForm() {
+  const cfg = state.subagentConfig;
+  const readOnly = cfg === null;
 
   const enabledEl = $("subagent-enabled");
-  if (enabledEl) enabledEl.checked = !!cfg.enabled;
-
-  const statusEl = $("subagent-status");
-  if (statusEl) {
-    const view = subagentStateView();
-    statusEl.textContent = view.label;
-    statusEl.dataset.tone = view.tone;
+  if (enabledEl) {
+    enabledEl.checked = cfg ? !!cfg.enabled : false;
+    enabledEl.disabled = readOnly;
   }
 
-  // 后端下拉：由目录驱动（后端给什么画什么）
   const select = $("subagent-backend");
   if (select) {
-    const current = cfg.backend || "null";
-    const types = state.subagentBackendTypes || [];
-    // 只重建 options，不动 select 本身（保留焦点）
+    const types = Array.isArray(state.subagentBackendTypes) ? state.subagentBackendTypes : [];
+    const want = cfg ? (cfg.backend || BACKEND_NONE) : "";
     select.innerHTML = "";
-    for (const t of types) {
+    if (readOnly) {
+      // 没读到配置时**明确说**，不留一个看着能点的空下拉（选了也写不进任何东西）
       const opt = document.createElement("option");
-      opt.value = t.id;
-      opt.textContent = t.label || t.id;
-      if (t.id === current) opt.selected = true;
+      opt.value = "";
+      opt.textContent = "（配置未读到）";
       select.appendChild(opt);
+    } else {
+      for (const t of types) {
+        const opt = document.createElement("option");
+        opt.value = t.id;
+        opt.textContent = t.label || t.id;
+        if (t.id === want) opt.selected = true;
+        select.appendChild(opt);
+      }
+      // 目录里没有当前值 → **如实显示**，不静默换成别的后端
+      if (!types.some((t) => t.id === want)) {
+        const opt = document.createElement("option");
+        opt.value = want;
+        opt.textContent = `${want || "（空）"}（后端目录里没有这一项）`;
+        opt.selected = true;
+        select.appendChild(opt);
+      }
     }
-    // 目录里没有当前值时**如实显示**（不静默留空 —— 那会让人以为是后端丢了）
-    if (types.length && !types.some((t) => t.id === current)) {
-      const opt = document.createElement("option");
-      opt.value = current;
-      opt.textContent = `${current}（后端目录里没有这一项）`;
-      opt.selected = true;
-      select.appendChild(opt);
-    }
+    select.disabled = readOnly;
+  }
+
+  renderStatus();
+  renderFormLocks();
+}
+
+/** 表单锁：配置没读到就**不许**保存 / 测试 / 加子代理。
+ *
+ * 🔴 不加锁的后果是一次误点把用户的配置覆盖成空（`collectSavePayload` 那时
+ *    只能拿到全空 + `backend:"null"`），而界面还会显示"已保存"。
+ */
+export function renderFormLocks() {
+  const readOnly = state.subagentConfig === null;
+  for (const id of ["subagent-save", "subagent-test", "subagent-add-agent"]) {
+    const el = $(id);
+    if (el) el.disabled = readOnly;
   }
 }
 
@@ -172,49 +364,63 @@ export function renderBackendFields() {
   if (!host) return;
   host.innerHTML = "";
 
-  const cfg = state.subagentConfig || {};
-  const meta = backendMeta(cfg.backend || "null");
-  state.subagentFormFields = (meta && Array.isArray(meta.fields)) ? meta.fields : [];
-
+  const cfg = state.subagentConfig;
   const desc = $("subagent-backend-desc");
-  if (desc) {
-    desc.textContent = meta ? (meta.description || "") : "";
-  }
+  const meta = cfg ? backendMeta(cfg.backend || BACKEND_NONE) : null;
 
-  if (!state.subagentFormFields.length) {
-    // 空态要说清是"这个后端没有可配项"，不是"渲染失败"
-    const empty = document.createElement("p");
-    empty.className = "hint";
-    empty.textContent = meta
-      ? "这个后端没有需要填的连接参数。"
-      : "还没有读到后端目录。";
-    host.appendChild(empty);
+  state.subagentFormFields = [];
+
+  if (cfg === null) {
+    if (desc) desc.textContent = "";
+    host.appendChild(hintLine("配置没读到，先点「重新读取」。"));
     return;
   }
-
-  for (const f of state.subagentFormFields) {
-    host.appendChild(buildBackendField(f, cfg));
+  if (!Array.isArray(state.subagentBackendTypes)) {
+    if (desc) desc.textContent = "";
+    host.appendChild(hintLine("还没读到 agent 平台目录，所以不知道这个平台要填什么。"));
+    return;
   }
+  if (!meta) {
+    if (desc) desc.textContent = "";
+    host.appendChild(hintLine("选中的 agent 平台不在后端目录里 —— 后端可能刚改过，重新读取即可。"));
+    return;
+  }
+  if (desc) desc.textContent = meta.description || "";
+  if (!Array.isArray(meta.fields)) {
+    // 形状不对 → 如实说（不静默画个空表单，那会被当成"这个平台没有配置项"）
+    host.appendChild(hintLine("后端目录里这个平台的 fields 不是数组（后端形状不符）。"));
+    return;
+  }
+  state.subagentFormFields = meta.fields;
+  if (!meta.fields.length) {
+    host.appendChild(hintLine("这个平台没有需要填的连接参数。"));
+    return;
+  }
+  for (const f of meta.fields) host.appendChild(buildBackendField(f, cfg));
 }
 
-/** 画一个字段。`type` 只认 string/int/bool/secret/string_list。 */
+function hintLine(text) {
+  const p = document.createElement("p");
+  p.className = "hint";
+  p.textContent = text;
+  return p;
+}
+
+/** 造一个字段控件（`f.type` 决定画什么）。**结构照 adapters.js 的两列网格**。 */
 export function buildBackendField(f, values) {
   const key = f.key;
   const kind = f.type || "string";
   const id = "subagent-field-" + key;
-  const raw = Object.prototype.hasOwnProperty.call(values, key) ? values[key] : f.default;
+  const hasValue = values && Object.prototype.hasOwnProperty.call(values, key);
+  const raw = hasValue ? values[key] : f.default;
 
-  // 🔴 结构必须照 `.field-labeled` 的两列网格来：
-  //    左列 `.fl-text`（label + hint）、右列直接放控件。
-  //    ⚠️ 少了 `.fl-text` 包裹层，label 和控件会各自独占一格 → 整行错位。
-  //    真浏览器截图抓到过（标签在左、输入框跑到下一行、复选框飘到中间）。
   const wrap = document.createElement("div");
   wrap.className = "field-labeled";
   wrap.dataset.key = key;
   wrap.dataset.fieldType = kind;
 
-  const textWrap = document.createElement("div");
-  textWrap.className = "fl-text";
+  const text = document.createElement("div");
+  text.className = "fl-text";
   const label = document.createElement("label");
   label.htmlFor = id;
   label.textContent = f.label || key;
@@ -224,60 +430,90 @@ export function buildBackendField(f, values) {
     req.textContent = "必填";
     label.appendChild(req);
   }
-  textWrap.appendChild(label);
+  text.appendChild(label);
   if (f.help) {
     const help = document.createElement("span");
     help.className = "hint";
     help.textContent = f.help;
-    textWrap.appendChild(help);
+    text.appendChild(help);
   }
-  wrap.appendChild(textWrap);
+
+  const ctl = document.createElement("div");
+  ctl.className = "fl-ctl";
 
   let el;
   if (kind === "bool") {
+    const box = document.createElement("label");
+    box.className = "adapter-check";
     el = document.createElement("input");
     el.type = "checkbox";
-    el.checked = !!raw;
-  } else if (kind === "string_list") {
-    el = document.createElement("textarea");
-    el.rows = 4;
-    el.value = Array.isArray(raw) ? raw.join("\n") : String(raw == null ? "" : raw);
+    el.checked = raw === undefined ? !!f.default : !!raw;
+    const t = document.createElement("span");
+    t.textContent = el.checked ? "开启" : "关闭";
+    el.addEventListener("change", () => { t.textContent = el.checked ? "开启" : "关闭"; });
+    box.append(el, t);
+    ctl.appendChild(box);
   } else if (kind === "int") {
     el = document.createElement("input");
     el.type = "number";
-    el.value = raw == null ? "" : String(raw);
-    if (f.default != null) el.placeholder = String(f.default);
+    el.step = "1";
+    el.value = raw === undefined || raw === null ? "" : String(raw);
+    if (f.default !== undefined && f.default !== null) el.placeholder = String(f.default);
+    ctl.appendChild(el);
+  } else if (kind === "string_list") {
+    el = document.createElement("textarea");
+    el.rows = 3;
+    el.placeholder = "每行一个值";
+    el.value = Array.isArray(raw) ? raw.join("\n") : (raw === undefined || raw === null ? "" : String(raw));
+    ctl.appendChild(el);
+    ctl.appendChild(hintLine("一行一个值，提交时会按行拆成数组。"));
   } else if (kind === "secret") {
-    el = document.createElement("input");
-    el.type = "password";
-    // ⚠️ 打码值原样放进 value：用户不动它 → 原样回传 → 后端保持原值。
-    //    故意用 password 类型，避免有人从屏幕上抄走。
-    el.value = raw == null ? "" : String(raw);
-    el.autocomplete = "new-password";
-    if (/^•/.test(el.value)) el.placeholder = "留空或保持不动表示不修改";
-  } else {
+    // ⚠️ 用 text 而不是 password：要让人**看得见**打码值（`•` 开头），
+    //    才能判断"它是配过的、我不该动它"（照 adapters.js 的同款决定）。
     el = document.createElement("input");
     el.type = "text";
-    el.value = raw == null ? "" : String(raw);
+    el.autocomplete = "off";
+    el.spellcheck = false;
+    el.value = raw === undefined || raw === null ? "" : String(raw);
+    ctl.appendChild(el);
+    if (isMasked(el.value)) {
+      ctl.appendChild(hintLine(
+        "已设置（这里显示的是打码值）：不动它 = 保持原值；清空 = 删除令牌；"
+        + "换新令牌请先全选清空再填（保留开头的 • 会被当成「没改」）。"
+      ));
+    } else {
+      el.placeholder = "未设置（填了才生效）";
+    }
+  } else {
+    // string 与**未来新增的未知类型**：一律当文本输入，不静默丢字段
+    el = document.createElement("input");
+    el.type = "text";
+    el.value = raw === undefined || raw === null ? "" : String(raw);
     if (f.placeholder) el.placeholder = f.placeholder;
+    ctl.appendChild(el);
+    if (kind !== "string") ctl.appendChild(hintLine(`（未知字段类型 ${kind}，按文本渲染）`));
   }
   el.id = id;
   el.dataset.fieldKey = key;
-  el.dataset.fieldType = kind;
-  wrap.appendChild(el);
+
+  wrap.append(text, ctl);
   return wrap;
 }
 
-/** 收集后端连接表单（只收当前后端 `fields[]` 里声明的字段）。 */
+/* ---------------- 表单 → 请求体 ---------------- */
+
+/** 收集当前后端 `fields[]` 里声明的字段值（**只收渲染过的那些**）。 */
 export function collectBackendForm() {
   const out = {};
   for (const f of state.subagentFormFields || []) {
     const el = $("subagent-field-" + f.key);
     if (!el) continue;
     const kind = f.type || "string";
-    if (kind === "bool") out[f.key] = !!el.checked;
-    else if (kind === "int") {
+    if (kind === "bool") {
+      out[f.key] = !!el.checked;
+    } else if (kind === "int") {
       const raw = String(el.value == null ? "" : el.value).trim();
+      // 空 → 交 "" 给后端（它会回落 default）；非数字 → 原样送，让后端报"必须是整数"
       if (raw === "") out[f.key] = "";
       else {
         const n = Number(raw);
@@ -287,59 +523,105 @@ export function collectBackendForm() {
       out[f.key] = String(el.value == null ? "" : el.value)
         .split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
     } else {
-      // string / secret：**原文提交**（不 trim —— 密钥里可能有前导空格）
+      // string / secret：**原文提交**（不 trim —— 密钥里可能有前导空格；
+      // 打码值必须原样回传，见纪律 ①）
       out[f.key] = el.value == null ? "" : String(el.value);
     }
   }
   return out;
 }
 
-/* ---------------- 渲染：子代理清单 ---------------- */
+/** 组装 `PUT /api/v1/subagents` 的请求体。
+ *
+ * 🔴 拆成独立函数是为了**可判据**：打码值原样回传这件事必须能被测到，
+ *    而不是埋在 `saveSubagents()` 的请求里。
+ * ⚠️ 结构键放在字段 spread **之后**：万一某个平台声明了同名配置字段，
+ *    也不许它覆盖掉 `enabled` / `backend` 这两个本页的语义键。
+ */
+export function collectSavePayload() {
+  const cfg = state.subagentConfig || {};
+  const enabledEl = $("subagent-enabled");
+  const backendEl = $("subagent-backend");
+  return {
+    ...collectBackendForm(),
+    enabled: enabledEl ? !!enabledEl.checked : !!cfg.enabled,
+    backend: backendEl && backendEl.value ? backendEl.value : (cfg.backend || BACKEND_NONE),
+    agents: collectAgentList(),
+  };
+}
 
+/* ---------------- 子代理清单 ---------------- */
+
+/** 清单为空时的那两句话 —— **必须说清是哪一种空**（互不相同）。
+ *
+ * 返回 `{title, text}`：`title` 是粗体的那一行（"是什么状态"），
+ * `text` 是下面的说明（"下一步做什么"）。照 `.empty` 的设计：
+ * 一条好的空态要说三件事，而不是丢一句灰字。
+ */
+export function agentsEmptyView() {
+  if (state.subagentConfig === null) {
+    return state.subagentError
+      ? {
+        title: "读取失败",
+        text: "配置没读到，所以这里也读不到清单（原因见上方提示）。修好后点「重新读取」。",
+      }
+      : { title: "正在读取…", text: "正在读取子代理配置。" };
+  }
+  const cfg = state.subagentConfig;
+  if (!cfg.backend || cfg.backend === BACKEND_NONE) {
+    return {
+      title: "还没选 agent 平台",
+      text: "先在上面选一个平台、填好连接参数，再回来加子代理。",
+    };
+  }
+  return {
+    title: "还没有子代理",
+    text: "点「+ 添加子代理」建一个 —— 建好后角色就能通过 transfer_to_<名字> 把活派给它。",
+  };
+}
+
+/** `transfer_to_<name>` 的工具名（官方 `handoff.py:26` 就是这么拼的）。 */
+export function agentToolName(rawName) {
+  const name = String(rawName == null ? "" : rawName).trim();
+  return `transfer_to_${name}`;
+}
+
+/** 一行工具名预览：让用户**看得懂它怎么被调用**。 */
+export function agentToolPreview(rawName) {
+  const name = String(rawName == null ? "" : rawName).trim();
+  return name
+    ? `角色会看到的工具：${agentToolName(name)}`
+    : "填上名字后，角色会看到一个 transfer_to_<名字> 的工具";
+}
+
+/** 按 `state.subagentConfig.agents` 重画清单（`null` = 还没读到，与"读到 0 个"是两件事）。 */
 export function renderAgentList() {
   const host = $("subagent-agent-list");
   const empty = $("subagent-agents-empty");
+  const emptyTitle = $("subagent-agents-empty-title");
+  const emptyText = $("subagent-agents-empty-text");
   if (!host) return;
+
   host.innerHTML = "";
+  const agents = agentsOf(state.subagentConfig);
 
-  const cfg = state.subagentConfig;
-  if (cfg === null) {
-    if (empty) {
-      empty.classList.remove("hidden");
-      empty.textContent = state.subagentError
-        ? "配置读取失败（原因见上方提示）。"
-        : "正在读取…";
-    }
-    return;
-  }
-
-  const agents = Array.isArray(cfg.agents) ? cfg.agents : [];
   if (!agents.length) {
-    if (empty) {
-      empty.classList.remove("hidden");
-      empty.textContent = "还没有子代理。点「+ 添加子代理」建一个 —— "
-        + "建好后角色就能通过 transfer_to_<名字> 把活派给它。";
-    }
+    if (empty) empty.classList.remove("hidden");
+    // ⚠️ 只改**文字那两个子节点**：`empty.textContent = …` 会把里面的
+    //    `.empty-ico` 一起抹掉（本项目通则：`textContent=` 会清空子节点）。
+    const view = agentsEmptyView();
+    if (emptyTitle) emptyTitle.textContent = view.title;
+    if (emptyText) emptyText.textContent = view.text;
     return;
   }
   if (empty) empty.classList.add("hidden");
-
   agents.forEach((agent, index) => host.appendChild(buildAgentRow(agent, index)));
 }
 
-/** `transfer_to_<name>` 的可读预览。
- *
- * ⚠️ 前缀是官方约定（`handoff.py:26` 拼的就是 `transfer_to_`），换掉会对不上。
- */
-export function agentToolPreview(rawName) {
-  const name = String(rawName == null ? "" : rawName).trim();
-  return `角色会看到工具：transfer_to_${name || "（未命名）"}`;
-}
-
-/** 一行 = 一个子代理的编辑卡。 */
+/** 一张子代理编辑卡。 */
 export function buildAgentRow(agent, index) {
   const card = document.createElement("div");
-  card.className = "subagent-agent-card";
+  card.className = "providers-card subagent-agent-card";
   card.dataset.index = String(index);
 
   const head = document.createElement("div");
@@ -347,23 +629,28 @@ export function buildAgentRow(agent, index) {
 
   const name = document.createElement("input");
   name.type = "text";
+  name.id = `subagent-agent-${index}-name`;
   name.className = "subagent-agent-name";
-  name.placeholder = "子代理名字（英文，如 coder）";
+  name.placeholder = "名字（英文/下划线，如 coder）";
   name.value = agent.name || "";
   name.dataset.field = "name";
+  // `aria-label` 而不是可见的 label：卡片头部是一行紧凑布局，
+  // 多一个文字标签会把名字框挤窄（「启用」「移除」已经被压过，见 CSS 注释）。
+  name.setAttribute("aria-label", "子代理名字");
   head.appendChild(name);
 
   const enabledLabel = document.createElement("label");
   enabledLabel.className = "subagent-agent-enabled";
   const enabled = document.createElement("input");
   enabled.type = "checkbox";
+  enabled.id = `subagent-agent-${index}-enabled`;
   enabled.checked = agent.enabled !== false;
   enabled.dataset.field = "enabled";
+  enabledLabel.htmlFor = enabled.id;
   enabledLabel.appendChild(enabled);
-  // 🔴 文字必须包在 `<span>` 里，**不能直接 `createTextNode`**：
-  //    flex 容器里的裸文本节点是一个匿名 flex item，`white-space: nowrap`
-  //    对它不起作用 —— 实测宽度被压到 26px、文字竖排成两行
-  //    （真浏览器截图 + getBoundingClientRect 双双抓到）。
+  // ⚠️ 文字必须包在 `<span>` 里，**不能直接 createTextNode**：
+  //    flex 容器里的裸文本节点是一个匿名 flex item，`white-space: nowrap` 对它不起作用
+  //    （实测被压成两行，"启用"竖排）。
   const enabledText = document.createElement("span");
   enabledText.textContent = "启用";
   enabledLabel.appendChild(enabledText);
@@ -371,7 +658,7 @@ export function buildAgentRow(agent, index) {
 
   const remove = document.createElement("button");
   remove.type = "button";
-  remove.className = "btn btn-ghost subagent-agent-remove";
+  remove.className = "subagent-agent-remove";
   remove.textContent = "移除";
   remove.dataset.action = "remove-agent";
   remove.dataset.index = String(index);
@@ -379,134 +666,246 @@ export function buildAgentRow(agent, index) {
 
   card.appendChild(head);
 
-  // 🔴 工具名预览：让用户**看得懂它怎么被调用**。
-  //    `transfer_to_` 前缀是官方约定（`handoff.py:26`），换掉会对不上。
+  // 工具名预览：让用户看得懂它怎么被调用；名字一改就跟着变
+  // （没有这条，用户会以为工具名没生效）
   const preview = document.createElement("p");
   preview.className = "hint subagent-agent-preview";
   preview.textContent = agentToolPreview(agent.name);
   card.appendChild(preview);
-  // 🔴 名字一改预览就要跟着变：真浏览器判据抓到过"改了名字预览还是（未命名）"。
-  //    没有这条，用户会以为工具名没生效。
-  name.addEventListener("input", () => {
-    preview.textContent = agentToolPreview(name.value);
-  });
+  name.addEventListener("input", () => { preview.textContent = agentToolPreview(name.value); });
 
-  card.appendChild(buildAgentTextarea(agent, "system_prompt", "子代理的指令（它会按这个身份干活）", 4));
-  card.appendChild(buildAgentTextarea(
-    agent, "public_description",
-    "对外描述（角色看到的一行说明，留空用默认）", 2,
+  card.appendChild(agentTextarea(
+    agent, index, "system_prompt",
+    "指令", "这个子代理按什么身份干活（作为它的 system 提示词）", 5,
   ));
-  card.appendChild(buildAgentTextarea(agent, "tools", "允许它用的工具名（一行一个，可留空）", 3));
+  card.appendChild(agentTextarea(
+    agent, index, "public_description",
+    "对外描述", "角色看到的一行说明；留空 = 用默认描述", 2,
+  ));
+  card.appendChild(agentTextarea(
+    agent, index, "tools",
+    "可用工具", "允许它用的工具名，一行一个；留空 = 不限制（由对面平台决定）", 3,
+  ));
 
-  const providerField = document.createElement("div");
-  providerField.className = "field-labeled";
-  const providerText = document.createElement("div");
-  providerText.className = "fl-text";
-  const providerLabel = document.createElement("label");
-  providerLabel.textContent = "指定模型供应商（可选）";
-  providerText.appendChild(providerLabel);
-  providerField.appendChild(providerText);
   const provider = document.createElement("input");
   provider.type = "text";
-  provider.placeholder = "留空 = 用默认";
+  provider.id = `subagent-agent-${index}-provider`;
+  provider.placeholder = "留空 = 用默认模型";
   provider.value = agent.provider_id || "";
   provider.dataset.field = "provider_id";
-  providerField.appendChild(provider);
-  card.appendChild(providerField);
+  card.appendChild(labeledField("模型供应商", provider, "可选：让这个子代理用指定的模型供应商", provider.id));
 
   return card;
 }
 
-function buildAgentTextarea(agent, key, labelText, rows) {
-  // 结构同 `buildBackendField`：左 `.fl-text`、右控件（见那里的长注释）
+/** 左说明 / 右控件（复用全站的 `.field-labeled` 两列网格）。 */
+function labeledField(labelText, control, helpText, htmlFor) {
   const wrap = document.createElement("div");
   wrap.className = "field-labeled";
-  const textWrap = document.createElement("div");
-  textWrap.className = "fl-text";
+  const text = document.createElement("div");
+  text.className = "fl-text";
   const label = document.createElement("label");
+  if (htmlFor) label.htmlFor = htmlFor;
   label.textContent = labelText;
-  textWrap.appendChild(label);
-  wrap.appendChild(textWrap);
-  const el = document.createElement("textarea");
-  el.rows = rows;
-  el.dataset.field = key;
-  if (key === "tools") {
-    el.value = Array.isArray(agent.tools) ? agent.tools.join("\n") : "";
-  } else {
-    el.value = agent[key] == null ? "" : String(agent[key]);
+  text.appendChild(label);
+  if (helpText) {
+    const h = document.createElement("span");
+    h.className = "hint";
+    h.textContent = helpText;
+    text.appendChild(h);
   }
-  wrap.appendChild(el);
+  const ctl = document.createElement("div");
+  ctl.className = "fl-ctl";
+  ctl.appendChild(control);
+  wrap.append(text, ctl);
   return wrap;
 }
 
-/** 从 DOM 读回子代理清单（**保留用户刚打的字**，不走 state）。 */
+function agentTextarea(agent, index, key, labelText, helpText, rows) {
+  const el = document.createElement("textarea");
+  el.id = `subagent-agent-${index}-${key}`;
+  el.rows = rows;
+  el.dataset.field = key;
+  el.value = key === "tools"
+    ? (Array.isArray(agent.tools) ? agent.tools.join("\n") : "")
+    : (agent[key] == null ? "" : String(agent[key]));
+  return labeledField(labelText, el, helpText, el.id);
+}
+
+/** 从 DOM 读回清单（**保留用户刚打的字**，包括还没保存的）。
+ *
+ * ⚠️ 只 trim `name` / `provider_id`（它们是 id 类，带空白会被当成另一个名字），
+ *    正文类字段**原文返回** —— `strip()` 静默改掉用户原文是本项目记过的一条坑
+ *    （判断空可以 trim，保存必须是原文）。
+ */
 export function collectAgentList() {
   const host = $("subagent-agent-list");
   if (!host) return [];
-  const out = [];
-  for (const card of host.querySelectorAll(".subagent-agent-card")) {
-    const read = (sel) => {
-      const el = card.querySelector(sel);
+  return Array.from(host.querySelectorAll(".subagent-agent-card")).map((card) => {
+    const read = (key) => {
+      const el = card.querySelector(`[data-field="${key}"]`);
       return el ? String(el.value == null ? "" : el.value) : "";
     };
-    const toolsRaw = read('[data-field="tools"]');
     const enabledEl = card.querySelector('[data-field="enabled"]');
-    out.push({
-      name: read('[data-field="name"]').trim(),
-      system_prompt: read('[data-field="system_prompt"]').trim(),
-      public_description: read('[data-field="public_description"]').trim(),
-      tools: toolsRaw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
-      provider_id: read('[data-field="provider_id"]').trim(),
+    return {
+      name: read("name").trim(),
+      system_prompt: read("system_prompt"),
+      public_description: read("public_description"),
+      tools: read("tools").split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
+      provider_id: read("provider_id").trim(),
       enabled: enabledEl ? !!enabledEl.checked : true,
-    });
-  }
-  return out;
+    };
+  });
 }
 
-/* ---------------- 动作 ---------------- */
+/** 把 DOM 里的编辑结果写回 `state`（**增删之前必须先做**，否则会丢用户刚打的字）。 */
+function syncAgentsFromDom() {
+  if (state.subagentConfig === null) return;
+  state.subagentConfig = { ...state.subagentConfig, agents: collectAgentList() };
+}
 
-/** 保存配置。 */
+/** 「+ 添加子代理」：先保住已打的字，再追加一个空白项。 */
+export function addAgent() {
+  if (state.subagentConfig === null) {
+    toast($("subagents-hint"), "配置还没读到，先点「重新读取」再添加。", true);
+    return;
+  }
+  syncAgentsFromDom();
+  const agents = agentsOf(state.subagentConfig).slice();
+  agents.push({
+    name: "", system_prompt: "", public_description: "",
+    tools: [], provider_id: "", enabled: true,
+  });
+  state.subagentConfig = { ...state.subagentConfig, agents };
+  renderAgentList();
+  // 焦点落到新卡片的「名字」上（否则用户还要自己找一遍）
+  const cards = $("subagent-agent-list").querySelectorAll(".subagent-agent-card");
+  const last = cards[cards.length - 1];
+  const input = last && last.querySelector('[data-field="name"]');
+  if (input && input.focus) input.focus();
+}
+
+/** 移除第 `index` 个子代理（只改 DOM/state，**保存才落盘**）。 */
+export function removeAgent(index) {
+  if (state.subagentConfig === null) return;
+  syncAgentsFromDom();
+  const agents = agentsOf(state.subagentConfig).slice();
+  if (!Number.isInteger(index) || index < 0 || index >= agents.length) return;
+  agents.splice(index, 1);
+  state.subagentConfig = { ...state.subagentConfig, agents };
+  renderAgentList();
+}
+
+/* ---------------- 后端切换 / 参数变更 ---------------- */
+
+/** 后端下拉变化 → 只重画字段区（**不重建下拉**，否则会把用户的选择弹回旧值）。 */
+export function onSubagentBackendChange() {
+  const select = $("subagent-backend");
+  if (!select || state.subagentConfig === null) return;
+  const chosen = select.value;
+  state.subagentConfig = { ...state.subagentConfig, backend: chosen };
+  // 换了平台，上一次的测试结论不再成立
+  state.subagentTest = null;
+  clearTestResult();
+  renderBackendFields();
+  renderStatus();
+  if (select.value !== chosen) select.value = chosen;
+}
+
+/** 连接参数被改动 → 之前的测试结论作废（否则徽标会显示一个过期结论）。 */
+export function onSubagentParamsChanged() {
+  if (state.subagentConfig === null) return;
+  if (!state.subagentTest) return;
+  state.subagentTest = null;
+  clearTestResult("参数改过了，之前的测试结论不再有效 —— 请重新测试。");
+  renderStatus();
+}
+
+/** 清空并复位测试结果区（`msg` 为空就是彻底清掉）。 */
+export function clearTestResult(msg) {
+  const hint = $("subagent-test-result");
+  if (!hint) return;
+  hint.textContent = msg || "";
+  hint.dataset.tone = msg ? "muted" : "";
+}
+
+/* ---------------- 写操作：保存 / 测试 ---------------- */
+
+/** 保存配置（**局部更新**：只发改过的结构键 + 当前后端的字段）。 */
 export async function saveSubagents() {
   const hint = $("subagents-hint");
-  const enabledEl = $("subagent-enabled");
-  const backendEl = $("subagent-backend");
-  const payload = {
-    enabled: enabledEl ? !!enabledEl.checked : false,
-    backend: backendEl ? backendEl.value : "null",
-    agents: collectAgentList(),
-    ...collectBackendForm(),
-  };
+  const btn = $("subagent-save");
+  if (state.subagentConfig === null) {
+    // 界面上的按钮已经 disable 了；这里再挡一次（别让人绕过，把配置覆盖成空）
+    toast(hint, "配置还没读到，不能保存（保存会把没读到的配置覆盖成空）。先点「重新读取」。", true);
+    return false;
+  }
+  const payload = collectSavePayload();
+  const oldText = btn ? btn.textContent : "";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "保存中…";
+  }
+  toast(hint, "保存中…");
   try {
     const d = await apiData("PUT", "/api/v1/subagents", payload);
-    if (d && d.config) state.subagentConfig = d.config;
+    const cfg = requireConfig(d);
+    state.subagentConfig = cfg;
     state.subagentError = "";
+    // 配置变了 → 旧测试结论不再成立
+    state.subagentTest = null;
+    clearTestResult();
     renderSubagentForm();
     renderAgentList();
     renderBackendFields();
-    if (d && d.applied === false) {
-      // 🔴 后端明确说了"没生效" —— 必须原样告诉用户，不能只弹"保存成功"
-      toast(hint, `已保存，但**尚未生效**：${d.reason || "原因未知"}`, true);
+
+    if (d.applied === false) {
+      // 🔴 后端明说"没生效"：必须原样讲出来，不能只报"保存成功"
+      toast(hint, `已保存，但**尚未生效**：${d.reason || "后端没给原因"}`
+        + "。要让改动真的起作用，需要先处理这条原因（例如重启服务）。", true);
     } else {
-      toast(hint, "子代理配置已保存。");
+      const count = agentsOf(cfg).length;
+      toast(hint, `已保存并生效：${backendLabel(cfg.backend)} · ${count} 个子代理`
+        + (cfg.enabled ? "。" : "（总开关关着，工具不会注册）。"));
     }
     return true;
   } catch (e) {
+    // 失败**留在表单里**：用户填的东西不能因为一次报错就没了
     toast(hint, `保存失败：${subagentErrorText(e)}`, true);
     return false;
+  } finally {
+    if (btn) {
+      btn.disabled = state.subagentConfig === null;
+      btn.textContent = oldText;
+    }
   }
 }
 
-/** 连通性测试 —— **读 `data.ok`**，只看 HTTP 状态码会漏掉业务失败。 */
+/** 连通性测试。
+ *
+ * 🔴 **必须读 `data.ok`**：后端把"业务失败"也用 HTTP 200 返回
+ *    （那不是请求格式错误，是"试了，对面不通"）。只看 HTTP 状态码会把
+ *    "连不上"显示成"成功" —— 本项目最贵的那类假成功。
+ * 🔴 成败都**原样显示 reason**，不能只写"测试完成"。
+ */
 export async function testSubagentConnection() {
   const hint = $("subagent-test-result");
+  const btn = $("subagent-test");
+  if (state.subagentConfig === null) {
+    toast($("subagents-hint"), "配置还没读到，先点「重新读取」再测试。", true);
+    return false;
+  }
   const backendEl = $("subagent-backend");
-  // ⚠️ 顺序不能反：`backend` 必须**最后**写，不能被字段里同名键覆盖。
-  //    真浏览器判据抓到过一次：切到 null 后仍报"没有填接口地址"，
-  //    原因是旧后端的字段还留在 payload 里（那时 backend 已被选成 null）。
   const payload = {
     ...collectBackendForm(),
-    backend: backendEl ? backendEl.value : "null",
+    // ⚠️ 结构键最后写：字段里万一同名，也不许覆盖掉真正的后端 id
+    backend: backendEl && backendEl.value ? backendEl.value : BACKEND_NONE,
   };
+  const oldText = btn ? btn.textContent : "";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "测试中…";
+  }
   if (hint) {
     hint.textContent = "正在测试…";
     hint.dataset.tone = "muted";
@@ -514,64 +913,37 @@ export async function testSubagentConnection() {
   try {
     const d = await apiData("POST", "/api/v1/subagents/test", payload);
     const ok = !!(d && d.ok);
-    const reason = (d && d.reason) || (ok ? "连通性正常。" : "连接失败（后端没给原因）。");
+    const reason = (d && d.reason) || (ok ? "连通正常（后端没给细节）。" : "连接失败（后端没给原因）。");
+    const backend = (d && d.backend) || payload.backend;
+    const extra = [];
+    const detail = d && d.detail;
+    if (detail && typeof detail.elapsed_ms === "number" && detail.elapsed_ms > 0) {
+      extra.push(`${Math.round(detail.elapsed_ms)} ms`);
+    }
+    if (detail && detail.preview) extra.push(`对方返回：${String(detail.preview).slice(0, 120)}`);
+    state.subagentTest = { ok, reason };
     if (hint) {
-      hint.textContent = reason;
+      hint.textContent = (ok ? `✅ ${backend} 已连通：` : `❌ ${backend} 连不上：`)
+        + reason
+        + (extra.length ? `（${extra.join("；")}）` : "");
       hint.dataset.tone = ok ? "ok" : "bad";
     }
+    renderStatus();
     return ok;
   } catch (e) {
+    // 请求本身失败（网络/鉴权/形状）—— 同样如实显示，并让徽标落到"未连通"
+    const reason = subagentErrorText(e);
+    state.subagentTest = { ok: false, reason };
     if (hint) {
-      hint.textContent = `测试失败：${subagentErrorText(e)}`;
+      hint.textContent = `❌ 测试请求失败：${reason}`;
       hint.dataset.tone = "bad";
     }
+    renderStatus();
     return false;
+  } finally {
+    if (btn) {
+      btn.disabled = state.subagentConfig === null;
+      btn.textContent = oldText;
+    }
   }
-}
-
-/** 后端下拉变化 → 重画它的字段（不同后端的字段不一样）。 */
-export function onSubagentBackendChange() {
-  const select = $("subagent-backend");
-  if (!select) return;
-  // 🔴 **只更新 state，绝不再调 `renderSubagentForm()`**。
-  //    它会重建 `<option>` 列表，而重建时用 `state.subagentConfig.backend`
-  //    去挑 `selected` —— 一旦 state 与用户刚选的值不同，下拉会**弹回旧值**。
-  //    真浏览器判据抓到过：选 null 后读回仍是 http，于是测试打到错的后端。
-  const chosen = select.value;
-  state.subagentConfig = { ...(state.subagentConfig || {}), backend: chosen };
-  renderBackendFields();
-  // 兜底：渲染完再确认一次，防止任何重建把值改掉
-  if (select.value !== chosen) select.value = chosen;
-  const hint = $("subagent-test-result");
-  if (hint) {
-    hint.textContent = "";
-    hint.dataset.tone = "";
-  }
-}
-
-/** 新增一个空白子代理。 */
-export function addAgent() {
-  if (state.subagentConfig === null) {
-    toast($("subagents-hint"), "配置还没读到，先等一下再添加。", true);
-    return;
-  }
-  const agents = Array.isArray(state.subagentConfig.agents)
-    ? state.subagentConfig.agents.slice() : [];
-  agents.push({
-    name: "", system_prompt: "", public_description: "",
-    tools: [], provider_id: "", enabled: true,
-  });
-  state.subagentConfig = { ...state.subagentConfig, agents };
-  renderAgentList();
-}
-
-/** 移除第 index 个子代理（只改 DOM/state，**保存才落盘**）。 */
-export function removeAgent(index) {
-  if (state.subagentConfig === null) return;
-  const agents = Array.isArray(state.subagentConfig.agents)
-    ? state.subagentConfig.agents.slice() : [];
-  if (index < 0 || index >= agents.length) return;
-  agents.splice(index, 1);
-  state.subagentConfig = { ...state.subagentConfig, agents };
-  renderAgentList();
 }

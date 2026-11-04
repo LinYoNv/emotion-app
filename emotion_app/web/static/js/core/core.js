@@ -99,9 +99,17 @@ export let state = {
   // ⚠️ 初值 `null` = "还没读到"，与 `{}`（读到了但空）语义不同 ——
   //    把两者混起来会让"读取失败"显示成"你没配"，用户会去配一个已经配好的东西。
   subagentConfig: null,
-  subagentBackendTypes: [],
+  // 后端目录（`GET /api/v1/subagents/backends` 的 types）；`null` = 还没读到。
+  // 🔴 与 `subagentConfig` 一样，`null`（没读到）和 `[]`（读到了、后端就是没有）
+  //    必须分开：混成一种，"目录读失败"会被显示成"这个平台没有可配项"。
+  subagentBackendTypes: null,
   //: 当前后端要渲染的 `fields[]`（后端给什么画什么，前端不硬编码）
   subagentFormFields: [],
+  // 🔴 最近一次连通性测试的结论 `{ok, reason}`；`null` = 本次打开还没测过。
+  //    为什么必须单独存：状态徽标要分"已配置但未测试" / "已配置但未连通" / "已连通"
+  //    三态，而这三者**只有这一条信息能区分**（配置本身看不出连不连得上）。
+  //    ⚠️ 它只是**本次打开**的结论：参数一改、重新读取、保存成功都会作废。
+  subagentTest: null,
   subagentError: "",
 
   adapterCreating: false,   // 表单是"新增"态（true）还是"编辑"态（false）
@@ -213,8 +221,14 @@ export const NAV_LOADERS = {
   //    ⚠️ 别在这里顺手把 `state.adapters` 预置成 `[]` —— 那是"读到 0 个"的语义，
   //    而"还没读到/读失败"必须是 `null`（见 state 里的注释）。
   adapters: () => loadAdapters(),
-  // ⚠️ 子代理页的 loader 自己把失败原因写进 `#subagents-hint` 并返回 false（不抛），
-  //    所以这里不需要再包 try（与 adapters 同款）。
+  // ⚠️ 子代理页的 loader **选"自己吞错误"这一种**（不抛）：
+  //    `loadSubagents()` 自己把原因写进 `#subagents-hint`、把 `state.subagentConfig`
+  //    置回 `null`、并返回 `false`，所以这里不需要再包 try（与 adapters 同款）。
+  //    为什么选它而不是抛：本页的**读取失败必须是可见状态**（徽标显示"读取失败" +
+  //    保存/测试按钮一并锁死）。抛出去会被 `applyRoute` 的 `catch {}` 静默吃掉，
+  //    页面停在一张"看起来空"的表单上 —— 用户随手一保存就把配置覆盖成空。
+  //    ⚠️ 也正因为走的是"返回 false"这条路，**别在这里写 `await` 后判定它抛不抛**：
+  //    返回 false 的函数不能当会抛异常的函数用（本项目踩过，见 providers 那段注释）。
   subagents: () => loadSubagents(),
   // ⚠️ 供应商页的 loader 走 `loadProviderSourcesOnce()` 而不是直接调：
   //    `saveProviderSource()` 保存成功后**自己已经 load 过一次**了，
