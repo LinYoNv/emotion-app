@@ -830,6 +830,47 @@ def create_app(
         """
         resp = await send_from_directory(static_dir, filename)
         resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+        # 🔴🔴 **gzip 压缩**（2026-11-04，真机实测的**性能事故**）。
+        #
+        #    现象：手机上打开面板要 **7~10 秒**，期间整页白屏；
+        #          偶发到「加载不出来」（`#cfg-hint` 永远停在「正在读取配置…」）。
+        #
+        #    实测根因：11 个 ES 模块共约 **385KB 未压缩**，
+        #       curl 抓 `core.js` = 47,838 字节、**没有 content-encoding**，
+        #       而且前面没有 nginx/Caddy 帮我们压（服务直接暴露 6191）。
+        #       ⇒ 公网上行慢 + 手机解码/解析 ≈ 秒级，还要串行走完 import 链。
+        #
+        #    这些文件 CRLF 空行多、重复标识符多、gzip 比很高（实测 ~4x）。
+        #    ⚠️ 只压文本类（HTML/JS/CSS/JSON/SVG）—— 图片/woff2 已经是压缩格式，
+        #       再 gzip 纯属浪费 CPU（本项目自用场景，CPU 比带宽省得动）。
+        import gzip as _gzip
+
+        ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+        compressible = (
+            ctype.startswith("text/")
+            or ctype in {
+                "application/javascript",
+                "application/json",
+                "application/xml",
+                "image/svg+xml",
+            }
+        )
+        accepts = "gzip" in (request.headers.get("Accept-Encoding") or "").lower()
+        if compressible and accepts and resp.status_code == 200:
+            # ⚠️ **Quart 的 `get_data()` 是协程**（Flask 里是同步的）——
+            #    不 await 会拿到 coroutine 对象，`len()` 直接 TypeError，
+            #    而且被兜成 500「内部错误」（静态文件全挂）。实测踩到。
+            body = await resp.get_data()
+            # 太小的文件压了反而变大（HTTP 头会多 ~20 字节），不折腾
+            if len(body) >= 1024:
+                packed = _gzip.compress(body, compresslevel=6)
+                if len(packed) < len(body):
+                    resp.set_data(packed)
+                    resp.headers["Content-Encoding"] = "gzip"
+                    resp.headers["Content-Length"] = str(len(packed))
+                    # ⚠️ 必须 `Vary`：否则中间的代理/浏览器会把**压缩版**缓存下来
+                    #    给不支持 gzip 的客户端，得到一堆乱码。
+                    resp.headers["Vary"] = "Accept-Encoding"
         return resp
 
     # ------------------------------------------------------------------

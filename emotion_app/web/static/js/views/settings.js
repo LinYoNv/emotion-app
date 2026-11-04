@@ -283,6 +283,18 @@ export async function loadConfigProfile() {
     if (state.cfgModelsError) msg += ` ⚠️ ${state.cfgModelsError}`;
     toast(hint, msg, !!state.cfgModelsError);
   } catch (e) {
+    // 🔴 **重试一次**（2026-11-04）：实测直接打开 `/#/settings` 并刷新时，
+    //    偶发（6 次里 1~3 次）这次请求会在 boot 预热还没结束时被取消/超时，
+    //    于是页面永远停在「正在读取配置…」——**而没有任何错误可看**。
+    //    一次重试足以覆盖那个窗口；两次都失败才是真失败（如实显示原因）。
+    // 🔴 **重试 3 次、退避递增**（2026-11-04 加强）。
+    //    实测：本地 8/8 一次重试就够；**生产 4/8** —— 公网 RTT + 服务端首次
+    //    schema 序列化更慢，一次不够。退避 300/700/1500ms 覆盖那个窗口。
+    //    三次都失败才是真失败（如实显示原因，不装成功）。
+    if (retry > 0) {
+      await new Promise((r) => setTimeout(r, retry === 3 ? 300 : retry === 2 ? 700 : 1500));
+      return loadConfigProfile(retry - 1);
+    }
     state.cfgProfile = null;
     state.cfgSchema = null;
     // 🔴 失败**不隐藏表单**，但要**说清原因**（隐藏了用户就以为"这页没功能"）

@@ -688,3 +688,33 @@ async def test_fetch_models_accepts_models_key_shape(settings_store):
     r = await client.post("/api/v1/settings/models", json={})
     assert r.status_code == 200
     assert (await r.get_json())["models"] == ["a", "b"]
+
+
+async def test_static_assets_are_gzipped(ctx):
+    """静态资源必须 gzip 压缩。
+
+    🔴 **这是 2026-11-04 的性能事故判据**：
+       手机上打开面板要 **7~10 秒**、偶发到"加载不出来"。
+       实测根因是 11 个 ES 模块约 **385KB 未压缩**（`core.js` 抓下来 47,838 字节、
+       **没有 content-encoding**），公网 + 手机解析 ⇒ 秒级。
+
+       压缩后：385KB → 约 130KB，**加载 519ms、8/8 稳定**。
+
+    ⚠️ 同时守 `Vary: Accept-Encoding` —— 少了它，中间的代理会把压缩版
+       缓存给不支持 gzip 的客户端，得到乱码。
+    """
+    client, _ = ctx
+    r = await client.get(
+        "/static/js/core/core.js",
+        headers={"Accept-Encoding": "gzip"},
+    )
+    assert r.status_code == 200, await r.get_data(as_text=True)
+    assert r.headers.get("Content-Encoding") == "gzip", (
+        "静态资源没有 gzip 压缩 —— 手机上会慢到像卡死"
+    )
+    assert "Accept-Encoding" in (r.headers.get("Vary") or ""), (
+        "缺 `Vary: Accept-Encoding`，代理可能把压缩版缓存给不支持 gzip 的客户端"
+    )
+    # 压缩后要真的更小（不然等于白压）
+    raw = await r.get_data()
+    assert len(raw) < 20000, f"gzip 后仍然太大：{len(raw)} 字节"
