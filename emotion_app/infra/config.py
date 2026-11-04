@@ -128,7 +128,13 @@ class UpstreamConfig:
     base_url: str = "https://api.syuan.org/v1"
     api_key: str = ""
     model: str = "gemini-3.1-flash-lite"
-    timeout_seconds: float = 60.0
+    #: 上游请求超时（秒）。
+    #:
+    #: 🔴 **2026-11-04 从 60 提到 120**：情绪把对话模型换成 `cpa/gemini-4-argon-high`
+    #:    （推理模型），60 秒不够 —— 实测 18:05 那次图文消息 ReadTimeout，
+    #:    而同一个会话用 `gemini-3.8-flash-high` 只要 9–14 秒。
+    #:    推理模型的思考时间必须留够，否则"用最强的模型"反而变成"必然超时"。
+    timeout_seconds: float = 120.0
 
     def validate(self) -> None:
         if not self.base_url.startswith(("http://", "https://")):

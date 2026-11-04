@@ -68,11 +68,16 @@ def test_default_values_match_specs():
 
 
 def test_mutable_defaults_are_not_shared():
-    """可变默认值（如回退模型列表）必须**深拷贝** —— 否则改一处污染全局 SPECS。"""
+    """可变默认值（列表型字段）必须**深拷贝** —— 否则改一处污染全局 SPECS。
+
+    ⚠️ 2026-11-04：原来拿 `session.fallback_chat_provider_ids` 当样本，
+       但那个字段被删了（它是全局死字段，见 `config_profile.py` 的注释）。
+       改用 `plugins.inactivated_plugins` —— 现在**唯一**的 list 型字段。
+    """
     a = default_profile()
-    a[SECTION_SESSION]["fallback_chat_provider_ids"].append("x/y")
+    a["plugins"]["inactivated_plugins"].append("x/y")
     b = default_profile()
-    assert b[SECTION_SESSION]["fallback_chat_provider_ids"] == [], (
+    assert b["plugins"]["inactivated_plugins"] == [], (
         "默认值被调用方改坏了 —— SPECS 是全局常量，必须深拷贝"
     )
 
@@ -231,8 +236,11 @@ def test_out_of_range_is_rejected(section, key, value):
         #    （它也是"值必须在一组合法取值里"的同一类校验）。
         (SECTION_SESSION, "default_chat_provider_id", 5),    # 该是字符串
         (SECTION_SESSION, "tts_trigger_probability", "yes"),  # 该是数字
-        (SECTION_SESSION, "fallback_chat_provider_ids", "a/b"),  # 该是数组
-        (SECTION_SESSION, "fallback_chat_provider_ids", [1, 2]),  # 元素不是字符串
+        # ⚠️ 2026-11-04：原这里是 `fallback_chat_provider_ids` 的两条，
+        #    该字段已删（全局死字段）。字符串列表的类型校验改由
+        #    `plugins.inactivated_plugins` 承担（见下方那条）。
+        ("plugins", "inactivated_plugins", "a/b"),        # 该是数组
+        ("plugins", "inactivated_plugins", [1, 2]),       # 元素不是字符串
         (SECTION_SESSION, "default_chat_provider_id", 5),    # 该是字符串
     ],
 )

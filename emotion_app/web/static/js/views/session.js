@@ -223,6 +223,55 @@ export function renderSessionModelField(s) {
     el.dataset.sessionModel = "1";
     el.onchange = () => saveSessionModel(s.id, el.value);
   }
+
+  // 🔴 **回退模型**（2026-11-04 情绪：「你得在配置文件界面设置"回退模型"了」）。
+  //
+  //    语义：主模型**超时/连不上/疑似拒答**时改用它再试一次。
+  //    典型场景：把会话模型换成推理模型（`cpa/gemini-4-argon-high`），
+  //    60 秒不够 ⇒ 直接失败；有回退就能退到快模型，用户至少拿到回复。
+  //
+  //    ⚠️ 为什么放在**会话级**而不是全局：原本有个全局的
+  //       `fallback_chat_provider_ids`，但它**从来没被读取过**（死字段，已删）。
+  //       而且"用哪个模型"本来就是按会话选的，回退凭什么全局。
+  host.appendChild(
+    buildConfigField(
+      "session",
+      {
+        key: "fallback_model",
+        label: "回退模型（可选）",
+        type: "provider_select",
+        provider_type: "chat_completion",
+        hint:
+          "主模型超时、连不上或疑似拒答时改用它重试。" +
+          "留空 = 不回退（此时失败会**如实报错**，不会偷偷换成别的模型）。",
+      },
+      s.fallback_model || "",
+    ),
+  );
+  const fallbackEl = host.querySelectorAll("select")[1];
+  if (fallbackEl) {
+    fallbackEl.dataset.sessionFallbackModel = "1";
+    fallbackEl.onchange = () => saveSessionFallbackModel(s.id, fallbackEl.value);
+  }
+}
+
+/** 保存"这条会话的回退模型"（同样是选了就立刻存）。 */
+export async function saveSessionFallbackModel(sessionId, modelId) {
+  const hint = $("cfg-session-model-hint") || $("cfg-session-hint");
+  try {
+    await api("PATCH", `/api/v1/sessions/${sessionId}`, { fallback_model: modelId || "" });
+    const s = state.sessions.find((x) => x.id === sessionId);
+    if (s) s.fallback_model = modelId || "";
+    if (state.currentSession && state.currentSession.id === sessionId) {
+      state.currentSession.fallback_model = modelId || "";
+    }
+    showHint(
+      hint,
+      modelId ? `已保存：主模型失败时回退到 ${modelId}` : "已清空：不回退（失败就如实报错）",
+    );
+  } catch (e) {
+    showHint(hint, "保存回退模型失败：" + e.message, true);
+  }
 }
 
 /** 保存"这条会话用哪个模型"（选了就立刻存，不需要再点保存）。

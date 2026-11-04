@@ -40,6 +40,41 @@ log = get_logger(__name__)
 # ===========================================================================
 
 
+def _transport_error_text(exc: Any, timeout: Any) -> str:
+    """把 httpx 的传输层异常翻成**人看得懂**的一句话。
+
+    🔴🔴 **为什么必须有这个函数**（2026-11-04 现场）：
+        `httpx.ReadTimeout` 的 `str()` 是**空字符串** ——
+        于是日志里出现的是 `UpstreamError: 上游连接失败：`（冒号后面啥也没有）。
+        用户只能看到"她不回我"，从日志里也读不出"是超时"。
+        **这正是本项目铁律点名的「错误信息会撒谎 / 静默失败」形态。**
+
+    映射：
+      * `ReadTimeout` / `ConnectTimeout` —— 超时，要告诉用户**几秒**、可以调大；
+      * `ConnectError` —— 连不上（地址/网络/DNS），要告诉用户**检查地址**；
+      * 其它 —— 带上类名，至少不是空白。
+    """
+    import httpx as _httpx
+
+    name = type(exc).__name__
+    try:
+        seconds = f"{float(timeout):.0f}"
+    except (TypeError, ValueError):
+        seconds = "?"
+
+    if isinstance(exc, _httpx.TimeoutException):
+        return (
+            f"上游超时（{seconds} 秒内没有返回）。"
+            "推理模型（如 gemini-4-argon-high）需要更长时间，"
+            "可以在「模型供应商」页把超时调大；也可以换更快的模型。"
+        )
+    if isinstance(exc, _httpx.ConnectError):
+        detail = str(exc) or name
+        return f"连不上上游（请检查接口地址与网络）：{detail}"
+    detail = str(exc) or "（无详细信息）"
+    return f"上游请求失败（{name}）：{detail}"
+
+
 class OpenAIChatBackend:
     """OpenAI 兼容的对话后端。
 
@@ -116,7 +151,7 @@ class OpenAIChatBackend:
         except httpx.HTTPError as exc:
             from .upstream import UpstreamError
 
-            raise UpstreamError(f"上游连接失败：{exc}") from exc
+            raise UpstreamError(_transport_error_text(exc, timeout)) from exc
 
         if resp.status_code >= 400:
             from .upstream import UpstreamError

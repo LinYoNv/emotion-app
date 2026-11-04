@@ -138,11 +138,16 @@ SPECS: dict[str, tuple[FieldSpec, ...]] = {
             hint="留空时使用第一个可用模型。插件与面板都按它选模型。",
             provider_type="chat_completion",
         ),
-        FieldSpec(
-            "fallback_chat_provider_ids", "回退对话模型", "provider_multi", [],
-            hint="主对话模型请求失败时，按顺序切换到这些模型。",
-            provider_type="chat_completion",
-        ),
+        # 🔴 **2026-11-04 删掉了 `fallback_chat_provider_ids`（「回退对话模型」）**。
+        #    它原来是全局字段（这一节是全站共用的默认值），但：
+        #      ① 语义错了 —— 「用哪个模型」本来就是**按会话**选的
+        #         （`Session.model`，见 `chat.py:resolve_target`），
+        #         回退模型凭什么做成全局；
+        #      ② **更糟：它从来没被读取过**。全仓只有这里的定义和 3 条测试引用，
+        #         `chat.py` 一行都没读 ⇒ 用户填了它**完全没有任何效果**，
+        #         而界面显示"已配置"。
+        #    ⇒ 死字段比没有更糟。现在改成会话级 `Session.fallback_model`，
+        #       真正接在 `_chat_with_fallback()` 上（`chat.py`）。
         FieldSpec(
             "tts_enable", "启用文本转语音", "bool", False,
             hint="⚠️ 本轮只保存配置，**暂不出声**（做出声要多做音频链路）。",

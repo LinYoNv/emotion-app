@@ -99,6 +99,17 @@ class Session:
     #:    理由：本项目最贵的 bug 类型是"静默用了别的东西，用户以为生效了"。
     model: str = ""
 
+    #: 🔴 **回退模型**（2026-11-04 情绪要的）。
+    #:
+    #: 语义：主模型**超时/连不上/疑似拒答**时，用它再试一次。
+    #: 典型场景：把对话模型换成推理模型（`cpa/gemini-4-argon-high`）后
+    #: 60 秒超时 —— 回退到一个快的模型，比让用户干等或直接失败好得多。
+    #:
+    #: 取值口径与 `model` 完全相同（`<源id>/<模型名>`）。
+    #: 空串 = 不回退（此时失败就如实报错，**不会**偷偷换成别的模型 ——
+    #: 本项目的铁律：静默用了别的东西比失败更糟）。
+    fallback_model: str = ""
+
     #: 摘要（rolling/semantic 模式用）
     summary: str = ""
 
@@ -134,6 +145,10 @@ class Session:
             "persona_id": self.persona_id,
             "user_id": self.user_id,
             "model": self.model,
+            # 🔴 回退模型必须出现在 to_dict 里：`_session_payload()` 全靠它，
+            #    漏了 ⇒ 前端拿不到值 ⇒ 控件永远显示"未选"，用户以为没存上
+            #    （实测：我第一版就漏了，被验证脚本当场抓到）。
+            "fallback_model": self.fallback_model,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "policy": self.policy.to_dict(),
@@ -163,6 +178,8 @@ class Session:
             user_id=str(d.get("user_id") or ""),
             # ⚠️ 旧数据没有这个字段 → 空串（不是"用了某个默认模型"，就是"没选"）
             model=str(d.get("model") or ""),
+            # ⚠️ 旧数据没有这个字段 → 空串 = 不回退（向后兼容）
+            fallback_model=str(d.get("fallback_model") or ""),
             created_at=float(d.get("created_at", time.time())),
             updated_at=float(d.get("updated_at", time.time())),
             policy=ContextPolicy.from_dict(d.get("policy") or {}),
@@ -511,7 +528,10 @@ class SessionRepository:
             #    所以加字段时**必须同时加到这里** —— 否则前端传了也没用，
             #    而用户看到的是"保存成功"（本项目最忌的静默失败）。
             #    `model` 于 2026-10-09 加入（按会话选模型）。
-            allowed = {"title", "persona_id", "user_id", "summary", "summarized_upto", "model"}
+            #: ⚠️ 加字段必须同改这里，否则前端传了也被**静默忽略**。
+            #: `fallback_model` 于 2026-11-04 加入（主模型超时/拒答时改用它）。
+            allowed = {"title", "persona_id", "user_id", "summary", "summarized_upto",
+                       "model", "fallback_model"}
             for k, v in patch.items():
                 if k == "policy":
                     if not isinstance(v, dict):

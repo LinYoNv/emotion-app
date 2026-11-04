@@ -150,6 +150,34 @@ def _complete_lifecycle(method: Any) -> Any:
     return complete
 
 
+def _retryable_upstream_error(exc: BaseException) -> bool:
+    """这个上游异常**值不值得换模型重试**。
+
+    🔴 判据是"换一个模型有没有可能成功"：
+      * **超时 / 连不上** ⇒ 值。慢的那一个可能是推理模型，快的那个就回得来。
+        （实测：`gemini-4-argon-high` 60 秒超时，`gemini-3.8-flash-high` 9–14 秒。）
+      * **HTTP 400 / 401 / 403** ⇒ 不值。那是请求本身或凭据的问题，
+        换模型只会再错一次，还会把真正的错误原因盖掉
+        （本项目通则：错误信息会撒谎，一个 bug 盖掉另一个 bug 的现场）。
+      * **其它** ⇒ 不值，原样抛。
+    """
+    from .upstream import UpstreamError
+
+    if isinstance(exc, UpstreamError):
+        status = getattr(exc, "status", None)
+        if status is None:
+            # 没有 status = 传输层失败（超时/连不上）⇒ 值
+            return True
+        # 有 status = 上游明确回了错误码 ⇒ 只有 5xx 才值得换模型重试
+        return int(status) >= 500
+    try:
+        import httpx as _httpx
+
+        return isinstance(exc, (_httpx.TimeoutException, _httpx.ConnectError))
+    except ImportError:  # pragma: no cover
+        return False
+
+
 class ChatService:
     """聊天服务。
 
@@ -906,8 +934,21 @@ class ChatService:
                     prepared.execute_tool = authorized_tool
             tool_payload = {"tools": prepared.tools}
 
+        # 🔴 会话上的「回退模型」要并进候选（2026-11-04 情绪要的）。
+        #    来源两处：`req.fallback_models`（调用方显式给的）+ `session.fallback_model`
+        #    （用户在设置页选的）。去重后按「先显式、后会话」排。
+        session_fallback = (
+            str(getattr(session, "fallback_model", "") or "").strip()
+            if session is not None else ""
+        )
+        fallback_candidates = tuple(
+            dict.fromkeys(
+                [m for m in req.fallback_models if m]
+                + ([session_fallback] if session_fallback else [])
+            )
+        )
         result = await self._chat_with_fallback(
-            target, messages, req.fallback_models, body_extra, tool_payload.get("tools"),
+            target, messages, fallback_candidates, body_extra, tool_payload.get("tools"),
             validate_context=prepared.validate_context if prepared is not None else None,
         )
 
@@ -951,18 +992,36 @@ class ChatService:
         )
 
         last: ChatResult | None = None
+        last_error: Exception | None = None
         for idx, model in enumerate(models):
             if validate_context is not None:
                 await validate_context()
-            result = await self._client.chat(
-                messages,
-                model=model,
-                base_url=target.base_url,
-                api_key=target.api_key,
-                timeout=target.timeout,
-                tools=tools,
-                extra=body_extra,
-            )
+            try:
+                result = await self._client.chat(
+                    messages,
+                    model=model,
+                    base_url=target.base_url,
+                    api_key=target.api_key,
+                    timeout=target.timeout,
+                    tools=tools,
+                    extra=body_extra,
+                )
+            except Exception as exc:  # noqa: BLE001 — 要分类决定"能不能重试"
+                # 🔴 **2026-11-04 修的真缺口**：原来超时/连不上**直接抛**，
+                #    配了 `fallback_model` 也不生效 —— 因为下面那段只处理"疑似拒答"。
+                #    实测现场：对话模型换成 `cpa/gemini-4-argon-high`（推理模型），
+                #    图文消息 60 秒 ReadTimeout ⇒ 整轮失败，用户只看到"她不回我"。
+                if idx + 1 < len(models) and _retryable_upstream_error(exc):
+                    last_error = exc
+                    log.warning(
+                        "上游失败，换回退模型重试",
+                        extra={"data": {
+                            "from": model, "to": models[idx + 1],
+                            "error": f"{type(exc).__name__}: {exc}"[:160],
+                        }},
+                    )
+                    continue
+                raise
             if validate_context is not None:
                 await validate_context()
             if not looks_like_refusal(result.content, self._refusal_keywords):
@@ -975,7 +1034,10 @@ class ChatService:
                     extra={"data": {"from": model, "to": models[idx + 1]}},
                 )
 
-        assert last is not None
+        if last is None:
+            # 所有候选都因**异常**失败（不是拒答）⇒ 抛最后一个，别返回 None
+            assert last_error is not None
+            raise last_error
         return last
 
     # ---- 工具循环 ----
