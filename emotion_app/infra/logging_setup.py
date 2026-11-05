@@ -238,6 +238,22 @@ class RingBufferHandler(logging.Handler):
         return list(reversed(items))[: max(1, min(int(limit), self._buf.maxlen or 500))]
 
 
+#: **噪音 logger 白名单**（只压它们的 INFO，不动根级别）。
+#:
+#: 判据：默认 `INFO` 下**每分钟**产出 > 1 行、且内容对排查没用。
+#: ⚠️ 加进来之前先想清楚"降掉它会不会丢真问题" ——
+#:    `aiocqhttp` 的 `received event: message.private.friend` 也在同一句里，
+#:    降级后**看不到消息到达了**。但那个信息我们自己在
+#:    `host/astrbot_host/adapters/onebot.py` 里有更完整的记录（含 umo/会话），
+#:    所以降掉不损失诊断能力。
+_NOISY_LOGGERS: dict[str, int] = {
+    # 每 10 秒一条 heartbeat × 2 个适配器 = 每分钟 12 行，且无信息量
+    "aiocqhttp": logging.WARNING,
+    # httpx 把每个请求都打一条（含上游调用），量大且我们在业务层已记录
+    "httpx": logging.WARNING,
+    "httpcore": logging.WARNING,
+}
+
 #: 全局唯一的缓冲 handler（供 `api_logs` 取用）。未 setup 前为 None。
 _buffer_handler: RingBufferHandler | None = None
 
@@ -265,6 +281,31 @@ def setup_logging(level: str = "INFO", *, json_output: bool = False) -> None:
     root.addHandler(_buffer_handler)
 
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    # 🔴 **噪音 logger 单独降级**（2026-11-05，情绪报「日志一直刷屏」）。
+    #
+    #    现场：面板「服务日志」整屏都是同一句
+    #        INFO aiocqhttp: received event: meta_event.heartbeat
+    #    每 10 秒一条 × 2 个适配器 ⇒ **每分钟 12 行**，把真日志全冲走了。
+    #
+    #    根因（`aiocqhttp/__init__.py:594`，第三方库）：
+    #        event_name = ev.name
+    #        self.logger.info(f'received event: {event_name}')
+    #    它对**每一个**事件都打 INFO，包括心跳这种纯维持连接的噪音。
+    #    而它的 `logger` 就是 `server_app.logger`（名字 `aiocqhttp`），
+    #    自己的 handler 级别是 WARNING，但 **propagate=True** ⇒
+    #    经根 logger（我们设的 INFO）再打一遍，于是满屏。
+    #
+    #    ⚠️ **不能改那个库**（第三方、升级会丢）。也不能把根降到 WARNING ——
+    #       那我们自己所有 INFO 日志都没了。
+    #    ✅ 正解：**只给这个 logger 设级别**，让它自己的 INFO 不被发出。
+    #
+    #    ⚠️ 降级时必须**显式 `propagate = False`**：只设 level 时若它的
+    #       有效级别仍低于根，INFO 还是会经根打出来。两处都要设。
+    for _noisy, _lvl in _NOISY_LOGGERS.items():
+        _lg = logging.getLogger(_noisy)
+        _lg.setLevel(_lvl)
+        _lg.propagate = False
 
     _CONFIGURED = True
 
