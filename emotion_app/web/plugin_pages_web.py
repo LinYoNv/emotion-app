@@ -26,6 +26,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any
 
@@ -157,7 +158,21 @@ def mount_plugin_page_routes(app: Any, service: Any, require_auth: Any) -> None:
         resp = Response(data, mimetype=ctype)
         # 🔴 插件页资源同样**不能长缓存** —— 否则插件升级后用户看到的还是旧页面
         #    （本项目实测事故：面板 CSS 缓存 12h 导致"改完看不见"）。
+        #    ⚠️ 但**可以**用 ETag 走 304：`no-cache` 的确切语义是
+        #       "可以缓存，但每次必须回源校验" —— 没变就 304（几十字节），
+        #       变了才重新下载。这既保证"改了立刻看得见"，又省掉重复传输。
+        #       「陪伴小屋」首屏 7MB，每次重下 vs 304 差距是数量级的。
         resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+        resp.headers["ETag"] = f'"{hashlib.sha1(data).hexdigest()}"'
+        # 🔴 **2026-11-05：插件页资源必须 gzip**。
+        #    用户报「陪伴小屋加载太久」的**直接原因**就是这里没压：
+        #    首屏 71 个文件 7.23MB 原样直出（`bundle.css` 单文件 1,415,808 字节）。
+        #    实测压后 7.23MB → 1.84MB（省 75%）。
+        #    ⚠️ 与面板静态资源**共用同一份实现**（`http_compress.maybe_gzip`），
+        #       不要在这里另写一套 —— 两份必然漂移。
+        from .http_compress import maybe_gzip
+
+        resp = await maybe_gzip(resp)
         return resp
 
     # 🔴 **URL 必须以 `/` 结尾**（实测关键细节）：

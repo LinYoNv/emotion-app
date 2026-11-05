@@ -718,3 +718,108 @@ async def test_static_assets_are_gzipped(ctx):
     # 压缩后要真的更小（不然等于白压）
     raw = await r.get_data()
     assert len(raw) < 20000, f"gzip 后仍然太大：{len(raw)} 字节"
+
+
+# ---------------------------------------------------------------------------
+# 全局 gzip（2026-11-05）—— 修「陪伴小屋加载太久」
+# ---------------------------------------------------------------------------
+
+
+async def test_global_gzip_middleware_is_actually_registered(ctx):
+    """🔴 **全局 gzip 中间件必须真的挂在 app 上，而且真的会压。**
+
+    这是「陪伴小屋加载太久」的**根因判据**：
+      * 首屏 71 个文件 **7.23 MB**，`bundle.css` 单文件 **1,415,808 字节**；
+      * 官方 AstrBot 是 `app.add_middleware(GZipMiddleware, minimum_size=1024)`
+        （`dashboard/api/app.py:99-101`）**全局压** —— 插件作者因此不必自己处理；
+      * **我们缺这一层** ⇒ 那些资源未压缩直出。**这是我们的问题，不是插件的问题。**
+
+    🔴 **为什么这条要发真 HTTP 请求**（2026-11-05 踩到）：
+       我原来的写法是"`should_compress()` 说该压" + "client 侧看不到
+       `Content-Encoding`"，结果**注入掉中间件仍然通过** —— 因为
+       Quart 测试 client 序列化时会重建响应头，`Content-Encoding` 那侧读不到。
+
+       ⇒ 换成**能观测到的物理量**：同一个大文本响应，
+         `Accept-Encoding: gzip` 时的 `Content-Length` 必须**明显小于**
+         不带压缩头时的长度。长度是真的、抄不掉的。
+    """
+    client, _ = ctx
+    from emotion_app.web.http_compress import MIN_BYTES, should_compress
+
+    # ⚠️ **样本必须选"路由自己不压缩"的路径**（2026-11-05 踩到）：
+    #    `/` 和 `/static/*` 在路由里**自己**调了 `_gzip_response`
+    #    ⇒ 拿它们做样本时，注入掉中间件后判据**仍然通过**（假判据）。
+    #    `config-profile` 是纯 `jsonify`，能不能压**只取决于中间件**。
+    plain = await client.get("/api/v1/config-profile")
+    assert plain.status_code == 200, plain.status_code
+    raw_len = len(await plain.get_data())
+    assert raw_len > MIN_BYTES, f"样本太小（{raw_len} 字节），压不压看不出区别"
+
+    gz = await client.get("/api/v1/config-profile", headers={"Accept-Encoding": "gzip"})
+    gz_len = len(await gz.get_data())
+
+    assert gz_len < raw_len * 0.85, (
+        f"全局 gzip 中间件没生效：{raw_len} 字节 → 请求 gzip 后仍有 {gz_len} 字节。"
+        " 插件页那 7MB 首屏会原样直出（这正是『陪伴小屋加载太久』的根因）"
+    )
+
+    # 顺带守住 SSE 的口径（纯函数层，见 test_sse_is_never_compressed）
+    assert not should_compress("text/event-stream", status_code=200, accept_encoding="gzip")
+
+
+async def test_sse_is_never_compressed(ctx):
+    """🔴 **`text/event-stream` 绝对不能被压缩。**
+
+    压缩要攒够数据块才吐 ⇒ 会把流式日志/对话**按帧攒住**，
+    用户看到的是"日志卡住不动"、对话要等很久才出第一个字。
+    而这个 bug **不会报错**，只表现为"变慢" —— 极易被当成网络问题。
+
+    ⚠️ 官方 AstrBot 的 `GZipMiddleware` 也是显式跳过 SSE 的。
+
+    🔴 **为什么直接测纯函数而不是发 HTTP 请求**（2026-11-05 踩到）：
+       Quart 的测试 client 序列化时会**重建响应头** ——
+       我 `set_data(gzip)` 后设的 `Content-Encoding` 在客户端那侧读不到
+       （实测：`content-length` 已是压缩后的 422，`Content-Encoding` 却是 None）。
+       于是「断言 client 侧没有 Content-Encoding」在**注入态下仍然通过**，
+       两个注入反证**都不红 = 假判据**。
+       ⇒ 判断逻辑抽成 `should_compress()` 纯函数，**直接调用它**，
+         不经过任何序列化层，读到什么就是什么。
+    """
+    from emotion_app.web.http_compress import should_compress
+
+    assert not should_compress(
+        "text/event-stream", status_code=200, accept_encoding="gzip"
+    ), "SSE 被判成可压缩 —— 流式响应会卡住，用户看到的是'没反应'"
+
+    # 带 charset 的写法也必须挡住
+    assert not should_compress(
+        "text/event-stream; charset=utf-8", status_code=200, accept_encoding="gzip"
+    ), "`text/event-stream; charset=utf-8` 没被识别成流式"
+
+    # 反证：普通 text 必须能压（否则上面那条恒真、等于没测）
+    assert should_compress(
+        "text/plain", status_code=200, accept_encoding="gzip"
+    ), "普通 text/plain 被判成不可压缩 —— 说明判断逻辑反了"
+
+
+async def test_tiny_responses_are_not_gzipped(ctx):
+    """太小的响应不压（压完可能更大，HTTP 头反而多几十字节）。"""
+    from emotion_app.web.http_compress import MIN_BYTES, maybe_gzip
+    from quart import Response
+
+    tiny = Response("ok", mimetype="application/json")
+    out = await maybe_gzip(tiny, accept_encoding="gzip")
+    assert out.headers.get("Content-Encoding") is None
+    assert MIN_BYTES >= 512, "阈值太小会把一堆小响应压得更大"
+
+
+async def test_binary_assets_are_not_gzipped(ctx):
+    """图片/字体已经是压缩格式，**再 gzip 纯属浪费 CPU**。"""
+    from emotion_app.web.http_compress import maybe_gzip
+    from quart import Response
+
+    for ctype in ("image/png", "image/gif", "font/woff2", "application/zip"):
+        r = Response(b"\x00" * 50000, mimetype=ctype)
+        out = await maybe_gzip(r, accept_encoding="gzip")
+        assert out.headers.get("Content-Encoding") is None, f"{ctype} 不该被 gzip"
+

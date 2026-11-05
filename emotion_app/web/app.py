@@ -36,36 +36,15 @@ SESSION_COOKIE = "emotion_session"
 
 
 async def _gzip_response(resp: Any) -> Any:
-    """同上，异步版（`get_data()` 要 await）。"""
-    import gzip as _gzip
+    """兼容壳 → `emotion_app.web.http_compress.maybe_gzip`。
 
-    ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-    compressible = (
-        ctype.startswith("text/")
-        or ctype in {
-            "application/javascript",
-            "application/json",
-            "application/xml",
-            "image/svg+xml",
-        }
-    )
-    if not compressible or resp.status_code != 200:
-        return resp
-    accepts = "gzip" in (request.headers.get("Accept-Encoding") or "").lower()
-    if not accepts:
-        return resp
-    body = await resp.get_data()
-    if len(body) < 1024:
-        return resp
-    packed = _gzip.compress(body, compresslevel=6)
-    if len(packed) >= len(body):
-        return resp
-    resp.set_data(packed)
-    resp.headers["Content-Encoding"] = "gzip"
-    resp.headers["Content-Length"] = str(len(packed))
-    resp.headers["Vary"] = "Accept-Encoding"
-    return resp
+    🔴 **2026-11-05 提取成公共模块**：插件拓展页（`plugin_pages_web._serve`）
+       也要压（「陪伴小屋」首屏 7.23MB 未压缩就是加载慢的直接原因），
+       而它够不着这里。**一份实现两处用**，避免"两条路径只改一条"的漂移。
+    """
+    from .http_compress import maybe_gzip
 
+    return await maybe_gzip(resp)
 
 def create_app(
     config: Config,
@@ -803,6 +782,53 @@ def create_app(
                 "Connection": "keep-alive",
             },
         )
+
+    # ------------------------------------------------------------------
+    # 全局 gzip（**与官方 AstrBot 同一个层次**）
+    # ------------------------------------------------------------------
+    #
+    # 🔴 **2026-11-05：用户报「陪伴小屋加载太久」的根因就是缺这一层。**
+    #
+    #    实读官方 AstrBot `astrbot/dashboard/api/app.py:99-101`：
+    #        app.add_middleware(GZipMiddleware, minimum_size=1024)
+    #    注释原文：「Compress JS/CSS and other sizable responses」。
+    #    ⇒ 官方是**全局**压缩，所以插件作者不必自己处理；我们宿主没这层，
+    #      那些资源就一直是未压缩直出。
+    #
+    #    实测代价：「陪伴小屋」首屏 71 个文件 **7.23 MB**，
+    #    `bundle.css` 单文件 **1,415,808 字节**、`curl -sI` 没有任何
+    #    `content-encoding`。压后 **7.23 MB → 1.84 MB（省 75%）**，
+    #    `bundle.css` → 243,513 字节（-83%）。
+    #
+    #    ⚠️ **这是我们的问题，不是插件的问题** —— 插件在真 AstrBot 上很快，
+    #       在我们这里慢，差别就在这一行中间件。所以**不提 PR**。
+    #
+    #    ⚠️ 用 `after_request` 而不是逐个路由挂：我们已经有 `/static/*`、
+    #       插件页、以及十几个 API 各自是**手写压缩/没压缩**（`app.py` 里那个
+    #       `_gzip_response` 只覆盖了 `/` 和 `/static/*`）。**逐路由做必然漏**，
+    #       而漏掉的地方不会报错 —— 只是慢。**一个全局出口才是根因修法。**
+    #
+    # 🔴 **`text/event-stream` 绝对不能压**：压缩要攒够数据块才吐，
+    #    会把流式日志**按帧攒住**（用户看到的是"日志卡住不动"）。
+    #    官方 `GZipMiddleware` 也是显式跳过 SSE 的（其注释写明了这一点）。
+    @app.after_request
+    async def _gzip_all_text_responses(response: Any) -> Any:  # type: ignore[no-untyped-def]
+        # 已经压过的不二次压（上游/内层已处理）
+        if response.headers.get("Content-Encoding"):
+            return response
+        from .http_compress import maybe_gzip, should_compress
+
+        # 🔴 **判断逻辑全部在 `should_compress` 这个纯函数里**，
+        #    这里只负责取参数 + 调用。理由见那个函数的 docstring：
+        #    写在这个闭包里的话**测试拿不到**，只能靠 HTTP 客户端断言，
+        #    而测试 client 会重建响应头 ⇒ 判据失效（注入反证不红）。
+        if not should_compress(
+            response.headers.get("Content-Type", ""),
+            status_code=response.status_code,
+            accept_encoding=request.headers.get("Accept-Encoding"),
+        ):
+            return response
+        return await maybe_gzip(response, accept_encoding=request.headers.get("Accept-Encoding"))
 
     # ------------------------------------------------------------------
     # 统一错误处理：**不泄漏内部细节**
