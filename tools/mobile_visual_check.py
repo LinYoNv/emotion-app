@@ -159,7 +159,12 @@ _PROBE = r"""
     }
 
     // ③ 触控目标
-    if (r.height < 40 && el.tagName !== 'A') {
+    //
+    // 🔴 **checkbox / radio 不参与**（2026-11-05）：它们的原生尺寸就是 16×16，
+    //    是**标准做法**，不是缺陷。第一版没排除，生产插件页一次报了 6 个假警报。
+    //    ⚠️ 真正该看的是**点击区域**（`<label>` 包住它），不是控件本身。
+    const isToggle = el.matches('input[type="checkbox"], input[type="radio"]');
+    if (r.height < 40 && el.tagName !== 'A' && !isToggle) {
       smallTouch.push({ label, tag: el.tagName, h: Math.round(r.height) });
     }
 
