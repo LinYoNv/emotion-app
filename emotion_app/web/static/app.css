@@ -903,7 +903,17 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 
   /* 表单控件够大够好点 */
   button { min-height: 40px; padding: 8px 12px; }
-  input, textarea, select {
+  input, textarea, select,
+  /* 🔴 **必须带到 `.cfg-field` 里的控件**（2026-11-05 实测踩到）：
+     `.cfg-field input/select` 那条规则写的是 `font-size: inherit`，
+     而它的父级是 13px ⇒ 把我这里的 16px **盖掉了**。
+     表现：设置页所有下拉/输入框在手机上仍是 13px，
+     用户一点输入框，**iOS 自动放大整页**（且不会自己缩回来）。
+     浏览器实测：`computed: 13px`，命中规则是 `input, textarea, select { font-size: inherit }`。
+     ⇒ 用同等或更高的具体度覆盖它。 */
+  .cfg-field input, .cfg-field select, .cfg-field textarea,
+  .cfg-provider-multi select, .cfg-pm-picker,
+  #cfg-profile-picker {
     /* ⚠️ iOS：<16px 会在聚焦时自动放大整个页面 */
     font-size: 16px;
     padding: var(--sp-2);
@@ -2540,5 +2550,31 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   gap: 8px;
   align-items: center;
 }
+/* 🔴 **移动端字号要在这里也写一遍**：手机那条 `@media` 在本文件**上面**
+ *    （约 900 行），而这条规则在 2553 行 —— **后写的赢**，
+ *    于是 picker 又回到继承来的 13px，iOS 一聚焦就放大整页。
+ *    实测：移动端自查报 `（不指定）... SELECT fs:13`。
+ *    ⚠️ 新加的控件只要在 `@media` **之后**，就要自己管字号 —— 这是本文件的结构性坑。 */
 .cfg-pm-picker { flex: 1 1 auto; min-width: 0; }
+
+@media (max-width: 640px) {
+  /* 🔴 **兜底：配置区里所有表单控件一律 16px**（2026-11-05）。
+   *
+   * 为什么用这么宽的选择器：实测这些小控件的 `computed: 13px` 而
+   * **`rules: []`** —— 没有任何一条规则命中它们，13px 是**继承**来的
+   * （`.cfg-field` 那段 `font-size: inherit` 的父级是 13px）。
+   * 于是"给某个类补 16px"永远补不全：`cfg-provider-select` /
+   * `cfg-field` / `cfg-pm-picker` …… 新控件一加就漏一个，
+   * 而 iOS 只要遇到 <16px 的输入框就会**聚焦时放大整页**（不自己缩回）。
+   *
+   * ⇒ 在移动端对**这一整片区域**兜底，而不是逐个类名追。
+   *   作用域限定在设置页与配置卡片内，不影响全局排版。
+   */
+  #tab-settings input, #tab-settings select, #tab-settings textarea,
+  .cfg-section input, .cfg-section select, .cfg-section textarea,
+  .cfg-field input, .cfg-field select, .cfg-field textarea,
+  .cfg-provider-select select, .cfg-pm-picker, .cfg-provider-multi select {
+    font-size: 16px;
+  }
+}
 .cfg-pm-add .primary { flex: 0 0 auto; }

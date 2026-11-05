@@ -224,6 +224,7 @@ EMOTION_IMAGE_DISPATCH=text_tag        # 退路：文本标签（更宽容，但
 ```bash
 TOKEN=$(grep '^EMOTION_AUTH_ACCESS_TOKEN=' .env | cut -d= -f2- | tr -d "'")
 
+.venv/bin/python tools/mobile_visual_check.py http://127.0.0.1:6191 "$TOKEN"   # ★ 手机视觉自查
 .venv/bin/python tools/mobile_sidebar_check.py http://127.0.0.1:6191/ "$TOKEN"  # 手机侧边栏
 .venv/bin/python tools/session_umo_hint_check.py …                            # umo 提示
 .venv/bin/python tools/plugin_detail_check.py …                               # 插件详情页
@@ -231,6 +232,30 @@ TOKEN=$(grep '^EMOTION_AUTH_ACCESS_TOKEN=' .env | cut -d= -f2- | tr -d "'")
 .venv/bin/python tools/login_check.py …                                       # 登录闸门 6 项
 ```
 （都是真 headless Chrome + CDP **真点击**，`.click()` 会掩盖遮挡类 bug。）
+
+#### 🔴 改前端必须做的两件事（情绪 2026-11-05 定）
+
+> 原话：「pc端的chrome没有问题，移动端有。以后你加个验证方式，你自己在本机浏览器看。」
+
+**① 改任何前端（HTML/CSS/JS）后，必须跑 `mobile_visual_check.py` 并看截图。**
+
+**② 桌面通过 ≠ 完成。** 必须在 **390×844 @3x、`mobile=True`** 的视口下再看一遍。
+
+为什么这条要写死（都是实测踩到的）：
+
+| 踩到的事 | 为什么桌面看不出来 |
+|---|---|
+| 设置页输入框 13px | 桌面 13px 很正常；**手机上 iOS 一聚焦就放大整页**且不缩回 |
+| 元素被 `overflow:hidden` 祖先裁掉 | `getBoundingClientRect()` 返回**未裁切**的完整盒子，DOM 越界检查**永远绿** |
+| 文案写「左边点一个人设」 | 手机没有"左边"，但桌面确实是左右分栏 |
+
+`mobile_visual_check.py` 的关键判据是 **`clipOf()`**：
+把元素 rect 与**所有 overflow 祖先的可视区求交**，得到用户真正看得见的那块。
+这是它和 `mobile_check.py`（只查 `scrollWidth`）的分水岭。
+
+⚠️ **截图是必须人看的一步**：脚本里的判据只是"我认为该有问题的地方"，
+   真正的 bug 往往出现在我没想到的地方 —— 所以它每次都会存图到 `/tmp/mobile_visual/`，
+   **交付前自己打开看**。
 
 ---
 
