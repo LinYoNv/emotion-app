@@ -2455,6 +2455,20 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   padding: 3px 6px;
 }
 
+/* 🔴 **移动端必须抬到 16px**：iOS 遇到 <16px 的 select 会**聚焦时放大整页**。
+ *    ⚠️ 又踩了同一个结构性坑：这条规则在手机 `@media`（约 900 行）**之后**，
+ *       后写者赢 ⇒ 纸面上的 16px 会被这里盖掉。
+ *    生产自查实测：会话页这个下拉 12.5px（`tools/mobile_visual_check.py` 抓到）。
+ */
+@media (max-width: 640px) {
+  .sess-profile-select {
+    font-size: 16px;
+    padding: 6px 8px;
+    /* ⚠️ 实测 37px —— 差 3px 就到 40px 的触控下限（Apple HIG 44px 放宽到 40） */
+    min-height: 40px;
+  }
+}
+
 /* ---------------- 有序多选（回退对话模型）（2026-11-04）----------------
  *
  * 🔴 情绪：「回退模型你咋不加下拉框嘞，ui也还用着默认的丑死了你看看 astrbot。
@@ -2578,3 +2592,54 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   }
 }
 .cfg-pm-add .primary { flex: 0 0 auto; }
+
+/* ==========================================================================
+ * 🔴 **移动端表单控件兜底**（2026-11-05，同一天踩了三次之后的终极修法）
+ *
+ * 问题结构（本文件的固有坑）：
+ *   手机那条 `@media (max-width: 640px)` 在**约 900 行**，
+ *   而后续不断有新规则写在 **1200~2500 行**（`.plugin-proxy-input`、
+ *   `.sess-profile-select`、`.cfg-pm-picker` …），
+ *   **CSS 后写者赢** ⇒ 纸上写了 16px 也会被它们盖掉。
+ *
+ * 后果（每一条都是生产自查抓到的真问题）：
+ *   * 输入框 12.5px / 13px → **iOS 聚焦自动放大整页**，且不缩回
+ *   * 下拉 37px 高 → 触控目标小于 40px 下限，不好点
+ *
+ * 所以把兜底放在**文件最末尾**，用 `!important` 明确它是最终裁决，
+ * 不再靠"谁的规则在下面"这种脆弱顺序。
+ *
+ * ⚠️ 作用域严格限制：只碰**表单控件**，且只在手机宽度。
+ *    不碰任何布局/颜色/间距 —— 避免这条兜底变成新的不可控来源。
+ * ========================================================================== */
+@media (max-width: 640px) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"]),
+  select,
+  textarea {
+    font-size: 16px !important;   /* iOS 聚焦不放大 */
+    min-height: 40px;             /* 触控下限（Apple HIG 44 放宽到 40） */
+  }
+  /* select 的 min-height 在部分浏览器上被行高吃掉，再钉一次 */
+  select { height: auto; min-height: 40px; }
+
+  /* ======================================================================
+   * 🔴 **会话行在手机上必须折行**（2026-11-05，看截图才发现的）
+   *
+   * 桌面是「标题/元信息 | 配置下拉 | 删除」横排一行。手机上 370px 分给三块后：
+   *      .sess-main 只剩 **82px**
+   * 而那 82px 里要塞 `"0 条 · recent_only · cpa/gemini-4-argon-high"`，
+   * 结果元信息被挤成 **70px 高的竖排**（每行两三个字），非常难读。
+   *
+   * ⚠️ 这个 bug **所有自动判据都没报**（无溢出、无裁切、字号够、触控够）——
+   *    是"按规范打开截图看一眼"才发现的。**这正是截图那一步存在的理由。**
+   *
+   * 修法：`sess-main` 独占整行，配置与删除放到第二行右对齐。
+   * ====================================================================== */
+  .session-grid li {
+    flex-wrap: wrap;
+    row-gap: 8px;
+  }
+  .session-grid .sess-main { flex: 1 1 100%; }      /* 标题+元信息独占一行 */
+  .session-grid .sess-profile { flex: 1 1 auto; }   /* 配置下拉吃掉剩余宽度 */
+  .session-grid .badge { white-space: normal; }     /* 允许换行，但不再被挤成竖排 */
+}

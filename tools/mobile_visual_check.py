@@ -273,8 +273,11 @@ def main() -> int:
                   f"出界={c.get('outside',0)} 小目标={c.get('smallTouch',0)} "
                   f"小字号={c.get('smallFont',0)}  scrollW={d.get('scrollW')}")
             print(f"        截图 → {res['shot']}")
+            # ⚠️ **每一项都要打印出来**（2026-11-05）：只报数字的话，
+            #    看到"小目标=3"却不知道该改哪儿 —— 等于没报。
             for key, why in (("clipped", "被父容器裁切（用户看不全）"),
                              ("outside", "超出视口"),
+                             ("smallTouch", "触控目标 <40px（不好点）"),
                              ("smallFont", "输入框字号 <16px（iOS 聚焦会放大）")):
                 for item in (d.get(key) or [])[:4]:
                     print(f"        ⚠️ {why}: {item}")
