@@ -160,3 +160,27 @@ def test_profile_model_callers_pass_umo():
     assert 'getattr(session, "native_origin", "")' in src, (
         "没从 native_origin 取 umo —— 传空等于没传"
     )
+
+
+def test_summary_fallback_also_uses_profile_model():
+    """⑧ 「总结」的后台兜底也要按**配置文件的模型**，不能一律用环境默认。
+
+    🔴 现场（2026-11-07）：诊断日志里出现 `profile=''` 的解析 ——
+       追下去是 `resolve_summary_target` 的第 ③ 步兜底写的
+       `self.resolve_target(None)`：**什么都不传** ⇒ 总结永远用环境默认模型，
+       用户在配置里选的模型对它无效。
+
+    ⚠️ 它不发对话请求，所以用户看不到错误回复 —— **更难发现**。
+    """
+    src = CHAT.read_text(encoding="utf-8")
+    # ⚠️ 必须匹配**真实定义**（带缩进的那个），不能只搜名字 ——
+    #    注释里也提到过这个函数名，`find` 会命中注释、切出空窗口（判据恒假红）。
+    i = src.find("    def resolve_summary_target")
+    assert i > 0, "找不到 resolve_summary_target 的真实定义"
+    seg = src[i:i + 3000]
+    assert "_profile_default_model" in seg, (
+        "总结兜底没读配置文件模型 —— 会一律落到环境默认"
+    )
+    assert "resolve_target(None, \"\", \"\", profile_model)" in seg, (
+        "传参形状不对 —— 模型没喂进去"
+    )

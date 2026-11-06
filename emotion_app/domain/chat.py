@@ -696,8 +696,14 @@ class ChatService:
                 "会话对话模型不可用，总结回落到环境默认",
                 extra={"data": {"session_model": session_model}},
             )
-        # ③ 兜底
-        return self.resolve_target(None)
+        # ③ 兜底：仍然**按这条会话的配置文件**取模型
+        #    （2026-11-07 修：原来 `resolve_target(None)` 什么都不传
+        #     ⇒ 总结一律用环境默认，用户在配置里选的模型对它无效）。
+        #    ⚠️ 它是后台任务，解析失败只影响摘要新旧，不该打断聊天 ——
+        #       所以这里不抛，让 `resolve_target` 自己走兜底。
+        umo = str(getattr(session, "native_origin", "") or "")
+        profile_model = self._profile_default_model(session, umo)
+        return self.resolve_target(None, "", "", profile_model)
 
     def model_unavailable_reason(self, session_model: str) -> str:
         """会话选了模型、但它**用不了**时，返回一句**可行动**的原因；能用则返回 `""`。
