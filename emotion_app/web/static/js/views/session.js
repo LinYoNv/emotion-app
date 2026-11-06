@@ -48,14 +48,20 @@ export function renderSessionList() {
 
     const meta = document.createElement("span");
     meta.className = "badge";
-    // 🔴 把「这条会话用哪个模型」显示出来（情绪要的就是"每条会话各自的模型"）。
-    //    ⚠️ 没选时如实说「未选模型」 —— 不能显示成某个具体模型名，
-    //       那会让用户以为已经选好了（而聊天会明确拒绝）。
-    const modelLabel = (s.model || "").trim()
-      ? s.model
-      : "未选模型";
+    // 🔴 显示「这条会话**实际会用**哪个模型」（2026-11-06 改）。
+    //
+    //    原来只读 `s.model`（会话自身字段）—— 但那个字段的界面入口
+    //    在改成「配置文件」那节时已经删掉了，只剩历史残留；
+    //    真正决定模型的是**会话绑的那份配置文件**。
+    //    于是出现「配置里明明有模型，会话行却写未选模型」——
+    //    用户看到的是"没配"，实际早配好了（情绪就是这么问的）。
+    //
+    //    现在优先后端算好的 `effective_model`，拿不到才回落 `s.model`。
+    //    ⚠️ 仍然**不编造**：真没有就说「未选模型」。
+    const shownModel = String(s.effective_model || s.model || "").trim();
+    const modelLabel = shownModel || "未选模型";
     meta.textContent = `${s.message_count} 条 · ${s.policy.mode} · ${modelLabel}`;
-    if (!(s.model || "").trim()) meta.classList.add("no-model");
+    if (!shownModel) meta.classList.add("no-model");
     main.appendChild(meta);
 
     // 未读小标（与消息数那个 badge 并排；只在该会话有未读时出现）

@@ -200,6 +200,41 @@ def build_blueprint(require_auth: Any) -> Blueprint:
                     extra={"data": {"session": d.get("id")}},
                     exc_info=True,
                 )
+        # 🔴 **`effective_model`：这条会话**实际会用**哪个模型**
+        #    （2026-11-06，情绪问「配置里不是有模型了吗，怎么会没选模型」）。
+        #
+        #    真相：会话行原来只显示 `session.model`（会话自身字段）。
+        #    但那个字段的**界面入口已经删掉**（改成「配置文件」那节时）
+        #    ⇒ 用户没有任何办法改它，它却还在生效、还在显示。
+        #    而真正决定模型的是**会话绑的那份配置文件**。
+        #
+        #    ⇒ 后端把结论直接给出，前端不再自己拼：
+        #       配置文件里的 default_chat_provider_id  →  没有才看会话字段
+        #    ⚠️ 取不到时留空（前端会显示"未选模型"），**不编造**。
+        d["effective_model"] = ""
+        try:
+            from quart import current_app
+
+            from emotion_app.domain.config_profile import (
+                PROFILES_DIR,
+                ConfigProfileRegistry,
+            )
+
+            root = current_app.config.get("EMOTION_PROFILES_DIR") or PROFILES_DIR
+            reg = ConfigProfileRegistry(root)
+            pid = reg.resolve_for_umo(umo, str(d.get("config_profile_id") or "")) if umo else reg.resolve("")
+            profile_session = reg.store(pid).load().get("session") or {}
+            from_profile = str(
+                profile_session.get("default_chat_provider_id") or ""
+            ).strip()
+            d["effective_model"] = from_profile or str(d.get("model") or "").strip()
+        except Exception:  # noqa: BLE001
+            # 读配置失败不该让会话列表打不开 —— 如实回落会话字段
+            d["effective_model"] = str(d.get("model") or "").strip()
+            log.warning(
+                "计算 effective_model 失败（回落到会话字段）",
+                extra={"data": {"session": d.get("id")}},
+            )
         return d
 
     # ==================================================================

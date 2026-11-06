@@ -510,11 +510,45 @@ class ChatService:
         values = (profile.get("session") or {}).get("fallback_chat_provider_ids")
         return list(values) if isinstance(values, list) else []
 
+    def _profile_default_model(self, session: Any) -> str:
+        """会话绑定的那份配置文件里的「默认对话模型」。
+
+        🔴 **情绪 2026-11-06 定：模型只看配置文件，不做会话级。**
+           原话：「对啊说了不要会话级，按配置文件来」
+
+        背景：`session.model` 这个字段的界面入口在改成「配置文件」那节时
+        已经被删掉了（`#cfg-session-model-fields` 不存在），
+        只剩历史数据残留 —— 用户**没有任何办法**再改它，
+        却还在实际生效，这就是"看不见却生效"的隐患。
+
+        解析链与 `_profile_fallbacks()` 保持一致：
+        `session.config_profile_id` → 注册表 `resolve()`（空/不存在回落默认）
+        → 那份的 `session.default_chat_provider_id`。
+
+        ⚠️ 注册表未注入（测试/降级）时返回空串 —— 调用方回落到旧行为，
+           **不编造一个模型名**。
+        """
+        registry = self._profiles
+        if registry is None or session is None:
+            return ""
+        try:
+            profile_id = registry.resolve(
+                str(getattr(session, "config_profile_id", "") or "")
+            )
+            profile = registry.store(profile_id).load()
+            value = (profile.get("session") or {}).get("default_chat_provider_id")
+            return str(value).strip() if value else ""
+        except Exception:  # noqa: BLE001
+            # 读配置失败不该让聊天挂掉 —— 如实回落并留痕
+            log.warning("读取配置文件默认模型失败（回落到旧解析链）", exc_info=True)
+            return ""
+
     def resolve_target(
         self,
         persona: Persona | None,
         model_override: str = "",
         session_model: str = "",
+        profile_model: str = "",
     ) -> UpstreamTarget:
         """决定这次调用用哪个 base_url / key / model。
 
@@ -564,6 +598,21 @@ class ChatService:
             # 没被 override 时，模型名也用它
             if not model_override:
                 model = sess_target.model
+
+        # 🔴 **配置文件里的「默认对话模型」**（情绪 2026-11-06：「按配置文件来」）。
+        #
+        #    位置：**低于会话字段、高于 ④运行设置 / ⑤环境变量**。
+        #    为什么在这个高度：
+        #      * 上面的 persona / 请求 override / 会话字段都是**更具体**的显式指定，该压过它；
+        #      * 但它必须压过 ④⑤ —— 否则「两条会话绑了不同配置」里的模型
+        #        会因为落进全局默认而**看起来没生效**（用户看到的就是这个）。
+        #
+        #    ⚠️ 只在"没被更高优先级覆盖"时才用：`model` 到这里还是空串（或仍是 ④⑤ 之前的占位）。
+        if profile_model and not model_override and sess_target is None:
+            prof_target = self.resolve_session_model(profile_model)
+            if prof_target is not None:
+                base_url, api_key = prof_target.base_url, prof_target.api_key
+                model = prof_target.model
 
         return UpstreamTarget(
             base_url=(persona.api_url if persona and persona.api_url else base_url),
@@ -904,7 +953,15 @@ class ChatService:
         #    当场把 32 个既有用例打成 `AttributeError: 'NoneType'`。
         session_model = session.model if session is not None else ""
         self._reject_if_model_unusable(req, session)
-        target = self.resolve_target(req.persona, req.model, session_model)
+        # 🔴 **配置文件里的默认模型**（情绪 2026-11-06：「按配置文件来」）。
+        #    会话字段的界面入口已被删掉（只剩历史残留），
+        #    真正决定模型的是会话绑的那份配置文件。
+        #    ⚠️ `complete()` 与 `stream()` **两处都要传** ——
+        #       只改一处会让流式和非流式走不同模型（极难发现的那种分叉）。
+        profile_model = self._profile_default_model(session)
+        target = self.resolve_target(
+            req.persona, req.model, session_model, profile_model
+        )
 
         messages = self.build_messages(req, history=history, summary=summary)
         # ⭐ P0-4：让插件在**发给模型之前**改提示词（记忆/人设注入靠这个）
@@ -1268,7 +1325,15 @@ class ChatService:
         #    当场把 32 个既有用例打成 `AttributeError: 'NoneType'`。
         session_model = session.model if session is not None else ""
         self._reject_if_model_unusable(req, session)
-        target = self.resolve_target(req.persona, req.model, session_model)
+        # 🔴 **配置文件里的默认模型**（情绪 2026-11-06：「按配置文件来」）。
+        #    会话字段的界面入口已被删掉（只剩历史残留），
+        #    真正决定模型的是会话绑的那份配置文件。
+        #    ⚠️ `complete()` 与 `stream()` **两处都要传** ——
+        #       只改一处会让流式和非流式走不同模型（极难发现的那种分叉）。
+        profile_model = self._profile_default_model(session)
+        target = self.resolve_target(
+            req.persona, req.model, session_model, profile_model
+        )
 
         messages = self.build_messages(req, history=history, summary=summary)
         # ⭐ P0-4：与 `complete()` 同款（**流式也要注入**，否则"流式聊天没有记忆"）

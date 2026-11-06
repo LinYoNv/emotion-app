@@ -21,7 +21,7 @@
 <link rel="preload" href="/static/fonts/geist-latin.woff2" as="font" type="font/woff2" crossorigin />
 <!-- ⚠️ `?v=` 必须与文件末尾 `<script src="js/main.js?v=…">` 的版本号**一起改** ——
      改 CSS 不改版本号 = 用户看不到新样式（本项目 2026-09-26 真事故）。 -->
-<link rel="stylesheet" href="/static/app.css?v=20261106c" />
+<link rel="stylesheet" href="/static/app.css?v=20261106d" />
 </head>
 <body>
 <!--
@@ -1152,6 +1152,6 @@
      ⇒ 改 `js/` 或 `app.css` **必须**同时改这里的版本号，两边一起走。
      ⚠️ 子模块（`js/views/*.js`）**不加** `?v=`：它们由 `main.js` 的静态 `import`
         决定 URL，加不了参数，改了子模块就靠 bump 这里来打破整张模块图的缓存。 -->
-<script type="module" src="/static/js/main.js?v=20261106c"></script>
+<script type="module" src="/static/js/main.js?v=20261106d"></script>
 </body>
 </html>
