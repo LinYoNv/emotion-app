@@ -510,7 +510,7 @@ class ChatService:
         values = (profile.get("session") or {}).get("fallback_chat_provider_ids")
         return list(values) if isinstance(values, list) else []
 
-    def _profile_default_model(self, session: Any) -> str:
+    def _profile_default_model(self, session: Any, umo: str = "") -> str:
         """会话绑定的那份配置文件里的「默认对话模型」。
 
         🔴 **情绪 2026-11-06 定：模型只看配置文件，不做会话级。**
@@ -532,9 +532,22 @@ class ChatService:
         if registry is None or session is None:
             return ""
         try:
-            profile_id = registry.resolve(
-                str(getattr(session, "config_profile_id", "") or "")
-            )
+            # 🔴 **必须走 `resolve_for_umo`，不能走 `resolve`**（2026-11-06 修，真 bug）。
+            #
+            #    `resolve()` 只看 `session.config_profile_id` + 默认那份，
+            #    **完全绕过 umo 路由表**。而会话字段是空的
+            #    （界面入口早就删了，全是 `""`）⇒ **永远回落到 default 配置**，
+            #    default 里模型是空 ⇒ 最终用了别的模型。
+            #
+            #    这正是"配置写的是 argon、实际跑 3.8"的根因：
+            #    同一份配置，`_config_for_umo()`（插件读配置）
+            #    走 `resolve_for_umo` **是对的**，
+            #    而这里走 `resolve` **是错的** —— 两条路径不一致。
+            explicit = str(getattr(session, "config_profile_id", "") or "")
+            if umo:
+                profile_id = registry.resolve_for_umo(umo, explicit)
+            else:
+                profile_id = registry.resolve(explicit)
             profile = registry.store(profile_id).load()
             value = (profile.get("session") or {}).get("default_chat_provider_id")
             return str(value).strip() if value else ""
@@ -614,10 +627,37 @@ class ChatService:
                 base_url, api_key = prof_target.base_url, prof_target.api_key
                 model = prof_target.model
 
+        # 🔴 **诊断日志：把"最终用了哪个模型 + 各档输入"打出来**（2026-11-06）。
+        #
+        #    起因：配置写的是 `cpa/gemini-4-argon-high`，实际调用**时好时坏**
+        #    （23:36 用 argon、23:55 用 3.8），而且**没有任何重试日志** ——
+        #    说明 `target.model` 一开始就是回退那个。
+        #    原来这里一条日志都没有，全靠猜。**静默用了别的模型 = 最贵的那类 bug。**
+        # ⚠️ 先算出**真正的返回值**再记日志 —— 记中间变量会误导
+        #    （`model` 还要被 persona / override 再压一层）
+        final_model = (
+            model_override
+            or (persona.model if persona and persona.model else "")
+            or model
+        )
+        log.info(
+            "模型解析结果",
+            extra={
+                "data": {
+                    "override": model_override or "",
+                    "session": session_model or "",
+                    "profile": profile_model or "",
+                    "persona": (persona.model if persona else "") or "",
+                    "candidate": model,
+                    "FINAL": final_model,
+                }
+            },
+        )
+
         return UpstreamTarget(
             base_url=(persona.api_url if persona and persona.api_url else base_url),
             api_key=(persona.api_key if persona and persona.api_key else api_key),
-            model=model_override or (persona.model if persona and persona.model else "") or model,
+            model=final_model,
             timeout=env.timeout_seconds,
         )
 
@@ -958,7 +998,11 @@ class ChatService:
         #    真正决定模型的是会话绑的那份配置文件。
         #    ⚠️ `complete()` 与 `stream()` **两处都要传** ——
         #       只改一处会让流式和非流式走不同模型（极难发现的那种分叉）。
-        profile_model = self._profile_default_model(session)
+        # 🔴 必须把**真实 umo** 传进去 —— `_profile_default_model` 要靠它走路由表。
+        #    用 `native_origin`（原生会话的完整 umo）；Web 端没有它就是空，
+        #    那时会回落到 `resolve()`（只看会话字段/默认）。
+        _umo = str(getattr(session, "native_origin", "") or "") if session is not None else ""
+        profile_model = self._profile_default_model(session, _umo)
         target = self.resolve_target(
             req.persona, req.model, session_model, profile_model
         )
@@ -1330,7 +1374,11 @@ class ChatService:
         #    真正决定模型的是会话绑的那份配置文件。
         #    ⚠️ `complete()` 与 `stream()` **两处都要传** ——
         #       只改一处会让流式和非流式走不同模型（极难发现的那种分叉）。
-        profile_model = self._profile_default_model(session)
+        # 🔴 必须把**真实 umo** 传进去 —— `_profile_default_model` 要靠它走路由表。
+        #    用 `native_origin`（原生会话的完整 umo）；Web 端没有它就是空，
+        #    那时会回落到 `resolve()`（只看会话字段/默认）。
+        _umo = str(getattr(session, "native_origin", "") or "") if session is not None else ""
+        profile_model = self._profile_default_model(session, _umo)
         target = self.resolve_target(
             req.persona, req.model, session_model, profile_model
         )

@@ -88,8 +88,12 @@ def test_both_paths_pass_profile_model(func):
        用户只会觉得"有时好有时不好"。
     """
     src = CHAT.read_text(encoding="utf-8")
-    assert src.count("profile_model = self._profile_default_model(session)") == 2, (
-        "不是两处都传了 —— 流式与非流式会走不同模型"
+    # ⚠️ 现在调用形式带 umo（`(session, _umo)`）—— 判据要跟着改，
+    #    但不能放宽成"含 profile_model 就算过"（那样删掉一处也查不出来）。
+    n = src.count("self._profile_default_model(session, _umo)")
+    assert n == 2, (
+        f"只有 {n} 处调用（应为 2：complete + stream）—— "
+        "只改一处会让流式与非流式走不同模型"
     )
 
 
@@ -116,4 +120,43 @@ def test_frontend_shows_effective_model():
     )
     assert '"未选模型"' in src or "'未选模型'" in src, (
         "没有「未选模型」的如实说法 —— 可能在编造模型名"
+    )
+
+
+def test_profile_model_uses_umo_routing_not_plain_resolve():
+    """⑥ `_profile_default_model` 必须走 **`resolve_for_umo`**，不能用 `resolve`。
+
+    🔴 **这是"配置写 argon、实际跑 3.8"的根因**（2026-11-06 真 bug）：
+
+        `resolve()`        只看 `session.config_profile_id` + 默认那份，
+                           **完全绕过 umo 路由表**；
+        `resolve_for_umo()` 才按 umo 走路由表。
+
+    而会话字段 `config_profile_id` 的界面入口**早就删了**（全是 `""`）
+    ⇒ 用 `resolve()` 就**永远回落到 default 配置** → 模型是空的
+    → 最终用了别的模型。
+
+    ⚠️ 更要命的是**两条路径不一致**：`_config_for_umo()`（插件读配置）
+       走的是 `resolve_for_umo`（对的），这里走 `resolve`（错的）——
+       同一件事两套逻辑，必然分叉。
+    """
+    src = CHAT.read_text(encoding="utf-8")
+    i = src.find("def _profile_default_model")
+    assert i > 0
+    seg = src[i:i + 2600]
+    assert "resolve_for_umo" in seg, (
+        "_profile_default_model 没用 resolve_for_umo —— "
+        "会绕过 umo 路由表，永远回落到 default 配置"
+    )
+    # 且必须真的在调（不是只在注释里提）
+    assert "registry.resolve_for_umo(" in seg, "只提了名字但没调用"
+
+
+def test_profile_model_callers_pass_umo():
+    """⑦ 两个调用点都必须把 umo 传进去（不传就退化成 resolve）。"""
+    src = CHAT.read_text(encoding="utf-8")
+    n = src.count("self._profile_default_model(session, _umo)")
+    assert n == 2, f"只有 {n} 处传了 umo（应为 2：complete + stream）"
+    assert 'getattr(session, "native_origin", "")' in src, (
+        "没从 native_origin 取 umo —— 传空等于没传"
     )
