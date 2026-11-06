@@ -130,12 +130,23 @@ export function buildProfilePicker(session) {
     sel.appendChild(opt);
     sel.disabled = true;
   } else {
-    const current = String(session.config_profile_id || "");
+    // 🔴 **优先用后端算好的 `effective_profile_id`**（2026-11-06 修）。
+    //
+    //    原来只读 `config_profile_id`（用户显式点名的那个）：
+    //    它是空 ⇒ 就画"默认配置"。**但真正生效的是 umo 路由表** ——
+    //    于是出现「界面显示默认、实际跑的是私聊/糯米」，
+    //    用户以为自己没绑上（情绪就是这么报障的）。
+    //
+    //    解析链三段，后端已经算好最终结论：显式字段 > 路由表 > 默认。
+    //    前端**不再自己猜**，直接用结论；拿不到才回落旧行为。
+    const current = String(
+      session.effective_profile_id || session.config_profile_id || "",
+    );
     for (const p of list) {
       const opt = document.createElement("option");
       opt.value = p.id;
       opt.textContent = p.name + (p.is_default ? "（默认）" : "");
-      // 空 = 用默认那份 ⇒ 选中项就该是默认那份（后端也是这么解析的）
+      // ⚠️ 有结论就按结论选中；没结论才回落到"默认那份"
       if (current ? p.id === current : p.is_default) opt.selected = true;
       sel.appendChild(opt);
     }
@@ -176,9 +187,27 @@ export async function saveSessionProfile(sessionId, profileId) {
       );
       return;
     }
+    // 🔴 **必须同时写两处**（2026-11-06 修，情绪实测报障
+    //    「我绑定了配置，切出去再切回来直接又变成默认」）：
+    //
+    //      ① **路由表**：宿主解析 `get_config(umo)` 时用它（真正生效的那条）；
+    //      ② **会话字段** `config_profile_id`：**渲染时读的是它**。
+    //
+    //    原来只写了 ① ⇒ 表面上"保存成功"，但下拉框渲染时读到空字段，
+    //    重新进页面就显示"默认配置"。用户看到的是"绑定没保存"，
+    //    而真相是**两条路径只写了一条**（本项目栽过多次的同型问题）。
+    //
+    //    写入顺序：先写字段（会话记录的权威值），再写路由表。
+    //    路由表失败时字段已生效，界面不会骗人（下面 catch 会报错）。
     const current = await apiData("GET", "/api/v1/config-routing");
     const routes = (current.routes || []).filter((r) => r.umop !== umo);
-    routes.push({ umop: umo, profile_id: profileId });
+    // ⚠️ 选了「默认配置」就**不要**往路由表塞一条指向 default 的规则 ——
+    //    那会让这条 umo 从此被钉死，将来换默认配置时这里不跟着变。
+    if (profileId) routes.push({ umop: umo, profile_id: profileId });
+
+    await api("PATCH", `/api/v1/sessions/${encodeURIComponent(sessionId)}`, {
+      config_profile_id: profileId || "",
+    });
     await apiData("PUT", "/api/v1/config-routing", { routes });
 
     const s = state.sessions.find((x) => x.id === sessionId);

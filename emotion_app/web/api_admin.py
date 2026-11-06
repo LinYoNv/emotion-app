@@ -119,7 +119,25 @@ def build_blueprint(require_auth: Any) -> Blueprint:
         d = s.to_dict()
         uid = str(d.get("user_id") or "")
         umo = ""
-        if uid:
+        # 🔴 **原生会话直接用 `native_origin`**（2026-11-06 修，真 bug）。
+        #
+        #    原来这里无条件 `build_umo(uid)`，而它的 `platform_id` 默认是 `"11"`：
+        #
+        #        napcat1 的会话 → 11:FriendMessage:3412642082
+        #        napcat2 的会话 → 11:FriendMessage:3412642082   ← **两条一模一样！**
+        #
+        #    后果（情绪实测报障「绑定了配置，切出去再回来又变默认」）：
+        #      * 会话页选配置是往 **umo 路由表** 写规则；
+        #      * 两个 bot 的 umo 相同 ⇒ 给 napcat2 绑配置，**napcat1 也被改**；
+        #      * 而 `native_origin` 里明明存着正确的
+        #        `onebot-napcat1:FriendMessage:…` / `onebot-napcat2:FriendMessage:…`。
+        #
+        #    ⇒ 有 `native_origin` 就**原样用它**（那才是这位会话在插件眼中的身份）；
+        #      只有非原生会话（我们自己的 Web 端）才回落到 `build_umo(uid)`。
+        native_origin = str(d.get("native_origin") or "").strip()
+        if native_origin:
+            umo = native_origin
+        elif uid:
             try:
                 # 🔴 **必须复用宿主的唯一权威定义**（`host/astrbot_host/umo.py`）：
                 #    `host/tests/test_umo.py` 有一条判据禁止第二处手写 umo 片段，
@@ -141,6 +159,47 @@ def build_blueprint(require_auth: Any) -> Blueprint:
                 )
         d["umo"] = umo
         d["platform"] = umo.split(":", 1)[0] if umo else ""
+
+        # 🔴 **`effective_profile_id`：告诉前端"这条会话实际会用哪份配置"**
+        #    （2026-11-06 修，情绪报障「绑定了配置却显示默认」的最后一层）。
+        #
+        #    真相是：解析链有三段，而后台只暴露了第一段
+        #        ① 会话字段 `config_profile_id`（用户显式点名）
+        #        ② **路由表**（按 umo 匹配，真正生效的那条）   ← 前端看不见
+        #        ③ 默认配置
+        #
+        #    前端原来只读 ①：空 ⇒ 就画"默认配置"。
+        #    而实际生效的是 ②（路由表给了「私聊」/「糯米」）——
+        #    **界面显示 A、真正跑的是 B**，用户当然以为自己没绑上。
+        #
+        #    ⇒ 后端把 ①②③ 的**最终结论**直接给出，前端不再自己猜。
+        #      取不到时如实留空（前端会回落到 ①/默认），不编。
+        d["effective_profile_id"] = ""
+        if umo:
+            try:
+                # ⚠️ **不能用 `app`**：`_session_payload` 是 `create_routes()` 内的
+                #    闭包，作用域里没有 `app`（实测 `NameError: name 'app' is not defined`）。
+                #    也不能调 `_registry()` —— 它定义在**这个函数之后**，
+                #    到这里还没绑定。⇒ 用 `current_app` 自己取根目录，
+                #    与 `_registry()` 保持**同一套路径规则**（`EMOTION_PROFILES_DIR` 可覆盖）。
+                from quart import current_app
+
+                from emotion_app.domain.config_profile import (
+                    PROFILES_DIR,
+                    ConfigProfileRegistry,
+                )
+
+                root = current_app.config.get("EMOTION_PROFILES_DIR") or PROFILES_DIR
+                d["effective_profile_id"] = ConfigProfileRegistry(root).resolve_for_umo(
+                    umo, str(d.get("config_profile_id") or "")
+                )
+            except Exception:  # noqa: BLE001
+                # 解析不出来就用空 —— 前端回落旧行为，不影响会话本身
+                log.warning(
+                    "计算 effective_profile_id 失败（前端将按会话字段显示）",
+                    extra={"data": {"session": d.get("id")}},
+                    exc_info=True,
+                )
         return d
 
     # ==================================================================
