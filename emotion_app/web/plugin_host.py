@@ -407,10 +407,92 @@ class PluginHostService:
             explicit = str(getattr(session, "config_profile_id", "") or "") if session else ""
             # 显式指定 > 路由表（照 AstrBot abconf）> 默认
             profile_id = registry.resolve_for_umo(str(umo), explicit)
-            return registry.store(profile_id).load()
+            profile = registry.store(profile_id).load()
+            return self._augment_astrbot_config_shape(profile, umo=umo)
         except Exception:  # noqa: BLE001 — 读配置失败不该打断插件
             logger.warning("按 umo 解析配置文件失败（回落全局配置）umo=%s", umo, exc_info=True)
             return None
+
+    def _augment_astrbot_config_shape(self, profile: Any, *, umo: str = "") -> Any:
+        """把我们的配置文件形状**补上插件真正会读的那几个键**。
+
+        🔴 **为什么需要这层**（2026-11-06，情绪问「为什么是 liloth，我哪里没弄好」）：
+
+        我们存的形状是我们自己的：
+
+            {"session": {"default_persona_id": "<UUID>", "default_chat_provider_id": ...}}
+
+        但陪伴插件读的是 **AstrBot 的形状**（`companion_v2/adapters/astrbot/native.py`）：
+
+            configuration["agent_runner"]["config"]["persona"]["persona_id"]
+            # 或
+            configuration["provider_settings"]["default_personality"]
+
+        **两个键我们都没有** ⇒ 插件拿到空 ⇒ 一路回落到"全局默认人设"
+        ⇒ 用户明明把配置里的人设指定成「糯米茨」，界面上却永远显示默认那个（liloth）。
+
+        ⚠️ **必须是「人设名字」不是 UUID**：AstrBot/插件的主键是 name
+           （`_persona_to_v3`「`name` 是插件的主键」；`multi_controller.py:322`
+            还会校验 `native["name"] == binding.persona_id`）。
+           写 UUID 进去 = **看起来配了，实际用不上**（本项目栽过一次）。
+
+        ⚠️ 这是**兼容层**，不是数据搬家：原始 `session`/`plugins` 段**原样保留**，
+           我们自己的面板仍旧读它们。只**新增**两个 AstrBot 形状的键。
+
+        ⚠️ 查不到名字（缓存未预热/人设已删）时**不写**这个键 ——
+           让插件走它自己的兜底，而不是拿一个空名字去匹配。
+        """
+        if not isinstance(profile, dict):
+            return profile
+        session = profile.get("session")
+        if not isinstance(session, dict):
+            return profile
+
+        persona_uuid = str(session.get("default_persona_id") or "").strip()
+        persona_name = ""
+        if persona_uuid:
+            try:
+                persona_name = str(self._persona_name_of(persona_uuid) or "").strip()
+            except Exception:  # noqa: BLE001
+                logger.warning("人设 id → 名字失败（不写 AstrBot 兼容键）", exc_info=True)
+
+        if not persona_name:
+            return profile
+
+        out = dict(profile)          # 浅拷贝：不改原始 dict（它可能是缓存里的同一份）
+        provider_settings = out.get("provider_settings")
+        if not isinstance(provider_settings, dict):
+            provider_settings = {}
+        else:
+            provider_settings = dict(provider_settings)
+        provider_settings["default_personality"] = persona_name
+        out["provider_settings"] = provider_settings
+
+        # `agent_runner` 也给上（插件两条路径取其一，给全了才不会因形状差异回落）
+        runner = out.get("agent_runner")
+        if not isinstance(runner, dict):
+            runner = {"runner_type": "local", "config": {}}
+        else:
+            runner = dict(runner)
+        runner_config = runner.get("config")
+        if not isinstance(runner_config, dict):
+            runner_config = {}
+        else:
+            runner_config = dict(runner_config)
+        runner_persona = runner_config.get("persona")
+        if not isinstance(runner_persona, dict):
+            runner_persona = {}
+        else:
+            runner_persona = dict(runner_persona)
+        runner_persona["persona_id"] = persona_name
+        runner_config["persona"] = runner_persona
+        runner["config"] = runner_config
+        out["agent_runner"] = runner
+
+        logger.debug(
+            "已为插件补上 AstrBot 兼容配置键 umo=%s persona=%s", umo, persona_name
+        )
+        return out
 
     def _subagent_registry(self) -> Any:
         """取用户配置的子代理注册表（**没配就返回 None，由宿主如实拒绝**）。
