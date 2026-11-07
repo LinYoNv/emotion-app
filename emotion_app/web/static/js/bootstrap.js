@@ -16,7 +16,7 @@ import { addAgent, onSubagentBackendChange, onSubagentEnabledChange, onSubagentP
 import { downloadExport, loadPersonas, refreshPersonaInState, renderPersonaList, renderPromptStats, selectPersona } from "./views/persona.js";
 import { NAV_PLUGIN_OPEN_KEY, collectPluginConfigChanges, openPluginConfig, savePluginSwitch, syncNavPluginGroupOpen } from "./views/plugins.js";
 import { PROVIDER_FILTER_ALL, addHeaderRow, addProviderModel, clearProviderDetail, closeModelsModal, closePresetPicker, closeTestModal, deleteProviderSource, fetchSourceModels, newProviderSourceFlow, removeProviderModel, renderAvailableModels, saveProviderSource, setAdapterType, setProviderFilter, showModal, testProviderModel } from "./views/providers.js";
-import { currentUmo, deleteSessionById, fillSessionForm, loadSessions, refreshSessionInfo, renderSessionList, renderSessionPicker, renderSessionSelect, saveSessionConfig, selectSession, showHint } from "./views/session.js";
+import { fillSessionForm, loadSessions, refreshSessionInfo, renderSessionList, renderSessionPicker, renderSessionSelect, saveSessionConfig, selectSession, showHint } from "./views/session.js";
 import { copyLogs, createConfigProfile, deleteConfigProfile, loadLogs, renameConfigProfile, resetConfigProfile, saveConfigSection, selectConfigProfile, stopLogsAutoRefresh } from "./views/settings.js";
 
 window.addEventListener("hashchange", () => { applyRoute(); });
@@ -316,7 +316,8 @@ $("new-session").onclick = $("new-session-2").onclick = async () => {
       showHint($("cfg-session-hint"), "已新建会话，去上面那条「对话模型」给它选个模型");
     }
   } catch (e) {
-    showHint($("session-hint"), "创建失败：" + e.message, true);
+    // ⚠️ `#session-hint` 不存在（会话页没有这个元素）—— 落回真正存在的那个提示位
+    showHint($("chat-hint"), "创建失败：" + e.message, true);
     showHint($("cfg-session-hint"), "创建失败：" + e.message, true);
     showHint($("session-page-hint"), "创建失败：" + e.message, true);
   }
@@ -334,56 +335,18 @@ $("clear-session").onclick = async () => {
   } catch (e) { toast($("chat-hint"), "失败：" + e.message, true); }
 };
 
-if ($("s-mode")) {
-  $("s-mode").onchange = () => {
-    const h = $("mode-hint");
-    if (h) h.textContent = MODE_HINTS[$("s-mode").value] || "";
-  };
-}
+/* 🔴 **2026-11-07：这一整块 `s-*` 是死代码，已删除**。
+ *
+ *   `#s-mode` / `#s-del` / `#s-umo-copy` / `#s-umo-new` / `#s-user-id`
+ *   全是「旧的设置页会话表单」里的元素 —— 设置页改成「只编辑配置文件」时
+ *   整块删掉了，绑定却一直留着。
+ *
+ *   ⚠️ 表面上无害（都包在 `if ($(id))` / `&&` 里，不会崩），
+ *      但**「复制 umo / 换 umo」是用户还要用的功能** ——
+ *      它们已经按说明文字搬回「会话」行内（见 `views/session.js` 的 `buildUmoButtons`）。
+ *      留着这里等于同一功能两份实现（其中一份永远跑不到）。
+ */
 
-if ($("s-del")) {
-  $("s-del").onclick = () => {
-    if (state.currentSession) deleteSessionById(state.currentSession);
-  };
-}
-
-$("s-umo-copy") && ($("s-umo-copy").onclick = async () => {
-  const umo = currentUmo();
-  if (!umo) return toast($("s-umo-hint"), "这个会话还没有 umo", true);
-  try {
-    await navigator.clipboard.writeText(umo);
-    toast($("s-umo-hint"), `已复制：${umo}`);
-  } catch (e) {
-    // 剪贴板 API 在非 https / 未聚焦时会拒绝 —— 如实提示，
-    // 并把值显示出来让用户手动选（别只报一句"失败"）。
-    toast($("s-umo-hint"), `复制失败，请手动选：${umo}`, true);
-  }
-});
-
-$("s-umo-new") && ($("s-umo-new").onclick = async () => {
-  if (!state.currentSession) return;
-  const before = currentUmo();
-  if (!confirm(
-    "换一个专用 umo？\n\n" +
-    "陪伴插件按这个值认人：换掉之后，这个会话在插件眼里就是**另一个用户**。\n" +
-    "旧标签下的记忆/关系不会丢（还挂在旧标签下），但之后写的东西都记到新标签下。\n\n" +
-    `当前：${before}`
-  )) return;
-  try {
-    const d = await api("POST", `/api/v1/sessions/${state.currentSession.id}/umo`);
-    state.currentSession = d.session;
-    const i = state.sessions.findIndex((x) => x.id === d.session.id);
-    if (i >= 0) state.sessions[i] = d.session;
-    // ⚠️ `s-user-id` 属于**旧的设置页表单**，2026-11-04 改造成「只编辑配置文件」
-    //    之后它已不在 DOM 里。这里必须判空 —— 否则用户点「换一个专用 umo」时
-    //    会抛 TypeError，而那一步**已经成功改了 umo**，用户却看到报错（假失败）。
-    const uidEl = $("s-user-id");
-    if (uidEl) uidEl.value = d.session.user_id ?? "";
-    renderSessionList();
-    renderSessionSelect();
-    toast($("s-umo-hint"), `已换成 ${d.session.umo}`);
-  } catch (e) { toast($("s-umo-hint"), "换 umo 失败：" + e.message, true); }
-});
 
 // 🔴 **`cfg-session-form` 已不存在**（2026-11-04 设置页改造成「只编辑配置文件」时
 //    删掉了那个 form）。直接赋值会在元素为 null 时抛 TypeError，
@@ -422,6 +385,46 @@ $("ps-configured-list").onclick = (ev) => {
 };
 
 $("provider-source-new").onclick = () => newProviderSourceFlow();
+
+/* ---------------- 适配器页（2026-11-07 补：**整页交互一行都没接线**）----------------
+ *
+ * 🔴 情绪报障：「宿主适配器界面那些"编辑、添加适配器、刷新状态"按钮都没反应」。
+ *
+ *    真相：`views/adapters.js` 写好了 740 行（渲染 / 表单 / 保存 / 删除全有），
+ *    但 **`bootstrap.js` 只是 import 了它们、从没调用过** ——
+ *    7 个导出函数在文件里各只出现 1 次（就是 import 那一行）。
+ *
+ *    `git log -S` 也证实：**这些绑定历史上从未存在过**，
+ *    不是这次改坏的，是当初就没接。
+ *    ⇒ 这正是本项目那条「模块能工作 ≠ 被接上了」的又一份现场。
+ */
+
+$("adapter-new").onclick = () => openAdapterCreate();
+
+$("adapter-refresh").onclick = () => loadAdapters();
+
+// 行内按钮走**事件委托**（列表是动态重画的，逐个绑会随重画丢失）
+$("adapter-list").onclick = (ev) => {
+  const btn = ev.target.closest("button[data-op]");
+  if (!btn) return;
+  const id = btn.dataset.adapterId || "";
+  if (btn.dataset.op === "edit") openAdapterEdit(id);
+  else if (btn.dataset.op === "del") deleteAdapter(id);
+};
+
+// 启停开关：同样是委托（`change` 而不是 `click`）
+$("adapter-list").addEventListener("change", (ev) => {
+  const box = ev.target.closest('input[type="checkbox"][data-adapter-id]');
+  if (!box) return;
+  setAdapterEnabled(box.dataset.adapterId || "", box.checked);
+});
+
+$("adapter-type").addEventListener("change", () => onAdapterTypeChange());
+
+$("adapter-save").onclick = () => saveAdapter();
+
+$("adapter-cancel").onclick = () => closeAdapterForm();
+
 
 $("provider-source-back").onclick = () => {
   clearProviderDetail();
@@ -624,39 +627,20 @@ if (_cfgSessionSaveBtn) {
   };
 }
 
-export const _cfgSessionDel = $("cfg-session-del");
-if (_cfgSessionDel) {
-  _cfgSessionDel.onclick = () => {
-    const sid = $("cfg-session-picker") ? $("cfg-session-picker").value : "";
-    const s = state.sessions.find((x) => x.id === sid) || state.currentSession;
-    if (!s) {
-      showHint($("cfg-session-hint"), "没有可删除的会话", true);
-      return;
-    }
-    deleteSessionById(s);
-  };
-}
-
-export const _cfgSessionPicker = $("cfg-session-picker");
-if (_cfgSessionPicker) {
-  _cfgSessionPicker.onchange = () => {
-    const s = state.sessions.find((x) => x.id === _cfgSessionPicker.value);
-    if (!s) return;
-    // ⚠️ 这里**不调 `selectSession`** —— 那会把"聊天页当前会话"也换掉，
-    //    而用户此刻只是在**改配置**，没说要换聊天对象。
-    state.currentSession = s;
-    fillSessionForm(s);
-    showHint($("cfg-session-model-hint"), `正在配置：${s.title || "(未命名)"}`);
-  };
-}
-
-export const _cfgSessionNew = $("cfg-session-new");
-if (_cfgSessionNew) {
-  _cfgSessionNew.onclick = () => {
-    const btn = $("new-session");
-    if (btn) btn.onclick ? btn.onclick() : btn.click();
-  };
-}
+/* 🔴 **2026-11-07 清掉一整块死代码**：
+ *
+ *   `#cfg-session-del` / `#cfg-session-picker` / `#cfg-session-new` /
+ *   `#cfg-session-model-hint` 这四个元素，在「设置页改成只编辑配置文件」
+ *   那次改造里已经**从 index.html 删掉了**，但绑定代码一直留着。
+ *
+ *   它们当时都包在 `if ($(id))` 里，所以不会崩 ——
+ *   但判据 `test_buttons_referenced_by_bootstrap_exist_in_html` 会报出来：
+ *   **绑一个不存在的元素永远静默无效**，而这正是"按钮点了没反应"的温床。
+ *
+ *   ⚠️ 同一类事故本项目已经踩过：`#cfg-session-form` 裸赋值 →
+ *      整页 JS 中断 → **连登录都进不去**。判空能防崩溃，但防不了"以为接了其实没接"。
+ *   ⇒ 删掉比留着安全：**死代码不会自己变活，只会误导下一个人。**
+ */
 
 /* ── 侧边栏「插件页面」分组折叠（原 plugins.js 顶层）──────────────
  * ⚠️ 惰性取值：模块顶层调 `$()` 会在循环依赖初始化时拿到未定义。 */

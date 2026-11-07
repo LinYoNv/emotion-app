@@ -82,6 +82,17 @@ export function renderSessionList() {
     //    配置文件本身的内容在「设置」页改。
     li.appendChild(buildProfilePicker(s));
 
+    // 🔴 **复制 umo / 换一个专用 umo**（2026-11-07 补回）。
+    //
+    //    这两个功能原来在「设置页的会话表单」里（`#s-umo-copy` / `#s-umo-new`），
+    //    设置页改成「只编辑配置文件」时**表单整块删掉了，按钮也跟着没了** ——
+    //    但「会话」页的说明文字还在教用户「点『复制 umo』」「点『换一个专用 umo』」。
+    //    **用户按说明去找一个不存在的按钮**，这是最难自查的一类：
+    //    文案、绑定、按钮三者只有绑定和按钮被删了。
+    //
+    //    ⇒ 按说明的说法（"在「会话」页点"）把它们放到**会话行内**。
+    li.appendChild(buildUmoButtons(s));
+
     // 🔴 **点一下就进聊天**（情绪 2026-10-09：「单击所选会话跳转到聊天」）。
     li.onclick = () => openSessionInChat(s.id);
     li.title = "点一下进这条会话聊天";
@@ -106,6 +117,71 @@ export function renderSessionList() {
   }
   // 列表有内容时隐藏空态
   if ($("session-empty")) $("session-empty").classList.toggle("hidden", !!state.sessions.length);
+}
+
+/** 行内的「复制 umo」与「换一个专用 umo」两个小按钮。
+ *
+ * ⚠️ 都必须 `stopPropagation` —— `li` 上有"点一下开聊"的 onclick，
+ *    不挡住的话**一碰按钮就跳进聊天**了（同 `buildProfilePicker` 的理由）。
+ */
+export function buildUmoButtons(session) {
+  const wrap = document.createElement("span");
+  wrap.className = "sess-umo-ops";
+
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.className = "sess-umo-btn";
+  copy.textContent = "复制 umo";
+  copy.title = "复制这条会话的 umo（到陪伴面板添加用户时要用）";
+  copy.onclick = async (e) => {
+    e.stopPropagation();
+    const umo = String(session.umo || session.native_origin || "").trim();
+    const hint = $("session-page-hint");
+    if (!umo) {
+      showHint(hint, "这条会话还没有 umo，先给它绑定插件用户 ID。", true);
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(umo);
+      showHint(hint, `已复制：${umo}`);
+    } catch (err) {
+      // 剪贴板 API 在非 https / 未聚焦时会拒绝 —— **如实提示并把值显示出来**，
+      // 让用户手动选（只报一句"失败"等于没帮上忙）。
+      showHint(hint, `复制失败，请手动选：${umo}`, true);
+    }
+  };
+  wrap.appendChild(copy);
+
+  const renew = document.createElement("button");
+  renew.type = "button";
+  renew.className = "sess-umo-btn";
+  renew.textContent = "换 umo";
+  renew.title = "给这条会话换一个专用 umo（陪伴插件会把它当成另一个用户）";
+  renew.onclick = async (e) => {
+    e.stopPropagation();
+    const hint = $("session-page-hint");
+    const before = String(session.umo || session.native_origin || "").trim();
+    if (!confirm(
+      "换一个专用 umo？\n\n"
+      + "陪伴插件按这个值认人：换掉之后，这条会话在插件眼里就是**另一个用户**。\n"
+      + "旧标签下的记忆/关系不会丢（还挂在旧标签下），但之后写的东西都记到新标签下。\n\n"
+      + `当前：${before || "（无）"}`
+    )) return;
+    try {
+      const d = await api("POST", `/api/v1/sessions/${session.id}/umo`);
+      const i = state.sessions.findIndex((x) => x.id === session.id);
+      if (i >= 0 && d.session) state.sessions[i] = d.session;
+      renderSessionList();
+      renderSessionPicker();
+      renderSessionSelect();
+      showHint(hint, `已换成 ${d.session && d.session.umo ? d.session.umo : "新的 umo"}`);
+    } catch (err) {
+      showHint(hint, "换 umo 失败：" + err.message, true);
+    }
+  };
+  wrap.appendChild(renew);
+
+  return wrap;
 }
 
 /** 行内的「用哪份配置文件」下拉。

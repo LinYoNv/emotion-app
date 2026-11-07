@@ -2643,3 +2643,32 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   .session-grid .sess-profile { flex: 1 1 auto; }   /* 配置下拉吃掉剩余宽度 */
   .session-grid .badge { white-space: normal; }     /* 允许换行，但不再被挤成竖排 */
 }
+
+/* ---------------- 会话行内的 umo 操作（2026-11-07 补回）----------------
+ *
+ * 说明文字一直教用户点「复制 umo」「换一个专用 umo」，
+ * 但按钮在设置页改造时被删掉了。现在放回会话行内（文案说的就是"在会话页"）。
+ */
+.sess-umo-ops {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+.sess-umo-btn {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+.sess-umo-btn:hover {
+  background: var(--hover);
+  border-color: var(--line);
+  color: var(--fg);
+}
+@media (max-width: 640px) {
+  .sess-umo-ops { flex: 1 1 100%; }
+  .sess-umo-btn { min-height: 40px; }
+}
