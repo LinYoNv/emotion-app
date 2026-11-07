@@ -21,7 +21,7 @@
 <link rel="preload" href="/static/fonts/geist-latin.woff2" as="font" type="font/woff2" crossorigin />
 <!-- ⚠️ `?v=` 必须与文件末尾 `<script src="js/main.js?v=…">` 的版本号**一起改** ——
      改 CSS 不改版本号 = 用户看不到新样式（本项目 2026-09-26 真事故）。 -->
-<link rel="stylesheet" href="/static/app.css?v=20261107a" />
+<link rel="stylesheet" href="/static/app.css?v=20261107c" />
 </head>
 <body>
 <!--
@@ -896,13 +896,11 @@
     <!-- 🔴 插件**启停**（照真 AstrBot 的 inactivated_plugins）。
          判据必须真浏览器验："有没有这个元素" 与 "值对不对" 是两件事，
          `curl` 验不了 JS。 -->
-    <h3>插件启停 <small>（停用的插件不会被加载，也不算加载失败）</small></h3>
-    <p class="hint" id="plugin-switch-hint">正在读取…</p>
-    <div id="plugin-switch-list" class="switch-list"></div>
-    <div class="row">
-      <button type="button" id="plugin-switch-save">保存启停设置</button>
-      <span class="hint" id="plugin-switch-saved"></span>
-    </div>
+    <!-- 🔴 **「插件启停」独立区块已删除**（2026-11-07，情绪：
+         「不对不对，启停开关你直接放卡片上啊哇笨笨」）。
+         它和下面的升级卡片是**同一份数据的两个视图** —— 同一个插件要在两处看。
+         现在合成一张卡片：启停开关 + 详情 + 配置 + 升级，全在一个卡片里。
+         ⚠️ 开关**即时生效**，所以也没有「保存启停设置」按钮了。 -->
 
     <!-- ==================== 插件升级 ====================
          照真 AstrBot 的 `POST /plugins/{id}/update`（`dashboard/api/plugins.py:1143`），
@@ -921,14 +919,17 @@
             所以这里只给一个输入框，留空 = 直连。
          🔴 **升级不会删用户数据**：`files/` 这类"落在源码目录里的用户文件"
             由后端保护清单跳过（判据见 `tests/test_plugin_updater.py`）。
-         🔴 宿主没有热重载 ⇒ 升级后**必须重启服务**才生效，提示写清楚，
-            不许让用户以为点完就生效了。 -->
+         🔴 **升级完会自动热重载**（2026-11-07 改）。
+            我们本来就有 `reload_plugin()`，`plugin_lifecycle.py` 自己的注释写着
+            「两者组合起来才是"升级完点一下重载"」——
+            只是以前没串起来，把"重启整个服务"丢给了用户。
+            现在后端升级完直接重载，只有重载失败时才提示可以重试。 -->
     <div class="plugin-market-head">
       <h3>插件升级 <small>（从插件仓库拉新版本）</small></h3>
       <p class="hint" id="plugin-update-hint">
         从插件 <code>metadata.yaml</code> 的 <code>repo:</code> 拉最新版本。
         升级<b>不会删除</b>插件数据与已上传文件（<code>files/</code> 等会被跳过）。
-        完成后<b>需要重启服务</b>才生效。
+        升级完成后<b>自动热重载</b>，不用重启服务。
       </p>
     </div>
 
@@ -1152,6 +1153,6 @@
      ⇒ 改 `js/` 或 `app.css` **必须**同时改这里的版本号，两边一起走。
      ⚠️ 子模块（`js/views/*.js`）**不加** `?v=`：它们由 `main.js` 的静态 `import`
         决定 URL，加不了参数，改了子模块就靠 bump 这里来打破整张模块图的缓存。 -->
-<script type="module" src="/static/js/main.js?v=20261107a"></script>
+<script type="module" src="/static/js/main.js?v=20261107c"></script>
 </body>
 </html>

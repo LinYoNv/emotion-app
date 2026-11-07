@@ -14,7 +14,7 @@ import { $, MODE_HINTS, api, applyRoute, boot, closeDrawer, go, hideLogin, isMob
 import { closeAdapterForm, deleteAdapter, loadAdapters, onAdapterTypeChange, openAdapterCreate, openAdapterEdit, saveAdapter, setAdapterEnabled } from "./views/adapters.js";
 import { addAgent, onSubagentBackendChange, onSubagentEnabledChange, onSubagentParamsChanged, reloadSubagents, removeAgent, saveSubagents, testSubagentConnection } from "./views/subagents.js";
 import { downloadExport, loadPersonas, refreshPersonaInState, renderPersonaList, renderPromptStats, selectPersona } from "./views/persona.js";
-import { NAV_PLUGIN_OPEN_KEY, collectPluginConfigChanges, openPluginConfig, savePluginSwitch, syncNavPluginGroupOpen } from "./views/plugins.js";
+import { NAV_PLUGIN_OPEN_KEY, collectPluginConfigChanges, openPluginConfig, syncNavPluginGroupOpen } from "./views/plugins.js";
 import { PROVIDER_FILTER_ALL, addHeaderRow, addProviderModel, clearProviderDetail, closeModelsModal, closePresetPicker, closeTestModal, deleteProviderSource, fetchSourceModels, newProviderSourceFlow, removeProviderModel, renderAvailableModels, saveProviderSource, setAdapterType, setProviderFilter, showModal, testProviderModel } from "./views/providers.js";
 import { fillSessionForm, loadSessions, refreshSessionInfo, renderSessionList, renderSessionPicker, renderSessionSelect, saveSessionConfig, selectSession, showHint } from "./views/session.js";
 import { copyLogs, createConfigProfile, deleteConfigProfile, loadLogs, renameConfigProfile, resetConfigProfile, saveConfigSection, selectConfigProfile, stopLogsAutoRefresh } from "./views/settings.js";
@@ -544,7 +544,8 @@ $("subagent-agent-list").onclick = (ev) => {
 $("subagent-backend-fields").addEventListener("input", () => onSubagentParamsChanged());
 $("subagent-backend-fields").addEventListener("change", () => onSubagentParamsChanged());
 
-$("plugin-switch-save").onclick = savePluginSwitch;
+// 🔴 `#plugin-switch-save` 已删除（启停开关搬到卡片上、即时生效）
+//    —— 见 `views/plugins.js` 的 `togglePluginEnabled`。
 
 $("plugin-frame-back").onclick = () => go("plugins");
 

@@ -2672,3 +2672,159 @@ h3 small { color: var(--muted); font-weight: 400; font-size: 12px; }
   .sess-umo-ops { flex: 1 1 100%; }
   .sess-umo-btn { min-height: 40px; }
 }
+
+/* ==========================================================================
+ * 插件启停：卡片式行 + 滑块开关（2026-11-07，情绪：
+ * 「上面那节"启停"好丑，按图二那样加个开关不就好了」）
+ *
+ * 原来是「复选框 + 名字 + 模块路径 + 状态 + 详情 + 配置」六件套平铺，
+ * 手机上挤成一团。现在是「左边信息 / 右边开关」两栏。
+ * ⚠️ 不做成整行可点：行内还有「详情/配置」两个按钮，
+ *    整行可点会让它们被误触（本项目在 label 套 button 上栽过）。
+ * ========================================================================== */
+
+.plugin-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: 10px var(--sp-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  transition: border-color var(--ease), background var(--ease);
+}
+.plugin-row:hover { border-color: var(--border-strong); }
+
+.plugin-row-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;          /* 让内部的省略号生效 */
+  flex: 1 1 auto;
+}
+
+.plugin-row-title {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.plugin-row-name {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.plugin-row-ver {
+  font-size: 11.5px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  flex: 0 0 auto;
+}
+
+/* 状态徽标：运行中用绿、失败用红，其余灰 */
+.plugin-row-state {
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--hover);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.plugin-row-state.ok { color: var(--ok, #4ade80); background: rgba(74, 222, 128, .12); }
+.plugin-row-state.bad { color: var(--danger); background: var(--danger-soft); }
+
+.plugin-row-err {
+  font-size: 11.5px;
+  color: var(--danger);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plugin-row-ops {
+  display: flex;
+  flex-direction: row;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* ---------------- 滑块开关（照 iOS 观感）---------------- */
+.toggle {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  cursor: pointer;
+  /* ⚠️ 全局 `label{flex-direction:column}` 会把它压成竖排 —— 必须显式 row */
+  flex-direction: row;
+}
+.toggle-input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  margin: 0;
+  pointer-events: none;
+}
+.toggle-track {
+  position: relative;
+  display: block;
+  width: 44px;
+  height: 26px;
+  border-radius: 999px;
+  background: var(--border-strong);
+  transition: background var(--ease);
+}
+.toggle-track::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .3);
+  transition: transform var(--ease);
+}
+.toggle-input:checked + .toggle-track {
+  background: var(--accent);
+}
+.toggle-input:checked + .toggle-track::after {
+  transform: translateX(18px);
+}
+/* 键盘可达性：focus 时给出可见轮廓（别因为隐藏了 input 就丢掉键盘操作） */
+.toggle-input:focus-visible + .toggle-track {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* 手机端：信息与开关分两行，开关右对齐 */
+@media (max-width: 640px) {
+  .plugin-row { flex-wrap: wrap; }
+  .plugin-row-info { flex: 1 1 auto; }
+  .toggle-track { width: 48px; height: 28px; }
+  .toggle-track::after { width: 22px; height: 22px; }
+  .toggle-input:checked + .toggle-track::after { transform: translateX(20px); }
+}
+
+/* ---------------- 卡片标题行里的启停开关（2026-11-07）----------------
+ *
+ * 启停开关搬到插件卡片右上角，与「标题 + 版本」同一行。
+ * ⚠️ 标题必须能被压缩（省略号），否则长插件名会把开关挤出去。
+ */
+/* ⚠️ **不要再写一份 `.plugin-title-row`** —— 上面（约 1155 行）已有
+ *    `display:flex; justify-content:space-between`，那份足够把开关推到右边。
+ *    重复定义会让"改了上面那份、下面这份还压着"的漂移（本项目踩过多次）。 */
+.plugin-card-toggle { flex: 0 0 auto; }

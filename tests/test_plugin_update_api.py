@@ -223,12 +223,19 @@ def test_update_end_to_end_keeps_user_data(tmp_path):
     res = body.get("result") or {}
     assert res.get("old_version") == "1.0.0"
     assert res.get("new_version") == "2.0.0"
-    assert res.get("restart_required") is True, "必须如实告知要重启"
+    # 🔴 **2026-11-07 改契约**：升级完自动热重载（情绪要求），不再要求重启。
+    # ⚠️ `reloaded` / `restart_required` 在**外层响应体**里，
+    #    不在 `result`（那是升级器 `PluginUpdateResult.as_dict()` 的输出，
+    #    它根本不知道"重载"这回事）。查错层级会永远红 —— 我第一版就写错在这。
+    assert body.get("reloaded") is True, f"升级后应自动热重载：{body}"
+    assert body.get("restart_required") is False, (
+        f"自动重载成功就不该再要求重启：{body}"
+    )
     assert "files/" in (res.get("preserved") or []), f"必须回报保住了什么：{res}"
     assert user_img.exists(), "🔴 接口层升级把用户数据删了"
     assert user_img.read_bytes() == b"\x89PNG\r\n\x1a\nUSER"
     assert (installed / "added_v2.py").is_file(), "新版本没落地"
-    assert "重启" in str(body.get("message", "")), "message 必须提醒重启"
+    assert "热重载" in str(body.get("message", "")), "message 应说明已热重载"
 
 
 def _git(cwd: Path, *args: str) -> None:

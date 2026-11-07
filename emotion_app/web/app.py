@@ -2149,13 +2149,55 @@ def _mount_plugin_routes(
             msg = f"已从 {out.old_version or '未知'} 升级到 {out.new_version or '未知'}"
         if out.preserved:
             msg += f"；保留了用户数据 {', '.join(out.preserved)}"
+
+        # 🔴 **升级完自动热重载**（2026-11-07，情绪：
+        #    「更新插件直接热重载就是，不应该提示"重启整个服务"」）。
+        #
+        #    我们**早就有** `reload_plugin()`（`plugin_lifecycle.py:394`，那份文件自己
+        #    的注释写得很清楚：「升级换了磁盘上的代码但不重载（要重启）；
+        #    重载是同一个目录重新 import。**两者组合起来才是"升级完点一下重载"**」）。
+        #    ⇒ 设计上本来就是这个链路，只是**没串起来**，把活儿丢给了用户去重启服务。
+        #
+        #    ⚠️ 重载失败**不能把升级本身判成失败** —— 磁盘上的代码已经换成新版了，
+        #       那次操作是成功的。这里如实分两部分报：
+        #         * 升级成功 + 重载成功 ⇒ 「已升级并生效」
+        #         * 升级成功 + 重载失败 ⇒ 「已升级，但重载失败（原因）」
+        reload_error = ""
+        reloaded = False
+        try:
+            from astrbot_host.plugin_lifecycle import (
+                PluginLifecycleError,
+                reload_plugin as do_reload,
+            )
+
+            await do_reload(service.host, plugin_id)
+            reloaded = True
+        except PluginLifecycleError as exc:
+            # 停用中的插件重载会 409 —— 那不是错误，是**它本来就没跑**
+            reload_error = exc.message
+        except Exception as exc:  # noqa: BLE001
+            reload_error = f"{type(exc).__name__}: {exc}"
+            log.warning("升级后自动重载失败（plugin=%s）", plugin_id, exc_info=True)
+
+        if reloaded:
+            tail = "。**已热重载，新版本已生效**"
+            note = "升级 + 热重载已完成，不需要重启服务。"
+        else:
+            tail = (
+                f"。已升级到新版本，但**自动重载失败**（{reload_error}）"
+                "—— 可在下方插件卡片点「重载」再试，或重启服务。"
+            )
+            note = f"自动重载失败：{reload_error}"
+
         return (
             jsonify(
                 {
                     "ok": True,
                     "result": out.as_dict(),
-                    "message": msg + "。**需要重启服务**才生效",
-                    "note": "宿主没有热重载 —— 必须重启服务，新版本才会真正加载",
+                    "message": msg + tail,
+                    "note": note,
+                    "reloaded": reloaded,
+                    "restart_required": not reloaded,
                 }
             ),
             200,

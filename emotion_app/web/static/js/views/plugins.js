@@ -52,7 +52,7 @@ export async function loadPluginSwitch() {
   try {
     const d = await api("GET", "/api/v1/plugins");
     state.pluginSwitch = d;
-    renderPluginSwitch();
+    renderPluginUpdate();   // 启停开关住在升级卡片上（2026-11-07 合并）
     // 🔴 升级列表与启停列表**同一份数据**（`state.pluginSwitch`）——
     //    另开一条 `/api/v1/plugins` 请求会漂（本项目踩过"同源数据各取一份"）。
     renderPluginUpdate();
@@ -242,142 +242,65 @@ export function syncNavPluginGroupOpen() {
 
 
 
-/** 按 `state.pluginSwitch` 重画勾选列表 + 提示。 */
-export function renderPluginSwitch() {
-  const d = state.pluginSwitch;
-  const hint = $("plugin-switch-hint");
-  const host = $("plugin-switch-list");
-  host.innerHTML = "";
-  if (!d) return;
+/* 🔴 **`renderPluginSwitch()` / `savePluginSwitch()` 已删除**（2026-11-07）。
+ *
+ *   启停开关搬到插件**卡片上**、并改成**即时生效**（`togglePluginEnabled`），
+ *   所以：
+ *     * 不再有独立的启停列表 → `renderPluginSwitch()` 无对象可画；
+ *     * 不再有「保存启停设置」按钮 → `savePluginSwitch()` 无入口可调。
+ *
+ *   ⚠️ 留着它们的后果和本例正相反 —— 那是"**写了没人调**"的死代码，
+ *      下次有人改启停逻辑会改到一份**永远不执行**的实现上。
+ */
 
-  const plugins = d.plugins || [];
-  if (!plugins.length) {
-    hint.textContent = "没有发现任何插件（检查 plugins.plugin_dirs）—— 这不是「读取失败」。";
-    return;
-  }
+/** 卡片上的启停开关：**点了就存**（不再有"保存启停设置"那一步）。
+ *
+ * 🔴 为什么改成即时生效（2026-11-07）：
+ *    原来是一个独立区块 + 底部「保存启停设置」按钮。合并到卡片后，
+ *    同一屏里若还保留"这个要保存、那个即时生效"两种手感，用户必然搞混。
+ *
+ * ⚠️ **失败必须把开关拨回去**：不然界面显示"已停用"而服务端根本没改，
+ *    用户以为生效了（假成功，本项目最忌）。
+ *
+ * ⚠️ 这段一度被我**误删**（清理死代码时连同 `renderPluginSwitch` 一起切掉了），
+ *    判据 `test_failed_toggle_reverts_the_switch` 当场抓出来 ——
+ *    说明"删区间"确实容易带走相邻的新代码，别用大块切片。
+ */
+export async function togglePluginEnabled(p, cb, toggle) {
+  const wantEnabled = cb.checked;
+  const hint = $("plugin-update-hint");
+  // 用后端给的 `module_path` 拼停用名单，**不自己拼路径**
+  const d = state.pluginSwitch || {};
+  const off = (d.plugins || [])
+    .filter((x) => x.enabled_saved === false)
+    .map((x) => x.module_path)
+    .filter((mp) => mp !== p.module_path);
+  if (!wantEnabled) off.push(p.module_path);
 
-  const STATE_TEXT = {
-    loaded: "运行中",
-    inactivated: "已停用（未加载）",
-    failed: "加载失败",
-    not_loaded: "未加载",
-  };
-  for (const p of plugins) {
-    const row = document.createElement("label");
-    row.className = "switch-row";
-    row.dataset.pluginId = p.id;
-    row.dataset.modulePath = p.module_path;
-
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.className = "switch-cb";
-    // 勾选 = 启用（= 不在停用名单里）；这里用的是**保存的意图**
-    cb.checked = p.enabled_saved !== false;
-    row.appendChild(cb);
-
-    const name = document.createElement("span");
-    name.className = "switch-name";
-    name.textContent = p.name || p.id;
-    row.appendChild(name);
-
-    const id = document.createElement("span");
-    id.className = "switch-id";
-    id.textContent = p.module_path;
-    row.appendChild(id);
-
-    const st = document.createElement("span");
-    const bad = p.state === "failed";
-    st.className = "switch-state" + (bad ? " bad" : "");
-    st.textContent = STATE_TEXT[p.state] || p.state;
-    // 失败原因要看得见（否则用户只知道"没跑"，不知道"为什么"）
-    if (bad && p.error) st.title = p.error;
-    row.appendChild(st);
-
-    // 🔴 「详情」按钮：这是**唯一**进详情页的入口（照真 AstrBot：点卡片进详情）。
-    //    ⚠️ 必须 `type="button"` + `preventDefault()` + `stopPropagation()`：
-    //       整行是 `<label>`，点它**会切换那个勾选框** ——
-    //       不挡的话"看详情"会顺手把插件停用/启用（静默改配置，本项目最忌）。
-    const detail = document.createElement("button");
-    detail.type = "button";
-    detail.className = "link-btn switch-detail";
-    detail.textContent = "详情";
-    detail.onclick = (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      go(`plugins/${encodeURIComponent(p.id)}`);
-    };
-    row.appendChild(detail);
-
-    // 🔴 「配置」按钮（情绪 2026-10-09：「有些插件没有内置的独立 webui
-    //    就可以打开插件的配置」）。
-    //    ⚠️ 与「详情」按钮**同款三条防护**，一条都不能少：
-    //       `type="button"` + `preventDefault()` + `stopPropagation()` ——
-    //       整行是 `<label>`，不挡的话"打开配置"会**顺手把插件停用/启用**
-    //       （静默改配置，本项目最忌的那类 bug）。
-    const cfgBtn = document.createElement("button");
-    cfgBtn.type = "button";
-    cfgBtn.className = "link-btn switch-config";
-    cfgBtn.textContent = "配置";
-    cfgBtn.title = "打开这个插件的配置";
-    cfgBtn.onclick = (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      // ⚠️ 也走 hash 路由（与"详情"一致）：这样能后退、能分享、刷新还在
-      go(`plugins/${encodeURIComponent(p.id)}/config`);
-    };
-    row.appendChild(cfgBtn);
-
-    if (bad && p.error) {
-      const err = document.createElement("small");
-      err.className = "switch-err";
-      err.textContent = p.error;
-      row.appendChild(err);
-    }
-    host.appendChild(row);
-  }
-
-  // ---- 提示（生效时机 + 对不上的名单项）----
-  const parts = [`共 ${plugins.length} 个插件。取消勾选 = 停用（不加载、不初始化、也不算失败）。`];
-  if (d.restart_required) {
-    parts.push("⚠️ 有改动**还没生效**：需要重启服务（./run.sh serve）后才会应用。");
-  } else {
-    parts.push("当前设置与运行状态一致（无需重启）。");
-  }
-  if ((d.unmatched || []).length) {
-    parts.push(`⚠️ 名单里有对不上任何插件的项（拼写错误？）：${d.unmatched.join(", ")}`);
-  }
-  hint.textContent = parts.join(" ");
-  // 有"待重启 / 名单对不上"⇒ 警告色；否则交还样式表（不写主题色）
-  hint.style.color = d.restart_required || (d.unmatched || []).length ? "var(--warn)" : "";
-}
-
-/** 保存启停设置（整体替换停用名单）。 */
-export async function savePluginSwitch() {
-  const saved = $("plugin-switch-saved");
-  const d = state.pluginSwitch;
-  if (!d) {
-    toast(saved, "还没读到插件清单，无法保存。", true);
-    return;
-  }
-  // 未勾选 = 停用 → 提交的就是停用名单（用后端给的 module_path，不自己拼）
-  const off = [];
-  document.querySelectorAll("#plugin-switch-list .switch-row").forEach((row) => {
-    const cb = row.querySelector("input.switch-cb");
-    if (cb && !cb.checked) off.push(row.dataset.modulePath);
-  });
+  cb.disabled = true;
   try {
     const out = await api("PUT", "/api/v1/plugins/inactivated", {
       inactivated_plugins: off,
     });
     state.pluginSwitch = out;
-    renderPluginSwitch();          // 用后端回来的真值重画（不假设自己写对了）
-    toast(saved, `已保存：停用 ${off.length} 个插件。` +
-      (out.restart_required ? "重启服务后生效。" : "（当前状态已一致）"));
+    // 用后端回来的真值重画（不假设自己写对了）
+    renderPluginUpdate();
+    const all = out.plugins || [];
+    const offN = all.filter((x) => x.enabled_saved === false).length;
+    const label = p.display_name || p.name || p.id;
+    toast(
+      hint,
+      (wantEnabled ? `已启用「${label}」` : `已停用「${label}」`)
+        + `（共 ${all.length} 个插件，停用 ${offN} 个）`,
+    );
   } catch (e) {
-    toast(saved, `保存失败：${e.message}`, true);
+    // 🔴 拨回去 —— 界面上不许留一个"看起来已改"的开关
+    cb.checked = !wantEnabled;
+    toast(hint, `启停失败：${e.message}`, true);
+  } finally {
+    cb.disabled = false;
   }
 }
-
 
 /* ==================== 插件升级 ====================
  * 照真 AstrBot 的 `POST /plugins/{plugin_id}/update`
@@ -482,6 +405,38 @@ export function renderPluginUpdate() {
       ver.textContent = /^v/i.test(raw) ? raw : `v${raw}`;
       titleRow.appendChild(ver);
     }
+
+    // 🔴 **启停开关直接放卡片上**（2026-11-07，情绪：
+    //    「不对不对，启停开关你直接放卡片上啊哇笨笨」）。
+    //
+    //    原来是独立一整节「插件启停」（复选框列表 + 保存按钮），
+    //    和下面的升级卡片**是同一份数据的两个视图** —— 用户要在两处看同一个插件。
+    //    合成一处才对：**一张卡片 = 一个插件的全部操作**（启停 / 详情 / 配置 / 升级）。
+    //
+    //    ⚠️ 开关**即时生效**（点了就存），不再有"保存启停设置"那一步：
+    //       同一屏里"这个开关要保存、那个按钮即时生效"是灾难。
+    const toggle = document.createElement("label");
+    toggle.className = "toggle plugin-card-toggle";
+    toggle.title = p.enabled_saved !== false ? "已启用（关闭 = 停用）" : "已停用";
+
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.className = "toggle-input";
+    cb.checked = p.enabled_saved !== false;
+    cb.setAttribute("role", "switch");
+    cb.setAttribute("aria-label", (p.display_name || p.name || p.id) + " 启用");
+    toggle.appendChild(cb);
+
+    const track = document.createElement("span");
+    track.className = "toggle-track";
+    track.setAttribute("aria-hidden", "true");
+    toggle.appendChild(track);
+
+    // 点开关不许冒泡（卡片上将来若加"整卡可点"，这一下会变成"进详情"）
+    toggle.addEventListener("click", (ev) => ev.stopPropagation());
+    cb.addEventListener("change", () => togglePluginEnabled(p, cb, toggle));
+
+    titleRow.appendChild(toggle);
     meta.appendChild(titleRow);
 
     // chip 组：分类 + 标签（照真实现的 extension-chip-group）
