@@ -14,7 +14,7 @@ import { $, MODE_HINTS, api, applyRoute, boot, closeDrawer, go, hideLogin, isMob
 import { closeAdapterForm, deleteAdapter, loadAdapters, onAdapterTypeChange, openAdapterCreate, openAdapterEdit, saveAdapter, setAdapterEnabled } from "./views/adapters.js";
 import { addAgent, onSubagentBackendChange, onSubagentEnabledChange, onSubagentParamsChanged, reloadSubagents, removeAgent, saveSubagents, testSubagentConnection } from "./views/subagents.js";
 import { downloadExport, loadPersonas, refreshPersonaInState, renderPersonaList, renderPromptStats, selectPersona } from "./views/persona.js";
-import { NAV_PLUGIN_OPEN_KEY, collectPluginConfigChanges, openPluginConfig, syncNavPluginGroupOpen } from "./views/plugins.js";
+import { NAV_PLUGIN_OPEN_KEY, collectPluginConfigChanges, syncNavPluginGroupOpen } from "./views/plugins.js";
 import { PROVIDER_FILTER_ALL, addHeaderRow, addProviderModel, clearProviderDetail, closeModelsModal, closePresetPicker, closeTestModal, deleteProviderSource, fetchSourceModels, newProviderSourceFlow, removeProviderModel, renderAvailableModels, saveProviderSource, setAdapterType, setProviderFilter, showModal, testProviderModel } from "./views/providers.js";
 import { fillSessionForm, loadSessions, refreshSessionInfo, renderSessionList, renderSessionPicker, renderSessionSelect, saveSessionConfig, selectSession, showHint } from "./views/session.js";
 import { copyLogs, createConfigProfile, deleteConfigProfile, loadLogs, renameConfigProfile, resetConfigProfile, saveConfigSection, selectConfigProfile, stopLogsAutoRefresh } from "./views/settings.js";
@@ -570,12 +570,30 @@ $("plugin-config-save").onclick = async () => {
   btn.textContent = "保存中…";
   try {
     const r = await api("PUT", `/api/v1/plugins/${encodeURIComponent(id)}/config`, { config: changes });
-    // ⚠️ 后端的文案里有"需要重启服务才生效"——**原样透出**，
-    //    不在这里简化成"已保存"（那会掩盖生效时机）
-    // ⚠️ 顺序要紧：**先重新拉数据**（界面上的值要等于服务端的真实值），
-    //    再写提示 —— 反过来的话那句提示会被重拉过程清掉（见 openPluginConfig）。
-    await openPluginConfig(id, { keepHint: true });
-    toast(hint, (r && r.message) || "已保存");
+
+    // 🔴 **按钮叫「保存并关闭」，就必须真的关掉**（2026-11-07 情绪报障：
+    //    「当我点击"保存并关闭"时会刷新一次但是并没有关闭设置页」）。
+    //
+    //    原来这里只做了"重新拉数据 + 写提示"，**从来没离开这一页** ——
+    //    用户看到页面闪一下、还停在那儿，自然以为"没保存成功"。
+    //    （实测后端确实写盘了，是 UI 的承诺没兑现。）
+    //
+    //    ⚠️ 提示的去处踩过一次坑：我先把它写到列表页的 `#plugin-update-result` 上，
+    //       结果 `go("plugins")` 会触发 `loadPluginPages()`，**同一元素被 5 处写**
+    //       （升级结果/加载提示/配置结果…），提示当场被覆盖成"共 4 个插件拓展页"。
+    //       ⇒ 实测：用户点完保存，只看到一句不相干的话。
+    //
+    //    ✅ 正解：**成功就关闭**（页面关掉本身就是最强的"成了"信号），
+    //       **失败不关闭**（留在配置页，错误显示在 `#plugin-config-hint` 上，
+    //       用户能立刻看到是哪个字段/什么原因）。
+    //
+    //       ⚠️ 这里**必须放在 `if` 里**：失败时在上面那个 `catch` 里已经
+    //          `toast(hint, ..., true)` 并留在原页，不能把它盖掉。
+    const message = (r && r.message) || "已保存";
+    go("plugins");
+    // 关闭后仍要说清"刚才那一保存成不成" —— 写到**专用**的那个提示位
+    // （`#plugin-action-result`，只有这里写，不会被别的渲染覆盖）。
+    toast($("plugin-action-result"), message);
   } catch (e) {
     toast(hint, `保存失败：${e.message}`, true);
   } finally {

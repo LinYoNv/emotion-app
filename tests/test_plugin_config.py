@@ -221,11 +221,32 @@ async def test_config_save_persists_to_plugin_config_file(make):
     cfg_obj = c.app.config["EMOTION_CONFIG"]
     schema_file = Path(cfg_obj.plugins.source_mirror_dir) / PLUGIN_ID / "_conf_schema.json"
     schema = json.loads(schema_file.read_text(encoding="utf-8-sig"))
+    # 🔴 **跳过插件自己会"规范化"的键**（2026-11-07，被这条判据抓出来的真事）。
+    #
+    #    现场：这条判据原来挑 `cands[0]`，正好是 `call_mode`。
+    #    而插件 `main.py:668` 有这么一段**合理逻辑**：
+    #
+    #        if mode == "openai" and not config.get("openai_api_base_url"):
+    #            config["call_mode"] = "direct"      # 选了 openai 却没地址 → 退回
+    #
+    #    ⇒ 判据把 `call_mode` 从 `direct` 改成 `openai`，插件初始化时**正确地**
+    #      把它退回 `direct` ⇒ "读回来还是旧值" ⇒ **判据红，但产品是对的**。
+    #
+    #    ⚠️ 这是「判据不许依赖用户可改的持久设置」的同类：
+    #       **判据也不许挑"被测系统会主动改写的字段"** ——
+    #       否则测得的是"插件怎么规范化"，不是"保存能不能存住"。
+    #
+    #    实测会被插件改写的键（`plugins/astrbot_plugin_nai_image/main.py`）：
+    #       `call_mode`(668/671) / `enable_translate`(651) / `enable_proxy`(927)
+    #    要验证"保存"，就必须挑**插件不会动**的键。
+    NORMALIZED_BY_PLUGIN = {"call_mode", "enable_translate", "enable_proxy"}
     cands = [
         (k, v["options"]) for k, v in schema.items()
-        if isinstance(v, dict) and v.get("type") == "string" and isinstance(v.get("options"), list) and len(v["options"]) >= 2
+        if isinstance(v, dict) and v.get("type") == "string"
+        and isinstance(v.get("options"), list) and len(v["options"]) >= 2
+        and k not in NORMALIZED_BY_PLUGIN
     ]
-    assert cands, "这个插件没有【带 options 的 string 键】，换一个插件或换判据"
+    assert cands, "这个插件没有【带 options 且插件不改写】的 string 键，换一个插件或换判据"
     key, options = cands[0]
 
     r0 = await c.get(f"/api/v1/plugins/{PLUGIN_ID}/config")
@@ -237,9 +258,16 @@ async def test_config_save_persists_to_plugin_config_file(make):
     assert r.status_code == 200, await r.get_data(as_text=True)
     body = await r.get_json()
     assert body["ok"] is True
-    # ⚠️ 文案必须**如实**说需要重启（我们没实现热重载）—— 不许照抄真实现的
-    #    "正在热重载插件"（那是假信息）
-    assert "重启" in body["message"], f"文案没说清生效时机：{body['message']}"
+    # 🔴 **2026-11-07 契约反转**：原来这条要求文案如实说"需要重启"，
+    #    因为当时**确实没有热重载**（照抄真实现的"正在热重载插件"会是假信息）。
+    #
+    #    现在 `self.reload_plugin()` 是真的、保存完真的调它，
+    #    所以契约反过来了：**必须说"已热重载"**。
+    #    判据守的语义没变 —— 一直是「文案必须与真实行为一致」，
+    #    只是真实行为变了。
+    assert "热重载" in body["message"], (
+        f"文案没说清生效时机（保存后会自动热重载）：{body['message']}"
+    )
 
     # 读回来（走**接口**）
     r2 = await c.get(f"/api/v1/plugins/{PLUGIN_ID}/config")

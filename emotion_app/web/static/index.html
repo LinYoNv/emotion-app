@@ -21,7 +21,7 @@
 <link rel="preload" href="/static/fonts/geist-latin.woff2" as="font" type="font/woff2" crossorigin />
 <!-- ⚠️ `?v=` 必须与文件末尾 `<script src="js/main.js?v=…">` 的版本号**一起改** ——
      改 CSS 不改版本号 = 用户看不到新样式（本项目 2026-09-26 真事故）。 -->
-<link rel="stylesheet" href="/static/app.css?v=20261107d" />
+<link rel="stylesheet" href="/static/app.css?v=20261107f" />
 </head>
 <body>
 <!--
@@ -893,6 +893,13 @@
             2026-09-27 那次"入口列表被压成 0 高"的完整取证）。
          ================================================================== -->
     <div id="plugins-list-view" class="plugins-list-view">
+    <!-- 🔴 **插件页自己的操作结果提示**（2026-11-07 加）。
+         为什么不复用 `#plugin-update-result`：那个元素被 **5 处**写
+         （升级结果 / 加载提示 / 配置结果…），保存提示写进去会**立刻被覆盖** ——
+         实测用户点完「保存并关闭」只看到一句"共 4 个插件拓展页"。
+
+         ⇒ 一个用途一个元素。这条只写"某次插件操作的结果"。 -->
+    <p class="hint" id="plugin-action-result" role="status"></p>
     <!-- 🔴 插件**启停**（照真 AstrBot 的 inactivated_plugins）。
          判据必须真浏览器验："有没有这个元素" 与 "值对不对" 是两件事，
          `curl` 验不了 JS。 -->
@@ -1161,6 +1168,6 @@
      ⇒ 改 `js/` 或 `app.css` **必须**同时改这里的版本号，两边一起走。
      ⚠️ 子模块（`js/views/*.js`）**不加** `?v=`：它们由 `main.js` 的静态 `import`
         决定 URL，加不了参数，改了子模块就靠 bump 这里来打破整张模块图的缓存。 -->
-<script type="module" src="/static/js/main.js?v=20261107d"></script>
+<script type="module" src="/static/js/main.js?v=20261107f"></script>
 </body>
 </html>

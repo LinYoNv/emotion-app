@@ -1065,15 +1065,48 @@ class PluginHost:
         #    （`config_profile.py` 里"改完需要重启服务才生效"是同一个约定）。
         #    将来真做了重载，改这一处即可。
         # ==================================================================
+        # 🔴 **保存后自动热重载该插件**（2026-11-07，情绪：
+        #    「更新插件直接热重载就是，不应该提示"重启整个服务"」——
+        #    同一条要求适用于配置保存：插件在 `__init__` 里就把配置读进了属性，
+        #    不重载 = 用户改的不生效，而他看到的是"已保存"）。
+        #
+        #    我们**早就有** `reload_plugin()`（`plugin_lifecycle.py`），
+        #    原来这里写着"尚未实现插件热重载"是**过期的自述**。
+        #
+        #    ⚠️ 重载失败**不把保存判成失败** —— 配置文件已经写盘了，那次操作是成功的；
+        #       如实分两部分报，让用户知道"存了但没生效、可以手动重载"。
+        reload_error = ""
+        try:
+            # ⚠️ 用**本类已有的** `self.reload_plugin()`，别在这里再 import 一次
+            #    `plugin_lifecycle.reload_plugin` —— 同一能力两条调用路径，
+            #    以后改重载语义就必须改两处（本项目踩过多次）。
+            from .plugin_lifecycle import PluginLifecycleError
+
+            await self.reload_plugin(plugin_id)
+        except PluginLifecycleError as exc:
+            reload_error = exc.message
+        except Exception as exc:  # noqa: BLE001
+            reload_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("保存配置后自动重载失败（plugin=%s）", plugin_id, exc_info=True)
+
+        if reload_error:
+            logger.info(
+                "插件 %s 的配置已保存，但自动重载失败：%s",
+                plugin_id,
+                reload_error,
+                extra={"data": {"plugin": plugin_id, "keys": sorted(config.keys())[:20]}},
+            )
+            return (
+                f"插件 {plugin_id} 的配置已保存，但**自动重载失败**（{reload_error}）"
+                "—— 可在插件卡片上点「重载」再试。"
+            )
+
         logger.info(
-            "插件 %s 的配置已保存（需要重启服务才能生效）",
+            "插件 %s 的配置已保存并热重载",
             plugin_id,
             extra={"data": {"plugin": plugin_id, "keys": sorted(config.keys())[:20]}},
         )
-        return (
-            f"插件 {plugin_id} 的配置已保存。"
-            "⚠️ 本服务**尚未实现插件热重载**，需要**重启服务**后生效。"
-        )
+        return f"插件 {plugin_id} 的配置已保存，**已热重载，新配置已生效**。"
 
     # ======================================================================
     # 插件「配置文件」管理（照真实现 `ConfigFileService`，2026-10-09 补）
