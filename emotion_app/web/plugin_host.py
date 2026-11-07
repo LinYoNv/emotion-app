@@ -456,10 +456,38 @@ class PluginHostService:
             except Exception:  # noqa: BLE001
                 logger.warning("人设 id → 名字失败（不写 AstrBot 兼容键）", exc_info=True)
 
-        if not persona_name:
-            return profile
-
         out = dict(profile)          # 浅拷贝：不改原始 dict（它可能是缓存里的同一份）
+
+        # 🔴 **三个 AstrBot 官方 `provider_settings.*` 键必须传过去**
+        #    （2026-11-07，情绪要求「删掉 tts/stt 用陪伴的」+ 检查这些有没有归属）。
+        #
+        #    实读官方 `astrbot/core/config/default.py`：
+        #        provider_settings.streaming_response       默认 False
+        #        provider_settings.display_reasoning_text   默认 False
+        #        provider_settings.datetime_system_prompt   默认 True
+        #    **键名与我们配置文件里的字段一模一样** —— 但我们从来没传过它们，
+        #    于是插件读到的永远是官方默认值，用户在配置页改了也不生效。
+        #    这与昨天「人格永远是默认那个」是同一个病：**值在我们这儿，喂错了形状**。
+        #
+        #    ⚠️ **只传"用户真的设过"的**（`is not None`）—— 没设过就别写，
+        #       让官方默认值生效，而不是用一个空值把它盖成 False。
+        _extra_provider_keys = (
+            "streaming_response",
+            "display_reasoning_text",
+            "datetime_system_prompt",
+        )
+        _from_session = {
+            k: session.get(k) for k in _extra_provider_keys
+            if session.get(k) is not None
+        }
+        if _from_session:
+            ps = out.get("provider_settings")
+            ps = dict(ps) if isinstance(ps, dict) else {}
+            ps.update(_from_session)
+            out["provider_settings"] = ps
+
+        if not persona_name:
+            return out
         provider_settings = out.get("provider_settings")
         if not isinstance(provider_settings, dict):
             provider_settings = {}

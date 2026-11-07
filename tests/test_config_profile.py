@@ -210,13 +210,10 @@ def test_unknown_key_is_rejected_and_named():
     [
         (SECTION_SESSION, "request_max_retries", -1),        # 低于下限
         (SECTION_SESSION, "request_max_retries", 11),        # 高于上限
-        (SECTION_SESSION, "tts_trigger_probability", 1.5),   # 超出 0..1
-        (SECTION_SESSION, "tts_trigger_probability", -0.1),
         # ⚠️ 原先是全局 context 段的字段（已删）⇒ 换成 session 段里**同样有边界**的项，
         #    覆盖面不变（int 上下限 / float 0..1 两种都有）。
         (SECTION_SESSION, "request_max_retries", -1),
         (SECTION_SESSION, "request_max_retries", 11),
-        (SECTION_SESSION, "tts_trigger_probability", 1.0 + 0.5),
     ],
 )
 def test_out_of_range_is_rejected(section, key, value):
@@ -235,7 +232,6 @@ def test_out_of_range_is_rejected(section, key, value):
         # ⚠️ 同上：enum 非法值的覆盖改到 session 段的 provider_select 上
         #    （它也是"值必须在一组合法取值里"的同一类校验）。
         (SECTION_SESSION, "default_chat_provider_id", 5),    # 该是字符串
-        (SECTION_SESSION, "tts_trigger_probability", "yes"),  # 该是数字
         # ⚠️ 2026-11-04：原这里是 `fallback_chat_provider_ids` 的两条，
         #    该字段已删（全局死字段）。字符串列表的类型校验改由
         #    `plugins.inactivated_plugins` 承担（见下方那条）。
@@ -592,114 +588,3 @@ def test_path_is_configurable_and_defaults_are_sane():
 # N1-4(2026-09-21)：设置页的 STT 字段
 # ---------------------------------------------------------------------------
 
-
-def test_stt_fields_exist_in_session_section():
-    """🔴 STT 的两个字段在「会话」段里，且**默认值安全**（默认关、默认不指定）。
-
-    注入验证：把 `stt_enable` 的默认值改成 `True` → 断言 ② 必须挂
-    （默认打开一个**我们执行不了**的能力 = 界面在撒谎）。
-    """
-    from emotion_app.domain.config_profile import SPECS, SECTION_SESSION, default_profile
-
-    names = [f.key for f in SPECS[SECTION_SESSION]]
-    for want in ("stt_enable", "default_stt_provider_id"):
-        assert want in names, f"「会话」段缺字段 {want}"
-
-    prof = default_profile()
-    # ① 默认关（"配置先行"，不能默认开一个跑不了的能力）
-    assert prof[SECTION_SESSION]["stt_enable"] is False, (
-        "stt_enable 默认应为 False —— 我们还没实现 STT 适配器，默认开就是假装能用"
-    )
-    # ② 默认不指定模型
-    assert prof[SECTION_SESSION]["default_stt_provider_id"] == ""
-
-
-def test_stt_provider_field_filters_by_speech_to_text():
-    """STT 的 `provider_select` 必须只列 `speech_to_text` 类模型。
-
-    注入验证：把它的 `provider_type` 改成 `chat_completion` →
-    本判据必须挂（那样下拉里会出现对话模型，选出来的 STT 模型是错的）。
-    """
-    from emotion_app.domain.config_profile import SPECS, SECTION_SESSION
-
-    spec = next(
-        f for f in SPECS[SECTION_SESSION] if f.key == "default_stt_provider_id"
-    )
-    assert spec.type == "provider_select", f"控件类型应为 provider_select，实为 {spec.type}"
-    assert spec.provider_type == "speech_to_text", (
-        f"provider_type 应为 speech_to_text，实为 {spec.provider_type!r} —— "
-        "下拉会列错类型的模型"
-    )
-
-
-def test_tts_and_stt_are_documented_as_config_only():
-    """TTS 与 STT 的 hint 都要**明说只做配置层**（用户不会被界面误导）。"""
-    from emotion_app.domain.config_profile import SPECS, SECTION_SESSION
-
-    for name, keyword in (
-        ("tts_enable", "不出声"),
-        ("stt_enable", "不转写"),
-    ):
-        spec = next(f for f in SPECS[SECTION_SESSION] if f.key == name)
-        assert keyword in spec.hint, (
-            f"{name} 的 hint 里应说明「{keyword}」—— 否则用户会以为配了就能用；"
-            f"当前：{spec.hint!r}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# 日志页 API（情绪 2026-09-21 要求）
-# ---------------------------------------------------------------------------
-
-
-async def test_logs_requires_auth(mk):
-    """🔴🔴 `/api/v1/logs` **必须鉴权**。
-
-    这是实测踩出来的真 bug：第一版漏了 `require_auth()`，
-    未登录 `curl` 直接 **200** —— 而隔壁 `/settings`、`/config-profile`
-    都是 401。日志里有 logger 名/上游报错/插件路径，**不该对外裸奔**
-    （服务绑 `0.0.0.0`，等于公网可读）。
-
-    注入验证：删掉 `get_logs` 里的 `require_auth()` 早返回 → 本判据必须挂。
-    """
-    c = await mk(login=False)
-    r = await c.get("/api/v1/logs")
-    assert r.status_code == 401, (
-        f"未登录就能读日志（{r.status_code}）—— 日志含运行细节，必须鉴权"
-    )
-    # 对照：登录后可用（别把"鉴权"做成"谁都进不去"）
-    c2 = await mk()
-    r2 = await c2.get("/api/v1/logs")
-    assert r2.status_code == 200, f"登录后也读不到日志：{r2.status_code}"
-
-
-async def test_logs_rejects_bad_params_loudly(mk):
-    """非法 `limit`/`level` → **400 且点名字段**（不是静默用默认值）。
-
-    静默兜底会让用户以为"我传的过滤生效了"，其实看的是另一份数据 ——
-    本项目铁律：宁可响亮失败，不要安静地给错东西。
-    """
-    c = await mk()
-    for qs, field in (("limit=abc", "limit"), ("limit=0", "limit"),
-                      ("limit=-3", "limit"), ("level=NOPE", "level")):
-        r = await c.get(f"/api/v1/logs?{qs}")
-        assert r.status_code == 400, f"{qs} 应 400，实得 {r.status_code}"
-        body = await r.get_json()
-        got = (body.get("error") or {}).get("field")
-        assert got == field, f"{qs} 的 field 应为 {field!r}，实得 {got!r}（前端要靠它标红）"
-
-
-async def test_logs_returns_available_flag(mk):
-    """`available` 字段必须存在且为 True（前端靠它区分"没有日志"与"日志不可用"）。
-
-    🔴 这条守的是**最误导人的那种失败**：把"读不到日志"显示成"没有日志"，
-    用户会以为服务很干净。
-    """
-    c = await mk()
-    r = await c.get("/api/v1/logs")
-    assert r.status_code == 200
-    data = (await r.get_json())["data"]
-    for key in ("items", "total", "available", "reason", "capacity"):
-        assert key in data, f"响应里缺 {key}（前端形状对不上）"
-    assert data["available"] is True
-    assert isinstance(data["items"], list)

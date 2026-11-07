@@ -164,30 +164,7 @@ SPECS: dict[str, tuple[FieldSpec, ...]] = {
         #         而界面显示"已配置"。
         #    ⇒ 死字段比没有更糟。现在改成会话级 `Session.fallback_model`，
         #       真正接在 `_chat_with_fallback()` 上（`chat.py`）。
-        FieldSpec(
-            "tts_enable", "启用文本转语音", "bool", False,
-            hint="⚠️ 本轮只保存配置，**暂不出声**（做出声要多做音频链路）。",
-        ),
-        FieldSpec(
-            "default_tts_provider_id", "默认文本转语音模型", "provider_select", "",
-            hint="留空 = 不指定。", provider_type="text_to_speech",
-        ),
-        FieldSpec(
-            "tts_trigger_probability", "TTS 触发概率", "float", 1.0,
-            hint="0.0–1.0；1.0 = 每条都触发（将来真出声时生效）。",
-            minimum=0.0, maximum=1.0,
-        ),
         # ---- 语音识别（STT，2026-09-21 加；与 TTS 同为**配置层**） ----
-        FieldSpec(
-            "stt_enable", "启用语音识别", "bool", False,
-            hint="⚠️ 只保存配置，**暂不转写** —— 我们还没实现 STT 适配器"
-                 "（whisper / xinference / mimo 三条预设均标注为不可执行）。",
-        ),
-        FieldSpec(
-            "default_stt_provider_id", "默认语音识别模型", "provider_select", "",
-            hint="留空 = 不指定。⚠️ 目前列出的模型本平台都还不能真跑（配置先行）。",
-            provider_type="speech_to_text",
-        ),
         FieldSpec(
             "default_persona_id", "默认采用的人格", "persona_select", "",
             hint="留空 = 用当前激活的人格。",

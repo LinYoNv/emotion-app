@@ -115,3 +115,77 @@ def test_empty_persona_id_is_noop():
     out = _aug(src)
     assert "provider_settings" not in out
     assert out["session"] == {}
+
+
+# ---------------------------------------------------------------------------
+# ⑨ 三个官方 `provider_settings.*` 键必须传过去
+#    （2026-11-07，情绪：「流式这块…得你完全弄清楚陪伴有没有流式开关」）
+# ---------------------------------------------------------------------------
+
+
+def test_three_official_provider_settings_are_forwarded():
+    """我们的字段名**就是** AstrBot 官方的键名，必须原样传过去。
+
+    实读 `astrbot/core/config/default.py`（官方）：
+
+        provider_settings.streaming_response       默认 False
+        provider_settings.display_reasoning_text   默认 False
+        provider_settings.datetime_system_prompt   默认 True
+
+    🔴 我们存了这三个值却**从来没传给插件** ⇒ 插件读到的永远是官方默认值，
+       用户在配置页改了不生效。**和「人格永远是默认那个」是同一个病。**
+
+    ⚠️ 特别注意 `streaming_response`：陪伴插件作者建议在 AstrBot 侧**开流式**
+       （插件自己的 `model.streaming` 只管它自己生成的路径，不是主链）。
+    """
+    out = _aug({
+        "session": {
+            "default_persona_id": "uuid-nuomi",
+            "streaming_response": True,
+            "display_reasoning_text": True,
+            "datetime_system_prompt": False,
+        }
+    })
+    ps = out.get("provider_settings") or {}
+    assert ps.get("streaming_response") is True, (
+        "`streaming_response` 没传 —— 作者建议开的主链流式开不了"
+    )
+    assert ps.get("display_reasoning_text") is True, "`display_reasoning_text` 没传"
+    assert ps.get("datetime_system_prompt") is False, (
+        "`datetime_system_prompt` 没传（注意传 False 也算「设过」）"
+    )
+
+
+def test_unset_provider_settings_keys_are_not_forced():
+    """**没设过的键不许写** —— 否则会用空值盖掉官方默认。
+
+    ⚠️ `datetime_system_prompt` 官方默认是 `True`。我们若因为"字段没值"
+       就写 `False`，等于把用户的默认行为关掉了。
+    """
+    out = _aug({"session": {"default_persona_id": "uuid-nuomi"}})
+    ps = out.get("provider_settings") or {}
+    for k in ("streaming_response", "display_reasoning_text", "datetime_system_prompt"):
+        assert k not in ps, f"{k} 没设过却被写进去了 —— 会盖掉官方默认值"
+
+
+def test_tts_stt_fields_are_gone():
+    """⑩ TTS / STT 字段必须**已删除**（改用陪伴插件的 `voice_reply`）。
+
+    情绪 2026-11-07：「删掉 tts 和 stt 用陪伴的功能」。
+
+    依据：
+      * 陪伴插件 `voice_reply.*` 有 **30 项完整实现**（多语言 provider、
+        私聊/群聊概率、冷却、触发词…），我们这 4 个字段**0 个消费方**；
+      * 我们自己的 hint 都写着「本轮只保存配置，暂不出声」——填了不出声；
+      * STT 陪伴也没有，我们也没实现。
+    """
+    import dataclasses
+
+    from emotion_app.domain.config_profile import SECTION_SESSION, SPECS
+
+    keys = {dataclasses.asdict(f).get("key") for f in SPECS[SECTION_SESSION]}
+    for gone in ("tts_enable", "default_tts_provider_id", "tts_trigger_probability",
+                 "stt_enable", "default_stt_provider_id"):
+        assert gone not in keys, (
+            f"{gone} 还在 —— 它是「填了不生效」的死字段，比没有更糟"
+        )
