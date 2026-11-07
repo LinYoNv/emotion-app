@@ -278,3 +278,35 @@ def test_session_info_flags_non_exclusive_umo():
     )
     # title 要给出动作（否则用户知道有问题但不知道怎么办）
     assert "换一个专用 umo" in body, "提示里没说该怎么做"
+
+
+def test_html_comments_are_closed():
+    """🔴 **每个 `<!--` 必须有对应的 `-->`**（2026-11-07 踩）。
+
+    现场：我给插件页加了一段说明注释，**忘了写结尾 `-->`**，
+    于是它把后面那一行的 `</div>` 一起吞进了注释 ——
+
+        <!-- 说明……
+             ...这一条。 -->
+        </div><!-- /#plugins-list-view -->
+        ↑ 这行的 `</div>` 被上面的注释吃掉了
+
+    ⇒ `#plugins-list-view` 那个 div 从此**永远不闭合**，
+      浏览器用容错"猜"着补，**页面看起来完全正常**，
+      但 DOM 已经和我们写的不一样（后续 `querySelector` 会莫名失配）。
+      是 `test_html_tags_are_balanced` 当场抓出来的。
+
+    ⚠️ 为什么这条要单独存在：标签配平那条**只能事后发现"不平衡"**，
+       报的是 `</section> 之前有未闭合 div` —— 离真因（漏写 `-->`）
+       隔了好几屏。这条直接指向真因。
+    """
+    from pathlib import Path as _P
+
+    html = _P(__file__).resolve().parent.parent / "emotion_app/web/static/index.html"
+    text = html.read_text(encoding="utf-8")
+    opens = text.count("<!--")
+    closes = text.count("-->")
+    assert opens == closes, (
+        f"HTML 注释没配平：`<!--` {opens} 个，`-->` {closes} 个。"
+        "漏一个 `-->` 会把后面的真实标签吞进注释（页面看起来还正常，DOM 已经错了）"
+    )

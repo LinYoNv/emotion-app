@@ -596,42 +596,47 @@ export async function upgradePlugin(p, btn) {
 
 
 export async function loadPluginPages() {
-  const ul = $("plugin-page-list");
-  const hint = $("plugins-hint");
+  /* 🔴 **这个函数现在只负责"取数据 + 喂给侧边栏"，不再画列表**
+   *    （2026-11-07，情绪：「下面这一节扩展页也可以删了，左侧有了独立 webui
+   *    的显示地方下面这一节就不用保留了的」）。
+   *
+   *    原来的 `#plugin-page-list` 与侧边栏的「插件页面」分组**读同一份数据**
+   *    （`/api/v1/plugins/pages`）、用同一条过滤规则（有拓展页 且 state=loaded）
+   *    ⇒ 两处必然一致，留着只是同一个入口出现两次。
+   *
+   *    ⚠️ 数据仍然要取：`state.pluginPages` 是 `openPluginPage()` 的查找表，
+   *       `plugins-badge` 也要靠它显示数量。
+   *    ⚠️ 取失败**照样要如实报**（侧边栏那块会自己隐藏，但用户得知道为什么空）。
+   */
+  // ⚠️ `#plugins-hint` 随列表一起删了 —— 落到页面里**真实存在**的那个提示位。
+  //    判空不是目的：绑一个不存在的 id 等于这条信息永远不会显示（假成功）。
+  const hint = $("plugin-update-result");
   try {
     const d = await api("GET", "/api/v1/plugins/pages");
     const pages = d.pages || [];
     state.pluginPages = pages;
 
     const badge = $("plugins-badge");
-    if (pages.length) { badge.textContent = String(pages.length); badge.classList.remove("hidden"); }
-    else badge.classList.add("hidden");
-
-    if (!pages.length) {
-      hint.textContent = "没有发现插件拓展页。可能原因：插件宿主没启用（EMOTION_PLUGINS_ENABLED），或插件没有声明 pages。";
-      ul.innerHTML = "";
-      return;
+    if (badge) {
+      if (pages.length) {
+        badge.textContent = String(pages.length);
+        badge.classList.remove("hidden");
+      } else {
+        badge.classList.add("hidden");
+      }
     }
-    hint.textContent = `共 ${pages.length} 个插件拓展页，点一个打开：`;
-    ul.innerHTML = "";
-    for (const p of pages) {
-      const li = document.createElement("li");
-      li.tabIndex = 0;
-      const t = document.createElement("span");
-      t.textContent = p.title || p.page_name;
-      const pid = document.createElement("span");
-      pid.className = "pid";
-      pid.textContent = p.plugin_id;
-      li.append(t, pid);
-      const openIt = () => go(`plugins/${encodeURIComponent(p.plugin_id)}/${encodeURIComponent(p.page_name)}`);
-      li.onclick = openIt;
-      li.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openIt(); } };
-      ul.appendChild(li);
+    if (hint) {
+      hint.style.color = "";
+      hint.textContent = pages.length
+        ? `共 ${pages.length} 个插件拓展页（左侧「插件页面」里点开）。`
+        : "没有发现插件拓展页。可能原因：插件宿主没启用（EMOTION_PLUGINS_ENABLED），"
+          + "或插件没有声明 pages。";
     }
   } catch (e) {
-    hint.textContent = "读取插件页失败：" + e.message;
-    hint.style.color = "var(--danger)";
-    ul.innerHTML = "";
+    if (hint) {
+      hint.style.color = "var(--danger)";
+      hint.textContent = "读取插件页失败：" + e.message;
+    }
   }
 }
 

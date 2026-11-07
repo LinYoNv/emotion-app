@@ -21,7 +21,7 @@
 <link rel="preload" href="/static/fonts/geist-latin.woff2" as="font" type="font/woff2" crossorigin />
 <!-- ⚠️ `?v=` 必须与文件末尾 `<script src="js/main.js?v=…">` 的版本号**一起改** ——
      改 CSS 不改版本号 = 用户看不到新样式（本项目 2026-09-26 真事故）。 -->
-<link rel="stylesheet" href="/static/app.css?v=20261107c" />
+<link rel="stylesheet" href="/static/app.css?v=20261107d" />
 </head>
 <body>
 <!--
@@ -948,9 +948,17 @@
     <div id="plugin-update-list" class="plugin-card-list"></div>
     <p class="hint plugin-update-result" id="plugin-update-result"></p>
 
-    <h3>插件拓展页 <small>（AstrBot 插件自带的面板）</small></h3>
-    <p class="hint" id="plugins-hint">正在读取…</p>
-    <ul id="plugin-page-list" class="list"></ul>
+    <!-- 🔴 **「插件拓展页」列表已删除**（2026-11-07，情绪：
+         「下面这一节扩展页也可以删了，左侧有了独立webui的显示地方下面这一节就不用保留了的」）。
+
+         侧边栏的「插件页面」分组（`#nav-plugin-items`）列的就是**同一份数据**：
+         `renderNavPluginPages()` 与这里原列表都读 `/api/v1/plugins/pages`，
+         也都只列「有拓展页 **且** `state=loaded`」的插件 ⇒ **两处必然一致**，
+         留着只是同一个入口出现两次。
+
+         ⚠️ 删的只是**列表**。`#plugin-frame` 那个 iframe 还在 ——
+            `openPluginPage()` 由 **hash 路由**触发（侧边栏点进来走的就是它），
+            不依赖这个列表。判据 `test_plugin_pages_single_entry` 守着这条。 -->
     </div><!-- /#plugins-list-view（列表态到此为止；下面三块是互斥的其它视图） -->
 
     <!-- ==================== 插件详情 ====================
@@ -1153,6 +1161,6 @@
      ⇒ 改 `js/` 或 `app.css` **必须**同时改这里的版本号，两边一起走。
      ⚠️ 子模块（`js/views/*.js`）**不加** `?v=`：它们由 `main.js` 的静态 `import`
         决定 URL，加不了参数，改了子模块就靠 bump 这里来打破整张模块图的缓存。 -->
-<script type="module" src="/static/js/main.js?v=20261107c"></script>
+<script type="module" src="/static/js/main.js?v=20261107d"></script>
 </body>
 </html>
